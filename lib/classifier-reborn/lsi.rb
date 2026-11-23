@@ -331,15 +331,28 @@ module ClassifierReborn
       votes.sort_by { |_, score| score }
     end
 
-    # Prototype, only works on indexed documents.
-    # I have no clue if this is going to work, but in theory
-    # it's supposed to.
+    # Returns the stems of the +count+ highest weighted terms in the
+    # search vector of the indexed document +doc+. Only works on indexed
+    # documents. Tied weights are broken by word position, so the result
+    # is stable and equally weighted stems never shadow each other.
     def highest_ranked_stems(doc, count = 3)
       raise 'Requested stem ranking on non-indexed content!' unless @items[doc]
 
-      content_vector_array = node_for_content(doc).lsi_vector.to_a
-      top_n = content_vector_array.sort.reverse[0..count - 1]
-      top_n.collect { |x| @word_list.word_for_index(content_vector_array.index(x)) }
+      highest_ranked_stems_with_scores(doc, count).map(&:first)
+    end
+
+    # Like highest_ranked_stems, but returns [stem, weight] pairs so the
+    # explanation can be verified against the document's vector: each
+    # weight is the coordinate of the document's search vector at the
+    # stem's word position. Word positions come from the word list that
+    # produced the document's vector, so old nodes are never explained
+    # with another vocabulary generation's positions, even after new
+    # words are added or the index is rebuilt. Works the same for plain
+    # and cached content nodes.
+    def highest_ranked_stems_with_scores(doc, count = 3)
+      raise 'Requested stem ranking on non-indexed content!' unless @items[doc]
+
+      @items[doc].highest_weighted_terms(count, @word_list)
     end
 
     def reset

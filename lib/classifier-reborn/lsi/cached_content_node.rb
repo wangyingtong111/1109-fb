@@ -37,13 +37,16 @@ module ClassifierReborn
       super
     end
 
-    # We don't want the cached_data here
+    # We don't want the cached_data here, but we do keep the word list
+    # generation that produced the vectors, so a restored node can still
+    # explain them with the correct word positions. All nodes of an index
+    # usually share one word list object, which Marshal stores only once.
     def marshal_dump
-      [@lsi_vector, @lsi_norm, @raw_vector, @raw_norm, @categories, @word_hash]
+      [@lsi_vector, @lsi_norm, @raw_vector, @raw_norm, @categories, @word_hash, @vector_word_list]
     end
 
     def marshal_load(array)
-      @lsi_vector, @lsi_norm, @raw_vector, @raw_norm, @categories, @word_hash = array
+      @lsi_vector, @lsi_norm, @raw_vector, @raw_norm, @categories, @word_hash, @vector_word_list = array
     end
   end
 end

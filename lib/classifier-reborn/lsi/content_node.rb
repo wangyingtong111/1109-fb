@@ -13,7 +13,7 @@ module ClassifierReborn
                   :lsi_vector, :lsi_norm,
                   :categories
 
-    attr_reader :word_hash
+    attr_reader :word_hash, :vector_word_list
     # If text_proc is not specified, the source will be duck-typed
     # via source.to_s
     def initialize(word_hash, *categories)
@@ -42,8 +42,13 @@ module ClassifierReborn
     end
 
     # Creates the raw vector out of word_hash using word_list as the
-    # key for mapping the vector space.
+    # key for mapping the vector space. The given word list is remembered
+    # as +vector_word_list+, so that anything explaining this vector later
+    # can map its coordinates back to words with the very same vocabulary
+    # generation that produced it, even if the index has since moved on
+    # to a new generation of word positions.
     def raw_vector_with(word_list)
+      @vector_word_list = word_list
       vec = if $SVD == :numo
               Numo::DFloat.zeros(word_list.size)
             elsif $SVD == :gsl
@@ -107,6 +112,38 @@ module ClassifierReborn
       else
         @raw_norm   = Vector[*vec].normalize
         @raw_vector = Vector[*vec]
+      end
+    end
+
+    # Returns up to +count+ [word, weight] pairs explaining the highest
+    # weighted terms of this node's search vector. The word positions are
+    # taken from the word list that produced the vector (see
+    # raw_vector_with), so a node whose vector was built by an older
+    # vocabulary generation is still explained with its own word positions,
+    # never with another generation's. +fallback_word_list+ is only used
+    # for vectors built before the word list could be recorded (e.g. nodes
+    # restored from an old Marshal dump).
+    #
+    # Terms with equal weights are ordered by their vector position, so
+    # tied terms never shadow each other and the ordering is stable across
+    # calls. Requesting zero or fewer terms yields an empty array, and
+    # requesting more terms than the vocabulary holds yields one pair per
+    # known word position.
+    def highest_weighted_terms(count, fallback_word_list = nil)
+      count = count.to_i
+      return [] if count <= 0
+
+      vector = search_vector
+      return [] if vector.nil?
+
+      word_list = @vector_word_list || fallback_word_list
+      return [] if word_list.nil?
+
+      coords = vector.to_a
+      ranked = coords.each_index.sort_by { |i| [-coords[i], i] }
+      ranked.first(count).each_with_object([]) do |i, pairs|
+        word = word_list.word_for_index(i)
+        pairs << [word, coords[i]] if word
       end
     end
   end

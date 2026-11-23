@@ -222,4 +222,166 @@ class LSITest < Minitest::Test
     lsi.add_item @str3, 'Cat'
     refute lsi.items.empty?
   end
+
+  # --- Highest-weighted term explanations ---------------------------------
+
+  # Three documents with overlapping vocabularies but different word orders.
+  # :doc_a is the document being explained; its three content words appear
+  # 3, 3 and 1 times respectively.
+  def build_explanation_lsi(cached)
+    lsi = ClassifierReborn::LSI.new(cache_node_vectors: cached)
+    lsi.add_item(:doc_b) { 'cat dog bird fish cat bird' }
+    lsi.add_item(:doc_c) { 'bird horse dog cat bird horse' }
+    lsi.add_item(:doc_a) { 'dog dog dog cat cat cat bird' }
+    lsi
+  end
+
+  def item_node(lsi, item)
+    lsi.instance_variable_get(:@items)[item]
+  end
+
+  def replace_lsi_vector(node, coords)
+    node.lsi_vector =
+      case $SVD
+      when :numo then Numo::DFloat[*coords]
+      when :gsl then GSL::Vector[*coords]
+      else Vector[*coords]
+      end
+  end
+
+  def test_highest_ranked_stems_with_scores_handles_ties
+    [false, true].each do |cached|
+      lsi = build_explanation_lsi(cached)
+      node = item_node(lsi, :doc_a)
+
+      counts = node.word_hash
+      assert_equal [3, 3, 1], counts.values
+      stem3a, stem3b, stem1 = counts.keys
+
+      # Give the document a vector whose three explanation weights are 3, 3, 1.
+      coords = Array.new(lsi.word_list.size, 0.0)
+      coords[lsi.word_list[stem3a]] = 3.0
+      coords[lsi.word_list[stem3b]] = 3.0
+      coords[lsi.word_list[stem1]] = 1.0
+      replace_lsi_vector(node, coords)
+
+      tied = [stem3a, stem3b].sort_by { |word| lsi.word_list[word] }
+
+      # Taking two results yields two different words with the same score,
+      # instead of one tied word shadowing the other.
+      top2 = lsi.highest_ranked_stems_with_scores(:doc_a, 2)
+      assert_equal tied, top2.map(&:first)
+      assert_equal [3.0, 3.0], top2.map(&:last)
+
+      # The full explanation carries the 3, 3, 1 weights in stable order.
+      top3 = lsi.highest_ranked_stems_with_scores(:doc_a, 3)
+      assert_equal [[tied[0], 3.0], [tied[1], 3.0], [stem1, 1.0]], top3
+
+      # The original interface still returns just the word list.
+      assert_equal [tied[0], tied[1], stem1], lsi.highest_ranked_stems(:doc_a, 3)
+
+      # Every weight sits at its word's position in the node's vector.
+      top3.each do |word, weight|
+        assert_equal weight, node.search_vector.to_a[lsi.word_list[word]]
+      end
+    end
+  end
+
+  def test_explanations_survive_vocabulary_regeneration
+    explanations = {}
+    [false, true].each do |cached|
+      lsi = build_explanation_lsi(cached)
+      old_dog_position = lsi.word_list[:dog]
+
+      # Remove another document and introduce a brand new word that lands
+      # at the front of the vocabulary, then rebuild the index.
+      lsi.remove_item(:doc_c)
+      lsi.add_item(:doc_b) { 'aardvark cat dog bird' }
+      assert !lsi.needs_rebuild?
+
+      new_stem = item_node(lsi, :doc_b).word_hash.keys.first
+      assert_equal 0, lsi.word_list[new_stem], 'new word should land at the front of the vocabulary'
+      refute_equal old_dog_position, lsi.word_list[:dog], 'word positions should have shifted'
+
+      # Re-query the old document: the first explanation after the rebuild
+      # must already use the new generation of word positions.
+      explained = lsi.highest_ranked_stems_with_scores(:doc_a, lsi.word_list.size)
+      refute_empty explained
+      assert_equal explained, lsi.highest_ranked_stems_with_scores(:doc_a, lsi.word_list.size),
+                   'explanations should be stable across repeated calls'
+
+      node = item_node(lsi, :doc_a)
+      coords = node.search_vector.to_a
+      explained.each do |word, weight|
+        position = lsi.word_list[word]
+        refute_nil position
+        assert_in_delta coords[position], weight, 1e-9,
+                        "weight of #{word} must belong to its current word position"
+      end
+
+      if cached
+        # The word list generation survives a Marshal round trip as well.
+        restored = Marshal.load(Marshal.dump(lsi))
+        assert_equal explained, restored.highest_ranked_stems_with_scores(:doc_a, restored.word_list.size)
+      end
+
+      explanations[cached] = explained
+    end
+
+    # Plain and cached content nodes return the same verifiable explanation.
+    assert_equal explanations[false].map(&:first), explanations[true].map(&:first)
+    explanations[false].zip(explanations[true]).each do |(_, plain_weight), (_, cached_weight)|
+      assert_in_delta plain_weight, cached_weight, 1e-9
+    end
+  end
+
+  def test_explanation_uses_word_list_generation_that_built_the_vector
+    [ClassifierReborn::ContentNode, ClassifierReborn::CachedContentNode].each do |node_class|
+      gen1 = ClassifierReborn::WordList.new
+      %i[dog cat bird].each { |word| gen1.add_word(word) }
+      gen2 = ClassifierReborn::WordList.new
+      %i[aardvark dog cat bird].each { |word| gen2.add_word(word) }
+
+      node = node_class.new(dog: 3, cat: 3, bird: 1)
+      node.raw_vector_with(gen1)
+      assert_same gen1, node.vector_word_list
+
+      # Even when a newer-generation word list is offered as fallback, the
+      # cached vector must be explained with the positions of the word list
+      # generation that produced it, never with another generation's.
+      explained = node.highest_weighted_terms(3, gen2)
+      coords = node.search_vector.to_a
+      assert_equal %i[dog cat bird], explained.map(&:first)
+      explained.each_with_index do |(_, weight), i|
+        assert_equal coords[i], weight
+      end
+
+      # A node whose vector was never built has a deterministic empty explanation.
+      assert_equal [], node_class.new(dog: 1).highest_weighted_terms(3, gen1)
+    end
+  end
+
+  def test_highest_ranked_stems_edge_cases
+    [false, true].each do |cached|
+      lsi = build_explanation_lsi(cached)
+
+      # A miss raises, on both interfaces.
+      error = assert_raises(RuntimeError) { lsi.highest_ranked_stems(:no_such_doc) }
+      assert_match(/non-indexed/, error.message)
+      assert_raises(RuntimeError) { lsi.highest_ranked_stems_with_scores(:no_such_doc) }
+
+      # Zero or fewer requested stems deterministically yields nothing.
+      assert_equal [], lsi.highest_ranked_stems(:doc_a, 0)
+      assert_equal [], lsi.highest_ranked_stems_with_scores(:doc_a, 0)
+      assert_equal [], lsi.highest_ranked_stems_with_scores(:doc_a, -2)
+
+      # Requesting more stems than words yields one pair per word position.
+      vocab_size = lsi.word_list.size
+      all = lsi.highest_ranked_stems_with_scores(:doc_a, vocab_size + 10)
+      assert_equal vocab_size, all.size
+      assert_equal all, lsi.highest_ranked_stems_with_scores(:doc_a, vocab_size)
+      assert_equal vocab_size, all.map(&:first).uniq.size
+      assert_equal all, lsi.highest_ranked_stems_with_scores(:doc_a, vocab_size + 10)
+    end
+  end
 end

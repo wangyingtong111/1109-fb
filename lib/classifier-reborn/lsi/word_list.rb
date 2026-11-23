@@ -15,7 +15,10 @@ module ClassifierReborn
 
     # Adds a word (if it is new) and assigns it a unique dimension.
     def add_word(word)
-      @location_table[word] = @location_table.size unless @location_table[word]
+      unless @location_table[word]
+        @location_table[word] = @location_table.size
+        @inverse_table = nil
+      end
     end
 
     # Returns the dimension of the word or nil if the word is not in the space.
@@ -24,7 +27,7 @@ module ClassifierReborn
     end
 
     def word_for_index(ind)
-      @location_table.invert[ind]
+      (@inverse_table ||= @location_table.invert)[ind]
     end
 
     # Returns the number of words mapped.

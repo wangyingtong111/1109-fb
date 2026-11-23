@@ -1,5 +1,12 @@
 ## HEAD
 
+### Minor Enhancements
+
+  * LSI: add `highest_ranked_stems_with_scores` returning verifiable `[stem, weight]`
+    pairs. Word positions now come from the word list generation that produced the
+    document vector, tied weights no longer shadow each other and are ordered
+    stably, and zero or over-vocabulary count requests return deterministic results.
+
 ### Documentation
 
   * Update macOS instructions in Numo docs (#199)
