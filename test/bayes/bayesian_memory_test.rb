@@ -15,4 +15,10 @@ class BayesianMemoryTest < Minitest::Test
   def teardown
     TokenFilter::Stopword::STOPWORDS['en'] = @old_stopwords
   end
+
+  private
+
+  def backend_class
+    ClassifierReborn::BayesMemoryBackend
+  end
 end

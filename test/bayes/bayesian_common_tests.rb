@@ -179,6 +179,68 @@ module BayesianCommonTests
     refute_equal Float::INFINITY, classifier.classify_with_score('To be or not to be')[1]
   end
 
+  def test_stopword_lists_are_isolated_between_classifiers
+    with_isolated_backends do |maps_backend, gravel_backend|
+      maps_classifier   = ClassifierReborn::Bayes.new 'Maps', 'Other', stopwords: %w[bridge], backend: maps_backend
+      gravel_classifier = ClassifierReborn::Bayes.new 'Maps', 'Other', stopwords: %w[gravel], backend: gravel_backend
+
+      maps_classifier.train('Maps', 'bridge gravel')
+      gravel_classifier.train('Maps', 'bridge gravel')
+
+      # Stemming is enabled by default, so "bridge" is stored as "bridg".
+      assert_equal %w[gravel], learned_words(maps_classifier, 'Maps')
+      assert_equal %w[bridg], learned_words(gravel_classifier, 'Maps')
+    end
+  end
+
+  def test_stopword_isolation_is_independent_of_creation_order
+    with_isolated_backends do |maps_backend, gravel_backend|
+      gravel_classifier = ClassifierReborn::Bayes.new 'Maps', 'Other', stopwords: %w[gravel], backend: gravel_backend
+      maps_classifier   = ClassifierReborn::Bayes.new 'Maps', 'Other', stopwords: %w[bridge], backend: maps_backend
+
+      maps_classifier.train('Maps', 'bridge gravel')
+      gravel_classifier.train('Maps', 'bridge gravel')
+
+      assert_equal %w[gravel], learned_words(maps_classifier, 'Maps')
+      assert_equal %w[bridg], learned_words(gravel_classifier, 'Maps')
+    end
+  end
+
+  def test_classification_uses_each_classifiers_own_stopwords
+    with_isolated_backends do |maps_backend, gravel_backend|
+      maps_classifier   = ClassifierReborn::Bayes.new 'Maps', 'Other', stopwords: %w[bridge], backend: maps_backend
+      gravel_classifier = ClassifierReborn::Bayes.new 'Maps', 'Other', stopwords: %w[gravel], backend: gravel_backend
+
+      maps_classifier.train('Maps', 'bridge gravel')
+      maps_classifier.train('Other', 'river valley')
+      gravel_classifier.train('Maps', 'bridge gravel')
+      gravel_classifier.train('Other', 'river valley')
+
+      assert_equal 'Maps', maps_classifier.classify('gravel')
+      assert_equal 'Maps', gravel_classifier.classify('bridge')
+
+      # A document consisting only of the model's own stopword has no features
+      assert_equal Float::INFINITY, maps_classifier.classify_with_score('bridge')[1]
+      assert_equal Float::INFINITY, gravel_classifier.classify_with_score('gravel')[1]
+    end
+  end
+
+  def test_default_language_stopwords_coexist_with_custom_stopwords
+    with_isolated_backends do |default_backend, custom_backend|
+      default_classifier = ClassifierReborn::Bayes.new 'Maps', 'Other', backend: default_backend
+      custom_classifier  = ClassifierReborn::Bayes.new 'Maps', 'Other', stopwords: %w[bridge], backend: custom_backend
+
+      default_classifier.train('Maps', 'bridge gravel')
+      custom_classifier.train('Maps', 'bridge gravel')
+
+      assert_includes learned_words(default_classifier, 'Maps'), 'bridg'
+      refute_includes learned_words(custom_classifier, 'Maps'), 'bridg'
+      # The shared bundled vocabulary is untouched and still filters "the"
+      default_classifier.train('Maps', 'the quick brown fox')
+      refute_includes learned_words(default_classifier, 'Maps'), 'the'
+    end
+  end
+
   def test_reset
     @classifier.add_category 'Test'
     assert_equal %w[Test Interesting Uninteresting].sort, @classifier.categories.sort
@@ -192,6 +254,32 @@ module BayesianCommonTests
   end
 
   private
+
+  # Builds two fresh, independent backends so classifiers under test never
+  # share categories or word counts. Concrete test classes provide the class
+  # via +backend_class+ and reset the store through +teardown+ as usual.
+  def with_isolated_backends
+    first_backend = backend_class.new(*isolated_backend_options(2))
+    second_backend = backend_class.new(*isolated_backend_options(3))
+    yield first_backend, second_backend
+  ensure
+    first_backend&.reset
+    second_backend&.reset
+  end
+
+  def isolated_backend_options(_db_index)
+    []
+  end
+
+  def learned_words(classifier, category)
+    category = ClassifierReborn::CategoryNamer.prepare_name(category)
+    backend = classifier.instance_variable_get(:@backend)
+    if backend.instance_variable_defined?(:@redis)
+      backend.instance_variable_get(:@redis).hkeys(category).map(&:to_s)
+    else
+      backend.instance_variable_get(:@categories)[category].keys.map(&:to_s)
+    end
+  end
 
   def another_classifier
     ClassifierReborn::Bayes.new %w[Interesting Uninteresting], backend: @alternate_backend

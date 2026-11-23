@@ -55,9 +55,9 @@ module ClassifierReborn
       @enable_stemmer      = options[:enable_stemmer]
       @backend             = options[:backend]
       @tokenizer           = options[:tokenizer] || Tokenizer::Whitespace
-      @token_filters       = options[:token_filters] || [TokenFilter::Stopword]
+      @stopword_filter     = TokenFilter::StopwordFilter.new(language: @language)
+      @token_filters       = options[:token_filters] || [@stopword_filter]
       @token_filters << TokenFilter::Stemmer if @enable_stemmer && !@token_filters.include?(TokenFilter::Stemmer)
-      TokenFilter::Stopword.language = @language if @token_filters.include?(TokenFilter::Stopword)
 
       populate_initial_categories
 
@@ -278,7 +278,7 @@ module ClassifierReborn
           return # Do not overwrite the default
         end
       end
-      TokenFilter::Stopword::STOPWORDS[@language] = Set.new stopwords
+      @stopword_filter.custom_stopwords = stopwords
     end
   end
 end

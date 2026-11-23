@@ -56,11 +56,11 @@ module ClassifierReborn
       @version = 0
       @built_at_version = -1
       @language = options[:language] || 'en'
+      @stopword_filter = TokenFilter::StopwordFilter.new(language: @language)
       @token_filters = [
-        TokenFilter::Stopword,
+        @stopword_filter,
         TokenFilter::Symbol
       ]
-      TokenFilter::Stopword.language = @language
       extend CachedContentNode::InstanceMethods if @cache_node_vectors = options[:cache_node_vectors]
     end
 

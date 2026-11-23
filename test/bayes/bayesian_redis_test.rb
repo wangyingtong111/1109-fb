@@ -23,4 +23,14 @@ class BayesianRedisTest < Minitest::Test
       @alternate_backend.reset
     end
   end
+
+  private
+
+  def backend_class
+    ClassifierReborn::BayesRedisBackend
+  end
+
+  def isolated_backend_options(db_index)
+    [{ db: db_index }]
+  end
 end
