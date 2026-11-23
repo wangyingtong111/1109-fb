@@ -5,7 +5,7 @@ import pytest
 
 import autograd.numpy as np
 import autograd.numpy.random as npr
-from autograd import tuple
+from autograd import grad, tuple
 from autograd.test_util import check_grads
 
 npr.seed(1)
@@ -131,6 +131,78 @@ def test_solve_arg1_3d_3d():
     B = npr.randn(D + 1, D, D + 2)
     fun = lambda A: np.linalg.solve(A, B)
     check_grads(fun)(A)
+
+
+def _well_conditioned(*shape):
+    D = shape[-1]
+    return npr.randn(*shape) + 5 * np.eye(D)
+
+
+def test_solve_broadcast_shared_matrix():
+    # One (1, D, D) coefficient is shared across several matrix right-hand
+    # sides; gradients keep each argument's own (possibly size-1) batch dims.
+    A = _well_conditioned(1, 3, 3)
+    B = npr.randn(4, 3, 2)
+    check_grads(lambda a: np.linalg.solve(a, B).sum())(A)
+    check_grads(lambda b: np.linalg.solve(A, b).sum())(B)
+
+    # A bare (D, D) matrix shared with a stacked multi-column RHS.
+    A = _well_conditioned(3, 3)
+    B = npr.randn(4, 3, 2)
+    check_grads(lambda a: np.linalg.solve(a, B).sum())(A)
+    check_grads(lambda b: np.linalg.solve(A, b).sum())(B)
+
+
+def test_solve_broadcast_shared_vector_rhs():
+    # Several coefficient matrices share a single 1-D vector right-hand side.
+    A = _well_conditioned(4, 3, 3)
+    b = npr.randn(3)
+    check_grads(lambda a: np.linalg.solve(a, b).sum())(A)
+    check_grads(lambda x: np.linalg.solve(A, x).sum())(b)
+
+
+def test_solve_broadcast_mutual_batch_dims():
+    # Batch dimensions of A and B are broadcast against each other both ways.
+    A = _well_conditioned(3, 1, 3, 3)
+    B = npr.randn(1, 2, 3, 2)
+    check_grads(lambda a: np.linalg.solve(a, B).sum())(A)
+    check_grads(lambda b: np.linalg.solve(A, b).sum())(B)
+
+
+def test_solve_broadcast_gradient_values():
+    # Exact-value check: diag(2, 4) of shape (1, 2, 2) shared by three
+    # (2, 1) right-hand sides (2, 4), (4, 8), (6, 12).
+    A = np.array([np.diag([2.0, 4.0])])
+    B = np.array([[[2.0], [4.0]], [[4.0], [8.0]], [[6.0], [12.0]]])
+
+    grad_A = grad(lambda a: np.linalg.solve(a, B).sum())(A)
+    assert grad_A.shape == (1, 2, 2)
+    assert np.allclose(grad_A, np.array([[[-3.0, -3.0], [-1.5, -1.5]]]))
+
+    grad_B = grad(lambda b: np.linalg.solve(A, b).sum())(B)
+    assert grad_B.shape == (3, 2, 1)
+    assert np.allclose(grad_B, np.broadcast_to(np.array([[[0.5], [0.25]]]), (3, 2, 1)))
+
+    # Swap the shared direction: three coefficient matrices share one 1-D
+    # right-hand side [4, 8].
+    A2 = np.stack([np.diag([2.0, 4.0]), np.diag([1.0, 2.0]), np.diag([4.0, 8.0])])
+    b2 = np.array([4.0, 8.0])
+
+    grad_b2 = grad(lambda b: np.linalg.solve(A2, b).sum())(b2)
+    assert grad_b2.shape == (2,)
+    assert np.allclose(grad_b2, [1.75, 0.875])
+
+    grad_A2 = grad(lambda a: np.linalg.solve(a, b2).sum())(A2)
+    assert grad_A2.shape == (3, 2, 2)
+    # Each batch slot keeps the gradient at its own position.
+    expected = np.array(
+        [
+            [[-1.0, -1.0], [-0.5, -0.5]],
+            [[-4.0, -4.0], [-2.0, -2.0]],
+            [[-0.25, -0.25], [-0.125, -0.125]],
+        ]
+    )
+    assert np.allclose(grad_A2, expected)
 
 
 def test_det():

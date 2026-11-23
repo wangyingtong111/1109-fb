@@ -77,12 +77,44 @@ def grad_pinv(ans, x):
 defvjp(pinv, grad_pinv)
 
 
+def _unbroadcast(x, shape):
+    # Sum out the leading dimensions that were broadcast away and reshape back
+    # to the original shape, so the gradient matches the forward argument.
+    extra = x.ndim - len(shape)
+    for axis in range(extra):
+        x = anp.sum(x, axis=0)
+    for axis, size in enumerate(shape):
+        if size == 1:
+            x = anp.sum(x, axis=axis, keepdims=True)
+    return anp.reshape(x, shape)
+
+
 def grad_solve(argnum, ans, a, b):
-    updim = lambda x: x if x.ndim == a.ndim else x[..., None]
-    if argnum == 0:
-        return lambda g: -_dot(updim(solve(T(a), g)), T(updim(ans)))
+    # numpy only treats an exactly 1-D b as a vector right-hand side; every
+    # other b is a stack of (M, K) matrices (matching the forward semantics).
+    vector_rhs = b.ndim == 1
+    if vector_rhs:
+        # Work with an explicit trailing column so the matrix formulas apply.
+        b_col = b[..., None]
+        ans_col = ans[..., None]
     else:
-        return lambda g: solve(T(a), g)
+        b_col = b
+        ans_col = ans
+
+    if argnum == 0:
+        def vjp(g):
+            g_col = g[..., None] if vector_rhs else g
+            ga = -_dot(solve(T(a), g_col), T(ans_col))
+            return _unbroadcast(ga, a.shape)
+    else:
+        def vjp(g):
+            g_col = g[..., None] if vector_rhs else g
+            gb = solve(T(a), g_col)
+            if vector_rhs:
+                gb = gb[..., 0]
+            return _unbroadcast(gb, b.shape)
+
+    return vjp
 
 
 defvjp(solve, partial(grad_solve, 0), partial(grad_solve, 1))
