@@ -1,0 +1,17 @@
+# frozen_string_literal: true
+
+source 'https://rubygems.org'
+
+# Specify your gem's dependencies in rumale-manifold.gemspec
+gemspec
+
+gem 'rumale-core', path: '../rumale-core'
+gem 'rumale-decomposition', path: '../rumale-decomposition'
+gem 'rumale-kernel_approximation', path: '../rumale-kernel_approximation'
+
+gem 'numo-linalg-alt', '~> 0.2'
+gem 'rake', '~> 13.0'
+gem 'rspec', '~> 3.0'
+gem 'simplecov', '~> 0.21'
+
+eval_gemfile(File.expand_path('../Gemfile.rubocop', __dir__))

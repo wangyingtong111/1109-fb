@@ -1,0 +1,20 @@
+# frozen_string_literal: true
+
+source 'https://rubygems.org'
+
+# Specify your gem's dependencies in rumale-pipeline.gemspec
+gemspec
+
+gem 'rumale-clustering', path: '../rumale-clustering'
+gem 'rumale-core', path: '../rumale-core'
+gem 'rumale-decomposition', path: '../rumale-decomposition'
+gem 'rumale-kernel_approximation', path: '../rumale-kernel_approximation'
+gem 'rumale-linear_model', path: '../rumale-linear_model'
+gem 'rumale-naive_bayes', path: '../rumale-naive_bayes'
+gem 'rumale-preprocessing', path: '../rumale-preprocessing'
+
+gem 'rake', '~> 13.0'
+gem 'rspec', '~> 3.0'
+gem 'simplecov', '~> 0.21'
+
+eval_gemfile(File.expand_path('../Gemfile.rubocop', __dir__))

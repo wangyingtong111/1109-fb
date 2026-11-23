@@ -1,0 +1,36 @@
+# frozen_string_literal: true
+
+require 'bundler/gem_tasks'
+require 'rspec/core/rake_task'
+
+RSpec::Core::RakeTask.new(spec: :compile)
+if ENV['BUNDLE_WITH'] == 'memcheck'
+  require 'ruby_memcheck'
+  require 'ruby_memcheck/rspec/rake_task'
+
+  namespace :spec do
+    RubyMemcheck::RSpec::RakeTask.new(valgrind: :compile)
+  end
+end
+
+require 'rubocop/rake_task'
+
+RuboCop::RakeTask.new
+
+require 'rake/extensiontask'
+
+task build: :compile # rubocop:disable Rake/Desc
+
+Rake::ExtensionTask.new('ext') do |ext|
+  ext.ext_dir = 'ext/rumale/tree'
+  ext.lib_dir = 'lib/rumale/tree'
+end
+
+task default: %i[clobber compile spec]
+
+Rake::Task['release'].clear
+gemspec = Bundler.load_gemspec(Dir.glob('*.gemspec').first)
+desc "Build and push #{gemspec.name}-#{gemspec.version}.gem to rubygems.org\n" \
+     'To prevent publishing in RubyGems use `gem_push=no rake release`'
+task 'release', [:remote] => ['build', 'release:guard_clean', 'release:rubygem_push'] do # rubocop:disable Lint/EmptyBlock
+end
