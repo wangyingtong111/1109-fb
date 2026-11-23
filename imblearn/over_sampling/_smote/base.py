@@ -410,6 +410,20 @@ class SMOTENC(SMOTE):
         :class:`~sklearn.preprocessing.OneHotEncoder` is used with default parameters
         apart from `handle_unknown` which is set to 'ignore'.
 
+    categorical_groups : list of array-like, default=None
+        Groups of categorical features that are bound together and must take
+        their values jointly. Each group is an array-like of at least 2 column
+        indices (or column names when `X` is a :class:`pandas.DataFrame`)
+        referring to categorical features. For each generated sample, the
+        features of a group are set to one of the combinations observed in the
+        original samples of the class being over-sampled (the most frequent
+        combination among the nearest neighbors), instead of deciding each
+        feature independently. Categorical features that do not belong to any
+        group keep the usual per-feature majority vote strategy. Groups must
+        not overlap.
+
+        .. versionadded:: 0.14
+
     {sampling_strategy}
 
     {random_state}
@@ -442,6 +456,13 @@ class SMOTENC(SMOTE):
 
     categorical_features_ : ndarray of shape (n_cat_features,), dtype=np.int64
         Indices of the categorical features.
+
+    categorical_groups_ : list of ndarray
+        Groups of categorical features that are resampled jointly. Each entry
+        contains the positions (within `categorical_features_`) of the features
+        of a group. Empty when `categorical_groups` is `None`.
+
+        .. versionadded:: 0.14
 
     continuous_features_ : ndarray of shape (n_cont_features,), dtype=np.int64
         Indices of the continuous features.
@@ -528,6 +549,7 @@ class SMOTENC(SMOTE):
             HasMethods(["fit_transform", "inverse_transform"]),
             None,
         ],
+        "categorical_groups": ["array-like", None],
     }
 
     def __init__(
@@ -535,6 +557,7 @@ class SMOTENC(SMOTE):
         categorical_features,
         *,
         categorical_encoder=None,
+        categorical_groups=None,
         sampling_strategy="auto",
         random_state=None,
         k_neighbors=5,
@@ -546,6 +569,7 @@ class SMOTENC(SMOTE):
         )
         self.categorical_features = categorical_features
         self.categorical_encoder = categorical_encoder
+        self.categorical_groups = categorical_groups
 
     def _check_X_y(self, X, y):
         """Overwrite the checking to let pass some string for categorical
@@ -579,6 +603,48 @@ class SMOTENC(SMOTE):
                 np.arange(self.n_features_), self.categorical_features_
             )
 
+    def _validate_categorical_groups(self, X):
+        """Validate `categorical_groups` and map them to categorical positions.
+
+        Each group is stored as an array of positions within
+        `categorical_features_` so that it can be mapped to the one-hot
+        encoded columns when generating samples.
+        """
+        self.categorical_groups_ = []
+        if self.categorical_groups is None:
+            return
+        cat_position = {
+            col_idx: pos for pos, col_idx in enumerate(self.categorical_features_)
+        }
+        seen_columns = []
+        for group in self.categorical_groups:
+            group_indices = np.asarray(_get_column_indices(X, list(group)))
+            if group_indices.size < 2:
+                raise ValueError(
+                    "Each group in `categorical_groups` must contain at least "
+                    f"2 categorical features. Got {group_indices.size} in group "
+                    f"{list(group)!r}."
+                )
+            not_categorical = [
+                col_idx for col_idx in group_indices if col_idx not in cat_position
+            ]
+            if not_categorical:
+                raise ValueError(
+                    "The features of a group in `categorical_groups` must be "
+                    "categorical features. The following columns of group "
+                    f"{list(group)!r} are not in `categorical_features`: "
+                    f"{not_categorical}."
+                )
+            seen_columns.extend(group_indices.tolist())
+            self.categorical_groups_.append(
+                np.array([cat_position[col_idx] for col_idx in group_indices])
+            )
+        if len(seen_columns) != len(set(seen_columns)):
+            raise ValueError(
+                "The groups in `categorical_groups` must not overlap: a "
+                "categorical feature can only belong to a single group."
+            )
+
     def _validate_estimator(self):
         super()._validate_estimator()
         if self.categorical_features_.size == self.n_features_in_:
@@ -595,6 +661,7 @@ class SMOTENC(SMOTE):
     def _fit_resample(self, X, y):
         self.n_features_ = _num_features(X)
         self._validate_column_types(X)
+        self._validate_categorical_groups(X)
         self._validate_estimator()
 
         X_continuous = _safe_indexing(X, self.continuous_features_, axis=1)
@@ -749,13 +816,27 @@ class SMOTENC(SMOTE):
 
         all_neighbors = nn_data[nn_num[rows]]
 
-        categories_size = [self.continuous_features_.size] + [
+        categories_size = [
             cat.size for cat in self.categorical_encoder_.categories_
         ]
+        # offsets of each categorical feature in the one-hot encoded space
+        offsets = self.continuous_features_.size + np.concatenate(
+            ([0], np.cumsum(categories_size)[:-1])
+        )
 
-        for start_idx, end_idx in zip(
-            np.cumsum(categories_size)[:-1], np.cumsum(categories_size)[1:]
-        ):
+        grouped_positions = (
+            set(np.concatenate(self.categorical_groups_).tolist())
+            if self.categorical_groups_
+            else set()
+        )
+
+        # categorical features that do not belong to any group are decided
+        # independently with the usual majority vote over the nearest neighbors
+        for feat_idx in range(len(categories_size)):
+            if feat_idx in grouped_positions:
+                continue
+            start_idx = offsets[feat_idx]
+            end_idx = start_idx + categories_size[feat_idx]
             col_maxs = all_neighbors[:, :, start_idx:end_idx].sum(axis=1)
             # tie breaking argmax
             is_max = np.isclose(col_maxs, col_maxs.max(axis=1, keepdims=True))
@@ -766,6 +847,37 @@ class SMOTENC(SMOTE):
             ys = start_idx + col_sels
             X_new[:, start_idx:end_idx] = 0
             X_new[xs, ys] = 1
+
+        # grouped categorical features are decided jointly: the group takes
+        # the most frequent combination observed among the nearest neighbors,
+        # which guarantees that the generated combination was seen in the
+        # original samples of the class being over-sampled
+        for group in self.categorical_groups_:
+            slices = [
+                (offsets[pos], offsets[pos] + categories_size[pos]) for pos in group
+            ]
+            # decode the combination of each neighbor: the index of the active
+            # category for each feature of the group
+            neighbor_combos = np.stack(
+                [
+                    all_neighbors[:, :, start:end].argmax(axis=2)
+                    for start, end in slices
+                ],
+                axis=-1,
+            )
+            n_new = neighbor_combos.shape[0]
+            chosen_combos = np.empty((n_new, len(group)), dtype=np.int64)
+            for row_idx in range(n_new):
+                combos, counts = np.unique(
+                    neighbor_combos[row_idx], axis=0, return_counts=True
+                )
+                # tie breaking among the most frequent combinations
+                best = np.flatnonzero(counts == counts.max())
+                chosen_combos[row_idx] = combos[rng.choice(best)]
+            rows_idx = np.arange(n_new)
+            for member, (start, end) in enumerate(slices):
+                X_new[:, start:end] = 0
+                X_new[rows_idx, start + chosen_combos[:, member]] = 1
 
         return X_new
 

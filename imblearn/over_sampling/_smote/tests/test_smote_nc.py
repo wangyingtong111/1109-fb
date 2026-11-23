@@ -416,3 +416,156 @@ def test_smote_nc_categorical_features_auto_error():
     err_msg = "SMOTE-NC is not designed to work only with numerical features"
     with pytest.raises(ValueError, match=err_msg):
         smote.fit_resample(X, y)
+
+
+def test_smotenc_categorical_groups():
+    """Check that grouped categorical features take values jointly.
+
+    The combination of the grouped features of a generated sample must be one
+    of the combinations observed in the original samples of the class being
+    over-sampled, while the continuous features are still interpolated in the
+    neighborhood of the original samples.
+    """
+    rng = np.random.RandomState(0)
+    X_minority = np.array(
+        [
+            [0.0, 0, 1, 1],
+            [1.0, 1, 0, 1],
+            [2.0, 1, 1, 0],
+        ]
+    )
+    X_majority = np.column_stack(
+        [rng.uniform(10, 20, 30), rng.randint(0, 2, (30, 3))]
+    )
+    X = np.vstack([X_minority, X_majority])
+    y = np.array([1] * 3 + [0] * 30)
+
+    smote = SMOTENC(
+        categorical_features=[1, 2, 3],
+        categorical_groups=[[1, 2, 3]],
+        sampling_strategy={1: 26},
+        k_neighbors=2,
+        random_state=42,
+    )
+    X_res, y_res = smote.fit_resample(X, y)
+
+    # the minority class is resampled to exactly 26 samples
+    assert Counter(y_res)[1] == 26
+
+    X_new = X_res[y_res == 1][len(X_minority):]
+    observed_combinations = {(0, 1, 1), (1, 0, 1), (1, 1, 0)}
+    new_combinations = {tuple(row[1:4].astype(int)) for row in X_new}
+    # all generated combinations were observed in the original minority class
+    assert new_combinations <= observed_combinations
+    # the continuous feature is interpolated within the range of the minority
+    # samples involved in the generation
+    assert X_new[:, 0].min() >= X_minority[:, 0].min()
+    assert X_new[:, 0].max() <= X_minority[:, 0].max()
+
+    # without groups, the per-feature strategy can generate unseen combinations
+    smote = SMOTENC(
+        categorical_features=[1, 2, 3],
+        sampling_strategy={1: 26},
+        k_neighbors=2,
+        random_state=42,
+    )
+    X_res, _ = smote.fit_resample(X, y)
+    X_new = X_res[y_res == 1][len(X_minority):]
+    new_combinations = {tuple(row[1:4].astype(int)) for row in X_new}
+    assert not new_combinations <= observed_combinations
+
+
+def test_smotenc_categorical_groups_with_ungrouped_features():
+    """Check that ungrouped categorical features keep the per-feature strategy."""
+    rng = np.random.RandomState(0)
+    X_minority = np.array(
+        [
+            [0.0, 0, 1, 1, 0],
+            [1.0, 1, 0, 1, 1],
+            [2.0, 1, 1, 0, 0],
+        ]
+    )
+    X_majority = np.column_stack(
+        [rng.uniform(10, 20, 30), rng.randint(0, 2, (30, 4))]
+    )
+    X = np.vstack([X_minority, X_majority])
+    y = np.array([1] * 3 + [0] * 30)
+
+    smote = SMOTENC(
+        categorical_features=[1, 2, 3, 4],
+        categorical_groups=[[1, 2, 3]],
+        sampling_strategy={1: 26},
+        k_neighbors=2,
+        random_state=42,
+    )
+    X_res, y_res = smote.fit_resample(X, y)
+
+    assert Counter(y_res)[1] == 26
+    X_new = X_res[y_res == 1][len(X_minority):]
+    observed_combinations = {(0, 1, 1), (1, 0, 1), (1, 1, 0)}
+    new_combinations = {tuple(row[1:4].astype(int)) for row in X_new}
+    assert new_combinations <= observed_combinations
+    # the ungrouped categorical feature takes valid categories
+    assert set(X_new[:, 4].astype(int)) <= {0, 1}
+
+
+def test_smotenc_categorical_groups_pandas_str():
+    """Check that groups can be specified with column names on a dataframe."""
+    pd = pytest.importorskip("pandas")
+
+    X = pd.DataFrame(
+        {
+            "A": [0.0, 1.0, 2.0] + list(np.random.RandomState(0).uniform(10, 20, 30)),
+            "B": [0, 1, 1] + [0, 1] * 15,
+            "C": [1, 0, 1] + [1, 0] * 15,
+            "D": [1, 1, 0] + [0, 1] * 15,
+        }
+    )
+    y = np.array([1] * 3 + [0] * 30)
+    smote = SMOTENC(
+        categorical_features=["B", "C", "D"],
+        categorical_groups=[["B", "C", "D"]],
+        sampling_strategy={1: 26},
+        k_neighbors=2,
+        random_state=42,
+    )
+    X_res, y_res = smote.fit_resample(X, y)
+    assert Counter(y_res)[1] == 26
+    X_new = X_res[y_res == 1].iloc[3:]
+    observed_combinations = {(0, 1, 1), (1, 0, 1), (1, 1, 0)}
+    new_combinations = {
+        (int(b), int(c), int(d))
+        for b, c, d in zip(X_new["B"], X_new["C"], X_new["D"])
+    }
+    assert new_combinations <= observed_combinations
+
+
+@pytest.mark.parametrize(
+    "categorical_groups, err_msg",
+    [
+        ([[1]], "must contain at least 2 categorical features"),
+        ([[0, 1]], "must be categorical features"),
+        ([[1, 2], [2, 3]], "must not overlap"),
+    ],
+)
+def test_smotenc_categorical_groups_error(categorical_groups, err_msg):
+    """Check the validation of the `categorical_groups` parameter."""
+    X = np.array(
+        [
+            [0.0, 0, 1, 1],
+            [1.0, 1, 0, 1],
+            [2.0, 1, 1, 0],
+            [3.0, 0, 0, 1],
+            [4.0, 1, 1, 1],
+        ]
+        * 4
+    )
+    y = np.array([1] * 5 + [0] * 15)
+    smote = SMOTENC(
+        categorical_features=[1, 2, 3],
+        categorical_groups=categorical_groups,
+        k_neighbors=2,
+        random_state=0,
+    )
+    with pytest.raises(ValueError, match=err_msg):
+        smote.fit_resample(X, y)
