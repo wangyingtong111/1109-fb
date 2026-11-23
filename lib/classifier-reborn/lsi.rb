@@ -55,6 +55,8 @@ module ClassifierReborn
       @items = {}
       @version = 0
       @built_at_version = -1
+      @cutoff = 0.75
+      @built_at_cutoff = nil
       @language = options[:language] || 'en'
       @token_filters = [
         TokenFilter::Stopword,
@@ -67,8 +69,11 @@ module ClassifierReborn
     # Returns true if the index needs to be rebuilt.  The index needs
     # to be built after all informaton is added, but before you start
     # using it for search, classification and cluster detection.
+    # The built representation is a contract over both the indexed
+    # content and the cutoff it was reduced with, so changing the
+    # cutoff also marks the index as stale.
     def needs_rebuild?
-      (@items.size > 1) && (@version != @built_at_version)
+      (@items.size > 1) && ((@version != @built_at_version) || (@cutoff != @built_at_cutoff))
     end
 
     # Adds an item to the index. item is assumed to be a string, but
@@ -144,8 +149,20 @@ module ClassifierReborn
     # cutoff parameter tells the indexer how many of these values to keep.
     # A value of 1 for cutoff means that no semantic analysis will take place,
     # turning the LSI class into a simple vector search engine.
-    def build_index(cutoff = 0.75)
+    #
+    # The cutoff is part of the built representation: passing a different
+    # cutoff forces a rebuild even when no documents changed, while
+    # repeating the same cutoff reuses the existing representation. The
+    # most recently given cutoff is remembered, so later automatic rebuilds
+    # (triggered by adding items) keep using it. Omit the parameter to
+    # reuse the last explicit choice.
+    def build_index(cutoff = nil)
+      @cutoff = cutoff unless cutoff.nil?
       return unless needs_rebuild?
+
+      # A rebuild replaces every lsi vector, so drop any cached vector
+      # transpositions up front; stale and fresh vectors must never mix.
+      clear_cache! if @cache_node_vectors
 
       make_word_list
 
@@ -154,7 +171,7 @@ module ClassifierReborn
 
       if $SVD == :numo
         tdm = Numo::NArray.asarray(tda.map(&:to_a)).transpose
-        ntdm = numo_build_reduced_matrix(tdm, cutoff)
+        ntdm = numo_build_reduced_matrix(tdm, @cutoff)
 
         ntdm.each_over_axis(1).with_index do |col_vec, i|
           doc_list[i].lsi_vector = col_vec
@@ -162,7 +179,7 @@ module ClassifierReborn
         end
       elsif $SVD == :gsl
         tdm = GSL::Matrix.alloc(*tda).trans
-        ntdm = build_reduced_matrix(tdm, cutoff)
+        ntdm = build_reduced_matrix(tdm, @cutoff)
 
         ntdm.size[1].times do |col|
           vec = GSL::Vector.alloc(ntdm.column(col)).row
@@ -171,7 +188,7 @@ module ClassifierReborn
         end
       else
         tdm = Matrix.rows(tda).trans
-        ntdm = build_reduced_matrix(tdm, cutoff)
+        ntdm = build_reduced_matrix(tdm, @cutoff)
 
         ntdm.column_size.times do |col|
           doc_list[col].lsi_vector = ntdm.column(col) if doc_list[col]
@@ -184,6 +201,7 @@ module ClassifierReborn
       end
 
       @built_at_version = @version
+      @built_at_cutoff = @cutoff
     end
 
     # This method returns max_chunks entries, ordered by their average semantic rating.

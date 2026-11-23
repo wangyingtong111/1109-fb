@@ -222,4 +222,85 @@ class LSITest < Minitest::Test
     lsi.add_item @str3, 'Cat'
     refute lsi.items.empty?
   end
+
+  def test_changing_cutoff_rebuilds_same_documents
+    lsi = ClassifierReborn::LSI.new auto_rebuild: false
+    [@str1, @str2, @str3, @str4, @str5].each { |x| lsi << x }
+
+    lsi.build_index(1.0)
+    refute lsi.needs_rebuild?
+    full_cutoff_vectors = lsi_vector_rows(lsi)
+
+    # Same documents, lower cutoff: the lower truncation must really be applied.
+    lsi.build_index(0.4)
+    refute lsi.needs_rebuild?
+    lower_cutoff_vectors = lsi_vector_rows(lsi)
+    refute_equal full_cutoff_vectors, lower_cutoff_vectors
+
+    # Building again with the same ratio reuses the existing representation.
+    node = lsi.instance_variable_get(:@items).values.first
+    reused_vector = node.lsi_vector
+    lsi.build_index(0.4)
+    assert_same reused_vector, node.lsi_vector
+    assert_equal lower_cutoff_vectors, lsi_vector_rows(lsi)
+  end
+
+  def test_cached_nodes_never_mix_vectors_across_cutoff_rebuilds
+    lsi = ClassifierReborn::LSI.new(cache_node_vectors: true, auto_rebuild: false)
+    [@str1, @str2, @str3, @str4, @str5].each { |x| lsi << x }
+    lsi.build_index(1.0)
+
+    nodes = lsi.instance_variable_get(:@items).values
+    # transposed_search_vector is only used by the GSL/numo implementations
+    supports_transposed_cache = $SVD != :ruby
+    nodes.each(&:transposed_search_vector) if supports_transposed_cache # populate the cache
+    if supports_transposed_cache
+      nodes.each { |node| refute_nil node.instance_variable_get(:@transposed_search_vector) }
+    end
+    old_vectors = nodes.map(&:lsi_vector)
+
+    lsi.build_index(0.4)
+
+    # Every node got a fresh vector and no stale cached transposition survives.
+    nodes.each_with_index do |node, i|
+      refute_same old_vectors[i], node.lsi_vector
+      if supports_transposed_cache
+        assert_nil node.instance_variable_get(:@transposed_search_vector)
+      end
+    end
+
+    # The repopulated cache derives from the new vectors, not the old ones.
+    return unless supports_transposed_cache
+
+    nodes.each do |node|
+      assert_equal node.transposed_search_vector.to_a.flatten,
+                   node.search_vector.to_a.flatten
+    end
+  end
+
+  def test_auto_rebuild_keeps_most_recent_explicit_cutoff
+    lsi = ClassifierReborn::LSI.new
+    [@str1, @str2, @str3, @str4].each { |x| lsi << x }
+    assert_equal 0.75, lsi.instance_variable_get(:@built_at_cutoff)
+
+    lsi.build_index(0.4)
+    assert_equal 0.4, lsi.instance_variable_get(:@built_at_cutoff)
+
+    # Adding a document triggers an automatic rebuild, which must keep
+    # the last explicitly chosen cutoff instead of reverting to the default.
+    lsi << @str5
+    refute lsi.needs_rebuild?
+    assert_equal 0.4, lsi.instance_variable_get(:@built_at_cutoff)
+
+    manual = ClassifierReborn::LSI.new auto_rebuild: false
+    [@str1, @str2, @str3, @str4, @str5].each { |x| manual << x }
+    manual.build_index(0.4)
+    assert_equal lsi_vector_rows(manual), lsi_vector_rows(lsi)
+  end
+
+  private
+
+  def lsi_vector_rows(lsi)
+    lsi.instance_variable_get(:@items).values.map { |node| node.lsi_vector.to_a }
+  end
 end
