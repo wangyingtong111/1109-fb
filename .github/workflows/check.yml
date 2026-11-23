@@ -1,0 +1,47 @@
+name: Style and package checks
+
+on:
+  pull_request:
+    branches:
+    - master
+  push:
+    branches:
+    - master
+  workflow_dispatch:
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  FORCE_COLOR: "3"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  check:
+    name: ${{ matrix.session == 'lint' && 'Style check' || 'Package check' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        session:
+        - lint
+        - validate-package
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - name: Install uv and dependencies
+      uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      with:
+        enable-cache: true
+        python-version: 3.11
+
+    - name: Run ${{ matrix.session }}
+      env:
+        MATRIX_SESSION: ${{ matrix.session }}
+      run: |
+        uv sync --all-extras --dev
+        uvx nox -s ${MATRIX_SESSION}
