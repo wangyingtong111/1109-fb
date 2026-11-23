@@ -332,4 +332,21 @@ class TestVector < Test::Unit::TestCase
     assert_raise(Vector::ZeroVectorError) { Vector[0, 0].angle_with(Vector[1, 1]) }
     assert_raise(Matrix::ErrDimensionMismatch) { Vector[1, 2, 3].angle_with(Vector[0, 1]) }
   end
+
+  def test_angle_with_phase_invariant
+    i = Complex::I
+    u = Vector[1, i]
+    v = Vector[i, -1]   # i * u: same direction up to a phase
+    w = Vector[1, -i]   # genuinely orthogonal to u
+    assert_in_delta(0.0, u.angle_with(v, mode: :phase_invariant), 1e-12)
+    assert_in_delta(Math::PI/2, u.angle_with(w, mode: :phase_invariant), 1e-12)
+
+    big = 1e180
+    assert_in_delta(0.0, (u * big).angle_with(v * big, mode: :phase_invariant), 1e-12)
+    assert_in_delta(Math::PI/2, (u * big).angle_with(w * big, mode: :phase_invariant), 1e-12)
+
+    # The default directed mode is unchanged.
+    assert_in_epsilon(Math::PI, Vector[1, 0].angle_with(Vector[-1, 0]))
+    assert_raise(ArgumentError) { u.angle_with(v, mode: :bogus) }
+  end
 end

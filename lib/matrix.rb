@@ -2402,17 +2402,52 @@ class Vector
   end
 
   #
-  # Returns an angle with another vector. Result is within the [0..Math::PI].
+  # Returns an angle with another vector.
+  #
+  # In the default +:directed+ mode, the result is the usual (real)
+  # angle within [0..Math::PI]:
   #   Vector[1,0].angle_with(Vector[0,1])
   #   # => Math::PI / 2
   #
-  def angle_with(v)
+  # In +:phase_invariant+ mode, the angle is derived from
+  # <tt>|<self, v>| / (|<self>| * |<v>|)</tt>, so vectors differing only
+  # by a complex phase (or a sign) are considered parallel. The result
+  # is within [0..Math::PI/2]:
+  #   Vector[1, Complex::I].angle_with(Vector[Complex::I, -1], mode: :phase_invariant)
+  #   # => 0.0
+  #
+  # The computation is carried out on coordinates rescaled by the
+  # largest component magnitude of each vector, so vectors of very
+  # large or very small scale are compared without overflow or
+  # underflow.
+  #
+  def angle_with(v, mode: :directed)
     raise TypeError, "Expected a Vector, got a #{v.class}" unless v.is_a?(Vector)
     raise ErrDimensionMismatch if size != v.size
-    prod = magnitude * v.magnitude
-    raise ZeroVectorError, "Can't get angle of zero vector" if prod == 0
-    dot = inner_product(v)
-    if dot.abs >= prod
+    unless mode == :directed || mode == :phase_invariant
+      raise ArgumentError, "Unknown angle mode: #{mode.inspect}"
+    end
+    # Rescaling each vector by its largest component magnitude leaves
+    # the angle unchanged while keeping every squared magnitude within
+    # floating point range.
+    scale = @elements.map(&:abs).max.to_f
+    v_scale = v.to_a.map(&:abs).max.to_f
+    raise ZeroVectorError, "Can't get angle of zero vector" if scale == 0 || v_scale == 0
+    dot = 0
+    norm = 0.0
+    v_norm = 0.0
+    each2(v) do |e1, e2|
+      e1 = e1 / scale
+      e2 = e2 / v_scale
+      dot += e1 * e2.conj
+      norm += e1.abs2
+      v_norm += e2.abs2
+    end
+    prod = Math.sqrt(norm * v_norm)
+    if mode == :phase_invariant
+      cos = dot.abs / prod
+      cos >= 1 ? 0.0 : Math.acos(cos)
+    elsif dot.abs >= prod
       dot.positive? ? 0 : Math::PI
     else
       Math.acos(dot / prod)
