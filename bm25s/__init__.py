@@ -220,6 +220,13 @@ class BM25:
         self._original_version = __version__
         self.csc_backend = csc_backend
 
+        # External integer ID bookkeeping. These are populated by `index` when the
+        # corpus is given directly as lists of integer IDs with external_ids=True; they
+        # stay at their defaults for string, tuple and object corpora.
+        self._external_ids_enabled = False
+        self.external_token_ids_set = None
+        self.empty_external_token_id = None
+
         if backend == "auto":
             self.backend = "numba" if NUMBA_AVAILABLE else "numpy"
         else:
@@ -478,6 +485,7 @@ class BM25:
         create_empty_token=True,
         show_progress=True,
         leave_progress=False,
+        external_ids=False,
     ):
         """
         Given a `corpus` of documents, create the BM25 index. The `corpus` can be either:
@@ -513,15 +521,35 @@ class BM25:
 
         leave_progress : bool
             If True, the progress bars will remain after the function completes.
+
+        external_ids : bool
+            Only used when ``corpus`` is a list of lists of integer token IDs. Set this to
+            True when those integers are caller-managed, fixed external IDs that are not
+            guaranteed to be zero-based or contiguous (for example hand-assigned IDs such
+            as ``17`` and ``4001``). When True, the external IDs are kept as the keys of
+            ``vocab_dict`` and mapped to compact, zero-based internal column indices, so
+            the number of allocated sparse columns stays equal to the number of distinct
+            tokens instead of growing with the largest external ID. Queries keep using
+            the original external IDs and the same mapping is restored after save/load.
+            When False (the default), the integers are treated as the compact internal
+            column indices directly, preserving the historical behavior used by the
+            tokenizer.
         """
         inferred_corpus_obj = self._infer_corpus_object(corpus)
+
+        # External-ID mode only makes sense for corpora given directly as integer IDs.
+        self._external_ids_enabled = bool(
+            external_ids and inferred_corpus_obj == "token_ids"
+        )
 
         if inferred_corpus_obj == "tokens":
             logger.debug(msg="Building index from tokens")
             scores, vocab_dict = self.build_index_from_tokens(
                 corpus, leave_progress=leave_progress, show_progress=show_progress
             )
+            empty_external_id = None
         else:
+            empty_external_id = None
             if inferred_corpus_obj == "tuple":
                 logger.debug(msg="Building index from IDs")
                 corpus_token_ids, vocab_dict = corpus
@@ -530,22 +558,62 @@ class BM25:
                 corpus_token_ids = corpus.ids
                 vocab_dict = corpus.vocab
             elif inferred_corpus_obj == "token_ids":
-                # we need to create a vocab_dict from the unique token IDs
                 logger.debug(msg="Building index from token IDs")
-                corpus_token_ids = corpus
-                unique_ids = set()
-                for doc_ids in corpus_token_ids:
-                    unique_ids.update(doc_ids)
-                # if there's allowed empty token, we need to add it to the vocab_dict to either 0 or max+1
-                if create_empty_token:
-                    if 0 not in unique_ids:
-                        unique_ids.add(0)
-                    else:
-                        unique_ids.add(max(unique_ids) + 1)
-                
-                # create the vocab_dict from the unique token IDs
-                vocab_dict = {token_id: i for i, token_id in enumerate(unique_ids)}
-                
+                if self._external_ids_enabled:
+                    # The caller provides arbitrary, fixed integer token IDs (for example
+                    # human-assigned IDs that are neither zero-based nor contiguous). We
+                    # keep those external IDs as the keys of ``vocab_dict`` and map them
+                    # to compact, zero-based column indices used inside the sparse index,
+                    # so the number of allocated columns never grows with the magnitude of
+                    # an external ID.
+                    external_corpus_token_ids = corpus
+                    unique_external_ids = set()
+                    for doc_ids in external_corpus_token_ids:
+                        unique_external_ids.update(doc_ids)
+
+                    # If an empty token is requested, reserve an external ID that does not
+                    # collide with any ID seen in the corpus.
+                    empty_external_id = None
+                    if create_empty_token:
+                        if 0 not in unique_external_ids:
+                            empty_external_id = 0
+                        else:
+                            empty_external_id = max(unique_external_ids) + 1
+                        unique_external_ids.add(empty_external_id)
+
+                    # ``vocab_dict`` maps each external token ID to its compact internal
+                    # column. Sorting makes the mapping deterministic across runs.
+                    sorted_external_ids = sorted(unique_external_ids)
+                    vocab_dict = {
+                        token_id: i for i, token_id in enumerate(sorted_external_ids)
+                    }
+
+                    # Re-encode the corpus with the compact internal column indices
+                    # expected by the index builders; the original external IDs remain
+                    # queryable through ``vocab_dict`` after build and save.
+                    corpus_token_ids = [
+                        [vocab_dict[token_id] for token_id in doc_ids]
+                        for doc_ids in tqdm(
+                            external_corpus_token_ids,
+                            desc="BM25S Map external token IDs to columns",
+                            leave_progress=leave_progress,
+                            disable=not show_progress,
+                        )
+                    ]
+                else:
+                    # Legacy behavior: the integers are already the compact internal
+                    # column indices; build the vocabulary directly from their range.
+                    corpus_token_ids = corpus
+                    unique_ids = set()
+                    for doc_ids in corpus_token_ids:
+                        unique_ids.update(doc_ids)
+                    if create_empty_token:
+                        if 0 not in unique_ids:
+                            unique_ids.add(0)
+                        else:
+                            unique_ids.add(max(unique_ids) + 1)
+                    vocab_dict = {token_id: i for i, token_id in enumerate(unique_ids)}
+
             else:
                 raise ValueError(
                     "Internal error: Found an invalid corpus object, indicating `_inferred_corpus_object` is not working correctly."
@@ -566,8 +634,38 @@ class BM25:
         self.scores = scores
         self.vocab_dict = vocab_dict
 
-        # we create unique token IDs from the vocab_dict for faster lookup
+        # we create unique token IDs from the vocab_dict for faster lookup.
+        # These are the compact internal column indices used by the sparse matrix.
         self.unique_token_ids_set = set(self.vocab_dict.values())
+
+        # Only indexes built with external_ids=True keep a set of caller-managed
+        # external integer token IDs. All other corpora (including tokenizer-produced
+        # integer IDs) retain the historical internal-column behavior.
+        if self._external_ids_enabled:
+            self.external_token_ids_set = set(self.vocab_dict.keys())
+            # Remember the external ID reserved for the empty token, if any, so OOV-only
+            # queries can fall back to it after a save/load cycle as well.
+            self.empty_external_token_id = empty_external_id
+        else:
+            self.external_token_ids_set = None
+            self.empty_external_token_id = None
+
+    def _map_external_token_ids(self, query_token_ids):
+        """
+        Translate a list of external integer token IDs into the compact internal column
+        indices used by the sparse index. Token IDs that are not part of the indexed
+        vocabulary are dropped.
+
+        This is the inverse direction of the mapping built by :meth:`index` when the
+        corpus is provided directly as lists of integer IDs: ``vocab_dict`` keeps the
+        external ID as key and the internal column as value, so callers keep querying
+        with their original, potentially non-contiguous IDs.
+        """
+        return [
+            self.vocab_dict[token_id]
+            for token_id in query_token_ids
+            if token_id in self.vocab_dict
+        ]
 
     def get_tokens_ids(self, query_tokens: List[str]) -> List[int]:
         """
@@ -628,8 +726,14 @@ class BM25:
         if isinstance(query_tokens_single[0], str):
             query_tokens_ids = self.get_tokens_ids(query_tokens_single)
         elif isinstance(query_tokens_single[0], int):
-            # already are token IDs, no need to convert
-            query_tokens_ids = query_tokens_single
+            # In external-ID mode the integer entry point always carries the caller's
+            # external IDs, so translate them to compact internal columns (unknown IDs
+            # are dropped). In every other mode the integers are already internal
+            # column indices, preserving the historical behavior.
+            if getattr(self, "external_token_ids_set", None) is not None:
+                query_tokens_ids = self._map_external_token_ids(query_tokens_single)
+            else:
+                query_tokens_ids = query_tokens_single
         else:
             raise ValueError(
                 "The query_tokens must be a list of tokens or a list of token IDs."
@@ -780,15 +884,44 @@ class BM25:
                     "The unique_token_ids_set attribute is not found. Please run the `index` method first, or make sure"
                     "run retriever.load(load_vocab=True) before calling retrieve on list of list of token IDs (int)."
                 )
+            # When the index was built directly from external integer IDs, the query also
+            # carries those external IDs and must be filtered against the external
+            # vocabulary. The actual translation to compact internal columns happens in
+            # ``get_scores`` (numpy backend) or below for the numba backend, so values that
+            # coincide numerically with internal columns are not translated twice.
+            # Otherwise the integers are already internal columns.
+            if getattr(self, "external_token_ids_set", None) is not None:
+                valid_token_ids = self.external_token_ids_set
+                translate_external_ids = True
+            else:
+                valid_token_ids = self.unique_token_ids_set
+                translate_external_ids = False
             query_tokens_filtered = []
             for query in query_tokens:
                 query_filtered = [
                     token_id
                     for token_id in query
-                    if token_id in self.unique_token_ids_set
+                    if token_id in valid_token_ids
                 ]
                 if len(query_filtered) == 0:
-                    if "" not in self.vocab_dict:
+                    if "" in self.vocab_dict:
+                        # String/tokenizer corpora reserve the empty token under "".
+                        query_filtered = [self.vocab_dict[""]]
+                    elif translate_external_ids:
+                        # Integer external-ID corpora reserve the empty token under a
+                        # dedicated external integer ID. There is no implicit fallback
+                        # column, so raise an explicit, actionable error.
+                        if getattr(self, "empty_external_token_id", None) is not None:
+                            query_filtered = [self.empty_external_token_id]
+                        else:
+                            raise ValueError(
+                                "The query does not contain any tokens that are in the vocabulary. "
+                                "Please provide a query that contains at least one external token ID that is in the index. "
+                                "Alternatively, you can set `create_empty_token=True` when calling `index` to reserve an empty token column."
+                            )
+                    else:
+                        # Legacy behavior for string/tokenizer corpora without an empty
+                        # token: reject an all-OOV integer query explicitly.
                         raise ValueError(
                             "The query does not contain any tokens that are in the vocabulary. "
                             "Please provide a query that contains at least one token that is in the vocabulary. "
@@ -796,9 +929,17 @@ class BM25:
                             "You can also manually add an empty token to the vocabulary by setting `retriever.vocab_dict[''] = max(retriever.vocab_dict.values()) + 1`. "
                             "Then, run `retriever.unique_token_ids_set = set(retriever.vocab_dict.values())` to update the unique token IDs."
                         )
-                    query_filtered = [self.vocab_dict[""]]
 
                 query_tokens_filtered.append(query_filtered)
+
+            # The numba backend bypasses ``get_scores`` entirely, so its external IDs
+            # must be translated to compact columns here. The numpy backend keeps the
+            # external IDs and lets ``get_scores`` perform the translation.
+            if translate_external_ids and self.backend == "numba":
+                query_tokens_filtered = [
+                    self._map_external_token_ids(query)
+                    for query in query_tokens_filtered
+                ]
 
             query_tokens = query_tokens_filtered
 
@@ -1028,11 +1169,17 @@ class BM25:
             nnm_path = save_dir / nnoc_name
             np.save(nnm_path, self.nonoccurrence_array, allow_pickle=allow_pickle)
 
-        # Save the vocab dictionary
+        # Save the vocab dictionary. JSON (and orjson in particular) only allows string
+        # object keys, so external integer IDs are stringified on save and converted back
+        # to integers on load when the index was built with external_ids=True.
         vocab_path = save_dir / vocab_name
+        if getattr(self, "_external_ids_enabled", False):
+            vocab_to_save = {str(key): value for key, value in self.vocab_dict.items()}
+        else:
+            vocab_to_save = self.vocab_dict
 
         with open(vocab_path, "wt", encoding="utf-8") as f:
-            f.write(json_functions.dumps(self.vocab_dict, ensure_ascii=False))
+            f.write(json_functions.dumps(vocab_to_save, ensure_ascii=False))
 
         # Save the parameters
         params_path = save_dir / params_name
@@ -1047,6 +1194,12 @@ class BM25:
             num_docs=self.scores["num_docs"],
             version=__version__,
             backend=self.backend,
+            # Persist the external-ID mode and the reserved empty-token external ID so a
+            # reloaded index keeps accepting the caller's original (sparse) integer IDs.
+            external_ids=bool(getattr(self, "_external_ids_enabled", False)),
+            empty_external_token_id=getattr(
+                self, "empty_external_token_id", None
+            ),
         )
         with open(params_path, "w") as f:
             json.dump(params, f, indent=4)
@@ -1249,21 +1402,47 @@ class BM25:
         if kwargs:
             params.update(kwargs)
 
+        original_version = params.pop("version", None)
+        num_docs = params.pop("num_docs", None)
+        # Indexes saved before these fields existed simply use internal column IDs and
+        # have no reserved empty external ID.
+        external_ids_enabled = bool(params.pop("external_ids", False))
+        empty_external_token_id = params.pop("empty_external_token_id", None)
+
         # Load the vocab dictionary
         if load_vocab:
             vocab_path = save_dir / vocab_name
             with open(vocab_path, "r", encoding="utf-8") as f:
                 vocab_dict: dict = json_functions.loads(f.read())
+            # JSON object keys are always strings. Both external-ID indexes (marked with
+            # external_ids=True) and older integer-ID indexes store integer keys, so
+            # convert purely numeric keys back to integers; string/tokenizer vocabularies
+            # contain at least one non-numeric key and are left untouched.
+            if len(vocab_dict) > 0 and all(
+                isinstance(key, str) for key in vocab_dict.keys()
+            ):
+                try:
+                    vocab_dict = {int(key): value for key, value in vocab_dict.items()}
+                except ValueError:
+                    pass
         else:
             vocab_dict = {}
-
-        original_version = params.pop("version", None)
-        num_docs = params.pop("num_docs", None)
 
         bm25_obj = cls(**params)
         bm25_obj.vocab_dict = vocab_dict
         bm25_obj._original_version = original_version
         bm25_obj.unique_token_ids_set = set(bm25_obj.vocab_dict.values())
+
+        # Restore the external-ID bookkeeping only for indexes that were built with
+        # external_ids=True; every other index keeps the historical internal-column
+        # behavior.
+        bm25_obj._external_ids_enabled = external_ids_enabled
+        if external_ids_enabled and load_vocab and len(vocab_dict) > 0:
+            bm25_obj.external_token_ids_set = set(bm25_obj.vocab_dict.keys())
+            bm25_obj.empty_external_token_id = empty_external_token_id
+        else:
+            bm25_obj.external_token_ids_set = None
+            bm25_obj.empty_external_token_id = None
 
         bm25_obj.load_scores(
             save_dir=save_dir,

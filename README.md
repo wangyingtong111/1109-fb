@@ -199,6 +199,39 @@ and tuples are written as provided.
 
 For an example that shows how to quickly index a 2M-documents corpus (Natural Questions), check out [`examples/index_nq.py`](examples/index_nq.py).
 
+### Non-contiguous integer token IDs
+
+When your upstream pipeline already assigns fixed integer IDs to tokens, those
+IDs may be sparse and non-contiguous (for example hand-assigned IDs such as
+`17` and `4001`). Pass the corpus directly as lists of integer IDs together
+with `external_ids=True`. The external IDs stay queryable as the keys of
+`retriever.vocab_dict`, while the index internally only allocates one compact,
+zero-based column per distinct token, so the number of sparse columns does not
+grow with the magnitude of an external ID:
+
+```python
+# External, non-contiguous token IDs.
+corpus_token_ids = [[17, 17], [4001], [17, 4001]]
+
+retriever = bm25s.BM25()
+retriever.index(corpus_token_ids, external_ids=True)
+
+# Queries keep using the original external IDs.
+results, scores = retriever.retrieve([[17], [4001]], k=2)
+# results[0] -> documents containing token 17  (docs 0 and 2)
+# results[1] -> documents containing token 4001 (docs 1 and 2)
+
+# The sparse index has one column per distinct token, not up to the largest ID.
+n_columns = len(retriever.scores["indptr"]) - 1  # 3 (two tokens + the empty token)
+```
+
+The mapping is persisted by `save()` and restored by `BM25.load()`, so a
+reloaded index answers the same external IDs against the same compact columns.
+String and tokenizer-produced corpora are unaffected by the flag, and without
+`external_ids=True` integer corpora keep the historical behavior where the
+integers are treated as internal column indices.
+
+
 ## High Level API
 
 > [!TIP]
