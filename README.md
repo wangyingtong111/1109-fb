@@ -52,6 +52,22 @@ text = "This is a sentence\ncut off in the middle because pdf."
 ps = PragmaticSegmenter::Cleaner.new(text: text, doc_type: 'pdf')
 ps.clean
 # => "This is a sentence cut off in the middle because pdf."
+
+# PDF text with an end-of-line hyphen: pass a vocabulary to distinguish
+# ordinary line-break hyphenation from hyphenated compound words. When both
+# the hyphenated spelling ('re-sign') and the plain spelling ('resign') are in
+# the vocabulary, the hyphen is kept. Without a vocabulary the default PDF
+# cleaning behavior is used.
+text = "This is a classi-\nfier that is noise-\nrobust and they re-\nsign the contract."
+vocabulary = ['classifier', 'noise-robust', 're-sign', 'resign']
+ps = PragmaticSegmenter::Segmenter.new(text: text, doc_type: 'pdf', vocabulary: vocabulary)
+ps.segment
+# => ["This is a classifier that is noise-robust and they re-sign the contract."]
+
+# The same option is available directly on the Cleaner
+ps = PragmaticSegmenter::Cleaner.new(text: text, doc_type: 'pdf', vocabulary: vocabulary)
+ps.clean
+# => "This is a classifier that is noise-robust and they re-sign the contract."
 ```
 
 ## Live Demo

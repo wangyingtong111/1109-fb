@@ -9,11 +9,12 @@ module PragmaticSegmenter
   class Cleaner
     include Rules
 
-    attr_reader :text, :doc_type
-    def initialize(text:, doc_type: nil, language: Languages::Common)
+    attr_reader :text, :doc_type, :vocabulary
+    def initialize(text:, doc_type: nil, language: Languages::Common, vocabulary: nil)
       @text = text.dup
       @doc_type = doc_type
       @language = language
+      @vocabulary = vocabulary
     end
 
     # Clean text of unwanted formatting
@@ -29,6 +30,10 @@ module PragmaticSegmenter
     #                (two character ISO 639-1 code e.g. 'en')
     #    doc_type:   (String)  *optional
     #                (e.g. 'pdf')
+    #    vocabulary: (Array)   *optional
+    #                words used to rejoin end-of-line hyphenated words in
+    #                PDF text. A hyphenated vocabulary entry keeps the
+    #                hyphen; a plain entry joins the two parts without one.
 
     def clean
       return unless text
@@ -114,10 +119,37 @@ module PragmaticSegmenter
     end
 
     def remove_pdf_line_breaks
+      join_hyphenated_line_breaks
       Rule.apply @text, NewLineFollowedByBulletRule,
 
         PDF::NewLineInMiddleOfSentenceRule,
         PDF::NewLineInMiddleOfSentenceNoSpacesRule
+    end
+
+    # Rejoins words split by an end-of-line hyphen when a vocabulary is
+    # provided. When both the hyphenated spelling (e.g. 're-sign') and the
+    # plain spelling (e.g. 'resign') are in the vocabulary, the hyphen is
+    # kept. Without a vocabulary nothing is changed here and the existing
+    # PDF line-break rules handle the text as before.
+    def join_hyphenated_line_breaks
+      return @text unless vocabulary
+
+      index = vocabulary.each_with_object({}) { |word, hsh| hsh[word.downcase] = true }
+      @text.gsub!(PDF::HyphenatedLineBreakRegex) do
+        head = Regexp.last_match(1)
+        tail = Regexp.last_match(2)
+        hyphenated = "#{head}-#{tail}".downcase
+        joined = "#{head}#{tail}".downcase
+
+        if index[hyphenated]
+          "#{head}-#{tail}"
+        elsif index[joined]
+          head + tail
+        else
+          Regexp.last_match(0)
+        end
+      end
+      @text
     end
 
     def clean_quotations

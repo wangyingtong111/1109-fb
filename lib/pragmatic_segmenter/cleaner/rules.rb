@@ -81,6 +81,11 @@ module PragmaticSegmenter
 
         # Rubular: http://rubular.com/r/eaNwGavmdo
         NewLineInMiddleOfSentenceNoSpacesRule = Rule.new(/\n(?=[a-z])/, ' ')
+
+        # Matches a word broken across lines by an end-of-line hyphen,
+        # e.g. "classi-\nfier". Capture groups: 1 = part before the hyphen,
+        # 2 = part after the line break.
+        HyphenatedLineBreakRegex = /([a-zA-Z]+)-\n([a-zA-Z]+)/
       end
 
     end
