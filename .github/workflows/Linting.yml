@@ -1,0 +1,42 @@
+name: Linting
+
+on:
+  push:
+    branches: main
+  pull_request:
+    branches: main
+
+jobs:
+  mypy:
+    name: MyPy
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v7.0.1
+      with:
+        fetch-depth: 0
+
+    - uses: astral-sh/setup-uv@v10.3.2
+      with:
+        python-version: "3.12"
+        enable-cache: true
+
+    - name: MyPy
+      run: make mypy
+
+  ruff:
+    name: Ruff
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v7.0.1
+      with:
+        fetch-depth: 0
+
+    - uses: astral-sh/setup-uv@v10.3.2
+      with:
+        python-version: "3.12"
+        enable-cache: true
+
+    - name: Lint
+      run: make format-check
