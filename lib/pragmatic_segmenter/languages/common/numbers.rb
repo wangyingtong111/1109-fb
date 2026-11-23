@@ -32,8 +32,13 @@ module PragmaticSegmenter
 
       SENTENCE_BOUNDARY_REGEX = /\u{ff08}(?:[^\u{ff09}])*\u{ff09}(?=\s?[A-Z])|\u{300c}(?:[^\u{300d}])*\u{300d}(?=\s[A-Z])|\((?:[^\)]){2,}\)(?=\s[A-Z])|'(?:[^'])*[^,]'(?=\s[A-Z])|"(?:[^"])*[^,]"(?=\s[A-Z])|“(?:[^”])*[^,]”(?=\s[A-Z])|\S.*?[。．.！!?？ȸȹ☉☈☇☄]/
 
+      # Closing quotation marks that may terminate a sentence. Includes the
+      # guillemet (») so that text nested inside an outer «...» quotation is
+      # not swallowed by the outer quotation when the sentence ends.
+      CLOSING_QUOTATION_MARKS = "\"'\u{201d}\u{201c}\u{00bb}\u{203a}"
+
       # Rubular: http://rubular.com/r/NqCqv372Ix
-      QUOTATION_AT_END_OF_SENTENCE_REGEX = /[!?\.-][\"\'\u{201d}\u{201c}]\s{1}[A-Z]/
+      QUOTATION_AT_END_OF_SENTENCE_REGEX = /[!?\.-][#{CLOSING_QUOTATION_MARKS}]\s{1}[A-Z]/
 
       # Rubular: http://rubular.com/r/6flGnUMEVl
       PARENS_BETWEEN_DOUBLE_QUOTES_REGEX = /["”]\s\(.*\)\s["“]/
@@ -42,7 +47,7 @@ module PragmaticSegmenter
       BETWEEN_DOUBLE_QUOTES_REGEX = /"(?:[^"])*[^,]"|“(?:[^”])*[^,]”/
 
       # Rubular: http://rubular.com/r/JMjlZHAT4g
-      SPLIT_SPACE_QUOTATION_AT_END_OF_SENTENCE_REGEX = /(?<=[!?\.-][\"\'\u{201d}\u{201c}])\s{1}(?=[A-Z])/
+      SPLIT_SPACE_QUOTATION_AT_END_OF_SENTENCE_REGEX = /(?<=[!?\.-][#{CLOSING_QUOTATION_MARKS}])\s{1}(?=[A-Z])/
 
       # Rubular: http://rubular.com/r/mQ8Es9bxtk
       CONTINUOUS_PUNCTUATION_REGEX = /(?<=\S)(!|\?){3,}(?=(\s|\z|$))/

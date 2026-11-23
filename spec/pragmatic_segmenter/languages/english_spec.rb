@@ -1460,7 +1460,17 @@ RSpec.describe PragmaticSegmenter::Languages::English, "(en)" do
     it 'correctly segments text #128' do
       ps = PragmaticSegmenter::Segmenter.new(text: "The table in (4) is a sample from the Wall Street Journal (1987).1 According to the distribution all the pairs given in (4) count as candidates for abbreviations.")
       expect(ps.segment).to eq([ "The table in (4) is a sample from the Wall Street Journal (1987).1", "According to the distribution all the pairs given in (4) count as candidates for abbreviations."])
-    
+
+    end
+
+    it 'correctly segments text #129' do
+      ps = PragmaticSegmenter::Segmenter.new(text: "She said «Dr. Blue asked “Ready?” and waited.» Then left.")
+      expect(ps.segment).to eq(["She said «Dr. Blue asked “Ready?” and waited.»", "Then left."])
+    end
+
+    it 'correctly segments text #130' do
+      ps = PragmaticSegmenter::Segmenter.new(text: "She asked «Is it Dr. Blue?» and left. Next.")
+      expect(ps.segment).to eq(["She asked «Is it Dr. Blue?» and left.", "Next."])
     end
   end
 end

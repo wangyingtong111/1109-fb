@@ -52,10 +52,77 @@ module PragmaticSegmenter
       )
 
       if txt =~ @language::QUOTATION_AT_END_OF_SENTENCE_REGEX
-        txt.split(@language::SPLIT_SPACE_QUOTATION_AT_END_OF_SENTENCE_REGEX)
+        split_at_outermost_quotation(txt)
       else
         txt.tr("\n", '').strip
       end
+    end
+
+    # A closing quotation mark only ends a sentence when it closes the
+    # outermost quotation. This keeps a nested quotation (for example «...»
+    # inside "...") from ending the sentence on its own, while still
+    # allowing the sentence to end where the outer quotation settles.
+    #
+    # Nesting is only tracked for texts that use guillemets («...»/‹...›),
+    # the style where two levels of quotation commonly co-occur. Other
+    # languages keep the original behaviour untouched.
+    def split_at_outermost_quotation(txt)
+      positions = []
+      txt.to_enum(:scan, @language::SPLIT_SPACE_QUOTATION_AT_END_OF_SENTENCE_REGEX).each do
+        positions << Regexp.last_match.begin(0)
+      end
+      positions.select! { |position| outermost_quotation?(txt, position) }
+      return txt.tr("\n", '').strip if positions.empty?
+
+      segments = []
+      start = 0
+      positions.each do |position|
+        segments << txt[start...position]
+        start = position + 1
+      end
+      segments << txt[start..-1]
+      segments
+    end
+
+    # The split regex matches at the space following a closing quotation mark,
+    # so the closing mark itself sits immediately before +position+. A mark
+    # only ends the sentence when no quotation is still open at that point,
+    # which keeps punctuation inside a nested quotation from splitting.
+    def outermost_quotation?(txt, position)
+      prefix = txt[0...position]
+      return true unless nested_quotation_text?(prefix)
+      quote_depth(prefix).eql?(0)
+    end
+
+    GUILLEMET_OPENING_MARKS = ['«', '‹'].freeze
+
+    # Pairs used to track nesting inside guillemet quotations. Straight double
+    # quotes are included so an outer "..." keeps a nested «...» from ending
+    # the sentence. Ambiguous marks used by other quotation styles (such as
+    # the German ,, ... “ style) are deliberately left out.
+    NESTED_QUOTE_PAIRS = {
+      '«' => '»',
+      '‹' => '›',
+      '“' => '”',
+      '"' => '"'
+    }.freeze
+
+    def nested_quotation_text?(txt)
+      txt.each_char.any? { |char| GUILLEMET_OPENING_MARKS.include?(char) }
+    end
+
+    # Counts quotations left open after reading +txt+. A mark closes the
+    # innermost matching quotation when possible, otherwise it opens one.
+    def quote_depth(txt)
+      open_marks = []
+      txt.each_char do |char|
+        if open_marks.any? && NESTED_QUOTE_PAIRS[open_marks.last].eql?(char)
+          open_marks.pop
+        elsif NESTED_QUOTE_PAIRS.key?(char)
+          open_marks << char
+        end
+      end
+      open_marks.length
     end
 
     def check_for_parens_between_quotes(txt)
