@@ -134,10 +134,15 @@ class POSTokenizer(object):
 
     def __cut_detail(self, sentence):
         blocks = re_han_detail.split(sentence)
+        force_split_words = self.tokenizer.force_split_words
         for blk in blocks:
             if re_han_detail.match(blk):
                 for word in self.__cut(blk):
-                    yield word
+                    if word.word not in force_split_words:
+                        yield word
+                    else:
+                        for c in word.word:
+                            yield pair(c, self.word_tag_tab.get(c, 'x'))
             else:
                 tmp = re_skip_detail.split(blk)
                 for x in tmp:

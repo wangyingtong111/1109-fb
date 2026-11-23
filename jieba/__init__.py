@@ -61,6 +61,7 @@ class Tokenizer(object):
         self.FREQ = {}
         self.total = 0
         self.user_word_tag_tab = {}
+        self.force_split_words = set()
         self.initialized = False
         self.tmp_dir = None
         self.cache_file = None
@@ -109,6 +110,10 @@ class Tokenizer(object):
                 pass
             if self.initialized:
                 return
+
+            # The prefix dict is going to be (re)built, so any word forced to
+            # be split by a previous dictionary no longer applies.
+            self.force_split_words.clear()
 
             default_logger.debug("Building prefix dict from %s ..." % (abs_path or 'the default dictionary'))
             t1 = time.time()
@@ -265,7 +270,7 @@ class Tokenizer(object):
                         buf = ''
                     else:
                         if not self.FREQ.get(buf):
-                            recognized = finalseg.cut(buf)
+                            recognized = finalseg.cut(buf, self.force_split_words)
                             for t in recognized:
                                 yield t
                         else:
@@ -279,7 +284,7 @@ class Tokenizer(object):
             if len(buf) == 1:
                 yield buf
             elif not self.FREQ.get(buf):
-                recognized = finalseg.cut(buf)
+                recognized = finalseg.cut(buf, self.force_split_words)
                 for t in recognized:
                     yield t
             else:
@@ -434,7 +439,9 @@ class Tokenizer(object):
             if wfrag not in self.FREQ:
                 self.FREQ[wfrag] = 0
         if freq == 0:
-            finalseg.add_force_split(word)
+            self.force_split_words.add(word)
+        else:
+            self.force_split_words.discard(word)
 
     def del_word(self, word):
         """
