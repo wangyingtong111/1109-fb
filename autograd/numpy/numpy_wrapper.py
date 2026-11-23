@@ -4,11 +4,14 @@ import numpy as _np
 
 from autograd import builtins
 from autograd.extend import notrace_primitive, primitive
+from autograd.tracer import isbox
 
 if _np.lib.NumpyVersion(_np.__version__) >= "2.0.0":
     from numpy._core.einsumfunc import _parse_einsum_input
+    from numpy.lib.array_utils import normalize_axis_index
 else:
     from numpy.core.einsumfunc import _parse_einsum_input
+    normalize_axis_index = _np.normalize_axis_index
 
 numpy_version = _np.__version__
 
@@ -148,6 +151,71 @@ def append(arr, values, axis=None):
         values = ravel(array(values))
         axis = ndim(arr) - 1
     return concatenate((arr, values), axis=axis)
+
+
+# wrap_namespace above registers numpy.diff as a primitive whose VJP only
+# covers its first argument, so prepend/append would not receive gradients.
+# Re-implement np.diff on top of the differentiable primitives
+# (concatenate, broadcast_to, subtract/not_equal) so that the boundary terms
+# are traced together with the body. This mirrors numpy's implementation,
+# preserving its difference order, axis and broadcasting semantics while
+# returning a gradient for every input. The redefinition shadows the wrapped
+# primitive in this namespace (and therefore in autograd.numpy).
+def _broadcast_boundary(boundary, a, axis):
+    # np.asanyarray has no VJP in autograd, so only cast untraced inputs;
+    # boxes already carry the array metadata we need and must pass through.
+    if not isbox(boundary):
+        boundary = _np.asanyarray(boundary)
+    if boundary.ndim == 0:
+        # Scalar values are expanded to length 1 along axis and broadcast to
+        # the shape of a on every other axis, exactly as numpy does. The
+        # reshape to a 1-sized axis is needed because broadcast_to's VJP does
+        # not support introducing new leading dimensions; it also makes the
+        # gradient collapse back to a scalar via summation.
+        broadcast_shape = list(shape(a))
+        broadcast_shape[axis] = 1
+        boundary = reshape(boundary, (1,) * ndim(a))
+        boundary = broadcast_to(boundary, tuple(broadcast_shape))
+    return boundary
+
+
+def diff(a, n=1, axis=-1, prepend=_np._NoValue, append=_np._NoValue):
+    if n == 0:
+        return a
+    if n < 0:
+        raise ValueError("order must be non-negative but got " + repr(n))
+
+    if not isbox(a):
+        a = _np.asanyarray(a)
+    nd = a.ndim
+    if nd == 0:
+        raise ValueError("diff requires input that is at least one dimensional")
+    axis = normalize_axis_index(axis, nd)
+
+    combined = []
+    if prepend is not _np._NoValue:
+        combined.append(_broadcast_boundary(prepend, a, axis))
+
+    combined.append(a)
+
+    if append is not _np._NoValue:
+        combined.append(_broadcast_boundary(append, a, axis))
+
+    if len(combined) > 1:
+        a = concatenate(combined, axis)
+
+    slice1 = [slice(None)] * nd
+    slice2 = [slice(None)] * nd
+    slice1[axis] = slice(1, None)
+    slice2[axis] = slice(None, -1)
+    slice1 = tuple(slice1)
+    slice2 = tuple(slice2)
+
+    op = not_equal if a.dtype == _np.bool_ else subtract
+    for _ in range(n):
+        a = op(a[slice1], a[slice2])
+
+    return a
 
 
 # ----- Enable functions called using [] ----

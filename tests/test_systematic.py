@@ -5,7 +5,7 @@ from numpy_utils import binary_ufunc_check, binary_ufunc_check_no_same_args, sta
 
 import autograd.numpy as np
 import autograd.numpy.random as npr
-from autograd.test_util import combo_check
+from autograd.test_util import check_grads, combo_check
 
 npr.seed(0)
 
@@ -267,6 +267,37 @@ def test_diff():
     combo_check(np.diff, [0])([R(5, 5), R(5, 5, 5)], n=[1, 2], axis=[0, 1])
     combo_check(np.diff, [0])([R(1), R(1, 1)], axis=[0])
     combo_check(np.diff, [0])([R(1, 1), R(3, 1)], axis=[1])
+
+
+def test_diff_with_boundaries():
+    def scalar_diff(prepend, x, append, n=1, axis=-1):
+        # Scalar prepend/append broadcast across the other axes; their
+        # gradients collapse back to scalars (0-d vspaces).
+        return np.diff(x, n=n, axis=axis, prepend=prepend, append=append)
+
+    check_grads(scalar_diff, modes=["fwd", "rev"], order=2)(-1.0, R(4), 9.0, 2, -1)
+    check_grads(scalar_diff, modes=["fwd", "rev"], order=2)(-1.0, R(4, 4), 9.0, 2, -1)
+    check_grads(scalar_diff, modes=["fwd", "rev"], order=2)(-1.0, R(2, 4, 3), 9.0, 1, 0)
+
+    def array_diff(prepend, x, append, n=1, axis=1):
+        # Array-shaped boundaries (length 1 along the diff axis) keep their
+        # own shapes in the gradient.
+        return np.diff(x, n=n, axis=axis, prepend=prepend, append=append)
+
+    # Each boundary shape matches the body on every axis except the diff axis.
+    check_grads(array_diff, modes=["fwd", "rev"], order=2)(R(4, 1), R(4, 4), R(4, 1), 2, 1)
+    check_grads(array_diff, modes=["fwd", "rev"], order=2)(R(3, 1), R(3, 4), R(3, 1), 2, 1)
+    check_grads(array_diff, modes=["fwd", "rev"], order=2)(R(2, 1), R(2, 4), R(2, 1), 2, 1)
+    check_grads(array_diff, modes=["fwd", "rev"], order=2)(R(2, 1), R(2, 3), R(2, 1), 2, 1)
+
+    def prepend_only(prepend, x, n=1, axis=-1):
+        return np.diff(x, n=n, axis=axis, prepend=prepend)
+
+    def append_only(x, append, n=1, axis=-1):
+        return np.diff(x, n=n, axis=axis, append=append)
+
+    check_grads(prepend_only, modes=["fwd", "rev"], order=2)(-1.0, R(4), 2, -1)
+    check_grads(append_only, modes=["fwd", "rev"], order=2)(R(4, 4), 9.0, 2, -1)
 
 
 def test_gradient():

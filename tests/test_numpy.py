@@ -1,5 +1,6 @@
 import warnings
 
+import numpy as onp
 import pytest
 from numpy_utils import combo_check
 
@@ -160,7 +161,6 @@ def test_plain_numpy_reductions_on_box():
     # on an ArrayBox routes through numpy's _wrapreduction, which forwards an
     # ``out=None`` keyword to the wrapped primitive (and thus to its VJP). The
     # reduction VJPs must tolerate this extra keyword argument.
-    import numpy as onp
 
     base = onp.abs(npr.randn(5)) + 0.5
 
@@ -692,6 +692,88 @@ def test_len():
 
     A = npr.randn(3, 2)
     check_grads(fun)(A)
+
+
+def test_diff_matches_numpy_with_boundaries():
+    rng = onp.random.default_rng(0)
+    for shape in [(9,), (4, 5), (2, 3, 4)]:
+        x = rng.standard_normal(shape)
+        ndim = len(shape)
+        for axis in range(-ndim, ndim):
+            for n in [0, 1, 2, 3]:
+                # no boundaries (ordinary call)
+                assert onp.allclose(np.diff(x, n=n, axis=axis), onp.diff(x, n=n, axis=axis))
+                # scalar boundaries
+                got = np.diff(x, n=n, axis=axis, prepend=-7.0, append=7.0)
+                ref = onp.diff(x, n=n, axis=axis, prepend=-7.0, append=7.0)
+                assert onp.allclose(got, ref) and got.shape == ref.shape
+                # array boundaries
+                bshape = list(shape)
+                bshape[axis % ndim] = 1
+                pre = rng.standard_normal(tuple(bshape))
+                app = rng.standard_normal(tuple(bshape))
+                got = np.diff(x, n=n, axis=axis, prepend=pre, append=app)
+                ref = onp.diff(x, n=n, axis=axis, prepend=pre, append=app)
+                assert onp.allclose(got, ref) and got.shape == ref.shape
+
+
+def test_diff_boundary_worked_example():
+    # Body [2, 5, 9], prepend 1, append 11, second difference weighted by
+    # [1, 2, 4]. Forward diff is [2, 1, -2]; reverse-mode gives gradients
+    # [1], [0, 1, -6], [4] for prepend, body and append respectively.
+    body = onp.array([2.0, 5.0, 9.0])
+    weights = onp.array([1.0, 2.0, 4.0])
+
+    def objective(prepend, x, append):
+        return np.sum(np.diff(x, n=2, prepend=prepend, append=append) * weights)
+
+    assert onp.allclose(np.diff(body, n=2, prepend=1.0, append=11.0), [2.0, 1.0, -2.0])
+    assert grad(objective, 0)(1.0, body, 11.0) == 1.0
+    assert onp.allclose(grad(objective, 1)(1.0, body, 11.0), [0.0, 1.0, -6.0])
+    assert grad(objective, 2)(1.0, body, 11.0) == 4.0
+
+
+def test_diff_scalar_boundary_gradient_sums_to_scalar():
+    # A scalar boundary repeated across several rows must return a single
+    # scalar gradient, i.e. the per-row contributions are summed together.
+    A = npr.randn(3, 4)
+
+    def objective(prepend, append):
+        return np.sum(np.diff(A, axis=1, prepend=prepend, append=append))
+
+    g_pre = grad(objective, 0)(-1.0, 9.0)
+    g_app = grad(objective, 1)(-1.0, 9.0)
+    assert onp.ndim(g_pre) == 0 and onp.ndim(g_app) == 0
+
+    # numerical cross-check
+    eps = 1e-6
+    num_pre = (objective(-1.0 + eps, 9.0) - objective(-1.0 - eps, 9.0)) / (2 * eps)
+    num_app = (objective(-1.0, 9.0 + eps) - objective(-1.0, 9.0 - eps)) / (2 * eps)
+    assert onp.allclose(g_pre, num_pre, rtol=1e-4)
+    assert onp.allclose(g_app, num_app, rtol=1e-4)
+
+    # array boundaries instead retain their full shape in the gradient
+    pre_arr = npr.randn(3, 1)
+    app_arr = npr.randn(3, 1)
+
+    def objective_arr(prepend, append):
+        return np.sum(np.diff(A, axis=1, prepend=prepend, append=append))
+
+    assert onp.shape(grad(objective_arr, 0)(pre_arr, app_arr)) == (3, 1)
+    assert onp.shape(grad(objective_arr, 1)(pre_arr, app_arr)) == (3, 1)
+
+
+def test_diff_n0_returns_input_and_differentiates():
+    x = npr.randn(5)
+    assert onp.allclose(np.diff(x, n=0, prepend=1.0, append=2.0), x)
+    check_grads(lambda z: np.diff(z, n=0, prepend=1.0, append=2.0))(x)
+
+
+def test_diff_invalid_arguments():
+    with pytest.raises(ValueError):
+        np.diff(npr.randn(3), n=-1)
+    with pytest.raises(ValueError):
+        np.diff(onp.array(1.0))
 
 
 def test_r_basic():
