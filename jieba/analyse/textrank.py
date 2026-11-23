@@ -21,7 +21,27 @@ class UndirectWeightedGraph:
         self.graph[start].append((start, end, weight))
         self.graph[end].append((end, start, weight))
 
-    def rank(self):
+    def rank(self, consistent=False, round_consistent=None):
+        """
+        Compute the TextRank weight of every node in the graph.
+
+        Parameter:
+            - consistent: keep False (the default) to preserve the historical
+              in-place iteration: while walking the sorted node list, a node
+              already reads the freshly computed scores of its neighbours in
+              the same iteration, so the result can depend on node labels and
+              on the edge insertion order.
+              When True, a round-consistent (Jacobi style) iteration is used:
+              every score of a round is computed from a snapshot of the
+              previous round and all new scores are swapped in together, so a
+              node keeps the same weight as long as it keeps the same position
+              in the graph, regardless of how the nodes are named or in which
+              order the edges were added.
+              `round_consistent` is an alias of `consistent`.
+        """
+        if round_consistent is not None:
+            consistent = round_consistent
+
         ws = defaultdict(float)
         outSum = defaultdict(float)
 
@@ -33,6 +53,18 @@ class UndirectWeightedGraph:
         # this line for build stable iteration
         sorted_keys = sorted(self.graph.keys())
         for x in xrange(10):  # 10 iters
+            if consistent:
+                # round-consistent update: score the whole round against a
+                # snapshot of the previous round, then swap in the new scores
+                prev_ws = dict(ws)
+                ws = defaultdict(float)
+                for n in sorted_keys:
+                    s = 0
+                    for e in self.graph[n]:
+                        s += e[2] / outSum[e[1]] * prev_ws[e[1]]
+                    ws[n] = (1 - self.d) + self.d * s
+                continue
+
             for n in sorted_keys:
                 s = 0
                 for e in self.graph[n]:
@@ -66,7 +98,8 @@ class TextRank(KeywordExtractor):
         return (wp.flag in self.pos_filt and len(wp.word.strip()) >= 2
                 and wp.word.lower() not in self.stop_words)
 
-    def textrank(self, sentence, topK=20, withWeight=False, allowPOS=('ns', 'n', 'vn', 'v'), withFlag=False):
+    def textrank(self, sentence, topK=20, withWeight=False, allowPOS=('ns', 'n', 'vn', 'v'), withFlag=False,
+                 consistent=False, round_consistent=None):
         """
         Extract keywords from sentence using TextRank algorithm.
         Parameter:
@@ -77,7 +110,16 @@ class TextRank(KeywordExtractor):
                         if the POS of w is not in this list, it will be filtered.
             - withFlag: if True, return a list of pair(word, weight) like posseg.cut
                         if False, return a list of words
+            - consistent: if True, iterate the keyword graph in a round-consistent
+                          (Jacobi style) way so that weights depend only on the
+                          graph position of a node, not on its label or on the
+                          edge insertion order; if False, keep the historical
+                          in-place iteration (default).
+                          `round_consistent` is an alias of `consistent`.
         """
+        if round_consistent is not None:
+            consistent = round_consistent
+
         self.pos_filt = frozenset(allowPOS)
         g = UndirectWeightedGraph()
         cm = defaultdict(int)
@@ -96,7 +138,7 @@ class TextRank(KeywordExtractor):
 
         for terms, w in cm.items():
             g.addEdge(terms[0], terms[1], w)
-        nodes_rank = g.rank()
+        nodes_rank = g.rank(consistent=consistent)
         if withWeight:
             tags = sorted(nodes_rank.items(), key=itemgetter(1), reverse=True)
         else:
