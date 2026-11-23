@@ -41,6 +41,15 @@ ps = PragmaticSegmenter::Segmenter.new(text: text, language: 'en', doc_type: 'pd
 ps.segment
 # => ["This is a sentence cut off in the middle because pdf."]
 
+# Specify an HTML document type
+# Block-level elements (e.g. <p>, <div>, <li>) become sentence boundaries,
+# inline elements (e.g. <em>, <b>, <span>) are treated as running text,
+# and HTML entities (e.g. &nbsp;, &lt;) are decoded.
+text = "<p>Dose&nbsp;<em>5.50</em></p><p>Next sample.</p><p>&lt;ok&gt;</p>"
+ps = PragmaticSegmenter::Segmenter.new(text: text, language: 'en', doc_type: 'html')
+ps.segment
+# => ["Dose 5.50", "Next sample.", "<ok>"]
+
 # Turn off text cleaning and preprocessing
 text = "This is a sentence\ncut off in the middle because pdf."
 ps = PragmaticSegmenter::Segmenter.new(text: text, language: 'en', doc_type: 'pdf', clean: false)

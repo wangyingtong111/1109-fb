@@ -2,6 +2,7 @@
 # frozen_string_literal: true
 
 require_relative 'cleaner/rules'
+require_relative 'html_converter'
 
 module PragmaticSegmenter
   # This is an opinionated class that removes errant newlines,
@@ -32,12 +33,16 @@ module PragmaticSegmenter
 
     def clean
       return unless text
+      convert_html_to_text if html_doc_type?
       remove_all_newlines
       replace_double_newlines
       replace_newlines
       replace_escaped_newlines
 
-      Rule.apply(@text, HTML::All)
+      # In HTML mode the tags and entities have already been handled by
+      # HTMLConverter; applying the generic tag stripping rules here
+      # would remove decoded literal text such as "<ok>".
+      Rule.apply(@text, HTML::All) unless html_doc_type?
 
       replace_punctuation_in_brackets
       Rule.apply(@text, InlineFormattingRule)
@@ -48,6 +53,14 @@ module PragmaticSegmenter
     end
 
     private
+
+    def html_doc_type?
+      doc_type.to_s.downcase.eql?('html')
+    end
+
+    def convert_html_to_text
+      @text = HTMLConverter.to_text(@text)
+    end
 
     def abbreviations
       @language::Abbreviation::ABBREVIATIONS
