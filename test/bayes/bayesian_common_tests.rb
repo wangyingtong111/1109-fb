@@ -179,6 +179,56 @@ module BayesianCommonTests
     refute_equal Float::INFINITY, classifier.classify_with_score('To be or not to be')[1]
   end
 
+  def test_posterior_probabilities_with_untrained_category
+    classifier = ClassifierReborn::Bayes.new 'Maps', 'Weather', backend: @alternate_backend
+    classifier.train_maps 'harbor river'
+    classifier.train_weather 'snow storm'
+    classifier.add_category 'Birds'
+
+    assert_equal %w[Birds], classifier.untrained_categories
+
+    # Long document with one known word and many distinct unseen words
+    text = (['harbor'] + (1..50).map { |i| "unseenword#{i}" }).join(' ')
+    probabilities = classifier.posterior_probabilities(text)
+
+    # Posterior is finite for every category
+    probabilities.each_value { |p| assert p.finite?, "expected finite probability, got #{p}" }
+    # Untrained category carries no forged training evidence
+    assert_equal 0.0, probabilities['Birds']
+    # Trained (valid) category probabilities sum to 1
+    trained_sum = probabilities['Maps'] + probabilities['Weather']
+    assert_in_delta 1.0, trained_sum, 1e-9
+    # Maps wins among the trained categories
+    assert probabilities['Maps'] > probabilities['Weather']
+    assert_equal 'Maps', classifier.classify_with_probability(text)[0]
+    # Untrained category never takes the maximum
+    refute_equal 'Birds', probabilities.max_by { |_, p| p }[0]
+
+    # After training, the category participates in normal comparison
+    classifier.train_birds 'sparrow eagle'
+    assert_equal [], classifier.untrained_categories
+    probabilities = classifier.posterior_probabilities(text)
+    assert probabilities['Birds'] > 0.0
+    assert_in_delta 1.0, probabilities.values.sum, 1e-9
+  end
+
+  def test_posterior_probabilities_with_empty_word_hash
+    classifier = ClassifierReborn::Bayes.new 'Maps', 'Weather', backend: @alternate_backend
+    classifier.train_maps 'harbor river'
+    classifier.train_weather 'snow storm'
+    probabilities = classifier.posterior_probabilities('to be or not to be')
+    probabilities.each_value { |p| assert p.finite? }
+    assert_in_delta 1.0, probabilities.values.sum, 1e-9
+    assert_in_delta 0.5, probabilities['Maps'], 1e-9
+  end
+
+  def test_posterior_probabilities_without_any_training
+    classifier = ClassifierReborn::Bayes.new 'Maps', 'Weather', backend: @alternate_backend
+    probabilities = classifier.posterior_probabilities('harbor storm')
+    assert_equal({ 'Maps' => 0.0, 'Weather' => 0.0 }, probabilities)
+    assert_equal %w[Maps Weather], classifier.untrained_categories
+  end
+
   def test_reset
     @classifier.add_category 'Test'
     assert_equal %w[Test Interesting Uninteresting].sort, @classifier.categories.sort

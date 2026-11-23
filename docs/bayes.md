@@ -254,6 +254,27 @@ You would sort on score and take only the top three or four categories as your t
 
 You could within your application establish the smallest acceptable score and only use those categories whose score is greater than or equal to your smallest acceptable score as your tags for the blog post.
 
+## Posterior Probabilities
+
+The raw scores returned by `classifications` are log-scores, which are hard to compare across inputs.
+If you need a comparable confidence measure, use `posterior_probabilities`, which normalizes the scores into a probability distribution via a numerically stable softmax:
+
+```ruby
+classifier = ClassifierReborn::Bayes.new 'Maps', 'Weather'
+classifier.train_maps 'harbor river'
+classifier.train_weather 'snow storm'
+classifier.add_category 'Birds' # not trained yet
+
+classifier.untrained_categories #=> ['Birds']
+classifier.posterior_probabilities 'harbor and many unseen words'
+#=> {"Maps"=>0.83..., "Weather"=>0.16..., "Birds"=>0.0}
+```
+
+The probabilities of all trained categories are finite and sum to 1, even for inputs with very few known words or many out-of-vocabulary words.
+Categories that have never been trained always receive exactly `0.0`, so an empty training set cannot masquerade as training evidence; inspect them explicitly with `untrained_categories`.
+Once trained, a category participates in the comparison normally.
+The convenience method `classify_with_probability` returns the best category together with its posterior probability.
+
 What if you only use the `classify` method?
 It does not show you the score of the best category.
 How do you know that the best category is really any good?

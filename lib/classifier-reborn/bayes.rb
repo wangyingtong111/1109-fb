@@ -153,6 +153,71 @@ module ClassifierReborn
       score
     end
 
+    # Returns the posterior probability of each category for the provided
+    # +text+, normalized so that the probabilities of all trained categories
+    # are finite and sum to 1. E.g.,
+    #    b.posterior_probabilities "I hate bad words and you"
+    #    =>  {"Uninteresting"=>0.9926, "Interesting"=>0.0074}
+    # Categories that have never been trained are assigned exactly 0.0, so an
+    # empty training set cannot masquerade as training evidence; use
+    # #untrained_categories to inspect their state explicitly. Inputs with
+    # very few known words, or none at all, still yield a valid distribution
+    # (approaching, or exactly, uniform over the trained categories).
+    def posterior_probabilities(text)
+      probabilities = {}
+      category_keys.each { |category| probabilities[category.to_s] = 0.0 }
+      trained = category_keys.select { |category| @backend.category_has_trainings?(category) }
+      return probabilities if trained.empty?
+
+      word_hash = Hasher.word_hash(text, @enable_stemmer,
+                                   tokenizer: @tokenizer, token_filters: @token_filters)
+      if word_hash.empty?
+        uniform = 1.0 / trained.size
+        trained.each { |category| probabilities[category.to_s] = uniform }
+        return probabilities
+      end
+
+      log_scores = {}
+      trained.each do |category|
+        score = 0.0
+        total = (@backend.category_word_count(category) || 1).to_f
+        word_hash.each do |word, _count|
+          s = @backend.word_in_category?(category, word) ? @backend.category_word_frequency(category, word) : 0.1
+          score += Math.log(s / total)
+        end
+        # add the prior probability for the category
+        score += Math.log(@backend.category_training_count(category) / @backend.total_trainings.to_f)
+        log_scores[category] = score
+      end
+
+      # Stable softmax over the log-scores of the trained categories
+      max_score = log_scores.values.max
+      exp_scores = {}
+      log_scores.each { |category, s| exp_scores[category] = Math.exp(s - max_score) }
+      exp_total = exp_scores.values.sum
+      exp_scores.each { |category, e| probabilities[category.to_s] = e / exp_total }
+      probabilities
+    end
+
+    # Provides a list of category names that have not been trained yet.
+    # Such categories always receive a posterior probability of 0.0 from
+    # #posterior_probabilities until they are trained.
+    # For example:
+    #     b.untrained_categories
+    #     =>   ["The other"]
+    def untrained_categories
+      category_keys.reject { |category| @backend.category_has_trainings?(category) }
+                   .collect(&:to_s)
+    end
+
+    # Returns the classification of the provided +text+ along with its
+    # posterior probability, based on #posterior_probabilities. E.g.,
+    #    b.classify_with_probability "I hate bad words and you"
+    #    =>  ['Uninteresting', 0.9926]
+    def classify_with_probability(text)
+      (posterior_probabilities(text).sort_by { |a| -a[1] })[0]
+    end
+
     # Returns the classification of the provided +text+, which is one of the
     # categories given in the initializer along with the score. E.g.,
     #    b.classify "I hate bad words and you"
