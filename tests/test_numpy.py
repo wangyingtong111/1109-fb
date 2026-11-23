@@ -1074,3 +1074,72 @@ def test_gradient():
 
     for a in [None, 0, 1, -1, (0, 1), (0, -1)]:
         check_grads(np.gradient, 0)(npr.randn(10, 10, 10), axis=a)
+
+
+def test_take_along_axis():
+    # Several index batches share the same score row; repeated and negative
+    # indices accumulate following NumPy rules.
+    idx = np.array([[2, 2, 0], [1, -1, 1]])
+    weights = np.array([[1.0, 9.0, 4.0], [2.0, 7.0, 3.0]])
+
+    def fun(scores):
+        return np.sum(np.take_along_axis(scores, idx, axis=-1) * weights)
+
+    scores = np.array([[1.0, 2.0, 3.0]])
+    assert np.allclose(grad(fun)(scores), [[4.0, 5.0, 17.0]])
+    check_grads(fun, modes=["rev"], order=2)(scores)
+
+
+def test_take_along_axis_transposed():
+    idx = np.array([[2, 1], [2, -1], [0, 1]])
+    weights = np.array([[1.0, 2.0], [9.0, 7.0], [4.0, 3.0]])
+
+    def fun(scores):
+        return np.sum(np.take_along_axis(scores, idx, axis=0) * weights)
+
+    scores = np.array([[1.0], [2.0], [3.0]])
+    assert np.allclose(grad(fun)(scores), [[4.0], [5.0], [17.0]])
+    check_grads(fun, modes=["rev"], order=2)(scores)
+
+
+def test_take_along_axis_empty_indices():
+    # Zero-length selection axis still produces a zero gradient shaped
+    # like the input scores.
+    idx = np.zeros((2, 0), dtype="int64")
+
+    def fun(scores):
+        return np.sum(np.take_along_axis(scores, idx, axis=-1) * np.ones((2, 0)))
+
+    scores = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    result = grad(fun)(scores)
+    assert result.shape == scores.shape
+    assert np.allclose(result, np.zeros_like(scores))
+
+
+def test_take_along_axis_broadcast():
+    # Indices broadcast against the input along the non-selected axes.
+    idx = np.array([[0, 1, 1]])
+    weights = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+
+    def fun(scores):
+        return np.sum(np.take_along_axis(scores, idx, axis=0) * weights)
+
+    scores = npr.randn(2, 3)
+    expected = np.zeros((2, 3))
+    for j in range(2):
+        for k in range(3):
+            expected[idx[0, k], k] += weights[j, k]
+    assert np.allclose(grad(fun)(scores), expected)
+    check_grads(fun, modes=["rev"])(scores)
+
+
+def test_take_along_axis_flattened():
+    idx = np.array([0, 3, 2])
+    weights = np.array([1.0, 2.0, 3.0])
+
+    def fun(scores):
+        return np.sum(np.take_along_axis(scores, idx, axis=None) * weights)
+
+    scores = np.array([[1.0, 2.0], [3.0, 4.0]])
+    assert np.allclose(grad(fun)(scores), [[1.0, 0.0], [3.0, 2.0]])
+    check_grads(fun, modes=["rev"])(scores)

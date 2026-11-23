@@ -955,6 +955,44 @@ defvjp(func(ArrayBox.__getitem__), lambda ans, A, idx: lambda g: untake(g, idx, 
 defvjp(untake, lambda ans, x, idx, _: lambda g: g[idx])
 
 
+def _untake_along_axis(g, arr, indices, axis):
+    """Scatters g back into an array shaped like arr, inverting take_along_axis.
+
+    indices is treated as a discrete constant. Repeated indices accumulate,
+    negative indices follow NumPy indexing rules, and indices are broadcast
+    against arr along the non-selected axes, exactly as in np.take_along_axis.
+    """
+    indices = onp.asarray(indices)
+    if axis is None:
+        # arr is treated as flattened, and indices must be one-dimensional.
+        full_idx = onp.unravel_index(onp.ravel(indices), anp.shape(arr))
+        return untake(anp.ravel(g), full_idx, vspace(arr))
+
+    g_shape = anp.shape(g)
+    arr_shape = anp.shape(arr)
+    ndim = len(g_shape)
+    axis = axis % ndim
+    idx = onp.broadcast_to(indices, g_shape)
+    full_idx = []
+    for i in range(ndim):
+        if i == axis:
+            full_idx.append(idx)
+        else:
+            # Broadcast the position along arr's own extent, so that axes
+            # where arr was broadcast accumulate back into the same slots.
+            shape = [1] * ndim
+            shape[i] = arr_shape[i]
+            full_idx.append(onp.broadcast_to(onp.arange(arr_shape[i]).reshape(shape), g_shape))
+    return untake(g, tuple(full_idx), vspace(arr))
+
+
+defvjp(
+    anp.take_along_axis,
+    lambda ans, arr, indices, axis=None: lambda g: _untake_along_axis(g, arr, indices, axis),
+    argnums=(0,),
+)
+
+
 def _unpad(array, width):
     if anp.isscalar(width):
         width = [[width, width]]
