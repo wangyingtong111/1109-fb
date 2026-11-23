@@ -1,0 +1,25 @@
+name: lint
+
+on:
+  push:
+    branches:
+      - main
+      - dev*
+  pull_request:
+
+jobs:
+  rubocop:
+    runs-on: ubuntu-latest
+    name: RuboCop
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Ruby 3.2
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: 3.2
+      - name: Install BLAS and LAPACK for numo-linalg-alt
+        run: sudo apt-get install -y libopenblas-dev liblapacke-dev
+      - name: Run RuboCop
+        run: |
+          bash bundle_update.sh
+          bash rumale-rubocop.sh

@@ -1,0 +1,13 @@
+# frozen_string_literal: true
+
+require 'numo/narray/alt'
+
+require_relative 'tree/version'
+
+require_relative 'tree/decision_tree_classifier'
+require_relative 'tree/decision_tree_regressor'
+require_relative 'tree/extra_tree_classifier'
+require_relative 'tree/extra_tree_regressor'
+require_relative 'tree/gradient_tree_regressor'
+require_relative 'tree/vr_tree_classifier'
+require_relative 'tree/vr_tree_regressor'

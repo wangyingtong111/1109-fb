@@ -1,0 +1,14 @@
+# frozen_string_literal: true
+
+source 'https://rubygems.org'
+
+# Specify your gem's dependencies in rumale-naive_bayes.gemspec
+gemspec
+
+gem 'rumale-core', path: '../rumale-core'
+
+gem 'rake', '~> 13.0'
+gem 'rspec', '~> 3.0'
+gem 'simplecov', '~> 0.21'
+
+eval_gemfile(File.expand_path('../Gemfile.rubocop', __dir__))
