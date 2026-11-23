@@ -25,11 +25,23 @@ def _retrieve_internal_jitted(
     num_docs: int,
     nonoccurrence_array: np.ndarray = None,
     weight_mask: np.ndarray = None,
+    candidate_ids: np.ndarray = None,
 ):
     N = len(query_pointers) - 1
 
-    topk_scores = np.zeros((N, k), dtype=dtype)
-    topk_indices = np.zeros((N, k), dtype=int_dtype)
+    # A candidate set restricts retrieval to a genuinely recallable subset of the
+    # corpus. Unlike ``weight_mask`` (which scales the complete score vector and
+    # therefore still lets zero-weight documents pad the top-k), candidates never
+    # pull in excluded documents, so fewer than ``k`` (even zero) results are valid.
+    if candidate_ids is not None:
+        n_candidates = len(candidate_ids)
+        effective_k = min(k, n_candidates)
+        topk_scores = np.zeros((N, effective_k), dtype=dtype)
+        topk_indices = np.zeros((N, effective_k), dtype=int_dtype)
+    else:
+        effective_k = k
+        topk_scores = np.zeros((N, k), dtype=dtype)
+        topk_indices = np.zeros((N, k), dtype=int_dtype)
 
     for i in prange(N):
         query_tokens_single = query_tokens_ids_flat[query_pointers[i] : query_pointers[i + 1]]
@@ -53,11 +65,22 @@ def _retrieve_internal_jitted(
         if weight_mask is not None:
             scores_single = scores_single * weight_mask
 
-        topk_scores_sing, topk_indices_sing = _numba_sorted_top_k(
-            scores_single, k=k, sorted=sorted
-        )
-        topk_scores[i] = topk_scores_sing
-        topk_indices[i] = topk_indices_sing
+        if candidate_ids is not None:
+            # Documents with no query-term hit simply keep their zero score; they
+            # remain legitimate recallable candidates.
+            candidate_scores = scores_single[candidate_ids]
+            candidate_topk_scores, candidate_topk_positions = _numba_sorted_top_k(
+                candidate_scores, k=effective_k, sorted=sorted
+            )
+            topk_scores[i] = candidate_topk_scores
+            # map positions within the candidate set back to corpus document IDs
+            topk_indices[i] = candidate_ids[candidate_topk_positions]
+        else:
+            topk_scores_sing, topk_indices_sing = _numba_sorted_top_k(
+                scores_single, k=k, sorted=sorted
+            )
+            topk_scores[i] = topk_scores_sing
+            topk_indices[i] = topk_indices_sing
 
     return topk_scores, topk_indices
 
@@ -82,6 +105,7 @@ def _retrieve_numba_functional(
     dtype="float32",
     int_dtype="int32",
     weight_mask=None,
+    candidate_ids=None,
 ):
     from numba import get_num_threads, set_num_threads
 
@@ -138,6 +162,7 @@ def _retrieve_numba_functional(
         num_docs=scores["num_docs"],
         nonoccurrence_array=nonoccurrence_array,
         weight_mask=weight_mask,
+        candidate_ids=candidate_ids,
     )
 
     # reset the number of threads

@@ -644,6 +644,7 @@ class BM25:
         backend="auto",
         sorted: bool = False,
         weight_mask: np.ndarray = None,
+        candidate_ids: np.ndarray = None,
     ):
         """
         This function is used to retrieve the top-k results for a single query.
@@ -657,6 +658,35 @@ class BM25:
             scores_q = np.zeros(self.scores["num_docs"], dtype=self.dtype)
         else:
             scores_q = self.get_scores(query_tokens_single, weight_mask=weight_mask)
+
+        if candidate_ids is not None:
+            # Restrict retrieval to the genuinely recallable candidate set. A
+            # candidate with no query-term hit keeps its zero score but is still
+            # eligible; excluded documents are never pulled in to pad the result.
+            candidate_ids = np.asarray(candidate_ids)
+            scores_q = scores_q[candidate_ids]
+            effective_k = min(k, len(candidate_ids))
+            if effective_k == 0:
+                empty_scores = np.zeros(0, dtype=scores_q.dtype)
+                empty_indices = np.zeros(0, dtype=np.dtype(self.int_dtype))
+                return empty_scores, empty_indices
+            if backend.startswith("numba"):
+                if NUMBA_AVAILABLE is False:
+                    raise ImportError(
+                        "Numba is not installed. Please install numba to use the numba backend."
+                    )
+                topk_scores, topk_positions = selection_jit.topk(
+                    scores_q, k=effective_k, sorted=sorted, backend=backend
+                )
+            else:
+                topk_scores, topk_positions = selection_np.topk(
+                    scores_q, k=effective_k, sorted=sorted, backend=backend
+                )
+            # map positions within the candidate set back to corpus document IDs
+            topk_indices = candidate_ids[topk_positions].astype(
+                np.dtype(self.int_dtype), copy=False
+            )
+            return topk_scores, topk_indices
 
         if backend.startswith("numba"):
             if NUMBA_AVAILABLE is False:
@@ -686,6 +716,7 @@ class BM25:
         chunksize: int = 50,
         backend_selection: str = "auto",
         weight_mask: np.ndarray = None,
+        candidate_ids: Union[np.ndarray, Iterable[int]] = None,
     ):
         """
         Retrieve the top-k documents for each query (tokenized).
@@ -741,6 +772,19 @@ class BM25:
         weight_mask : np.ndarray
             A weight mask to filter the documents. If provided, the scores for the masked
             documents will be set to 0 to avoid returning them in the results.
+
+        candidate_ids : np.ndarray or iterable of int, optional
+            A 1-D collection of document IDs that form the genuinely recallable
+            candidate set for every query. Retrieval is restricted to these
+            documents: IDs outside the set can never be returned, even when fewer
+            than ``k`` candidates exist. This is distinct from ``weight_mask``,
+            which scales the complete score vector and still lets zero-weight
+            documents pad the top-k. Candidates that no query term hits simply
+            receive a zero score yet remain eligible; therefore the result may
+            contain zero-score candidates and may be shorter than ``k`` (an empty
+            candidate set yields an empty result). When ``None`` (the default),
+            every indexed document is a candidate and the previous behavior is
+            preserved. Duplicate IDs are retained as given.
 
         Returns
         -------
@@ -844,6 +888,29 @@ class BM25:
                     "The length of the weight_mask must be the same as the length of the corpus."
                 )
 
+        if candidate_ids is not None:
+            # The candidate set is a hard restriction on recallable documents, so
+            # normalize it once here and validate it against the index. It is kept
+            # separate from weight_mask, which only scales scores.
+            candidate_ids = np.asarray(candidate_ids)
+
+            if candidate_ids.ndim != 1:
+                raise ValueError("candidate_ids must be a 1-D array of document IDs.")
+
+            if candidate_ids.size > 0:
+                if not np.issubdtype(candidate_ids.dtype, np.integer):
+                    raise ValueError(
+                        "candidate_ids must contain integer document IDs."
+                    )
+                if int(candidate_ids.min()) < 0 or int(candidate_ids.max()) >= num_docs:
+                    raise ValueError(
+                        "candidate_ids must contain valid document IDs in the range "
+                        f"[0, {num_docs - 1}]."
+                    )
+
+            # use the index's integer dtype so the Numba backend receives a matching type
+            candidate_ids = candidate_ids.astype(np.dtype(self.int_dtype), copy=False)
+
         if self.backend == "numba":
             if _retrieve_numba_functional is None:
                 raise ImportError(
@@ -879,6 +946,7 @@ class BM25:
                 int_dtype=self.int_dtype,
                 nonoccurrence_array=self.nonoccurrence_array,
                 weight_mask=weight_mask,
+                candidate_ids=candidate_ids,
             )
 
             if return_as == "tuple":
@@ -898,6 +966,7 @@ class BM25:
             sorted=sorted,
             backend=backend_selection,
             weight_mask=weight_mask,
+            candidate_ids=candidate_ids,
         )
 
         if n_threads == 0:
