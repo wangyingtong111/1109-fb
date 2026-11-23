@@ -462,12 +462,81 @@ def grad_np_mean(ans, x, axis=None, keepdims=False, **kwargs):
 defvjp(anp._primitive_mean, grad_np_mean)
 
 
-def grad_np_prod(ans, x, axis=None, keepdims=False, **kwargs):  # TODO: Support tuples of axes.
-    shape, dtype = anp.shape(x), anp.result_type(x)
+def _cumprod_trailing_axis(x):
+    # Cumulative product along the last axis, built only from operations that
+    # have VJPs (so the result is differentiable to arbitrary order). No
+    # division is used, hence zeros do not produce NaNs/infs.
+    n = x.shape[-1]
+    running = anp.ones_like(x[..., :1])
+    cumprods = []
+    for i in range(n):
+        running = running * x[..., i : i + 1]
+        cumprods.append(running)
+    return anp.concatenate(cumprods, axis=-1)
+
+
+def _exclusive_prod_trailing_axis(x):
+    # For each position along the last axis, return the product of every other
+    # entry along that axis. Prefix/suffix cumulative products avoid the
+    # g*ans/x division, which is undefined when x is zero (e.g. sparse gates
+    # that are genuinely switched off).
+    n = x.shape[-1]
+    if n == 0:
+        # Empty reduction: the empty product is the constant 1, whose VJP is 0.
+        return anp.zeros_like(x)
+    if n == 1:
+        return anp.ones_like(x)
+    # prefix[i] = product of x[..., 0:i]
+    cumprod = _cumprod_trailing_axis(x)
+    prefix = anp.concatenate([anp.ones_like(x[..., :1]), cumprod[..., :-1]], axis=-1)
+    # suffix[i] = product of x[..., i+1:n]
+    reversed_cumprod = _cumprod_trailing_axis(anp.flip(x, axis=-1))
+    suffix = anp.concatenate(
+        [anp.flip(reversed_cumprod[..., :-1], axis=-1), anp.ones_like(x[..., :1])],
+        axis=-1,
+    )
+    return prefix * suffix
+
+
+def _normalize_prod_axes(axis, ndim):
+    if axis is None:
+        return tuple(range(ndim))
+    if isinstance(axis, (tuple, list)):
+        return tuple(ndim + a if a < 0 else a for a in axis)
+    return (ndim + axis if axis < 0 else axis,)
+
+
+def grad_np_prod(ans, x, axis=None, keepdims=False, **kwargs):
+    # Supports single axes, tuples of axes and axis=None. The VJP is built from
+    # exclusive products instead of dividing by x, so it remains finite and
+    # differentiable when the reduced set contains zeros.
+    ndim = anp.ndim(x)
+    if ndim == 0:
+        return lambda g: g * anp.ones_like(x)
+
+    axes = _normalize_prod_axes(axis, ndim)
+    shape = anp.shape(x)
+    reduced_size = int(onp.prod([shape[a] for a in axes]))
+    kept_axes = tuple(a for a in range(ndim) if a not in axes)
+    # Gather the reduced axes at the end and the kept axes at the front.
+    permutation = kept_axes + axes
+    inverse_permutation = tuple(permutation.index(a) for a in range(ndim))
+    moved_kept_shape = tuple(shape[a] for a in kept_axes)
 
     def vjp(g):
-        g_repeated, _ = repeat_to_match_shape(g * ans, shape, dtype, axis, keepdims)
-        return g_repeated / x
+        moved_x = anp.transpose(x, permutation)
+        flat_x = anp.reshape(moved_x, moved_kept_shape + (reduced_size,))
+        # Exclusive product over the flattened, gathered reduction axes.
+        exclusive = _exclusive_prod_trailing_axis(flat_x)
+        # g has one entry per kept index (keepdims only adds singleton axes);
+        # broadcast it across the gathered reduction dimension.
+        g_moved = anp.reshape(g, moved_kept_shape)
+        g_broadcast = anp.reshape(g_moved, moved_kept_shape + (1,)) + onp.zeros(
+            (reduced_size,), dtype=exclusive.dtype
+        )
+        out_moved = anp.reshape(g_broadcast * exclusive, moved_x.shape)
+        out = anp.transpose(out_moved, inverse_permutation)
+        return anp.reshape(out, shape)
 
     return vjp
 

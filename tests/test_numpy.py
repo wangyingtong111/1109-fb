@@ -620,6 +620,83 @@ def test_prod_4():
     check_grads(fun)(mat)
 
 
+def test_prod_multiaxis_zeros_gradient():
+    # Sparse gates can be exactly zero: the prod VJP must stay finite and
+    # correct when a reduced group contains one or more zeros, across several
+    # reduction axes and with/without keepdims.
+    x = np.array([[[0.0, 2.0], [3.0, 4.0]], [[5.0, 0.0], [0.0, 7.0]]])
+    weights = np.array([2.0, 3.0])
+
+    def fun(a):
+        return np.sum(np.prod(a, axis=(0, 2)) * weights)
+
+    expected_grad = np.array(
+        [[[0.0, 0.0], [0.0, 0.0]], [[0.0, 0.0], [252.0, 0.0]]]
+    )
+    g = grad(fun)(x)
+    assert g.shape == x.shape
+    assert np.all(np.isfinite(g))
+    assert np.allclose(g, expected_grad)
+
+    def fun_keepdims(a):
+        return np.sum(np.prod(a, axis=(0, 2), keepdims=True) * weights.reshape(1, 2, 1))
+
+    g_kd = grad(fun_keepdims)(x)
+    assert g_kd.shape == x.shape
+    assert np.allclose(g_kd, expected_grad)
+
+
+def test_prod_multiaxis_zeros_second_order():
+    # The zero-safe reverse pass must itself be differentiable. The mixed
+    # second derivative of the two zero entries in the first slice is 20, and
+    # the result is broadcast back to the input shape.
+    x = np.array([[[0.0, 2.0], [3.0, 4.0]], [[5.0, 0.0], [0.0, 7.0]]])
+    weights = np.array([2.0, 3.0])
+
+    def fun(a):
+        return np.sum(np.prod(a, axis=(0, 2)) * weights)
+
+    h = grad(lambda a: grad(fun)(a)[0, 0, 0])(x)
+    assert h.shape == x.shape
+    assert np.all(np.isfinite(h))
+    assert h[1, 0, 1] == 20.0  # mixed term between x[0,0,0] and x[1,0,1]
+
+    # Hessian symmetry: approaching from the other zero entry.
+    h_other = grad(lambda a: grad(fun)(a)[1, 0, 1])(x)
+    assert h_other[0, 0, 0] == 20.0
+
+
+def test_prod_zeros_finite_across_axes():
+    # No NaN/inf for any axis convention, including axis=None and keepdims.
+    base = npr.randn(2, 3, 4)
+    base[0, 0, 0] = 0.0
+    base[1, 1, 1] = 0.0
+    for axis in (None, 0, 1, -1, (0, 2), (1, 2), (0, 1, 2)):
+        for keepdims in (False, True):
+            def fun(a, axis=axis, keepdims=keepdims):
+                return np.sum(np.prod(a, axis=axis, keepdims=keepdims))
+
+            g = grad(fun)(np.array(base))
+            assert g.shape == base.shape
+            assert np.all(np.isfinite(g))
+
+
+def test_prod_two_zeros_same_group():
+    # With two zeros in one reduced group, every first derivative of that
+    # group vanishes, but mixed second derivatives survive.
+    x = np.array([[0.0, 2.0, 3.0], [0.0, 5.0, 7.0]])
+
+    def fun(a):
+        return np.sum(np.prod(a, axis=0))
+
+    g = grad(fun)(x)
+    assert np.all(np.isfinite(g))
+    assert np.allclose(g[:, 0], 0.0)
+    h = grad(lambda a: grad(fun)(a)[0, 0])(x)
+    assert np.all(np.isfinite(h))
+    assert h[1, 0] == 1.0  # d2/dx00 dx10 of x00*x10
+
+
 def test_1d_array():
     def fun(x):
         return np.array([x, x * 1.0, x + 2.5])
