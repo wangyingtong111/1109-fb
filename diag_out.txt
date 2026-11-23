@@ -1,0 +1,619 @@
+
+========================================================================================
+案例 BASE（LF）   doc_type=nil   clean=true
+原始行:
+  L1: Read 1.2 ms.
+  L2: 1. First item.
+  L3:   1.1 Nested item.
+  L4: 2. Last item.
+
+-- 管线追踪（按真实执行顺序；规则改写均带入口）--
+
+[阶段] 清理阶段 PragmaticSegmenter::Languages::English::Cleaner#clean
+    文本: Read 1.2 ms.␊1. First item.␊  1.1 Nested item.␊2. Last item.
+  [规则] 入口 cleaner.rb:111 `PragmaticSegmenter::Cleaner#replace_newlines`  /\n/ → "\r"
+      前: Read 1.2 ms.␊1. First item.␊  1.1 Nested item.␊2. Last item.
+      后: Read 1.2 ms.␍1. First item.␍  1.1 Nested item.␍2. Last item.
+  [改写] Cleaner#replace_newlines
+      前: Read 1.2 ms.␊1. First item.␊  1.1 Nested item.␊2. Last item.
+      后: Read 1.2 ms.␍1. First item.␍  1.1 Nested item.␍2. Last item.
+[阶段末] 清理结束（→ 交给 Processor 的文本）
+    文本: Read 1.2 ms.␍1. First item.␍  1.1 Nested item.␍2. Last item.
+    标记图:
+    @12   硬边界␍      属L2 | ad 1.2 ms.❰␍❱1. First ite
+    @27   硬边界␍      属L3 | irst item.❰␍❱  1.1 Nested
+    @46   硬边界␍      属L4 | sted item.❰␍❱2. Last item
+
+[阶段] Processor#process（输入 = 清理后文本）
+    文本: Read 1.2 ms.␍1. First item.␍  1.1 Nested item.␍2. Last item.
+
+[阶段] 列表保护 List#add_line_break
+    文本: Read 1.2 ms.␍1. First item.␍  1.1 Nested item.␍2. Last item.
+  [判定] List#scan_lists（标记 "♨"） — 扫描命中编号 [1, 2]；只有与相邻编号连续者才被采纳
+  [改写] List#substitute_found_list_items：编号 1 的句号 → 1♨
+      前: Read 1.2 ms.␍1. First item.␍  1.1 Nested item.␍2. Last item.
+      后: Read 1.2 ms.␍1♨ First item.␍  1.1 Nested item.␍2. Last item.
+  [改写] List#substitute_found_list_items：编号 2 的句号 → 2♨
+      前: Read 1.2 ms.␍1♨ First item.␍  1.1 Nested item.␍2. Last item.
+      后: Read 1.2 ms.␍1♨ First item.␍  1.1 Nested item.␍2♨ Last item.
+  [判定] List#add_line_breaks_for_numbered_list_with_periods — 守卫 /♨.+\n.+♨|♨.+\r.+♨/ => 命中：列表项已跨行，不再插断行
+  [规则] 入口 list.rb:77 `PragmaticSegmenter::List#format_numbered_list_with_periods`  /♨/ → "∯"
+      前: Read 1.2 ms.␍1♨ First item.␍  1.1 Nested item.␍2♨ Last item.
+      后: Read 1.2 ms.␍1∯ First item.␍  1.1 Nested item.␍2∯ Last item.
+  [判定] List#scan_lists（标记 "☝"） — 扫描命中编号 []；只有与相邻编号连续者才被采纳
+  [判定] List#scan_lists（标记 "☝"） — 扫描命中编号 []；只有与相邻编号连续者才被采纳
+[阶段末] 列表保护结束（♨ 已在此阶段内换成 ∯）
+    文本: Read 1.2 ms.␍1∯ First item.␍  1.1 Nested item.␍2∯ Last item.
+    标记图:
+    @12   硬边界␍      属L2 | ad 1.2 ms.❰␍❱1∯ First ite
+    @14   保护句号∯     属L2 |  1.2 ms.␍1❰∯❱ First item.
+    @27   硬边界␍      属L3 | irst item.❰␍❱  1.1 Nested
+    @46   硬边界␍      属L4 | sted item.❰␍❱2∯ Last item
+    @48   保护句号∯     属L4 | ed item.␍2❰∯❱ Last item.
+  [改写] AbbreviationReplacer#replace_prepositive_abbr
+      前: Read 1.2 ms.␍1∯ First item.␍  1.1 Nested item.␍2∯ Last item.
+      后: Read 1.2 ms∯␍1∯ First item.␍  1.1 Nested item.␍2∯ Last item.
+  [改写] Processor#replace_abbreviations（缩写保护）
+      前: Read 1.2 ms.␍1∯ First item.␍  1.1 Nested item.␍2∯ Last item.
+      后: Read 1.2 ms∯␍1∯ First item.␍  1.1 Nested item.␍2∯ Last item.
+  [规则] 入口 processor.rb:106 `PragmaticSegmenter::Processor#replace_numbers`  /\.(?=\d)/ → "∯"
+      前: Read 1.2 ms∯␍1∯ First item.␍  1.1 Nested item.␍2∯ Last item.
+      后: Read 1∯2 ms∯␍1∯ First item.␍  1∯1 Nested item.␍2∯ Last item.
+  [改写] Processor#replace_numbers（数值保护）
+      前: Read 1.2 ms∯␍1∯ First item.␍  1.1 Nested item.␍2∯ Last item.
+      后: Read 1∯2 ms∯␍1∯ First item.␍  1∯1 Nested item.␍2∯ Last item.
+
+[阶段] 切分 split_into_segments：按 ␍ 硬切，再逐段恢复符号
+    文本: Read 1∯2 ms∯␍1∯ First item.␍  1∯1 Nested item.␍2∯ Last item.
+  [规则] 入口 processor.rb:39 `block in PragmaticSegmenter::Processor#split_into_segments`  /∯/ → "."
+      前: Read 1∯2 ms∯
+      后: Read 1.2 ms.
+  [规则] 入口 processor.rb:39 `block in PragmaticSegmenter::Processor#split_into_segments`  /∯/ → "."
+      前: 1∯ First item.
+      后: 1. First item.
+  [规则] 入口 processor.rb:39 `block in PragmaticSegmenter::Processor#split_into_segments`  /∯/ → "."
+      前: 1∯1 Nested item.
+      后: 1.1 Nested item.
+  [规则] 入口 processor.rb:39 `block in PragmaticSegmenter::Processor#split_into_segments`  /∯/ → "."
+      前: 2∯ Last item.
+      后: 2. Last item.
+[阶段末] 切分完成，共 4 段
+
+-- 最终分段 → 原始行映射 --
+  S1 [L1] "Read 1.2 ms."
+  S2 [L2] "1. First item."
+  S3 [L3] "1.1 Nested item."
+  S4 [L4] "2. Last item."
+  边界判定（相邻原始行是否被切开）:
+    L1 | L2 : 有边界 ✓
+    L2 | L3 : 有边界 ✓
+    L3 | L4 : 有边界 ✓
+
+========================================================================================
+案例 对照A：CRLF   doc_type=nil   clean=true
+原始行:
+  L1: Read 1.2 ms.␍
+  L2: 1. First item.␍
+  L3:   1.1 Nested item.␍
+  L4: 2. Last item.
+
+-- 管线追踪（按真实执行顺序；规则改写均带入口）--
+
+[阶段] 清理阶段 PragmaticSegmenter::Languages::English::Cleaner#clean
+    文本: Read 1.2 ms.␍␊1. First item.␍␊  1.1 Nested item.␍␊2. Last item.
+  [规则] 入口 cleaner.rb:111 `PragmaticSegmenter::Cleaner#replace_newlines`  /\n/ → "\r"
+      前: Read 1.2 ms.␍␊1. First item.␍␊  1.1 Nested item.␍␊2. Last item.
+      后: Read 1.2 ms.␍␍1. First item.␍␍  1.1 Nested item.␍␍2. Last item.
+  [改写] Cleaner#replace_newlines
+      前: Read 1.2 ms.␍␊1. First item.␍␊  1.1 Nested item.␍␊2. Last item.
+      后: Read 1.2 ms.␍␍1. First item.␍␍  1.1 Nested item.␍␍2. Last item.
+[阶段末] 清理结束（→ 交给 Processor 的文本）
+    文本: Read 1.2 ms.␍␍1. First item.␍␍  1.1 Nested item.␍␍2. Last item.
+    标记图:
+    @12   硬边界␍      属L2 | ad 1.2 ms.❰␍❱␍1. First it
+    @13   硬边界␍      属L2 | d 1.2 ms.␍❰␍❱1. First ite
+    @28   硬边界␍      属L3 | irst item.❰␍❱␍  1.1 Neste
+    @29   硬边界␍      属L3 | rst item.␍❰␍❱  1.1 Nested
+    @48   硬边界␍      属L4 | sted item.❰␍❱␍2. Last ite
+    @49   硬边界␍      属L4 | ted item.␍❰␍❱2. Last item
+
+[阶段] Processor#process（输入 = 清理后文本）
+    文本: Read 1.2 ms.␍␍1. First item.␍␍  1.1 Nested item.␍␍2. Last item.
+
+[阶段] 列表保护 List#add_line_break
+    文本: Read 1.2 ms.␍␍1. First item.␍␍  1.1 Nested item.␍␍2. Last item.
+  [判定] List#scan_lists（标记 "♨"） — 扫描命中编号 [1, 2]；只有与相邻编号连续者才被采纳
+  [改写] List#substitute_found_list_items：编号 1 的句号 → 1♨
+      前: Read 1.2 ms.␍␍1. First item.␍␍  1.1 Nested item.␍␍2. Last item.
+      后: Read 1.2 ms.␍␍1♨ First item.␍␍  1.1 Nested item.␍␍2. Last item.
+  [改写] List#substitute_found_list_items：编号 2 的句号 → 2♨
+      前: Read 1.2 ms.␍␍1♨ First item.␍␍  1.1 Nested item.␍␍2. Last item.
+      后: Read 1.2 ms.␍␍1♨ First item.␍␍  1.1 Nested item.␍␍2♨ Last item.
+  [判定] List#add_line_breaks_for_numbered_list_with_periods — 守卫 /♨.+\n.+♨|♨.+\r.+♨/ => 命中：列表项已跨行，不再插断行
+  [规则] 入口 list.rb:77 `PragmaticSegmenter::List#format_numbered_list_with_periods`  /♨/ → "∯"
+      前: Read 1.2 ms.␍␍1♨ First item.␍␍  1.1 Nested item.␍␍2♨ Last item.
+      后: Read 1.2 ms.␍␍1∯ First item.␍␍  1.1 Nested item.␍␍2∯ Last item.
+  [判定] List#scan_lists（标记 "☝"） — 扫描命中编号 []；只有与相邻编号连续者才被采纳
+  [判定] List#scan_lists（标记 "☝"） — 扫描命中编号 []；只有与相邻编号连续者才被采纳
+[阶段末] 列表保护结束（♨ 已在此阶段内换成 ∯）
+    文本: Read 1.2 ms.␍␍1∯ First item.␍␍  1.1 Nested item.␍␍2∯ Last item.
+    标记图:
+    @12   硬边界␍      属L2 | ad 1.2 ms.❰␍❱␍1∯ First it
+    @13   硬边界␍      属L2 | d 1.2 ms.␍❰␍❱1∯ First ite
+    @15   保护句号∯     属L2 | 1.2 ms.␍␍1❰∯❱ First item.
+    @28   硬边界␍      属L3 | irst item.❰␍❱␍  1.1 Neste
+    @29   硬边界␍      属L3 | rst item.␍❰␍❱  1.1 Nested
+    @48   硬边界␍      属L4 | sted item.❰␍❱␍2∯ Last ite
+    @49   硬边界␍      属L4 | ted item.␍❰␍❱2∯ Last item
+    @51   保护句号∯     属L4 | d item.␍␍2❰∯❱ Last item.
+  [改写] AbbreviationReplacer#replace_prepositive_abbr
+      前: Read 1.2 ms.␍␍1∯ First item.␍␍  1.1 Nested item.␍␍2∯ Last item.
+      后: Read 1.2 ms∯␍␍1∯ First item.␍␍  1.1 Nested item.␍␍2∯ Last item.
+  [改写] Processor#replace_abbreviations（缩写保护）
+      前: Read 1.2 ms.␍␍1∯ First item.␍␍  1.1 Nested item.␍␍2∯ Last item.
+      后: Read 1.2 ms∯␍␍1∯ First item.␍␍  1.1 Nested item.␍␍2∯ Last item.
+  [规则] 入口 processor.rb:106 `PragmaticSegmenter::Processor#replace_numbers`  /\.(?=\d)/ → "∯"
+      前: Read 1.2 ms∯␍␍1∯ First item.␍␍  1.1 Nested item.␍␍2∯ Last item.
+      后: Read 1∯2 ms∯␍␍1∯ First item.␍␍  1∯1 Nested item.␍␍2∯ Last item.
+  [改写] Processor#replace_numbers（数值保护）
+      前: Read 1.2 ms∯␍␍1∯ First item.␍␍  1.1 Nested item.␍␍2∯ Last item.
+      后: Read 1∯2 ms∯␍␍1∯ First item.␍␍  1∯1 Nested item.␍␍2∯ Last item.
+
+[阶段] 切分 split_into_segments：按 ␍ 硬切，再逐段恢复符号
+    文本: Read 1∯2 ms∯␍␍1∯ First item.␍␍  1∯1 Nested item.␍␍2∯ Last item.
+  [规则] 入口 processor.rb:39 `block in PragmaticSegmenter::Processor#split_into_segments`  /∯/ → "."
+      前: Read 1∯2 ms∯
+      后: Read 1.2 ms.
+  [规则] 入口 processor.rb:39 `block in PragmaticSegmenter::Processor#split_into_segments`  /∯/ → "."
+      前: 1∯ First item.
+      后: 1. First item.
+  [规则] 入口 processor.rb:39 `block in PragmaticSegmenter::Processor#split_into_segments`  /∯/ → "."
+      前: 1∯1 Nested item.
+      后: 1.1 Nested item.
+  [规则] 入口 processor.rb:39 `block in PragmaticSegmenter::Processor#split_into_segments`  /∯/ → "."
+      前: 2∯ Last item.
+      后: 2. Last item.
+[阶段末] 切分完成，共 4 段
+
+-- 最终分段 → 原始行映射 --
+  S1 [L1] "Read 1.2 ms."
+  S2 [L2] "1. First item."
+  S3 [L3] "1.1 Nested item."
+  S4 [L4] "2. Last item."
+  边界判定（相邻原始行是否被切开）:
+    L1 | L2 : 有边界 ✓
+    L2 | L3 : 有边界 ✓
+    L3 | L4 : 有边界 ✓
+
+========================================================================================
+案例 对照B：嵌套项前插一个空行   doc_type=nil   clean=true
+原始行:
+  L1: Read 1.2 ms.
+  L2: 1. First item.
+  L3: 
+  L4:   1.1 Nested item.
+  L5: 2. Last item.
+
+-- 管线追踪（按真实执行顺序；规则改写均带入口）--
+
+[阶段] 清理阶段 PragmaticSegmenter::Languages::English::Cleaner#clean
+    文本: Read 1.2 ms.␊1. First item.␊␊  1.1 Nested item.␊2. Last item.
+  [规则] 入口 cleaner.rb:104 `PragmaticSegmenter::Cleaner#replace_double_newlines`  /\n\n/ → "\r"
+      前: Read 1.2 ms.␊1. First item.␊␊  1.1 Nested item.␊2. Last item.
+      后: Read 1.2 ms.␊1. First item.␍  1.1 Nested item.␊2. Last item.
+  [改写] Cleaner#replace_double_newlines
+      前: Read 1.2 ms.␊1. First item.␊␊  1.1 Nested item.␊2. Last item.
+      后: Read 1.2 ms.␊1. First item.␍  1.1 Nested item.␊2. Last item.
+  [规则] 入口 cleaner.rb:111 `PragmaticSegmenter::Cleaner#replace_newlines`  /\n/ → "\r"
+      前: Read 1.2 ms.␊1. First item.␍  1.1 Nested item.␊2. Last item.
+      后: Read 1.2 ms.␍1. First item.␍  1.1 Nested item.␍2. Last item.
+  [改写] Cleaner#replace_newlines
+      前: Read 1.2 ms.␊1. First item.␍  1.1 Nested item.␊2. Last item.
+      后: Read 1.2 ms.␍1. First item.␍  1.1 Nested item.␍2. Last item.
+[阶段末] 清理结束（→ 交给 Processor 的文本）
+    文本: Read 1.2 ms.␍1. First item.␍  1.1 Nested item.␍2. Last item.
+    标记图:
+    @12   硬边界␍      属L2 | ad 1.2 ms.❰␍❱1. First ite
+    @27   硬边界␍      属L3 | irst item.❰␍❱  1.1 Nested
+    @46   硬边界␍      属L4 | sted item.❰␍❱2. Last item
+
+[阶段] Processor#process（输入 = 清理后文本）
+    文本: Read 1.2 ms.␍1. First item.␍  1.1 Nested item.␍2. Last item.
+
+[阶段] 列表保护 List#add_line_break
+    文本: Read 1.2 ms.␍1. First item.␍  1.1 Nested item.␍2. Last item.
+  [判定] List#scan_lists（标记 "♨"） — 扫描命中编号 [1, 2]；只有与相邻编号连续者才被采纳
+  [改写] List#substitute_found_list_items：编号 1 的句号 → 1♨
+      前: Read 1.2 ms.␍1. First item.␍  1.1 Nested item.␍2. Last item.
+      后: Read 1.2 ms.␍1♨ First item.␍  1.1 Nested item.␍2. Last item.
+  [改写] List#substitute_found_list_items：编号 2 的句号 → 2♨
+      前: Read 1.2 ms.␍1♨ First item.␍  1.1 Nested item.␍2. Last item.
+      后: Read 1.2 ms.␍1♨ First item.␍  1.1 Nested item.␍2♨ Last item.
+  [判定] List#add_line_breaks_for_numbered_list_with_periods — 守卫 /♨.+\n.+♨|♨.+\r.+♨/ => 命中：列表项已跨行，不再插断行
+  [规则] 入口 list.rb:77 `PragmaticSegmenter::List#format_numbered_list_with_periods`  /♨/ → "∯"
+      前: Read 1.2 ms.␍1♨ First item.␍  1.1 Nested item.␍2♨ Last item.
+      后: Read 1.2 ms.␍1∯ First item.␍  1.1 Nested item.␍2∯ Last item.
+  [判定] List#scan_lists（标记 "☝"） — 扫描命中编号 []；只有与相邻编号连续者才被采纳
+  [判定] List#scan_lists（标记 "☝"） — 扫描命中编号 []；只有与相邻编号连续者才被采纳
+[阶段末] 列表保护结束（♨ 已在此阶段内换成 ∯）
+    文本: Read 1.2 ms.␍1∯ First item.␍  1.1 Nested item.␍2∯ Last item.
+    标记图:
+    @12   硬边界␍      属L2 | ad 1.2 ms.❰␍❱1∯ First ite
+    @14   保护句号∯     属L2 |  1.2 ms.␍1❰∯❱ First item.
+    @27   硬边界␍      属L3 | irst item.❰␍❱  1.1 Nested
+    @46   硬边界␍      属L4 | sted item.❰␍❱2∯ Last item
+    @48   保护句号∯     属L4 | ed item.␍2❰∯❱ Last item.
+  [改写] AbbreviationReplacer#replace_prepositive_abbr
+      前: Read 1.2 ms.␍1∯ First item.␍  1.1 Nested item.␍2∯ Last item.
+      后: Read 1.2 ms∯␍1∯ First item.␍  1.1 Nested item.␍2∯ Last item.
+  [改写] Processor#replace_abbreviations（缩写保护）
+      前: Read 1.2 ms.␍1∯ First item.␍  1.1 Nested item.␍2∯ Last item.
+      后: Read 1.2 ms∯␍1∯ First item.␍  1.1 Nested item.␍2∯ Last item.
+  [规则] 入口 processor.rb:106 `PragmaticSegmenter::Processor#replace_numbers`  /\.(?=\d)/ → "∯"
+      前: Read 1.2 ms∯␍1∯ First item.␍  1.1 Nested item.␍2∯ Last item.
+      后: Read 1∯2 ms∯␍1∯ First item.␍  1∯1 Nested item.␍2∯ Last item.
+  [改写] Processor#replace_numbers（数值保护）
+      前: Read 1.2 ms∯␍1∯ First item.␍  1.1 Nested item.␍2∯ Last item.
+      后: Read 1∯2 ms∯␍1∯ First item.␍  1∯1 Nested item.␍2∯ Last item.
+
+[阶段] 切分 split_into_segments：按 ␍ 硬切，再逐段恢复符号
+    文本: Read 1∯2 ms∯␍1∯ First item.␍  1∯1 Nested item.␍2∯ Last item.
+  [规则] 入口 processor.rb:39 `block in PragmaticSegmenter::Processor#split_into_segments`  /∯/ → "."
+      前: Read 1∯2 ms∯
+      后: Read 1.2 ms.
+  [规则] 入口 processor.rb:39 `block in PragmaticSegmenter::Processor#split_into_segments`  /∯/ → "."
+      前: 1∯ First item.
+      后: 1. First item.
+  [规则] 入口 processor.rb:39 `block in PragmaticSegmenter::Processor#split_into_segments`  /∯/ → "."
+      前: 1∯1 Nested item.
+      后: 1.1 Nested item.
+  [规则] 入口 processor.rb:39 `block in PragmaticSegmenter::Processor#split_into_segments`  /∯/ → "."
+      前: 2∯ Last item.
+      后: 2. Last item.
+[阶段末] 切分完成，共 4 段
+
+-- 最终分段 → 原始行映射 --
+  S1 [L1] "Read 1.2 ms."
+  S2 [L2] "1. First item."
+  S3 [L3] "1.1 Nested item."
+  S4 [L4] "2. Last item."
+  边界判定（相邻原始行是否被切开）:
+    L1 | L2 : 有边界 ✓
+    L2 | L3 : 有边界 ✓
+    L3 | L4 : 有边界 ✓
+
+========================================================================================
+案例 对照C：首行改为以 1.2 开头   doc_type=nil   clean=true
+原始行:
+  L1: 1.2 Read 1.2 ms.
+  L2: 1. First item.
+  L3:   1.1 Nested item.
+  L4: 2. Last item.
+
+-- 管线追踪（按真实执行顺序；规则改写均带入口）--
+
+[阶段] 清理阶段 PragmaticSegmenter::Languages::English::Cleaner#clean
+    文本: 1.2 Read 1.2 ms.␊1. First item.␊  1.1 Nested item.␊2. Last item.
+  [规则] 入口 cleaner.rb:111 `PragmaticSegmenter::Cleaner#replace_newlines`  /\n/ → "\r"
+      前: 1.2 Read 1.2 ms.␊1. First item.␊  1.1 Nested item.␊2. Last item.
+      后: 1.2 Read 1.2 ms.␍1. First item.␍  1.1 Nested item.␍2. Last item.
+  [改写] Cleaner#replace_newlines
+      前: 1.2 Read 1.2 ms.␊1. First item.␊  1.1 Nested item.␊2. Last item.
+      后: 1.2 Read 1.2 ms.␍1. First item.␍  1.1 Nested item.␍2. Last item.
+[阶段末] 清理结束（→ 交给 Processor 的文本）
+    文本: 1.2 Read 1.2 ms.␍1. First item.␍  1.1 Nested item.␍2. Last item.
+    标记图:
+    @16   硬边界␍      属L2 | ad 1.2 ms.❰␍❱1. First ite
+    @31   硬边界␍      属L3 | irst item.❰␍❱  1.1 Nested
+    @50   硬边界␍      属L4 | sted item.❰␍❱2. Last item
+
+[阶段] Processor#process（输入 = 清理后文本）
+    文本: 1.2 Read 1.2 ms.␍1. First item.␍  1.1 Nested item.␍2. Last item.
+
+[阶段] 列表保护 List#add_line_break
+    文本: 1.2 Read 1.2 ms.␍1. First item.␍  1.1 Nested item.␍2. Last item.
+  [判定] List#scan_lists（标记 "♨"） — 扫描命中编号 [1, 2]；只有与相邻编号连续者才被采纳
+  [改写] List#substitute_found_list_items：编号 1 的句号 → 1♨
+      前: 1.2 Read 1.2 ms.␍1. First item.␍  1.1 Nested item.␍2. Last item.
+      后: 1.2 Read 1.2 ms.␍1♨ First item.␍  1.1 Nested item.␍2. Last item.
+  [改写] List#substitute_found_list_items：编号 2 的句号 → 2♨
+      前: 1.2 Read 1.2 ms.␍1♨ First item.␍  1.1 Nested item.␍2. Last item.
+      后: 1.2 Read 1.2 ms.␍1♨ First item.␍  1.1 Nested item.␍2♨ Last item.
+  [判定] List#add_line_breaks_for_numbered_list_with_periods — 守卫 /♨.+\n.+♨|♨.+\r.+♨/ => 命中：列表项已跨行，不再插断行
+  [规则] 入口 list.rb:77 `PragmaticSegmenter::List#format_numbered_list_with_periods`  /♨/ → "∯"
+      前: 1.2 Read 1.2 ms.␍1♨ First item.␍  1.1 Nested item.␍2♨ Last item.
+      后: 1.2 Read 1.2 ms.␍1∯ First item.␍  1.1 Nested item.␍2∯ Last item.
+  [判定] List#scan_lists（标记 "☝"） — 扫描命中编号 []；只有与相邻编号连续者才被采纳
+  [判定] List#scan_lists（标记 "☝"） — 扫描命中编号 []；只有与相邻编号连续者才被采纳
+[阶段末] 列表保护结束（♨ 已在此阶段内换成 ∯）
+    文本: 1.2 Read 1.2 ms.␍1∯ First item.␍  1.1 Nested item.␍2∯ Last item.
+    标记图:
+    @16   硬边界␍      属L2 | ad 1.2 ms.❰␍❱1∯ First ite
+    @18   保护句号∯     属L2 |  1.2 ms.␍1❰∯❱ First item.
+    @31   硬边界␍      属L3 | irst item.❰␍❱  1.1 Nested
+    @50   硬边界␍      属L4 | sted item.❰␍❱2∯ Last item
+    @52   保护句号∯     属L4 | ed item.␍2❰∯❱ Last item.
+  [改写] AbbreviationReplacer#replace_prepositive_abbr
+      前: 1.2 Read 1.2 ms.␍1∯ First item.␍  1.1 Nested item.␍2∯ Last item.
+      后: 1.2 Read 1.2 ms∯␍1∯ First item.␍  1.1 Nested item.␍2∯ Last item.
+  [改写] Processor#replace_abbreviations（缩写保护）
+      前: 1.2 Read 1.2 ms.␍1∯ First item.␍  1.1 Nested item.␍2∯ Last item.
+      后: 1.2 Read 1.2 ms∯␍1∯ First item.␍  1.1 Nested item.␍2∯ Last item.
+  [规则] 入口 processor.rb:106 `PragmaticSegmenter::Processor#replace_numbers`  /\.(?=\d)/ → "∯"
+      前: 1.2 Read 1.2 ms∯␍1∯ First item.␍  1.1 Nested item.␍2∯ Last item.
+      后: 1∯2 Read 1∯2 ms∯␍1∯ First item.␍  1∯1 Nested item.␍2∯ Last item.
+  [改写] Processor#replace_numbers（数值保护）
+      前: 1.2 Read 1.2 ms∯␍1∯ First item.␍  1.1 Nested item.␍2∯ Last item.
+      后: 1∯2 Read 1∯2 ms∯␍1∯ First item.␍  1∯1 Nested item.␍2∯ Last item.
+
+[阶段] 切分 split_into_segments：按 ␍ 硬切，再逐段恢复符号
+    文本: 1∯2 Read 1∯2 ms∯␍1∯ First item.␍  1∯1 Nested item.␍2∯ Last item.
+  [规则] 入口 processor.rb:39 `block in PragmaticSegmenter::Processor#split_into_segments`  /∯/ → "."
+      前: 1∯2 Read 1∯2 ms∯
+      后: 1.2 Read 1.2 ms.
+  [规则] 入口 processor.rb:39 `block in PragmaticSegmenter::Processor#split_into_segments`  /∯/ → "."
+      前: 1∯ First item.
+      后: 1. First item.
+  [规则] 入口 processor.rb:39 `block in PragmaticSegmenter::Processor#split_into_segments`  /∯/ → "."
+      前: 1∯1 Nested item.
+      后: 1.1 Nested item.
+  [规则] 入口 processor.rb:39 `block in PragmaticSegmenter::Processor#split_into_segments`  /∯/ → "."
+      前: 2∯ Last item.
+      后: 2. Last item.
+[阶段末] 切分完成，共 4 段
+
+-- 最终分段 → 原始行映射 --
+  S1 [L1] "1.2 Read 1.2 ms."
+  S2 [L2] "1. First item."
+  S3 [L3] "1.1 Nested item."
+  S4 [L4] "2. Last item."
+  边界判定（相邻原始行是否被切开）:
+    L1 | L2 : 有边界 ✓
+    L2 | L3 : 有边界 ✓
+    L3 | L4 : 有边界 ✓
+
+========================================================================================
+案例 M1a：行首小节号 "1.2"（疑似被当测量小数）   doc_type=nil   clean=true
+原始行:
+  L1: 1.2 Introduction.
+
+-- 管线追踪（按真实执行顺序；规则改写均带入口）--
+
+[阶段] 清理阶段 PragmaticSegmenter::Languages::English::Cleaner#clean
+    文本: 1.2 Introduction.
+[阶段末] 清理结束（→ 交给 Processor 的文本）
+    文本: 1.2 Introduction.
+    标记图:
+    （无保护标记 / 边界符）
+
+[阶段] Processor#process（输入 = 清理后文本）
+    文本: 1.2 Introduction.
+
+[阶段] 列表保护 List#add_line_break
+    文本: 1.2 Introduction.
+  [判定] List#scan_lists（标记 "♨"） — 扫描命中编号 []；只有与相邻编号连续者才被采纳
+  [判定] List#add_line_breaks_for_numbered_list_with_periods — 守卫 /♨.+\n.+♨|♨.+\r.+♨/ => 命中：列表项已跨行，不再插断行
+  [判定] List#scan_lists（标记 "☝"） — 扫描命中编号 []；只有与相邻编号连续者才被采纳
+  [判定] List#scan_lists（标记 "☝"） — 扫描命中编号 []；只有与相邻编号连续者才被采纳
+[阶段末] 列表保护结束（♨ 已在此阶段内换成 ∯）
+    文本: 1.2 Introduction.
+    标记图:
+    （无保护标记 / 边界符）
+  [规则] 入口 processor.rb:106 `PragmaticSegmenter::Processor#replace_numbers`  /\.(?=\d)/ → "∯"
+      前: 1.2 Introduction.
+      后: 1∯2 Introduction.
+  [改写] Processor#replace_numbers（数值保护）
+      前: 1.2 Introduction.
+      后: 1∯2 Introduction.
+
+[阶段] 切分 split_into_segments：按 ␍ 硬切，再逐段恢复符号
+    文本: 1∯2 Introduction.
+  [规则] 入口 processor.rb:39 `block in PragmaticSegmenter::Processor#split_into_segments`  /∯/ → "."
+      前: 1∯2 Introduction.
+      后: 1.2 Introduction.
+[阶段末] 切分完成，共 1 段
+
+-- 最终分段 → 原始行映射 --
+  S1 [L1] "1.2 Introduction."
+  边界判定（相邻原始行是否被切开）:
+
+========================================================================================
+案例 M1b：真测量小数 "1.2 ms"（对照）   doc_type=nil   clean=true
+原始行:
+  L1: Read 1.2 ms.
+
+-- 管线追踪（按真实执行顺序；规则改写均带入口）--
+
+[阶段] 清理阶段 PragmaticSegmenter::Languages::English::Cleaner#clean
+    文本: Read 1.2 ms.
+[阶段末] 清理结束（→ 交给 Processor 的文本）
+    文本: Read 1.2 ms.
+    标记图:
+    （无保护标记 / 边界符）
+
+[阶段] Processor#process（输入 = 清理后文本）
+    文本: Read 1.2 ms.
+
+[阶段] 列表保护 List#add_line_break
+    文本: Read 1.2 ms.
+  [判定] List#scan_lists（标记 "♨"） — 扫描命中编号 []；只有与相邻编号连续者才被采纳
+  [判定] List#add_line_breaks_for_numbered_list_with_periods — 守卫 /♨.+\n.+♨|♨.+\r.+♨/ => 命中：列表项已跨行，不再插断行
+  [判定] List#scan_lists（标记 "☝"） — 扫描命中编号 []；只有与相邻编号连续者才被采纳
+  [判定] List#scan_lists（标记 "☝"） — 扫描命中编号 []；只有与相邻编号连续者才被采纳
+[阶段末] 列表保护结束（♨ 已在此阶段内换成 ∯）
+    文本: Read 1.2 ms.
+    标记图:
+    （无保护标记 / 边界符）
+  [规则] 入口 processor.rb:106 `PragmaticSegmenter::Processor#replace_numbers`  /\.(?=\d)/ → "∯"
+      前: Read 1.2 ms.
+      后: Read 1∯2 ms.
+  [改写] Processor#replace_numbers（数值保护）
+      前: Read 1.2 ms.
+      后: Read 1∯2 ms.
+
+[阶段] 切分 split_into_segments：按 ␍ 硬切，再逐段恢复符号
+    文本: Read 1∯2 ms.
+  [规则] 入口 processor.rb:39 `block in PragmaticSegmenter::Processor#split_into_segments`  /∯/ → "."
+      前: Read 1∯2 ms.
+      后: Read 1.2 ms.
+[阶段末] 切分完成，共 1 段
+
+-- 最终分段 → 原始行映射 --
+  S1 [L1] "Read 1.2 ms."
+  边界判定（相邻原始行是否被切开）:
+
+========================================================================================
+案例 M2a：PDF+行尾空格（疑似小节落进上一句）   doc_type="pdf"   clean=true
+原始行:
+  L1: Read 1.2 ms. 
+  L2: 1. First item.
+
+-- 管线追踪（按真实执行顺序；规则改写均带入口）--
+
+[阶段] 清理阶段 PragmaticSegmenter::Languages::English::Cleaner#clean
+    文本: Read 1.2 ms. ␊1. First item.
+  [规则] 入口 cleaner.rb:117 `PragmaticSegmenter::Cleaner#remove_pdf_line_breaks`  /(?<=[^\n]\s)\n(?=\S)/ → ""
+      前: Read 1.2 ms. ␊1. First item.
+      后: Read 1.2 ms. 1. First item.
+  [改写] Cleaner#remove_pdf_line_breaks
+      前: Read 1.2 ms. ␊1. First item.
+      后: Read 1.2 ms. 1. First item.
+  [改写] Cleaner#replace_newlines
+      前: Read 1.2 ms. ␊1. First item.
+      后: Read 1.2 ms. 1. First item.
+[阶段末] 清理结束（→ 交给 Processor 的文本）
+    文本: Read 1.2 ms. 1. First item.
+    标记图:
+    （无保护标记 / 边界符）
+
+[阶段] Processor#process（输入 = 清理后文本）
+    文本: Read 1.2 ms. 1. First item.
+
+[阶段] 列表保护 List#add_line_break
+    文本: Read 1.2 ms. 1. First item.
+  [判定] List#scan_lists（标记 "♨"） — 扫描命中编号 [1]；只有与相邻编号连续者才被采纳
+  [判定] List#add_line_breaks_for_numbered_list_with_periods — 守卫 /♨.+\n.+♨|♨.+\r.+♨/ => 命中：列表项已跨行，不再插断行
+  [判定] List#scan_lists（标记 "☝"） — 扫描命中编号 []；只有与相邻编号连续者才被采纳
+  [判定] List#scan_lists（标记 "☝"） — 扫描命中编号 []；只有与相邻编号连续者才被采纳
+[阶段末] 列表保护结束（♨ 已在此阶段内换成 ∯）
+    文本: Read 1.2 ms. 1. First item.
+    标记图:
+    （无保护标记 / 边界符）
+  [改写] AbbreviationReplacer#replace_prepositive_abbr
+      前: Read 1.2 ms. 1. First item.
+      后: Read 1.2 ms∯ 1. First item.
+  [改写] Processor#replace_abbreviations（缩写保护）
+      前: Read 1.2 ms. 1. First item.
+      后: Read 1.2 ms∯ 1. First item.
+  [规则] 入口 processor.rb:106 `PragmaticSegmenter::Processor#replace_numbers`  /\.(?=\d)/ → "∯"
+      前: Read 1.2 ms∯ 1. First item.
+      后: Read 1∯2 ms∯ 1. First item.
+  [改写] Processor#replace_numbers（数值保护）
+      前: Read 1.2 ms∯ 1. First item.
+      后: Read 1∯2 ms∯ 1. First item.
+
+[阶段] 切分 split_into_segments：按 ␍ 硬切，再逐段恢复符号
+    文本: Read 1∯2 ms∯ 1. First item.
+  [规则] 入口 processor.rb:39 `block in PragmaticSegmenter::Processor#split_into_segments`  /∯/ → "."
+      前: Read 1∯2 ms∯ 1.
+      后: Read 1.2 ms. 1.
+[阶段末] 切分完成，共 2 段
+
+-- 最终分段 → 原始行映射 --
+  S1 [L1] "Read 1.2 ms. 1."
+  S2 [L2] "First item."
+  边界判定（相邻原始行是否被切开）:
+    L1 | L2 : 有边界 ✓
+
+========================================================================================
+案例 M2b：PDF 无行尾空格（对照）   doc_type="pdf"   clean=true
+原始行:
+  L1: Read 1.2 ms.
+  L2: 1. First item.
+
+-- 管线追踪（按真实执行顺序；规则改写均带入口）--
+
+[阶段] 清理阶段 PragmaticSegmenter::Languages::English::Cleaner#clean
+    文本: Read 1.2 ms.␊1. First item.
+[阶段末] 清理结束（→ 交给 Processor 的文本）
+    文本: Read 1.2 ms.␊1. First item.
+    标记图:
+    @12   换行␊       属L2 | ad 1.2 ms.❰␊❱1. First ite
+
+[阶段] Processor#process（输入 = 清理后文本）
+    文本: Read 1.2 ms.␊1. First item.
+
+[阶段] 列表保护 List#add_line_break
+    文本: Read 1.2 ms.␊1. First item.
+  [判定] List#scan_lists（标记 "♨"） — 扫描命中编号 [1]；只有与相邻编号连续者才被采纳
+  [判定] List#add_line_breaks_for_numbered_list_with_periods — 守卫 /♨.+\n.+♨|♨.+\r.+♨/ => 命中：列表项已跨行，不再插断行
+  [判定] List#scan_lists（标记 "☝"） — 扫描命中编号 []；只有与相邻编号连续者才被采纳
+  [判定] List#scan_lists（标记 "☝"） — 扫描命中编号 []；只有与相邻编号连续者才被采纳
+[阶段末] 列表保护结束（♨ 已在此阶段内换成 ∯）
+    文本: Read 1.2 ms.␊1. First item.
+    标记图:
+    @12   换行␊       属L2 | ad 1.2 ms.❰␊❱1. First ite
+  [改写] AbbreviationReplacer#replace_prepositive_abbr
+      前: Read 1.2 ms.␊1. First item.
+      后: Read 1.2 ms∯␊1. First item.
+  [改写] Processor#replace_abbreviations（缩写保护）
+      前: Read 1.2 ms.␊1. First item.
+      后: Read 1.2 ms∯␊1. First item.
+  [规则] 入口 processor.rb:106 `PragmaticSegmenter::Processor#replace_numbers`  /\.(?=\d)/ → "∯"
+      前: Read 1.2 ms∯␊1. First item.
+      后: Read 1∯2 ms∯␊1. First item.
+  [规则] 入口 processor.rb:106 `PragmaticSegmenter::Processor#replace_numbers`  /(?<=^\d)\.(?=(\s\S)|\))/ → "∯"
+      前: Read 1∯2 ms∯␊1. First item.
+      后: Read 1∯2 ms∯␊1∯ First item.
+  [改写] Processor#replace_numbers（数值保护）
+      前: Read 1.2 ms∯␊1. First item.
+      后: Read 1∯2 ms∯␊1∯ First item.
+
+[阶段] 切分 split_into_segments：按 ␍ 硬切，再逐段恢复符号
+    文本: Read 1∯2 ms∯␊1∯ First item.
+  [规则] 入口 processor.rb:37 `block in PragmaticSegmenter::Processor#split_into_segments`  /\n/ → "ȹ"
+      前: Read 1∯2 ms∯␊1∯ First item.
+      后: Read 1∯2 ms∯ȹ1∯ First item.
+  [规则] 入口 processor.rb:39 `block in PragmaticSegmenter::Processor#split_into_segments`  /∯/ → "."
+      前: Read 1∯2 ms∯ȹ
+      后: Read 1.2 ms.ȹ
+  [规则] 入口 processor.rb:39 `block in PragmaticSegmenter::Processor#split_into_segments`  /ȹ/ → "\n"
+      前: Read 1.2 ms.ȹ
+      后: Read 1.2 ms.␊
+  [规则] 入口 processor.rb:39 `block in PragmaticSegmenter::Processor#split_into_segments`  /∯/ → "."
+      前: 1∯ First item.
+      后: 1. First item.
+[阶段末] 切分完成，共 2 段
+
+-- 最终分段 → 原始行映射 --
+  S1 [L1] "Read 1.2 ms."
+  S2 [L2] "1. First item."
+  边界判定（相邻原始行是否被切开）:
+    L1 | L2 : 有边界 ✓
+
+========================================================================================
+汇总表
+  BASE（LF）
+    清理后: Read 1.2 ms.␍1. First item.␍  1.1 Nested item.␍2. Last item.
+    段数=4  边界 L1|L2:Y L2|L3:Y L3|L4:Y
+  对照A：CRLF
+    清理后: Read 1.2 ms.␍␍1. First item.␍␍  1.1 Nested item.␍␍2. Last item.
+    段数=4  边界 L1|L2:Y L2|L3:Y L3|L4:Y
+  对照B：嵌套项前插一个空行
+    清理后: Read 1.2 ms.␍1. First item.␍  1.1 Nested item.␍2. Last item.
+    段数=4  边界 L1|L2:Y L2|L3:Y L3|L4:Y
+  对照C：首行改为以 1.2 开头
+    清理后: 1.2 Read 1.2 ms.␍1. First item.␍  1.1 Nested item.␍2. Last item.
+    段数=4  边界 L1|L2:Y L2|L3:Y L3|L4:Y
+  M1a：行首小节号 "1.2"（疑似被当测量小数）
+    清理后: 1.2 Introduction.
+    段数=1  边界 
+  M1b：真测量小数 "1.2 ms"（对照）
+    清理后: Read 1.2 ms.
+    段数=1  边界 
+  M2a：PDF+行尾空格（疑似小节落进上一句）
+    清理后: Read 1.2 ms. 1. First item.
+    段数=2  边界 L1|L2:Y
+  M2b：PDF 无行尾空格（对照）
+    清理后: Read 1.2 ms.␊1. First item.
+    段数=2  边界 L1|L2:Y
