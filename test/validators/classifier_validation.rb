@@ -73,4 +73,8 @@ class ClassifierValidation < Minitest::Test
     end
     ClassifierValidator.cross_validate(lsi, @sample_data, 5)
   end
+
+  def test_bayes_classifier_5_fold_cross_validate_with_overlap_audit
+    ClassifierValidator.cross_validate_with_audit('Bayes', @sample_data, 5)
+  end
 end

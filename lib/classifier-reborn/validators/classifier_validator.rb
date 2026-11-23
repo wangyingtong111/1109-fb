@@ -6,25 +6,45 @@ module ClassifierReborn
 
     def cross_validate(classifier, sample_data, fold = 10, *options)
       classifier = ClassifierReborn.const_get(classifier).new(options) if classifier.is_a?(String)
-      sample_data.shuffle!
-      partition_size = sample_data.length / fold
-      partitioned_data = sample_data.each_slice(partition_size)
+      partitions = partition_folds(sample_data, fold)
       conf_mats = []
       fold.times do |i|
-        training_data = partitioned_data.take(fold)
-        test_data = training_data.slice!(i)
-        conf_mats << validate(classifier, training_data.flatten!(1), test_data)
+        training_data, test_data = split_fold(partitions, i)
+        conf_mats << validate(classifier, training_data, test_data)
       end
       classifier.reset
       generate_report(conf_mats)
     end
 
-    def validate(classifier, training_data, test_data, *options)
-      classifier = ClassifierReborn.const_get(classifier).new(options) if classifier.is_a?(String)
+    # Shuffles +sample_data+ in place and splits it into at most +fold+
+    # partitions of equal size, matching the slice size that #cross_validate
+    # has always used.
+    def partition_folds(sample_data, fold)
+      sample_data.shuffle!
+      sample_data.each_slice(sample_data.length / fold).take(fold).map(&:dup)
+    end
+
+    # Returns the [training_data, test_data] pair of fold +i+.
+    def split_fold(partitions, i)
+      folds = partitions.map(&:dup)
+      test_data = folds.slice!(i)
+      [folds.flatten(1), test_data]
+    end
+
+    # Trains a freshly reset +classifier+ with the given records, each of which
+    # is a [label, text] pair. Shared by #validate and by the overlap audit so
+    # that the evaluation and the audit describe the very same training pass.
+    def train_classifier(classifier, training_data)
       classifier.reset
       training_data.each do |rec|
         classifier.train(rec.first, rec.last)
       end
+      classifier
+    end
+
+    def validate(classifier, training_data, test_data, *options)
+      classifier = ClassifierReborn.const_get(classifier).new(options) if classifier.is_a?(String)
+      train_classifier(classifier, training_data)
       evaluate(classifier, test_data)
     end
 

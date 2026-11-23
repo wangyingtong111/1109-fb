@@ -108,6 +108,14 @@ module ClassifierReborn
       add_item(item)
     end
 
+    # Returns the word hash that #add_item indexes, i.e. the effective feature
+    # extraction of this indexer (its token filters and its stopword language).
+    # The filter list is copied so that asking for a word hash cannot change the
+    # rule the indexer uses.
+    def word_hash(text)
+      Hasher.word_hash(text.to_s, token_filters: @token_filters.dup)
+    end
+
     # Returns categories for a given indexed item. You are free to add and remove
     # items from this as you see fit. It does not invalide an index to change its categories.
     def categories_for(item)

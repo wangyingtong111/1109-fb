@@ -16,6 +16,7 @@ $ rake validate
 In this document we will talk about the following.
 
 * Running k-fold cross-validation
+* Auditing overlap between the training and holdout data
 * Writing a custom validation with reporting
 * Evaluating a well-populated existing classifier model
 
@@ -328,6 +329,108 @@ F1 score           : 0.9798816568047337
 ```
 
 **Note:** When dealing with real data, there might be cases when derived values (such as precision or recall) return zero which could be a side effect of the denominator being zero in the division.
+
+## Auditing Train/Holdout Overlap
+
+A cross-validation score is only meaningful if the holdout records are actually new to the classifier.
+Two records can be near duplicates even when their raw text differs: `Green Tea Leaves`, `green tea leaves` and `GREEN TEA LEAVES` are the same document as far as the classifier is concerned.
+Comparing raw strings would miss that, so the audit compares documents through the feature extraction that is actually in effect for the classifier under validation — its tokenizer, token filters, stopwords, stemmer and language settings.
+
+`Bayes` and `LSI` expose that rule as `word_hash`, and the audit calls it, so changing the classifier options changes what counts as an overlap.
+
+```ruby
+classifier = ClassifierReborn::Bayes.new("Ham", "Spam")
+classifier.word_hash "Green Tea Leaves"
+#=> {:green=>1, :tea=>1, :leav=>1}
+classifier.word_hash "GREEN TEA LEAVES"
+#=> {:green=>1, :tea=>1, :leav=>1}
+```
+
+Calling `audit_overlap` with the classifier and the two data sets of one run returns the evidence as data.
+
+```ruby
+audit = audit_overlap(classifier, training_data, test_data)
+audit[:feature_extraction]  #=> :classifier
+audit[:counts]
+#=> {:training_total=>..., :holdout_total=>...,
+#    :holdout_empty_features=>..., :holdout_overlapping=>...,
+#    :holdout_unique=>..., :holdout_conflicted=>...,
+#    :comparable_holdout=>..., :audited_holdout=>...}
+```
+
+Every holdout record with a non-empty feature set is reported under one of three statuses.
+
+* `:overlap` — the same normalized features appear in the training data.
+* `:unique` — the record is genuinely new to the classifier.
+* `:empty_features` — the text has no term left after tokenizing and filtering.
+
+### Overlaps keep every training source and every true label
+
+An overlap is not reported as a single label. Each matching training record is kept with its own position and its own true label, so a signature that was trained under two different labels reports a conflict instead of silently keeping whichever record was trained last.
+
+```
+-- Overlap with training (equal normalized features) --
+   #0 label="Green Tea Leaves" text="GREEN TEA LEAVES"
+     effective features : green, leav, tea
+     training source    : #0 label="Green Tea Leaves" text="Green Tea Leaves"
+     training source    : #1 label="green tea leaves" text="green tea leaves"
+     training labels    : "Green Tea Leaves", "green tea leaves"
+     CONFLICT           : one feature set, 2 different true labels
+     classifier category: "Green tea leaves"
+```
+
+Note the last two lines.
+`CategoryNamer` folds both spellings into the single classifier category `Green tea leaves`, so the classifier itself cannot represent the conflict.
+The audit therefore reports the true labels as they were supplied, and keeps the classifier's own category next to them.
+
+### Empty feature vectors are not copies
+
+A text such as `the and of` consists only of stopwords and short words.
+Tokenizing and filtering leave nothing, so the classifier produces an empty vector and cannot tell such documents apart — every one of them would "match" every other one.
+The audit never indexes an empty vector and never matches against it, and lists these records as a section of their own:
+
+```
+-- No comparable evidence (empty feature vectors) --
+   #1 label="Honey" text="the and of"
+     effective features : none
+     never indexed and never matched, so it is not a copy of anything
+```
+
+### Two denominators
+
+Removing empty vectors and duplicates changes the holdout count, so the report keeps both numbers rather than replacing one with the other.
+
+```
+-- Denominators --
+Full holdout sample         : 3
+No comparable evidence      : 1
+Overlapping with training   : 1
+  of which label conflicts  : 1
+Comparable holdout          : 2
+Audited holdout denominator : 1
+```
+
+* **Full holdout sample** — every holdout record, including empty vectors and duplicates.
+* **Comparable holdout** — the full sample minus the empty vectors.
+* **Audited holdout denominator** — only the records that are comparable *and* free of training overlap.
+
+### Running the audit as part of validation
+
+`validate_with_audit` performs one training pass and returns both the confusion matrix and the audit, so the two cannot describe different training runs.
+
+```ruby
+result = validate_with_audit("Bayes", training_data, test_data)
+result[:conf_mat]   #=> {"Ham"=>{"Ham"=>828, "Spam"=>27}, "Spam"=>{"Ham"=>7, "Spam"=>138}}
+result[:overlap]    #=> the audit Hash described above
+print_overlap_audit(result[:overlap])
+```
+
+`cross_validate_with_audit` does the same for every fold of a k-fold run, auditing each fold against the training data of that same fold and merging the per-fold evidence while keeping the fold number of each record.
+It prints the usual cross-validation report followed by the merged audit and returns the confusion matrices together with the merged audit, which is what `rake validate` now also exercises.
+
+```ruby
+cross_validate_with_audit("Bayes", sample_data, 5)
+```
 
 ## Evaluation
 

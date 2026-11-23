@@ -1,5 +1,9 @@
 ## HEAD
 
+### Minor Enhancements
+
+  * Report train/holdout overlap in classifier validation, using the classifier's effective feature extraction and keeping every training source and true label
+
 ### Documentation
 
   * Update macOS instructions in Numo docs (#199)
