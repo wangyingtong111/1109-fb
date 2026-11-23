@@ -1228,12 +1228,21 @@ class Matrix
   #
   # Matrix exponentiation.
   # Equivalent to multiplying the matrix by itself N times.
-  # Non-integer exponents will be handled by diagonalizing the matrix;
-  # this is not supported for Complex matrices.
+  # Non-integer exponents are defined through the corresponding matrix
+  # function. A diagonalizable matrix is evaluated through its eigensystem;
+  # a triangular matrix (including defective matrices with a repeated
+  # eigenvalue, such as a Jordan block) is evaluated directly, so that the
+  # coupling between repeated eigenvalues is preserved.
+  # A triangular matrix must have no zero diagonal entry, since a
+  # non-integer power of zero is not defined.
   #
   #   Matrix[[7,6], [3,9]] ** 2
   #   #  => 67 96
   #   #     48 99
+  #
+  #   Matrix[[4, 2], [0, 4]] ** 0.5
+  #   #  => 2.0 0.5
+  #   #     0.0 2.0
   #
   def **(exp)
     case exp
@@ -1248,11 +1257,160 @@ class Matrix
         power_int(exp)
       end
     when Numeric
-      v, d, v_inv = eigensystem
-      v * self.class.diagonal(*d.each(:diagonal).map{|e| e ** exp}) * v_inv
+      if diagonal?
+        self.class.diagonal(*each(:diagonal).map { |e| e ** exp })
+      elsif upper_triangular?
+        power_triangular(exp)
+      elsif lower_triangular?
+        transpose.send(:power_triangular, exp).transpose
+      else
+        v, d, v_inv = eigensystem
+        v * self.class.diagonal(*d.each(:diagonal).map{|e| e ** exp}) * v_inv
+      end
     else
       raise ErrOperationNotDefined, ["**", self.class, exp.class]
     end
+  end
+
+  #
+  # Computes this upper triangular matrix raised to a non-integer exponent
+  # using a block form of Parlett's algorithm.
+  #
+  # The diagonal entries are split into clusters of eigenvalues whose
+  # relative separation is at the level of floating-point round-off.
+  # Each cluster, which may be a genuine Jordan block with a repeated
+  # eigenvalue, is evaluated through the terminating generalized binomial
+  # series of its nilpotent part. Entries joining two distinct clusters
+  # are then filled with the Parlett divided-difference recurrence.
+  #
+  # Because the repeated-eigenvalue case never divides by the (vanishing)
+  # difference of two eigenvalues, the off-diagonal coupling is preserved
+  # and the answer stays continuous as two eigenvalues approach each other.
+  #
+  private def power_triangular(exp)
+    size = row_count
+    diagonals = Array.new(size) do |i|
+      diagonal = @rows[i][i]
+      diagonal.is_a?(Complex) ? diagonal : diagonal.to_f
+    end
+    if diagonals.any?(&:zero?)
+      raise ErrOperationNotDefined, ["**", self.class, exp.class]
+    end
+
+    values = triangular_function_values(exp, diagonals)
+    new_matrix(values, size)
+  end
+
+  # Relative separation below which two (adjacent) diagonal entries are
+  # treated as the same eigenvalue.
+  TRIANGULAR_EIGENVALUE_TOLERANCE = 1e-8
+  private_constant :TRIANGULAR_EIGENVALUE_TOLERANCE
+
+  # Returns the entry arrays of f(self), where f(x) = x ** exp.
+  private def triangular_function_values(exp, diagonals)
+    size = row_count
+    scale = [diagonals.map(&:abs).max, 1].max
+
+    # Group adjacent eigenvalues whose relative gap is within round-off.
+    groups = Array.new(size, 0)
+    (1...size).each do |i|
+      groups[i] = groups[i - 1]
+      if (diagonals[i] - diagonals[i - 1]).abs > TRIANGULAR_EIGENVALUE_TOLERANCE * scale
+        groups[i] += 1
+      end
+    end
+
+    values = Array.new(size) { Array.new(size, 0) }
+
+    # Evaluate each cluster as a whole, so a Jordan block keeps its coupling.
+    group_start = {}
+    group_end = {}
+    size.times do |i|
+      group = groups[i]
+      group_start[group] ||= i
+      group_end[group] = i
+    end
+    group_start.each do |_group, start_index|
+      end_index = group_end[_group]
+      block = triangular_block_power(exp, diagonals, start_index, end_index)
+      (start_index..end_index).each do |i|
+        (start_index..end_index).each do |j|
+          values[i][j] = block[i - start_index][j - start_index]
+        end
+      end
+    end
+
+    # Fill the entries joining distinct clusters with the Parlett recurrence,
+    # working outwards along the superdiagonals.
+    (1...size).each do |distance|
+      (0...(size - distance)).each do |i|
+        j = i + distance
+        next if groups[i] == groups[j]
+        numerator = 0
+        ((i + 1)..j).each do |k|
+          numerator += @rows[i][k] * values[k][j]
+        end
+        (i...j).each do |k|
+          numerator -= values[i][k] * @rows[k][j]
+        end
+        values[i][j] = numerator / (diagonals[j] - diagonals[i])
+      end
+    end
+
+    values
+  end
+
+  # Evaluates f on the upper triangular sub-block spanning rows (and columns)
+  # +start_index+ to +end_index+. Writing the block as +D + N+, with +D+ its
+  # diagonal and +N+ its strictly upper triangular, nilpotent part,
+  #
+  #   (D + N)**exp = D**exp * sum[k] binom(exp, k) * (N * D**-1)**k
+  #
+  # The series terminates because +N+ (and hence +N * D**-1+) is nilpotent.
+  private def triangular_block_power(exp, diagonals, start_index, end_index)
+    block_size = end_index - start_index + 1
+    factor = Array.new(block_size) { Array.new(block_size, 0) }
+    block_size.times do |a|
+      ((a + 1)...block_size).each do |b|
+        factor[a][b] = @rows[start_index + a][start_index + b] /
+                       diagonals[start_index + b]
+      end
+    end
+
+    series = Array.new(block_size) { Array.new(block_size, 0) }
+    block_size.times { |i| series[i][i] = 1 }
+    power = series.map(&:dup)
+    binomial = 1
+    (1...block_size).each do |k|
+      binomial = binomial * (exp - k + 1) / k
+      power = square_array_matrix(power, factor)
+      block_size.times do |i|
+        block_size.times do |j|
+          series[i][j] += binomial * power[i][j]
+        end
+      end
+    end
+
+    diagonal_power = Array.new(block_size) { Array.new(block_size, 0) }
+    block_size.times do |i|
+      diagonal_power[i][i] = diagonals[start_index + i] ** exp
+    end
+    square_array_matrix(diagonal_power, series)
+  end
+
+  # Multiplies two equally sized matrices represented as arrays of arrays.
+  private def square_array_matrix(left, right)
+    size = left.size
+    product = Array.new(size) { Array.new(size, 0) }
+    size.times do |i|
+      size.times do |k|
+        next if left[i][k] == 0
+        size.times do |j|
+          product[i][j] += left[i][k] * right[k][j]
+        end
+      end
+    end
+    product
   end
 
   protected def power_int(exp)

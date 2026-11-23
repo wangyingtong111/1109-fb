@@ -456,6 +456,86 @@ class TestMatrix < Test::Unit::TestCase
     assert_equal(Matrix[[0, 2 << (exp/2)], [1 << (exp/2), 0]], m ** exp)
   end
 
+  def test_exp_non_integer_diagonal
+    # Diagonal matrices take the entrywise diagonal branch.
+    assert_equal(Matrix[[2.0, 0], [0, 3.0]], Matrix.diagonal(4, 9) ** 0.5)
+    assert_equal(Matrix[[2.0, 0], [0, 3.0]], Matrix.diagonal(4, 9) ** Rational(1, 2))
+  end
+
+  def test_exp_non_integer_jordan_block
+    # A defective matrix (a repeated positive eigenvalue) has a principal
+    # square root whose off-diagonal coupling must not be lost.
+    jordan = Matrix[[4, 2], [0, 4]]
+    root = jordan ** 0.5
+    assert_kind_of(Matrix, root)
+    assert_in_epsilon(2.0, root[0, 0])
+    assert_in_epsilon(2.0, root[1, 1])
+    assert_in_epsilon(0.5, root[0, 1])
+    assert_in_epsilon(0.0, root[1, 0])
+    assert(jordan.map(&:to_f) == root * root)
+
+    # The lower-triangular orientation is handled symmetrically.
+    lower = Matrix[[4, 0], [2, 4]]
+    lower_root = lower ** 0.5
+    assert_in_epsilon(0.5, lower_root[1, 0])
+    assert((lower_root * lower_root - lower).all? { |e| e.abs < 1e-12 })
+  end
+
+  def test_exp_non_integer_near_repeated_eigenvalues
+    # A diagonalizable neighbor with eigenvalues very close together:
+    # the coupling term is kept and the answer stays continuous with the
+    # exact repeated-eigenvalue (Jordan block) result.
+    near = Matrix[[4, 2], [0, 4 + 1e-10]]
+    root = near ** 0.5
+    assert_in_epsilon(2.0, root[0, 0])
+    assert_in_epsilon(Math.sqrt(4 + 1e-10), root[1, 1])
+    assert_in_delta(0.5, root[0, 1], 1e-6)
+    assert((root * root - near).all? { |e| e.abs < 1e-9 })
+
+    # The off-diagonal coupling converges to the Jordan block value 0.5
+    # instead of suddenly collapsing to zero.
+    jordan_coupling = (Matrix[[4, 2], [0, 4]] ** 0.5)[0, 1]
+    [1e-8, 1e-10, 1e-12, 1e-14, 1e-16].each do |gap|
+      coupling = (Matrix[[4, 2], [0, 4 + gap]] ** 0.5)[0, 1]
+      assert_in_delta(jordan_coupling, coupling, 1e-6)
+    end
+  end
+
+  def test_exp_non_integer_triangular
+    # General (distinct diagonal entries) upper triangular matrix.
+    triangular = Matrix[[4, 1, 2], [0, 9, 3], [0, 0, 16]]
+    root = triangular ** 0.5
+    assert((root * root - triangular).all? { |e| e.abs < 1e-12 })
+
+    # A 3x3 Jordan block keeps every off-diagonal coupling term.
+    jordan3 = Matrix[[8, 3, 5], [0, 8, 7], [0, 0, 8]]
+    root3 = jordan3 ** 0.5
+    assert((root3 * root3 - jordan3).all? { |e| e.abs < 1e-12 })
+    assert(root3[0, 1] > 0 && root3[0, 2] > 0 && root3[1, 2] > 0)
+
+    # Three eigenvalues clustered within round-off are handled as one block.
+    near3 = Matrix[[8, 3, 5], [0, 8 + 1e-9, 7], [0, 0, 8 + 2e-9]]
+    assert((((near3 ** 0.5) ** 2) - near3).all? { |e| e.abs < 1e-8 })
+
+    # Other non-integer exponents, including negative ones, keep the coupling.
+    jordan = Matrix[[4, 2], [0, 4]]
+    cube_root = jordan ** (1.0 / 3)
+    assert((cube_root ** 3 - jordan).all? { |e| e.abs < 1e-12 })
+    inverse = jordan ** -1.0
+    assert((inverse * jordan - Matrix.I(2)).all? { |e| e.abs < 1e-12 })
+
+    # A triangular matrix with a zero diagonal entry can not be powered
+    # to a non-integer exponent.
+    assert_raise(Matrix::ErrOperationNotDefined) { Matrix[[0, 1], [0, 0]] ** 0.5 }
+  end
+
+  def test_exp_non_integer_diagonalizable
+    # A non-triangular, diagonalizable matrix keeps using the eigensystem.
+    m = Matrix[[7, 6], [3, 9]]
+    root = m ** 0.5
+    assert((root * root - m).all? { |e| e.abs < 1e-12 })
+  end
+
   def test_det
     assert_equal(Matrix.instance_method(:determinant), Matrix.instance_method(:det))
   end
