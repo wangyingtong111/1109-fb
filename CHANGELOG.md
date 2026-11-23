@@ -2,6 +2,14 @@
 
 List of new feature changes (excluding most bug fixes and optimizations)
 
+## Unreleased
+
+* Add `Matrix#qr` / `Matrix::QRDecomposition`, a rank-revealing QR
+  decomposition with column pivoting, and `Matrix#least_squares` (aliased
+  `Matrix#lstsq`) for rectangular, possibly rank deficient least squares
+  systems; a single decomposition can be reused for several right hand sides
+  and the numerical rank can be controlled through an explicit tolerance.
+
 ## v0.4.0
 
 * Add `Matrix#rotate_entries` [#19]

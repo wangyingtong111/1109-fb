@@ -502,6 +502,147 @@ class TestMatrix < Test::Unit::TestCase
     assert_equal(m.lup.solve([2, 5]), Vector[1, Rational(1,2)])
   end
 
+  def test_qr_factorization
+    m = Matrix[[1, 2], [3, 4], [5, 6], [2, 1]]
+    q, r, p = m.qr
+    n = m.row_count
+    assert_equal([n, n], [q.row_count, q.column_count])
+    assert_equal([n, m.column_count], [r.row_count, r.column_count])
+    assert_equal([m.column_count, m.column_count], [p.row_count, p.column_count])
+    # Q is m-by-m square here and orthogonal; R is upper triangular.
+    assert_in_delta(0, (q.transpose * q - Matrix.identity(n)).map(&:abs).max, 1e-12)
+    assert(r.upper_triangular?)
+    assert(p.permutation?)
+    assert_in_delta(0, ((m * p) - (q * r)).map(&:abs).max, 1e-12)
+
+    # The diagonal of R is ordered by non-increasing magnitude (rank revealing)
+    diag = (0...m.column_count).map {|j| r[j, j].abs}
+    assert(diag[0] >= diag[1])
+    # to_a / to_ary returns the same three factors
+    assert_equal([q, r, p], m.qr.to_a)
+  end
+
+  def test_qr_least_squares_vector_and_matrix
+    design = Matrix[[1, 0], [0, 1], [1, 1]]
+    expected = Rational(5, 3).to_f
+    vector_rhs = Vector[1, 1, 4]
+    matrix_rhs = Matrix[[1], [1], [4]]
+
+    qr = design.qr
+    assert_equal(2, qr.rank)
+
+    # The same decomposition is reused for both kinds of right hand sides.
+    x_vector = qr.solve(vector_rhs)
+    x_matrix = qr.solve(matrix_rhs)
+
+    # Shapes are preserved.
+    assert_kind_of(Vector, x_vector)
+    assert_kind_of(Matrix, x_matrix)
+    assert_equal(2, x_vector.size)
+    assert_equal([2, 1], [x_matrix.row_count, x_matrix.column_count])
+
+    # Both unknowns are 5/3 (checked with a float tolerance).
+    assert_in_delta(expected, x_vector[0], 1e-12)
+    assert_in_delta(expected, x_vector[1], 1e-12)
+    assert_in_delta(expected, x_matrix[0, 0], 1e-12)
+    assert_in_delta(expected, x_matrix[1, 0], 1e-12)
+
+    # Multiplied-back residuals are orthogonal to every column of the design.
+    [vector_rhs - design * x_vector, (matrix_rhs - design * x_matrix).column(0)].each do |residual|
+      design.column_vectors.each do |column|
+        assert_in_delta(0, column.inner_product(residual), 1e-12)
+      end
+    end
+
+    # Array right hand sides are accepted like LUPDecomposition#solve.
+    assert_in_delta(expected, qr.solve([1, 1, 4])[0], 1e-12)
+
+    # Matrix-level convenience entry points give the same answer.
+    assert_in_delta(expected, design.least_squares(vector_rhs)[0], 1e-12)
+    assert_in_delta(expected, design.lstsq(matrix_rhs)[1, 0], 1e-12)
+  end
+
+  def test_qr_reuses_decomposition_for_several_right_hand_sides
+    design = Matrix[[1, 0], [0, 1], [1, 1]]
+    qr = design.qr
+    several = Matrix[[1, 2], [1, 3], [4, 5]]
+    x = qr.solve(several)
+    assert_equal([2, 2], [x.row_count, x.column_count])
+    residual = several - design * x
+    residual.column_vectors.each do |r|
+      design.column_vectors.each {|c| assert_in_delta(0, c.inner_product(r), 1e-12)}
+    end
+    # Each column is identical to solving the corresponding vector separately.
+    2.times do |j|
+      single = qr.solve(several.column(j))
+      2.times {|i| assert_in_delta(single[i], x[i, j], 1e-12)}
+    end
+  end
+
+  def test_qr_rank_deficient_inputs
+    # Exactly duplicated column: rank 1, no exception, free unknown is zero.
+    duplicated = Matrix[[1, 1], [2, 2], [3, 3]]
+    qr = duplicated.qr
+    assert_equal(1, qr.rank)
+    assert(qr.rank_deficient?)
+    assert(qr.singular?)
+    x = qr.solve(Vector[1, 2, 3])
+    assert_equal(2, x.size)
+    assert_in_delta(0, (Vector[1, 2, 3] - duplicated * x).magnitude, 1e-12)
+
+    # A fully zero matrix is degenerate but still gives a defined result.
+    zero = Matrix.build(3, 2) {0}
+    assert_equal(0, zero.qr.rank)
+    assert_equal(Vector[0.0, 0.0], zero.qr.solve(Vector[1, 2, 3]))
+
+    # Empty / zero-column inputs give defined, empty results.
+    assert_equal(0, Matrix.empty(0, 0).qr.rank)
+    assert_equal(Vector[], Matrix.empty(0, 0).qr.solve(Vector[]))
+    assert_equal(0, Matrix.build(3, 0) {0}.qr.rank)
+    assert_equal(Vector[], Matrix.build(3, 0) {0}.qr.solve(Vector[1, 2, 3]))
+  end
+
+  def test_qr_tolerance_distinguishes_near_collinear_columns
+    epsilon = 1e-8
+    nearly_collinear = Matrix[[1, 1], [1, 1 + epsilon], [1, 1]]
+    rhs = Vector[1, 2, 1]
+    qr = nearly_collinear.qr
+
+    # Nearly collinear but still resolvable: full rank under the default
+    # tolerance, and the small pivot is kept by an effective numerical test.
+    assert_equal(2, qr.rank)
+    assert(!qr.rank_deficient?)
+    full = qr.solve(rhs)
+    # The system is heavily ill conditioned (pivot ratio ~1e-8), so the
+    # least squares residual is small but not at machine precision.
+    assert_in_delta(0, (rhs - nearly_collinear * full).magnitude, 1e-6)
+
+    # Under a coarser explicit tolerance the same pair is judged rank one.
+    assert_equal(1, qr.rank(1e-6))
+    assert(qr.rank_deficient?(1e-6))
+    deflated = qr.solve(rhs, 1e-6)
+    assert_equal(0.0, deflated[0]) # unresolved unknown reported as zero
+  end
+
+  def test_qr_square_system
+    m = Matrix[[2.0, 1.0], [1.0, 3.0]]
+    x = m.qr.solve(Vector[5.0, 10.0])
+    assert_in_delta(1.0, x[0], 1e-12)
+    assert_in_delta(3.0, x[1], 1e-12)
+  end
+
+  def test_qr_dimension_mismatch
+    design = Matrix[[1, 0], [0, 1], [1, 1]]
+    assert_raise(ExceptionForMatrix::ErrDimensionMismatch) { design.qr.solve(Vector[1, 2]) }
+    assert_raise(ExceptionForMatrix::ErrDimensionMismatch) do
+      design.qr.solve(Matrix[[1, 2], [1, 2]])
+    end
+  end
+
+  def test_qr_does_not_accept_complex
+    assert_raise(TypeError) { Matrix[[Complex(1, 2), 1], [1, 2], [0, 1]].qr }
+  end
+
   def test_real
     assert_equal(Matrix[[1, 0, 0], [1, 2, 3]], @c1.real)
   end

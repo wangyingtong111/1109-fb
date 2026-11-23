@@ -63,6 +63,7 @@ class Matrix
   include ExceptionForMatrix
   autoload :EigenvalueDecomposition, "matrix/eigenvalue_decomposition"
   autoload :LUPDecomposition, "matrix/lup_decomposition"
+  autoload :QRDecomposition, "matrix/qr_decomposition"
 
   # instance creations
   private_class_method :new
@@ -1568,6 +1569,49 @@ class Matrix
     LUPDecomposition.new(self)
   end
   alias_method :lup_decomposition, :lup
+
+  #
+  # Returns the QR decomposition with column pivoting of the matrix;
+  # see +QRDecomposition+.
+  #
+  # The decomposition is rank revealing and works for rectangular matrices,
+  # so the returned object can solve (possibly rank deficient) least squares
+  # systems.  A single decomposition can be reused for several right hand
+  # sides:
+  #
+  #   a  = Matrix[[1, 0], [0, 1], [1, 1]]
+  #   qr = a.qr
+  #   x1 = qr.solve(Vector[1, 1, 4])
+  #   x2 = qr.solve(Matrix.build(3, 1) { 1 })
+  #
+  def qr
+    QRDecomposition.new(self)
+  end
+  alias_method :qr_decomposition, :qr
+
+  #
+  # Returns a least squares solution +x+ of
+  #
+  #   A*x ~= b
+  #
+  # where +A+ is the receiver.  +b+ may be a Vector, an Array or a Matrix
+  # with as many rows as the receiver; the result keeps the corresponding
+  # shape (a Vector for a Vector/Array, a Matrix with the same number of
+  # columns for a Matrix).
+  #
+  # +tolerance+ controls the numerical rank determination (see
+  # QRDecomposition#rank); nearly collinear but still resolvable columns are
+  # kept when their pivot exceeds the tolerance.  Rank deficient inputs do
+  # not raise: a basic minimum residual solution is returned, with the
+  # unresolved unknowns reported as zero.
+  #
+  #   a = Matrix[[1, 0], [0, 1], [1, 1]]
+  #   a.least_squares(Vector[1, 1, 4]) # => Vector[1.6666666666666665, 1.6666666666666665]
+  #
+  def least_squares(b, tolerance = nil)
+    qr.solve(b, tolerance)
+  end
+  alias_method :lstsq, :least_squares
 
   #--
   # COMPLEX ARITHMETIC -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
