@@ -277,6 +277,25 @@ majority class is removed, whereas on the right, the entire Tomek's link is remo
    :scale: 60
    :align: center
 
+When several samples are equidistant from a given sample, the strict definition above
+means that none of them is a unique closest neighbour. By default
+(``tie_break='single'``), :class:`TomekLinks` keeps the historical behaviour and only
+inspects a single nearest neighbour per sample; the neighbour selected in case of a tie
+depends on the order of the samples, so reordering the data can change the detected
+links. Setting ``tie_break='all'`` enables an explicit tie-breaking mode: every sample
+located at the minimum distance is treated as a nearest neighbour and a pair is
+considered a Tomek's link only when the two samples from different classes are mutual
+true nearest neighbours. This makes the detection independent of the order of the
+samples, while ``sampling_strategy`` still controls which class(es) of the detected
+links are removed::
+
+  >>> import numpy as np
+  >>> from imblearn.under_sampling import TomekLinks
+  >>> X = np.array([[0.0], [2.0], [10.0], [1.0]])
+  >>> y = np.array([1, 1, 1, 0])
+  >>> TomekLinks(tie_break="all").fit_resample(X, y)[0].ravel()
+  array([10.,  1.])
+
 .. _edited_nearest_neighbors:
 
 Editing data using nearest neighbours

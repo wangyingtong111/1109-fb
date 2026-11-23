@@ -14,6 +14,15 @@ Bug fixes
 Enhancements
 ............
 
+- Add a `tie_break` parameter to
+  :class:`imblearn.under_sampling.TomekLinks`. The default `"single"` mode keeps
+  the historical behaviour where a single nearest neighbour is considered. The
+  new `"all"` mode provides an explicit tie-breaking rule: every equidistant
+  minimum-distance neighbour is considered and a pair is detected as a Tomek's
+  link only when both samples are mutual true nearest neighbours, making the
+  detection independent of the order of the samples. Only the classes targeted
+  by `sampling_strategy` are removed.
+
 Compatibility
 .............
 

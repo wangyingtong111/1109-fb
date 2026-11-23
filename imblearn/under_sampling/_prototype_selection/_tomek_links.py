@@ -10,6 +10,7 @@ import numbers
 import numpy as np
 from sklearn.neighbors import NearestNeighbors
 from sklearn.utils import _safe_indexing
+from sklearn.utils._param_validation import StrOptions
 
 from imblearn.under_sampling.base import BaseCleaningSampler
 from imblearn.utils import Substitution
@@ -30,6 +31,25 @@ class TomekLinks(BaseCleaningSampler):
     {sampling_strategy}
 
     {n_jobs}
+
+    tie_break : {{"single", "all"}}, default="single"
+        How to handle samples having several equidistant nearest neighbours.
+
+        - ``"single"``: keeps the historical behaviour. Only a single nearest
+          neighbour is considered for every sample. When several neighbours
+          are tied at the minimum distance, the one that is returned depends on
+          the order of the samples and the result can therefore change when the
+          input is reordered.
+
+        - ``"all"``: explicit tie-breaking mode. Every neighbour located at the
+          minimum distance is considered as a nearest neighbour. A pair of
+          samples from different classes forms a Tomek's link only when each
+          sample is a true nearest neighbour of the other, i.e. it belongs to
+          the set of minimum-distance neighbours of the other sample. This
+          detection is independent of the order of the samples. Only the samples
+          from the classes targeted by ``sampling_strategy`` are removed.
+
+        .. versionadded:: 0.15
 
     Attributes
     ----------
@@ -69,6 +89,13 @@ class TomekLinks(BaseCleaningSampler):
     Supports multi-class resampling. A one-vs.-rest scheme is used as
     originally proposed in [1]_.
 
+    When ``tie_break="single"`` and several neighbours are equidistant from a
+    sample, only the neighbour selected by the nearest-neighbour search is
+    inspected. This arbitrary choice makes the detected links sensitive to the
+    order of the samples. Setting ``tie_break="all"`` removes this ambiguity by
+    requiring that the two samples of a pair are mutual true nearest neighbours
+    before considering the pair as a Tomek's link.
+
     References
     ----------
     .. [1] I. Tomek, "Two modifications of CNN," In Systems, Man, and
@@ -93,11 +120,13 @@ class TomekLinks(BaseCleaningSampler):
     _parameter_constraints: dict = {
         **BaseCleaningSampler._parameter_constraints,
         "n_jobs": [numbers.Integral, None],
+        "tie_break": [StrOptions({"single", "all"})],
     }
 
-    def __init__(self, *, sampling_strategy="auto", n_jobs=None):
+    def __init__(self, *, sampling_strategy="auto", n_jobs=None, tie_break="single"):
         super().__init__(sampling_strategy=sampling_strategy)
         self.n_jobs = n_jobs
+        self.tie_break = tie_break
 
     @staticmethod
     def is_tomek(y, nn_index, class_type):
@@ -142,13 +171,106 @@ class TomekLinks(BaseCleaningSampler):
 
         return links
 
-    def _fit_resample(self, X, y):
-        # Find the nearest neighbour of every point
-        nn = NearestNeighbors(n_neighbors=2, n_jobs=self.n_jobs)
-        nn.fit(X)
-        nns = nn.kneighbors(X, return_distance=False)[:, 1]
+    @staticmethod
+    def is_tomek_with_ties(y, nn_indices, class_type):
+        """Detect Tomek's links while accounting for equidistant neighbours.
 
-        links = self.is_tomek(y, nns, self.sampling_strategy_)
+        Every index stored in ``nn_indices`` is considered as a nearest
+        neighbour of a sample (i.e. it is located at the minimum distance).
+        Two samples from different classes form a Tomek's link when each of
+        them is a true nearest neighbour of the other. Only the samples from
+        the classes targeted by ``class_type`` are flagged for removal.
+
+        Parameters
+        ----------
+        y : ndarray of shape (n_samples,)
+            Target vector of the data set, necessary to keep track of whether a
+            sample belongs to a targeted class or not.
+
+        nn_indices : ragged sequence of ndarray
+            ``nn_indices[i]`` contains the indices of every nearest neighbour
+            (all the samples located at the minimum distance) of sample ``i``.
+
+        class_type : dict, int or str
+            The class labels targeted by the resampling. A dictionary keyed by
+            the targeted class labels or a single class label are accepted.
+
+        Returns
+        -------
+        is_tomek : ndarray of shape (n_samples,)
+            Boolean vector with True for the targeted samples that belong to a
+            Tomek's link.
+        """
+        links = np.zeros(len(y), dtype=bool)
+
+        if isinstance(class_type, dict):
+            targeted_classes = tuple(class_type)
+        else:
+            targeted_classes = (class_type,)
+
+        for index_sample, target_sample in enumerate(y):
+            if target_sample not in targeted_classes:
+                continue
+
+            for neighbor_index in nn_indices[index_sample]:
+                # a link requires neighbours from different classes and mutual
+                # membership in each other's set of minimum-distance neighbours
+                if y[neighbor_index] != target_sample and (
+                    index_sample in nn_indices[neighbor_index]
+                ):
+                    links[index_sample] = True
+                    break
+
+        return links
+
+    def _fit_resample(self, X, y):
+        if self.tie_break == "single":
+            # Find the nearest neighbour of every point
+            nn = NearestNeighbors(n_neighbors=2, n_jobs=self.n_jobs)
+            nn.fit(X)
+            nns = nn.kneighbors(X, return_distance=False)[:, 1]
+
+            links = self.is_tomek(y, nns, self.sampling_strategy_)
+        else:
+            # Explicit tie-breaking mode: consider every neighbour located at
+            # the minimum distance instead of picking a single one.
+            links = np.zeros(X.shape[0], dtype=bool)
+
+            if X.shape[0] > 1:
+                nn = NearestNeighbors(n_jobs=self.n_jobs)
+                nn.fit(X)
+
+                # Minimum distance from each sample to another sample.
+                distances, _ = nn.kneighbors(X, n_neighbors=2)
+                min_distances = distances[:, 1]
+
+                # Gather the samples lying within the largest minimum distance
+                # and keep, for each row, only the samples located at its own
+                # minimum distance. The query always returns the sample itself
+                # (distance zero), which is explicitly discarded using its index
+                # so that coincident samples from another class are retained.
+                radius = np.max(min_distances)
+                radius_distances, radius_neighbors = nn.radius_neighbors(
+                    X, radius=radius
+                )
+                nn_indices = [
+                    neighbor_indices[
+                        (neighbor_indices != index_sample)
+                        & np.isclose(neighbor_distances, min_distance)
+                    ]
+                    for index_sample, (
+                        neighbor_indices,
+                        neighbor_distances,
+                        min_distance,
+                    ) in enumerate(
+                        zip(radius_neighbors, radius_distances, min_distances)
+                    )
+                ]
+
+                links = self.is_tomek_with_ties(
+                    y, nn_indices, self.sampling_strategy_
+                )
+
         self.sample_indices_ = np.flatnonzero(np.logical_not(links))
 
         return (
