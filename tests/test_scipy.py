@@ -263,6 +263,85 @@ else:
         check_grads(f, modes=["fwd", "rev"])(x)
         check_grads(lambda a: grad(f)(a), modes=["fwd", "rev"])(x)
 
+    def test_logsumexp_weights_grad():
+        # b is differentiable, including for the plain (sign-free) form.
+        x = R(3, 4)
+        b = 3.0 + np.exp(R(3, 4))
+        for axis in [None, 0, 1]:
+            for keepdims in [True, False]:
+                f = lambda b: special.logsumexp(x, axis=axis, b=b, keepdims=keepdims)
+                check_grads(f, modes=["fwd", "rev"], order=2)(b)
+
+    def test_logsumexp_return_sign_matches_scipy():
+        x = np.array([1.0, 2.0, -0.5])
+        b = np.array([1.0, -3.0, 2.0])
+        for axis in [None, 0]:
+            for keepdims in [True, False]:
+                got = special.logsumexp(x, b=b, axis=axis, keepdims=keepdims, return_sign=True)
+                expected = scipy.special.logsumexp(
+                    x, b=b, axis=axis, keepdims=keepdims, return_sign=True
+                )
+                assert np.all(np.isclose(got[0], expected[0]))
+                assert np.all(np.isclose(got[1], expected[1]))
+
+    def test_logsumexp_return_sign_grads():
+        x = R(3, 4)
+        b = 3.0 + np.exp(R(3, 4))
+        for axis in [None, 0, 1]:
+            for keepdims in [True, False]:
+                fx = lambda x: special.logsumexp(
+                    x, b=b, axis=axis, keepdims=keepdims, return_sign=True
+                )[0]
+                fb = lambda b: special.logsumexp(
+                    x, b=b, axis=axis, keepdims=keepdims, return_sign=True
+                )[0]
+                check_grads(fx, modes=["fwd", "rev"], order=2)(x)
+                check_grads(fb, modes=["fwd", "rev"], order=2)(b)
+
+    def test_logsumexp_return_sign_grads_signed_weights():
+        # Negative weights are the whole point of return_sign; check the
+        # log-magnitude gradient numerically where no exact cancellation occurs.
+        x = np.array([0.7, -1.3, 0.2, 1.1])
+        b = np.array([2.0, -3.0, 0.5, 4.0])
+        log_abs = lambda x, b: special.logsumexp(x, b=b, return_sign=True)[0]
+        check_grads(log_abs, argnum=0, modes=["fwd", "rev"], order=2)(x, b)
+        check_grads(log_abs, argnum=1, modes=["fwd", "rev"], order=2)(x, b)
+
+    def test_logsumexp_return_sign_example():
+        # Large, nearly cancelling terms: the naive log of the signed sum would
+        # overflow/underflow. The log-magnitude is log(2) below the max term and
+        # the sign carries the cancellation. Gradients must be finite.
+        x = np.array([1000.0, 1000.0 - np.log(2.0)])
+        b = np.array([1.0, -3.0])
+        log_abs, sign = special.logsumexp(x, b=b, return_sign=True)
+        assert np.isclose(log_abs, 1000.0 - np.log(2.0))
+        assert sign == -1.0
+        gx = grad(lambda x: special.logsumexp(x, b=b, return_sign=True)[0])(x)
+        gb = grad(lambda b: special.logsumexp(x, b=b, return_sign=True)[0])(b)
+        assert np.all(np.isfinite(gx)) and np.all(np.isfinite(gb))
+        assert np.allclose(gx, [-2.0, 3.0])
+        assert np.allclose(gb, [-2.0, -1.0])
+
+    def test_logsumexp_return_sign_cancellation():
+        # A weighted sum that cancels exactly has log-magnitude -inf and sign 0;
+        # the sign flags it and the (undefined) gradient is reported as finite 0.
+        x = np.array([0.5, 0.5])
+        b = np.array([1.0, -1.0])
+        log_abs, sign = special.logsumexp(x, b=b, return_sign=True)
+        assert np.isneginf(log_abs)
+        assert sign == 0.0
+        gx = grad(lambda x: special.logsumexp(x, b=b, return_sign=True)[0])(x)
+        gb = grad(lambda b: special.logsumexp(x, b=b, return_sign=True)[0])(b)
+        assert np.all(np.isfinite(gx)) and np.allclose(gx, 0.0)
+        assert np.all(np.isfinite(gb)) and np.allclose(gb, 0.0)
+
+    def test_logsumexp_return_sign_is_not_differentiated():
+        # The sign is an observation: its derivative is zero, but finite.
+        x = np.array([1.0, 2.0])
+        b = np.array([1.0, -0.5])
+        assert np.allclose(grad(lambda x: special.logsumexp(x, b=b, return_sign=True)[1])(x), 0.0)
+        assert np.allclose(grad(lambda b: special.logsumexp(x, b=b, return_sign=True)[1])(b), 0.0)
+
     ### Signal ###
     def test_convolve_generalization():
         ag_convolve = autograd.scipy.signal.convolve

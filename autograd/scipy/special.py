@@ -117,31 +117,150 @@ defvjp(logit, lambda ans, x: lambda g: g / (x * (1 - x)))
 defvjp(expit, lambda ans, x: lambda g: g * ans * (1 - ans))
 
 ### logsumexp ###
-logsumexp = primitive(scipy.special.logsumexp)
+# The primitive takes every option positionally so that `b` (like `x`) is
+# visible to autograd and can itself be differentiated. The public wrapper
+# below restores scipy's keyword-friendly signature.
+_logsumexp = primitive(scipy.special.logsumexp)
 
 
-def make_grad_logsumexp(ans, x, axis=None, b=1.0, keepdims=False):
-    shape, dtype = np.shape(x), np.result_type(x)
+def logsumexp(a, axis=None, b=None, keepdims=False, return_sign=False):
+    """Differentiable version of ``scipy.special.logsumexp``.
+
+    When ``return_sign=True`` the result is the pair ``(log(sum(b * exp(a))),
+    sign)`` where the first entry is the log of the *magnitude* of the weighted
+    sum and the second is its sign (``0`` when the weighted sum cancels
+    exactly). Only the log-magnitude is differentiated; the sign is treated as
+    an observation and contributes no gradient (for complex inputs it is the
+    phase, which is likewise held fixed). The weights ``b`` may be
+    differentiated with respect to.
+
+    At an exact cancellation the log-magnitude is ``-inf`` and has no
+    derivative; a zero gradient is returned (rather than NaN) and the ``0``
+    sign marks the cancellation for the caller to detect.
+    """
+    return _logsumexp(a, axis, b, keepdims, return_sign)
+
+
+def _logsumexp_components(ans, return_sign):
+    """Split a (possibly signed) logsumexp result into log-magnitude and sign."""
+    if return_sign:
+        log_abs_sum, sign = ans
+    else:
+        log_abs_sum, sign = ans, 1.0
+    return log_abs_sum, sign
+
+
+def _signed_exp(a, log_abs_sum, sign, return_sign):
+    """Derivative of ``log|sum(b * exp(a))|`` with respect to ``a`` per unit ``b``.
+
+    With ``S = sum(b * exp(a))`` and ``sign = S / |S|``, ``log|S| = log(sign *
+    S)`` so ``d log|S| / da_i = conj(sign) * exp(a_i - log|S|)``. (For real
+    inputs ``sign`` is ``±1`` and conjugation is a no-op; for complex inputs it
+    is the phase, matching autograd's complex convention.)
+
+    When the weighted sum cancels exactly, ``log|S|`` is ``-inf`` and this
+    derivative does not exist. We use a finite placeholder there and mask the
+    result to zero, so callers get a finite (zero) gradient instead of NaN;
+    the returned sign of ``0`` is what flags the cancellation.
+    """
+    if not return_sign:
+        return np.exp(a - log_abs_sum)
+    cancelled = sign == 0
+    # At an exact cancellation `log_abs_sum` is -inf, so `a - log_abs_sum` is
+    # +inf; blank the exponent there (keeping `a`'s broadcast shape) so `exp`
+    # stays finite, then zero out the whole coefficient.
+    exponent = np.where(cancelled, 0.0, a - log_abs_sum)
+    return np.where(cancelled, 0.0, np.conj(sign) * np.exp(exponent))
+
+
+def make_grad_logsumexp(ans, a, axis=None, b=None, keepdims=False, return_sign=False):
+    shape, dtype = np.shape(a), np.result_type(a)
+    log_abs_sum, sign = _logsumexp_components(ans, return_sign)
+    weights = 1.0 if b is None else b
 
     def vjp(g):
+        if return_sign:
+            g = g[0]  # the sign output is an observation, not a differentiable result
         g_repeated, _ = repeat_to_match_shape(g, shape, dtype, axis, keepdims)
-        ans_repeated, _ = repeat_to_match_shape(ans, shape, dtype, axis, keepdims)
-        return g_repeated * b * np.exp(x - ans_repeated)
+        ans_repeated, _ = repeat_to_match_shape(log_abs_sum, shape, dtype, axis, keepdims)
+        if return_sign:
+            sign_repeated, _ = repeat_to_match_shape(sign, shape, dtype, axis, keepdims)
+        else:
+            sign_repeated = sign
+        return g_repeated * weights * _signed_exp(a, ans_repeated, sign_repeated, return_sign)
 
     return vjp
 
 
-defvjp(logsumexp, make_grad_logsumexp)
+def make_grad_logsumexp_b(ans, a, axis=None, b=None, keepdims=False, return_sign=False):
+    shape, dtype = np.shape(a), np.result_type(a)
+    log_abs_sum, sign = _logsumexp_components(ans, return_sign)
+
+    def vjp(g):
+        if return_sign:
+            g = g[0]  # the sign output is an observation, not a differentiable result
+        g_repeated, _ = repeat_to_match_shape(g, shape, dtype, axis, keepdims)
+        ans_repeated, _ = repeat_to_match_shape(log_abs_sum, shape, dtype, axis, keepdims)
+        if return_sign:
+            sign_repeated, _ = repeat_to_match_shape(sign, shape, dtype, axis, keepdims)
+        else:
+            sign_repeated = sign
+        coeff = _signed_exp(a, ans_repeated, sign_repeated, return_sign)
+        return unbroadcast_f(b, lambda gg: gg * coeff)(g_repeated)
+
+    return vjp
 
 
-def fwd_grad_logsumexp(g, ans, x, axis=None, b=1.0, keepdims=False):
+defvjp(
+    _logsumexp,
+    make_grad_logsumexp,
+    None,
+    make_grad_logsumexp_b,
+    None,
+    None,
+)
+
+
+def _expand_reduced(ans, axis, keepdims):
     if not keepdims:
         if isinstance(axis, int):
             ans = np.expand_dims(ans, axis)
         elif isinstance(axis, tuple):
             for ax in sorted(axis):
                 ans = np.expand_dims(ans, ax)
-    return np.sum(g * b * np.exp(x - ans), axis=axis, keepdims=keepdims)
+    return ans
 
 
-defjvp(logsumexp, fwd_grad_logsumexp)
+def _fwd_grad_logsumexp(g, ans, a, axis, b, keepdims, return_sign, wrt_b=False):
+    log_abs_sum, sign = _logsumexp_components(ans, return_sign)
+    ans_expanded = _expand_reduced(log_abs_sum, axis, keepdims)
+    if return_sign:
+        sign = _expand_reduced(sign, axis, keepdims)
+    weights = 1.0 if wrt_b or b is None else b
+    coeff = _signed_exp(a, ans_expanded, sign, return_sign)
+    tangent = np.sum(g * weights * coeff, axis=axis, keepdims=keepdims)
+    # `log|S|` is real even when the inputs are complex, so its tangent is the
+    # real part of the complex expression above.
+    if not np.iscomplexobj(log_abs_sum) and np.iscomplexobj(tangent):
+        tangent = np.real(tangent)
+    if return_sign:
+        return tangent, np.zeros_like(ans[1])
+    return tangent
+
+
+def fwd_grad_logsumexp(g, ans, a, axis=None, b=None, keepdims=False, return_sign=False):
+    return _fwd_grad_logsumexp(g, ans, a, axis, b, keepdims, return_sign)
+
+
+def fwd_grad_logsumexp_b(g, ans, a, axis=None, b=None, keepdims=False, return_sign=False):
+    return _fwd_grad_logsumexp(g, ans, a, axis, b, keepdims, return_sign, wrt_b=True)
+
+
+defjvp(
+    _logsumexp,
+    fwd_grad_logsumexp,
+    None,
+    fwd_grad_logsumexp_b,
+    None,
+    None,
+)
