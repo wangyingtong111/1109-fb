@@ -10,6 +10,10 @@ class BackendMemoryTest < Minitest::Test
     @backend = ClassifierReborn::BayesMemoryBackend.new
   end
 
+  def new_empty_backend
+    ClassifierReborn::BayesMemoryBackend.new
+  end
+
   def test_persistence
     @backend.update_total_words(10)
     @backend.update_total_trainings(10)

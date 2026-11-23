@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require_relative 'mergeable_backend'
 require_relative 'no_redis_error'
 # require redis when we run #intialize. This way only people using this backend
 # will need to install and load the backend without having to
@@ -8,6 +9,8 @@ require_relative 'no_redis_error'
 module ClassifierReborn
   # This class provides Redis as the storage backend for the classifier data structures
   class BayesRedisBackend
+    include MergeableBackend
+
     # The class can be created with the same arguments that the redis gem accepts
     # E.g.,
     #      b = ClassifierReborn::BayesRedisBackend.new
@@ -88,6 +91,13 @@ module ClassifierReborn
       @redis.hget(category, word).to_i
     end
 
+    # Returns a copy of the word => frequency counts stored for +category+.
+    def category_word_frequencies(category)
+      @redis.hgetall(category).each_with_object({}) do |(word, count), frequencies|
+        frequencies[word.intern] = count.to_i
+      end
+    end
+
     def update_category_word_frequency(category, word, diff)
       @redis.hincrby(category, word, diff)
     end
@@ -104,6 +114,14 @@ module ClassifierReborn
       @redis.flushdb
       @redis.set(:total_words, 0)
       @redis.set(:total_trainings, 0)
+    end
+
+    # Redis stores every classifier of a database under the same keys, so there
+    # is no way to derive a distinct empty destination automatically. Callers
+    # must hand in a backend backed by its own empty database.
+    def merge_destination
+      raise ArgumentError, 'merging Redis backed classifiers requires an empty destination backend ' \
+                           '(pass it with the :into option)'
     end
   end
 end

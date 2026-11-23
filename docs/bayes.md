@@ -67,6 +67,58 @@ classifier = ClassifierReborn::Bayes.new 'Interesting', 'Uninteresting', backend
 # Perform training and classification using the classifier instance
 ```
 
+## Merging Independently Trained Classifiers
+
+When the training texts are spread over several places, each place can train its
+own classifier and the statistics can be added afterwards. A naive Bayes model is
+fully described by counts that are plain sums over the training documents: the
+number of trainings, the number of tokens, and per category the number of
+trainings, the number of tokens and the frequency of every word. `Bayes#merge`
+returns a new classifier holding those sums, which is exactly the model a single
+classifier would have become after training on all the documents.
+
+```ruby
+require 'classifier-reborn'
+
+options = { enable_stemmer: false }
+
+shard_a = ClassifierReborn::Bayes.new 'Maps', 'Weather', **options
+shard_a.train :Maps,    'harbor harbor'
+shard_a.train :Weather, 'rain fog'
+
+shard_b = ClassifierReborn::Bayes.new 'Maps', 'Weather', **options
+shard_b.train :Maps,    'harbor route'
+shard_b.train :Weather, 'fog route'
+shard_b.train :Weather, 'rain route'
+
+merged = shard_a.merge(shard_b)
+
+merged.backend.category_training_count(:Maps)          #=> 2
+merged.backend.category_training_count(:Weather)       #=> 3
+merged.backend.category_word_frequency(:Maps, :harbor) #=> 3
+merged.classify_with_score('harbor rain')              #=> ["Maps", -4.892852258439872]
+```
+
+`Bayes.merge(shard_a, shard_b, shard_c)` and the alias `combine` do the same.
+The shards themselves are left untouched: they keep their own statistics and can
+still be trained or used for classification by their other callers.
+
+Merging is only valid when every shard turns text into the same features. The
+tokenizer, the token filter chain (including whether stemming is enabled), the
+stopwords and the language must match, otherwise
+`ClassifierReborn::Bayes::IncompatibleClassifierError` is raised. Classifiers
+that do not share their feature space still classify on their own; only the
+combination is refused.
+
+The merged classifier writes into a new, empty backend. With the memory backend
+this happens automatically; Redis keeps every classifier of a database under the
+same keys, so hand in an empty backend explicitly:
+
+```ruby
+redis_backend = ClassifierReborn::BayesRedisBackend.new(db: 2)
+merged = shard_a.merge(shard_b, into: redis_backend)
+```
+
 ## Beyond the Basics
 
 Beyond the basic example, the constructor and trainer can be used in a more flexible way to accommodate non-trivial applications.

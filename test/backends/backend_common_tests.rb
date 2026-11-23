@@ -67,4 +67,63 @@ module BackendCommonTests
     assert @backend.total_trainings.zero?
     assert @backend.category_keys.empty?
   end
+
+  def test_category_word_frequencies
+    @backend.add_category(:Interesting)
+    assert_empty @backend.category_word_frequencies(:Interesting)
+    @backend.update_category_word_frequency(:Interesting, 'foo', 3)
+    @backend.update_category_word_frequency(:Interesting, 'bar', 2)
+    frequencies = @backend.category_word_frequencies(:Interesting).transform_keys(&:to_s)
+    assert_equal({ 'foo' => 3, 'bar' => 2 }, frequencies)
+  end
+
+  def test_absorb_adds_the_statistics_of_the_other_backend
+    other = new_empty_backend
+    other.add_category(:Interesting)
+    other.update_category_training_count(:Interesting, 2)
+    other.update_category_word_count(:Interesting, 5)
+    other.update_category_word_frequency(:Interesting, 'foo', 3)
+    other.update_category_word_frequency(:Interesting, 'bar', 2)
+    other.update_total_trainings(2)
+    other.update_total_words(5)
+
+    @backend.add_category(:Interesting)
+    @backend.update_category_training_count(:Interesting, 1)
+    @backend.update_category_word_count(:Interesting, 4)
+    @backend.update_category_word_frequency(:Interesting, 'foo', 4)
+    @backend.update_total_trainings(1)
+    @backend.update_total_words(4)
+
+    assert_same @backend, @backend.absorb(other)
+
+    assert_equal 3, @backend.total_trainings
+    assert_equal 9, @backend.total_words
+    assert_equal 3, @backend.category_training_count(:Interesting)
+    assert_equal 9, @backend.category_word_count(:Interesting)
+    assert_equal 7, @backend.category_word_frequency(:Interesting, 'foo')
+    assert_equal 2, @backend.category_word_frequency(:Interesting, 'bar')
+  end
+
+  def test_absorb_does_not_modify_the_other_backend
+    other = new_empty_backend
+    other.add_category(:Interesting)
+    other.update_category_training_count(:Interesting, 2)
+    other.update_category_word_count(:Interesting, 5)
+    other.update_category_word_frequency(:Interesting, 'foo', 5)
+    other.update_total_trainings(2)
+    other.update_total_words(5)
+
+    @backend.absorb(other)
+    @backend.update_category_word_frequency(:Interesting, 'foo', 100)
+    @backend.update_total_trainings(100)
+
+    assert_equal 2, other.total_trainings
+    assert_equal 5, other.total_words
+    assert_equal 2, other.category_training_count(:Interesting)
+    assert_equal 5, other.category_word_frequency(:Interesting, 'foo')
+  end
+
+  def test_absorb_refuses_to_absorb_itself
+    assert_raises(ArgumentError) { @backend.absorb(@backend) }
+  end
 end

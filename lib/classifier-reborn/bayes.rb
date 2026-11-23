@@ -17,6 +17,10 @@ module ClassifierReborn
   class Bayes
     CategoryNotFoundError = Class.new(StandardError)
 
+    # Raised when classifiers that do not share the same feature extraction
+    # contract (tokenizer, token filters, stemmer, stopwords) are merged.
+    IncompatibleClassifierError = Class.new(StandardError)
+
     # The class can be created with one or more categories, each of which will be
     # initialized and given a training method. E.g.,
     #      b = ClassifierReborn::Bayes.new 'Interesting', 'Uninteresting', 'Spam'
@@ -62,6 +66,8 @@ module ClassifierReborn
       populate_initial_categories
 
       custom_stopwords options[:stopwords] if options.key?(:stopwords)
+
+      @stopword_snapshot = stopword_snapshot
     end
 
     # Provides a general training method for all categories specified in Bayes#new
@@ -257,9 +263,179 @@ module ClassifierReborn
     def reset
       @backend.reset
       populate_initial_categories
+      @stopword_snapshot = stopword_snapshot
     end
 
+    # Combines the training statistics of +others+ with those of this
+    # classifier and returns a new classifier holding the sum. The result is
+    # exactly the model a single classifier would have become after training on
+    # the documents of every shard, provided all shards share the same feature
+    # extraction contract (tokenizer, token filters, stemmer, stopwords and
+    # category naming rules); otherwise IncompatibleClassifierError is raised.
+    #
+    # The receivers are never modified: every shard keeps its own statistics
+    # and remains usable for classification and training by its other callers.
+    #
+    #     merged = shard_a.merge(shard_b)
+    #
+    # The Redis backend stores everything in one database, so a destination
+    # backend cannot be derived for it; pass an empty one explicitly:
+    #
+    #     merged = shard_a.merge(shard_b, into: BayesRedisBackend.new(db: 2))
+    def merge(*others, into: nil)
+      shards = [self, *others.flatten.compact]
+      raise ArgumentError, 'merge needs at least one other classifier' if shards.size < 2
+
+      shards.each { |shard| assert_mergeable(shard) }
+      reused = shards.map { |shard| shard.backend.object_id }
+      raise ArgumentError, 'the same classifier cannot be merged twice' if reused.uniq.size != shards.size
+
+      merged = build_merge_shell(resolve_merge_destination(shards, into))
+      merged.merge_from(shards)
+      merged
+    end
+
+    alias combine merge
+
+    # Class level shortcut: Bayes.merge(shard_a, shard_b, shard_c)
+    def self.merge(*classifiers, into: nil)
+      classifiers = classifiers.flatten.compact
+      raise ArgumentError, 'merge needs at least two classifiers' if classifiers.size < 2
+
+      first, *rest = classifiers
+      first.merge(*rest, into: into)
+    end
+
+    # Read-only accessors describing this classifier, used to decide whether
+    # its statistics can be added to another classifier's.
+    attr_reader :backend, :language, :tokenizer
+
+    def token_filters
+      @token_filters.dup
+    end
+
+    # The categories handed to the constructor; the merged model resets to the
+    # union of the shards' ones.
+    attr_reader :initial_categories
+    protected :initial_categories
+
     private
+
+    def assert_mergeable(shard)
+      raise ArgumentError, "cannot merge #{shard.class}: expected a #{self.class}" unless shard.is_a?(self.class)
+
+      assert_stopword_table_unchanged(shard)
+      return if merge_signature == shard.merge_signature && labels_are_canonical?(shard)
+
+      raise IncompatibleClassifierError,
+            'cannot merge classifiers that extract features differently ' \
+            '(tokenizer, token filters, stemmer or stopwords differ)'
+    end
+
+    # The stopword table lives on the filter, not on the classifier. If another
+    # classifier replaced it after this shard was created, the shard would now
+    # filter differently than it did while training, and so would the merged
+    # model: its statistics could no longer be reproduced.
+    def assert_stopword_table_unchanged(shard)
+      trained_with = shard.effective_stopword_snapshot
+      return if trained_with.nil? || trained_with == shard.stopword_snapshot
+
+      raise IncompatibleClassifierError,
+            'cannot merge: the stopwords changed after the classifier was created, ' \
+            'so its statistics no longer describe the current feature space'
+    end
+
+    # Categories are always stored under the symbol produced by the naming
+    # rules, so merging the raw keys reproduces the labelling a single model
+    # would have produced. A shard holding any other kind of key (for example
+    # one written by legacy code) could silently split one label in two, so it
+    # is rejected instead of being merged.
+    def labels_are_canonical?(shard)
+      shard.category_keys.all? { |category| category.is_a?(Symbol) }
+    end
+
+    def resolve_merge_destination(shards, destination)
+      destination ||= @backend.merge_destination
+      unless destination.respond_to?(:absorb) && destination.respond_to?(:total_words)
+        raise ArgumentError, 'the merge destination must be a Bayes backend'
+      end
+      if shards.any? { |shard| shard.backend.equal?(destination) }
+        raise ArgumentError, 'merge destination must be a backend no shard is using'
+      end
+      unless destination.total_words.zero? && destination.total_trainings.zero? && destination.category_keys.empty?
+        raise ArgumentError, 'merge destination backend must be empty'
+      end
+
+      destination
+    end
+
+    def build_merge_shell(destination)
+      self.class.new(merge_options.merge(backend: destination))
+    end
+
+    def merge_options
+      { language: @language,
+        auto_categorize: @auto_categorize,
+        enable_threshold: @enable_threshold,
+        threshold: @threshold,
+        enable_stemmer: @enable_stemmer,
+        tokenizer: @tokenizer,
+        token_filters: @token_filters.dup }
+    end
+
+    # Snapshot of the stopwords this classifier was created with. The stopword
+    # table itself is process wide, so two shards created with different lists
+    # did not filter the same way even though they now observe the same table.
+    def stopword_snapshot
+      return nil unless @token_filters.include?(TokenFilter::Stopword)
+
+      Set.new(TokenFilter::Stopword::STOPWORDS[@language])
+    end
+
+    # The stopword list the shard really filtered with. Instances restored from
+    # a snapshot taken before the list was recorded fall back to the current
+    # one, so old marshaled classifiers stay mergeable.
+    def effective_stopword_snapshot
+      return stopword_snapshot unless defined?(@stopword_snapshot) && @stopword_snapshot
+
+      @stopword_snapshot
+    end
+
+    # The filter chain Hasher.word_hash actually applies: the stemmer is
+    # appended when stemming is enabled and dropped when it is not, so the
+    # effective chain is what defines the feature space.
+    def feature_token_filters
+      filters = @token_filters.dup
+      if filters.include?(TokenFilter::Stemmer)
+        filters.delete(TokenFilter::Stemmer) unless @enable_stemmer
+      elsif @enable_stemmer
+        filters << TokenFilter::Stemmer
+      end
+      filters
+    end
+
+    # Copies the statistics of +shards+ into this classifier's backend. Used by
+    # #merge on the freshly built result; the shards are only read.
+    def merge_from(shards)
+      @backend.absorb(*shards.map { |shard| shard.backend })
+      @initial_categories = shards.flat_map { |shard| shard.initial_categories }.uniq
+      self
+    end
+
+    # Everything that decides how a piece of text becomes counted features. Two
+    # shards may only be added when all of it agrees, because otherwise their
+    # word frequencies would not live in the same feature space.
+    def merge_signature
+      {
+        language: @language,
+        tokenizer: @tokenizer,
+        token_filters: feature_token_filters,
+        stopwords: effective_stopword_snapshot
+      }
+    end
+
+    protected :merge_from, :merge_signature, :assert_mergeable,
+              :stopword_snapshot, :effective_stopword_snapshot
 
     def populate_initial_categories
       @initial_categories.each do |c|

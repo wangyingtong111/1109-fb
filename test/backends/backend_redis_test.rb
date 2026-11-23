@@ -13,6 +13,12 @@ class BackendRedisTest < Minitest::Test
     skip(e)
   end
 
+  def new_empty_backend
+    ClassifierReborn::BayesRedisBackend.new(db: 1)
+  rescue Redis::CannotConnectError => e
+    skip(e)
+  end
+
   def teardown
     @backend.reset if defined? @backend
   end

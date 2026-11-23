@@ -1,5 +1,9 @@
 ## HEAD
 
+### Minor Enhancements
+
+  * Add `Bayes#merge` (alias `combine`) to combine classifiers trained on separate shards by adding their sufficient statistics, producing a model equivalent to training on all documents at once. Shards are left untouched; incompatible feature extraction contracts are rejected.
+
 ### Documentation
 
   * Update macOS instructions in Numo docs (#199)
