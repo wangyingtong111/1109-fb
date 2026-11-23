@@ -1,9 +1,13 @@
 # frozen_string_literal: false
 class Matrix
   # Adapted from JAMA: http://math.nist.gov/javanumerics/jama/
-  # Like JAMA, this code does not support Complex matrices inputs.
+  # Like JAMA, the generic code does not support non-Hermitian Complex
+  # matrix inputs. Complex Hermitian matrices are handled by embedding the
+  # problem in a real symmetric matrix of twice the size, so their
+  # eigenvalues stay real while their eigenvectors remain complex.
 
-  # Eigenvalues and eigenvectors of a real matrix.
+  # Eigenvalues and eigenvectors of a real matrix, or of a complex
+  # Hermitian matrix.
   #
   # Computes the eigenvalues and eigenvectors of a matrix A.
   #
@@ -12,6 +16,9 @@ class Matrix
   # equal to the eigenvalues and V is formed by the eigenvectors.
   #
   # If A is symmetric, then V is orthogonal and thus A = V*D*V.t
+  #
+  # If A is Hermitian (which includes the symmetric case), then V is
+  # unitary, the eigenvalues are real, and thus A = V*D*V.adjoint
 
   class EigenvalueDecomposition
 
@@ -27,10 +34,15 @@ class Matrix
       @e = Array.new(@size, 0)
 
       if (@symmetric = a.symmetric?)
+        @hermitian = false
         @v = a.to_a
         tridiagonalize
         diagonalize
+      elsif (@hermitian = a.hermitian?)
+        @hermitian_rows = a.to_a
+        tridiagonalize_hermitian
       else
+        @hermitian = false
         @v = Array.new(@size) { Array.new(@size, 0) }
         @h = a.to_a
         @ort = Array.new(@size, 0)
@@ -49,8 +61,14 @@ class Matrix
     # Returns the inverse of the eigenvector matrix +V+
     #
     def eigenvector_matrix_inv
+      # build_eigenvectors holds the eigenvectors as rows, so r = V.t
       r = Matrix.send(:new, build_eigenvectors)
-      r = r.transpose.inverse unless @symmetric
+      if @hermitian
+        # V is unitary, so V.inv = V.adjoint = conj(V.t) = r.conjugate
+        r = r.conjugate
+      elsif !@symmetric
+        r = r.transpose.inverse
+      end
       r
     end
     alias_method :v_inv, :eigenvector_matrix_inv
@@ -59,7 +77,16 @@ class Matrix
     #
     def eigenvalues
       values = @d.dup
-      @e.each_with_index{|imag, i| values[i] = Complex(values[i], imag) unless imag == 0}
+      if @hermitian
+        # The spectrum of a Hermitian matrix is real: strip any zero
+        # imaginary part so callers receive plain real numbers.
+        values.map!(&:real)
+      else
+        @e.each_with_index do |imag, i|
+          values[i] = Complex(values[i], imag) unless imag == 0
+        end
+      end
+      values.map! { |value| value.is_a?(Complex) && value.imag == 0 ? value.real : value }
       values
     end
 
@@ -348,6 +375,114 @@ class Matrix
           end
         end
       end
+    end
+
+    # Hermitian reduction.
+    #
+    # A complex Hermitian matrix H = A + i*B (A real symmetric, B real
+    # skew-symmetric) is embedded in the real symmetric matrix
+    #
+    #   R = [ A  -B ]
+    #       [ B   A ]
+    #
+    # Every eigenvalue of R occurs twice: if z = x + i*y is an
+    # eigenvector of H for the real eigenvalue lambda, then (x, y) and
+    # (-y, x) are the two corresponding orthonormal eigenvectors of R.
+    # The real symmetric solver is therefore reused on R, after which
+    # the eigenvector pairs are recombined into the complex eigenvectors
+    # of H, and the duplicated eigenvalues are collapsed.
+
+    private def tridiagonalize_hermitian
+      n = @size
+      rows = @hermitian_rows
+      real = Array.new(n) { |i| Array.new(n) { |j| rows[i][j].real } }
+      imag = Array.new(n) { |i| Array.new(n) { |j| rows[i][j].imag } }
+
+      r = Array.new(2*n) do |i|
+        Array.new(2*n) do |j|
+          if i < n && j < n
+            real[i][j]
+          elsif i < n
+            -imag[i][j - n]
+          elsif j < n
+            imag[i - n][j]
+          else
+            real[i - n][j - n]
+          end
+        end
+      end
+      real_solver = self.class.new(Matrix.send(:new, r))
+
+      d = real_solver.eigenvalues
+      v_matrix = real_solver.eigenvector_matrix
+      v = Array.new(2*n) { |i| Array.new(2*n) { |j| v_matrix[i, j] } }
+      # d is sorted in ascending order, so equal (duplicated) eigenvalues
+      # are adjacent. Group the 2n eigenvectors into clusters sharing an
+      # eigenvalue before pairing them. The tolerance is deliberately
+      # generous: eigenvectors are only ever paired within a cluster, and
+      # genuinely distinct eigenvalues are far apart compared with the
+      # rounding error of the duplicated pair.
+      scale = (d.map(&:abs).max.to_f.nonzero? || 1.0)
+      tol = 1000 * Float::EPSILON * scale
+      clusters = []
+      d.each_with_index do |val, idx|
+        if !clusters.empty? && (val - d[clusters.last.first]).abs <= tol
+          clusters.last << idx
+        else
+          clusters << [idx]
+        end
+      end
+
+      pairs = []
+      unmatched = []
+      clusters.each do |cluster|
+        remaining = cluster.dup
+        while remaining.size >= 2
+          j = remaining.shift
+          best_k = nil
+          best_score = nil
+          # The partner of column j is the column k whose upper block is
+          # the negative of j's lower block (and whose lower block equals
+          # j's upper block). Pick the closest match in the cluster.
+          remaining.each do |k|
+            score = n.times.sum do |i|
+              (v[i][k] + v[n + i][j]).abs2 +
+              (v[n + i][k] - v[i][j]).abs2
+            end
+            if best_score.nil? || score < best_score
+              best_score = score
+              best_k = k
+            end
+          end
+          remaining.delete(best_k)
+          pairs << [j, best_k]
+        end
+        # Only possible if the tolerance split a duplicated pair; such a
+        # column is paired below against columns from another cluster.
+        unmatched.concat(remaining)
+      end
+      while unmatched.size >= 2
+        j = unmatched.shift
+        best_k = unmatched.min_by do |k|
+          n.times.sum do |i|
+            (v[i][k] + v[n + i][j]).abs2 +
+            (v[n + i][k] - v[i][j]).abs2
+          end
+        end
+        unmatched.delete(best_k)
+        pairs << [j, best_k]
+      end
+      pairs.sort_by! { |(j, k)| (d[j] + d[k]) / 2.0 }
+
+      @v = Array.new(n) { Array.new(n) }
+      pairs.each_with_index do |(j, _k), col|
+        @d[col] = d[j].real
+        n.times do |i|
+          @v[i][col] = Complex(v[i][j], v[n + i][j])
+        end
+      end
+      # Hermitian matrices always have real eigenvalues.
+      @e.fill(0)
     end
 
     # Nonsymmetric reduction to Hessenberg form.

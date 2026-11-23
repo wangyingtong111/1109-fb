@@ -800,6 +800,108 @@ class TestMatrix < Test::Unit::TestCase
     assert_in_epsilon(-4 * vectors[1][0], vectors[1][1])
   end
 
+  def test_eigensystem_hermitian
+    # Purely imaginary off-diagonal entries still take part in the
+    # decomposition; the spectrum is real and V stays complex/unitary.
+    m = Matrix[[2, Complex::I], [-Complex::I, 2]]
+    es = m.eigensystem
+    v, d, v_inv = es
+
+    assert(m.hermitian?)
+    assert(!m.symmetric?)
+    assert_equal([1.0, 3.0], es.eigenvalues)
+    assert(es.eigenvalues.all?(&:real?))
+    assert(d.diagonal?)
+
+    # V.adjoint * V = I (unitary eigenvector matrix)
+    identity = Matrix.identity(m.row_count)
+    (v.adjoint * v - identity).each do |e|
+      assert_in_epsilon(0, e.abs)
+    end
+
+    # V * D * V.adjoint = H
+    (v * d * v.adjoint - m).each do |e|
+      assert_in_epsilon(0, e.abs)
+    end
+
+    # For a unitary V, its inverse is its adjoint
+    (v_inv - v.adjoint).each do |e|
+      assert_in_epsilon(0, e.abs)
+    end
+
+    # Every reported eigenvector actually satisfies H z = lambda z
+    es.eigenvectors.each_with_index do |vec, k|
+      (m * vec - vec * es.eigenvalues[k]).each do |e|
+        assert_in_epsilon(0, e.abs)
+      end
+    end
+  end
+
+  def test_eigensystem_hermitian_general
+    # A larger Hermitian matrix with real and imaginary parts everywhere
+    m = Matrix[
+      [  3.0, Complex(1, -2), Complex(0, 1)],
+      [Complex(1, 2),    2.0, Complex(2, 3)],
+      [Complex(0, -1), Complex(2, -3), -1.0]
+    ]
+    assert(m.hermitian?)
+    es = m.eigensystem
+    v, d, v_inv = es
+    assert(es.eigenvalues.all?(&:real?))
+    assert_equal(es.eigenvalues.sort, es.eigenvalues)
+
+    (v * d * v_inv - m).each do |e|
+      assert_in_epsilon(0, e.abs)
+    end
+
+    (v.adjoint * v - Matrix.identity(m.row_count)).each do |e|
+      assert_in_epsilon(0, e.abs)
+    end
+  end
+
+  def test_eigensystem_hermitian_repeated_eigenvalues
+    # Degenerate spectrum: the realification produces repeated identical
+    # eigenvalues whose eigenvectors must still be paired correctly.
+    m = Matrix.identity(3)
+    es = m.eigensystem
+    assert_equal([1.0, 1.0, 1.0], es.eigenvalues)
+    v, d, v_inv = es
+    (v * d * v_inv - m).each do |e|
+      assert_in_epsilon(0, e.abs)
+    end
+    (v.adjoint * v - Matrix.identity(3)).each do |e|
+      assert_in_epsilon(0, e.abs)
+    end
+  end
+
+  def test_eigensystem_real_symmetric_still_supported
+    # Real symmetric matrices keep using the original entry point and
+    # yield an orthogonal V with A = V * D * V.t
+    m = Matrix[[2, 1], [1, 2]]
+    es = m.eigensystem
+    v, d, v_inv = es
+    assert_equal([1.0, 3.0], es.eigenvalues.map { |e| e.round(10) })
+
+    (v * d * v_inv - m).each do |e|
+      assert_in_epsilon(0, e.abs)
+    end
+    (v.transpose * v - Matrix.identity(2)).each do |e|
+      assert_in_epsilon(0, e.abs)
+    end
+  end
+
+  def test_eigensystem_non_hermitian_complex_still_raises
+    # Generic (non-Hermitian) complex inputs remain unsupported and fail
+    # through the original code path with the same kind of error.
+    m = Matrix[[1, Complex::I], [2 * Complex::I, 3]]
+    assert(!m.hermitian?)
+    assert_raise(NoMethodError) { m.eigensystem }
+  end
+
+  def test_eigensystem_type_error
+    assert_raise(TypeError) { Matrix::EigenvalueDecomposition.new([[1, 2], [3, 4]]) }
+  end
+
   def test_unitary?
     assert_equal true, @rot.unitary?
     assert_equal true, ((0+1i) * @rot).unitary?

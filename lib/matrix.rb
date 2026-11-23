@@ -1548,7 +1548,8 @@ class Matrix
   #   v.inv == v_inv # => true
   #   (v * d * v_inv).round(5) == m # => true
   #
-  # This is not supported for Complex matrices
+  # Complex matrices are only supported when they are Hermitian; in that
+  # case the eigenvalues are real and the eigenvector matrix is unitary.
   def eigensystem
     EigenvalueDecomposition.new(self)
   end
