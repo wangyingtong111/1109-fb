@@ -1,5 +1,9 @@
 ## HEAD
 
+### Minor Enhancements
+
+  * Add an explicit word frequency mode (`enable_word_frequency`) to the Bayesian classifier so repeated words in a classified text are counted multiple times, while the default scoring still counts each distinct word once and adds the category prior exactly once.
+
 ### Documentation
 
   * Update macOS instructions in Numo docs (#199)

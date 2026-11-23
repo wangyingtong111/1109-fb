@@ -27,6 +27,7 @@ module ClassifierReborn
     #   enable_threshold: false                   When true, enables a threshold requirement for classifition
     #   threshold:        0.0                     Default threshold, only used when enabled
     #   enable_stemmer:   true                    When false, disables word stemming
+    #   enable_word_frequency: false              When true, repeated words in a classified text are counted multiple times; the default scores each distinct word only once
     #   stopwords:        nil                     Accepts path to a text file or an array of words, when supplied, overwrites the default stopwords; assign empty string or array to disable stopwords
     #   backend:          BayesMemoryBackend.new  Alternatively, BayesRedisBackend.new for persistent storage
     def initialize(*args)
@@ -35,6 +36,7 @@ module ClassifierReborn
                   enable_threshold: false,
                   threshold: 0.0,
                   enable_stemmer: true,
+                  enable_word_frequency: false,
                   backend: BayesMemoryBackend.new }
       args.flatten.each do |arg|
         if arg.is_a?(Hash)
@@ -53,6 +55,7 @@ module ClassifierReborn
       @enable_threshold    = options[:enable_threshold]
       @threshold           = options[:threshold]
       @enable_stemmer      = options[:enable_stemmer]
+      @enable_word_frequency = options[:enable_word_frequency]
       @backend             = options[:backend]
       @tokenizer           = options[:tokenizer] || Tokenizer::Whitespace
       @token_filters       = options[:token_filters] || [TokenFilter::Stopword]
@@ -129,6 +132,12 @@ module ClassifierReborn
     #    b.classifications "I hate bad words and you"
     #    =>  {"Uninteresting"=>-12.6997928013932, "Interesting"=>-18.4206807439524}
     # The largest of these scores (the one closest to 0) is the one picked out by #classify
+    #
+    # By default each distinct word in +text+ contributes once, matching the
+    # binary "which words appeared" view of the document. When word frequency
+    # mode is enabled, a word's contribution is repeated as many times as it
+    # occurs in +text+ (after the configured tokenizer and token filters run).
+    # The category prior is always added exactly once.
     def classifications(text)
       score = {}
       word_hash = Hasher.word_hash(text, @enable_stemmer,
@@ -142,11 +151,12 @@ module ClassifierReborn
       category_keys.each do |category|
         score[category.to_s] = 0
         total = (@backend.category_word_count(category) || 1).to_f
-        word_hash.each do |word, _count|
+        word_hash.each do |word, count|
           s = @backend.word_in_category?(category, word) ? @backend.category_word_frequency(category, word) : 0.1
-          score[category.to_s] += Math.log(s / total)
+          weight = word_frequency_enabled? ? count : 1
+          score[category.to_s] += weight * Math.log(s / total)
         end
-        # now add prior probability for the category
+        # now add prior probability for the category, once per text
         s = @backend.category_has_trainings?(category) ? @backend.category_training_count(category) : 0.1
         score[category.to_s] += Math.log(s / @backend.total_trainings.to_f)
       end
@@ -202,6 +212,28 @@ module ClassifierReborn
     # Is word stemming disabled?
     def stemmer_disabled?
       !@enable_stemmer
+    end
+
+    # Dynamically enable word frequency mode, so repeated words in a
+    # classified text contribute their full occurrence count
+    def enable_word_frequency
+      @enable_word_frequency = true
+    end
+
+    # Dynamically disable word frequency mode, restoring the default of
+    # scoring each distinct word only once
+    def disable_word_frequency
+      @enable_word_frequency = false
+    end
+
+    # Is word frequency mode enabled?
+    def word_frequency_enabled?
+      @enable_word_frequency
+    end
+
+    # Is word frequency mode disabled?
+    def word_frequency_disabled?
+      !@enable_word_frequency
     end
 
     # Provides training and untraining methods for the categories specified in Bayes#new
