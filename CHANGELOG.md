@@ -1,0 +1,390 @@
+v.2.11.2
+========
+
+* Fix: ``composite_cols`` no longer raises the "separator occurs in the data"
+  ``ValueError`` for column groups containing missing values on pandas >= 3,
+  where ``astype(str)`` keeps missing values as NaN. The separator-collision
+  check now runs on complete rows only; behavior on pandas 2 is unchanged (#528).
+* Fix: ``CountEncoder`` now clears its learned rare-category groups at the start
+  of each fit, so refitting (including refitting a pipeline) with
+  ``min_group_size`` no longer applies a stale grouping from the previous fit (#529).
+* Chore: bumped ``certifi`` and ``urllib3`` in ``poetry.lock`` (#551, #535).
+
+v.2.11.1
+========
+
+* Fix: ``NestedCVWrapper.fit_transform`` now returns out-of-fold rows in the
+  input's original order (issue#526). Previously the per-fold encodings were
+  concatenated in cross-validation iteration order, so with a shuffling
+  splitter (including the wrapper's default ``StratifiedKFold``) positional
+  consumers (NumPy arrays, ``.iloc``, scikit-learn estimators) received rows
+  misaligned with ``y`` even though the index labels were correct.
+
+v.2.11.0
+========
+
+* Docs: Fixed issue#400 - ``OneHotEncoder``'s ``handle_missing='value'`` docstring wrongly
+  claimed missing values are zero-filled; corrected it to describe the actual (and, per
+  ``test_missing_values``, intended library-wide) behavior of treating a missing value seen
+  during fit as its own category, same as ``MultiHotEncoder``'s existing ``value``/``ignore``
+  split. No behavior change: the existing ``ignore`` option already zero-fills missing values.
+* Docs: Added a documentation page on how category_encoders differs from
+  scikit-learn conventions (issue#480).
+* Feat: Added ``handle_missing='ignore'`` to ``RankHotEncoder``, matching the option already
+  available on ``OneHotEncoder`` and ``MultiHotEncoder`` (issue#400's RankHotEncoder gap).
+  Zero-fills a missing value at both fit and transform time, without adding an extra
+  thermometer column for it; the default ``value`` behavior (own category, unchanged) still
+  matches ``test_missing_values``' library-wide invariant.
+* Feat: Added issue#420 - ``CountTargetEncoder``, a supervised count-based
+  encoder that stores per-class category counts and encodes categories as
+  smoothing-adjusted log-odds against the global target prior (binary targets
+  emit one WOE-style column, multiclass targets one column per class).
+  Classification-only for now; a binning-based regression variant is planned
+  as a follow-up.
+* Feat: Added ``MultiHotEncoder``, an unsupervised encoder for delimiter-separated
+  multi-value cells (e.g. ``'mathematics|physics'``): every distinct item seen at
+  fit gets one binary column, with configurable ``delimiter`` and the usual
+  ``handle_unknown``/``handle_missing`` support (issue#161).
+* Feat: Added ``composite_cols`` on supervised encoders (Target, MEstimate, WOE,
+  JamesStein, CatBoost, GLMM, LeaveOneOut, Quantile): joint ("composite") target
+  encoding of column groups passed as tuples, learning statistics over
+  combinations rather than per column (issue#429). A new ``keep_components``
+  flag controls whether component columns are kept alongside the output.
+* Feat: Generalized ``min_group_size``/``min_group_name`` rare-category lumping
+  from ``CountEncoder`` to every encoder derived from ``BaseEncoder``; small
+  groups are merged before the encoder's own statistics are computed (issue#279).
+* Feat: ``handle_unknown``/``handle_missing`` now accept callables and integers
+  across the supervised and ordinal encoders: a callable receives the
+  unknown/missing value and returns the encoding to use, an integer assigns a
+  dedicated code (issues #283, #344). The ad-hoc ``-1``/``-2`` codes are now
+  shared sentinel constants and mapping finalization is centralized in one helper.
+* Perf: ``OneHotEncoder.transform``'s dummy expansion now assembles the output
+  with a single allocation instead of a per-column accumulator: measured peak
+  memory on a 100k×10×20 frame dropped 626 → 337 MB (−46%) (issue#362). Repro
+  script: ``benchmarks/repro-362.py``.
+* Perf: Removed redundant input copies from the shared ordinal preprocessing
+  passes used by WOE and OneHotEncoder (issues #364; PRs #503, #518).
+* Fix: encoders fitted on a DataFrame now accept arraylike input at ``transform``
+  (e.g. the numpy array emitted by the previous step of a scikit-learn pipeline):
+  the fitted column names are re-attached positionally and object/category dtypes
+  are restored, so the output matches transforming the equivalent DataFrame
+  (GH #406). ``OrdinalEncoder.inverse_transform`` re-attaches the fitted output
+  names for arraylike input, matching the BaseN/OneHot precedent.
+* Fix: fitting on a non-DataFrame input with named ``cols`` now explains in the
+  error that the names cannot be recovered positionally and how to proceed.
+* Fix: ``transform`` now accepts DataFrames carrying extra pass-through columns
+  beyond the encoded ones (GH #355 scenario, GH #367). Arraylike inputs keep the
+  strict dimension check, and missing encoded columns raise a clear error naming
+  them instead of a ``KeyError``.
+* Fix: ``GrayEncoder.inverse_transform`` now recovers the original categories.
+  Previously it inherited the positional base-N decoder from ``BaseNEncoder``,
+  which cannot invert a Gray code (consecutive code words differ by a single
+  bit and are not positional), so it returned the wrong categories.
+* Fix: Categorical missing values in ``CatBoostEncoder`` and ``RankHotEncoder``
+  are now handled consistently instead of producing degenerate encodings.
+* Fix: ``QuantileEncoder`` collapses singleton (unique-value) levels to the prior
+  instead of emitting degenerate quantile statistics (issue#327).
+* Fix: Encoders used inside scikit-learn CV without ``fit`` now raise an
+  informative ``NotFittedError`` naming the encoder instead of an opaque
+  ``AttributeError`` (issue#232 follow-up).
+* Change: Removed direct dependency on ``patsy``. The four contrast-coding
+  encoders (Polynomial, Helmert, BackwardDifference, Sum) now build their
+  contrast matrices in-tree.
+* Change: ``statsmodels`` is now an optional extra. ``GLMMEncoder`` is
+  loaded lazily and raises a clear ``ImportError`` if statsmodels is not
+  installed. Install with ``pip install category_encoders[glmm]`` to use
+  it. Removes both ``statsmodels`` and ``patsy`` from the default install.
+
+v.2.10.0
+========
+
+* Release: JOSS review release. Consolidated citation metadata with the JOSS
+  paper via new ``.zenodo.json`` and ``CITATION.cff`` files, and pointed the
+  README DOI badge at the Zenodo concept DOI (always resolves to the latest
+  version).
+* Feat: Added issue#291 - ``index_start`` parameter on OrdinalEncoder for
+  zero-indexed labels.
+* Feat: Added issue#456 - ``cols="all"`` encodes every column regardless of
+  dtype (useful inside sklearn ``ColumnTransformer``).
+* Fix: Fixed issue#168 - encoders now raise ValueError on unrecognised
+  handle_missing/handle_unknown string values instead of silently treating
+  them as the default.
+* Fix: Fixed issue#190 - inverse_transform with drop_invariant=True now
+  raises a clear ValueError instead of an opaque IndexError /
+  "X is not in list" error.
+* Fix: Fixed issue#333 - clarified that the Gaussian regularization
+  noise (``sigma`` parameter on TargetEncoder/LOO/CatBoost/WOE/GLMM/
+  JamesStein/MEstimate) is *multiplicative* (``X * N(1, sigma)``), not
+  additive.
+* Fix: Fixed issue#402 - clarified HashingEncoder ``n_components``
+  docstring (it is the number of output hash buckets, not bits).
+* Fix: Fixed issue#442 - encoders now honor return_df=False even when
+  the resolved column list is empty (e.g. on a numeric-only DataFrame).
+* Fix: Fixed issue#457 - CountEncoder with ``normalize=True`` and
+  ``drop_invariant=True`` no longer drops all output columns.
+* Fix: Fixed issue#486 - GLMMEncoder regression path used positional
+  ``Series[0]`` access that raised ``KeyError`` on recent pandas; use
+  ``.iloc[0]`` instead. Also fixed the bundled ``examples`` script
+  (removed the ``LogisticRegression(multi_class=...)`` argument removed in
+  scikit-learn 1.9).
+* Fix: Fixed issue#488 - encoders no longer raise ``NotFittedError`` during
+  ``fit``/``fit_transform`` when scikit-learn's ``transform_output='pandas'``
+  is configured globally or via a ``ColumnTransformer``.
+* Docs: Spelling fixes throughout the codebase (#464).
+
+v.2.9.0
+=======
+
+* Breaking: Dropped support for python 3.10
+* Change: Updated some dependencies to latest versions.
+* Fix:  Fixed issue#460 - TargetEncoder cannot be cloned.
+
+v.2.8.1
+=======
+
+* Fix: Support and test string targets and `pd.Categorical` targets.
+* Fix: Docs typo.
+ 
+v.2.8.0
+=======
+
+* Fix: Support new concept of sklearn tags, now requiring sklearn >= 1.6.0
+* Fix: Docs deployment
+
+v.2.7.0
+=======
+
+* Refactor: Use poetry as packaging tool
+* Refactor: Add more typing
+* Refactor: Add format checks
+* Change `feature_names_in_` and `feature_names_out_` to `np.ndarray` instead of lists.
+* Fixed: Support python 3.11, 3.12, 3.13.
+* Breaking: Drop support for python 3.7, 3.8 and 3.9
+* Breaking: No longer add intercept in contrast coding schemes.
+
+v2.6.4
+======
+* fixed: Future Warning in Pandas
+* fixed: np.NaNs in numpy 2.x
+* improved: performance of the hashing encoder (about twice as fast)
+  * deprecate the `max_sample`` parameter, it has no use anymore
+  * add `process_creation_method` parameter
+  * use concurrent.futures.ProcessPoolExecutor instead of hand-managed queues
+  * optimisations to hashlib calls, remove python 2 checks, fork instead of spawn
+
+v2.6.3
+======
+* fixed: issue 424 - pandas NaNs
+* fixed: pandas deprecations and ruff linter suggestions
+* fixed: issue 421 - detect pandas categorical type as categorical column
+
+v2.6.2
+======
+* fixed: issue 414 - broken link
+* fixed: issue 412 - timestamp types in ordinal encoder
+* fixed: `importlib` instead of `pkg_resources`
+
+v2.6.1
+======
+* added: ignore option for one-hot-encoding
+* fixed: external dependency in unit test
+* fixed: gaps in ordinal encoding if nan values are present
+* fixed: sklearn compliance: add `feature_names_in_` attribute
+* fixed: sklearn compliance: `get_feature_names_out` function has the correct signature
+* fixed: add RankHotEncoder in documentation
+* fixed: return correct mapping in one hot encoder `category_mapping` property (issue #256)
+* refactor: quadratic runtime in ordinal encoder (issue #407)
+
+v2.6.0
+======
+* added gray encoder
+* added thermometer / rank-hot encoder
+* introduce compatibility with sklearn 1.2
+  * compatibility with `feature_names_out_`
+  * remove boston housing dataset
+  * drop support for dataframes with non-homogenous data types in column names (i.e. having both string and integer column names)
+* improve performance of hashing encoder
+* improve catboost documentation
+* fix inverse transform in baseN with special character column names (issue 392)
+* fix inverse transform of ordinal encoder with custom mapping (issue 202)
+* fix re-fittable polynomial wrapper (issue 313)
+* fix numerical stability for target encoding (issue 377)
+* change default parameters of target encoding (issue 327)
+* drop support for sklearn 0.x
+ 
+v2.5.1.post0
+============
+* fix pypi sdist
+
+v2.5.1
+======
+* Added base class for contrast coding schemes in order to make them more maintainable
+* Added hierarchical column feature in target encoder
+* Fixed maximum recursion depth bug in hashing encoder
+
+v2.5.0
+======
+
+* Introduce base class for encoders
+* Introduce tagging system on encoders and use it to parametrize tests
+* Drop support for python 3.5 and python 3.6
+* Require pandas >=1.0
+* Introduce f-strings
+* Make BinaryEncoder a BaseNEncoder for base=2
+* FutureWarning for TargetEncoder's default parameters
+* Made all encoders re-fittable on different datasets (c.f. issue 122)
+* Introduced tox.ini file for easier version testing
+ 
+v2.4.1
+======
+
+* Fixed a bug with categorical data type in LeaveOneOut encoder
+* Do not install examples as a package on its own
+ 
+v2.4.0
+======
+
+* improved documentation
+* fix bug in CatBoost encoder
+* fix future warnings with pandas
+* added tests for python 3.9 and 3.10 in pipeline
+* fix treating np.NaN and python None equal
+* only build docs on release
+* unified conversion of inputs pandas objects that are used internally including some bugfixes.
+* added quantile encoder and summary encoder
+ 
+v2.3.0
+======
+
+ * many bugfixes
+ * added count encoder
+ 
+v2.2.2
+======
+* Added generalized linear mixed model encoder
+* Added cross-validation wrapper
+* Added multi-class wrapper
+* Support for pandas >= 1.0.1
+* Moved CI to github actions
+
+v2.1.0
+======
+
+* Added experimental support for multithreading in hashing encoder
+* Support for pandas >=0.24
+* Removed support for missing values represented by None due to changes in Pandas 0.24. Use numpy.NaN
+* Changed the default setting of Helmert encoder for handle_missing and handle_unknown
+* Fixed wrong calculation in m-estimate encoder
+* Fixed missing value handling in CatBoost encoder
+
+v2.0.0
+======
+
+ * Added James-Stein, CatBoost and m-estimate encoders
+ * Added get_feature_names method
+ * Refactored treatment of missing and new values 
+ * Speed up the encoders with vectorization
+ * Improved compatibility with Pandas Series and Numpy Arrays
+
+v1.3.0
+======
+
+ * Added Weight of Evidence encoder
+
+v1.2.8
+======
+
+ * Critical bugfix in hashing encoder
+
+v1.2.7
+======
+
+ * Bugfixes related to missing value imputation
+ * Category names optionally added to encoded column names for some encoders
+ * Documentation updates
+ * Stats models pinned to avoid errors
+ * Performance enhancements
+
+v1.2.6
+======
+
+ * Release for zenodo DOI
+ * Inverse transform implemented for some encoders
+
+v1.2.5
+======
+
+ * Onehot transform returns same columns always
+ * Missing value and unknown handling now configurable in all relevant encoders
+ 
+v1.2.4
+======
+
+ * Added more sophisticated missing value or unknown category handling to ordinal
+ * Passing through missing value config from onehot into ordinal
+ * Onehot will return an extra column when unknown categories are passed in if impute is used.
+ * Added BaseNEncoder to allow for more flexible alternatives to ordinal, onehot and binary.
+ 
+v1.2.3
+======
+
+ * Full support for numpy arrays as input, not just dataframes.
+ 
+v1.2.2
+======
+
+ * All encoders handle missing values and are tested for their handling
+ * Created a onehot encoder that follows the same conventions as the rest of the library instead of using sklearns.
+ * Did some basic benchmarking for data compression and memory usage, made some performance improvements
+ * Changed all docstrings to numpy style and added more documentation
+ * Moved all logic methods into staticmethods of the transformer classes themselves.
+ * Added more detailed checks for type and shape of input data in fit and transform
+ * Support input as list of lists, alongside numpy arrays and pandas dataframes.
+ 
+v1.2.1
+======
+
+ * Better handling for missing values in hashing encoder
+ 
+v1.2.0
+======
+
+ * Testing enhancements
+ * Hash type in hashing encoder now defaults to md5 using hashlib, but can be set to any valid hashlib hash
+
+v1.1.2
+======
+
+ * Added optional parameter to return a numpy array rather than a dataframe from all transformers.
+ 
+v1.1.1
+======
+
+ * Immediately return if cols is empty.
+ 
+
+v1.1.0
+======
+
+ * Optionally pass drop_invariant to any encoder to consistently drop columns with 0 variance from the output (based on training set data in fit())
+ * If None is passed as the cols param, every string column will be encoded (pandas type = object).
+ 
+v1.0.5
+======
+
+ * Changed setup.py to not explicitly force reinstalls of other packages
+ 
+v1.0.4
+======
+
+ * Bugfixes
+ 
+v1.0.0
+======
+
+ * First real usable release, includes sklearn compatible encoders.
+ 
+v0.0.1
+======
+
+ * Basic library of encoders, no automated testing.
