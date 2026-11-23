@@ -159,6 +159,37 @@ reloaded_retriever = bm25s.BM25.load("animal_index_bm25", load_corpus=True)
 # set load_corpus=False if you don't need the corpus
 ```
 
+### Append New Documents
+
+An index can be extended without re-indexing the documents it already contains, and
+without keeping their texts around:
+
+```python
+retriever = bm25s.BM25()
+retriever.index(bm25s.tokenize(["oak oak", "ash"]))
+
+# append new (tokenized) documents, in one or several batches
+retriever.append(bm25s.tokenize(["oak ash reed reed"]))
+retriever.append(bm25s.tokenize(["reed"]))
+
+# documents keep the IDs they got at index time (0 and 1 here), and the scores are
+# identical to a single rebuild over all four documents
+scores = retriever.get_scores(["oak", "reed"])
+```
+
+To make this possible, `index()` keeps a compact summary of each document: its length
+and the term frequency of every token it contains (no raw text). When documents are
+appended, the whole score matrix is recomputed from those summaries, so document
+frequencies, IDF values and the average document length are derived over the complete
+corpus — old and new documents get exactly the scores they would have gotten from a
+single full rebuild. The statistics are saved with `save()` and restored by `load()`,
+so an index can also be extended after being reloaded. Pass `store_stats=False` to
+`index()` if you know the index will never grow.
+
+If the retriever holds a `corpus` (see the next section), pass the matching entries to
+`append(..., documents=[...])` so retrieval keeps returning the right values for the
+old documents.
+
 ### Corpus Format
 
 `bm25s` separates the text you index from the values you get back. Pass

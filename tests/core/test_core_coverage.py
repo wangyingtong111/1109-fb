@@ -443,5 +443,159 @@ class TestBM25LoadingSaving(unittest.TestCase):
         self.assertEqual(len(loaded.corpus), len(self.corpus))
 
 
+class TestBM25Append(unittest.TestCase):
+    """Tests for appending documents to an already built index"""
+
+    initial_corpus = [["oak", "oak"], ["ash"]]
+    appended_corpus = [["oak", "ash", "reed", "reed"], ["reed"]]
+    query = ["oak", "reed"]
+
+    def _build_appended(self, method="lucene"):
+        retriever = BM25(method=method, backend="numpy")
+        retriever.index(self.initial_corpus, show_progress=False)
+        retriever.append([self.appended_corpus[0]], show_progress=False)
+        retriever.append([self.appended_corpus[1]], show_progress=False)
+        return retriever
+
+    def _build_full(self, method="lucene"):
+        retriever = BM25(method=method, backend="numpy")
+        retriever.index(self.initial_corpus + self.appended_corpus, show_progress=False)
+        return retriever
+
+    def test_append_keeps_old_document_ids(self):
+        """The documents indexed first keep IDs 0 and 1 after appending"""
+        retriever = self._build_appended()
+        self.assertEqual(retriever.scores["num_docs"], 4)
+
+        results = retriever.retrieve([self.query], k=4, show_progress=False)
+        # doc 0 contains "oak", docs 2 and 3 contain the query terms as well
+        self.assertIn(0, results.documents[0].tolist())
+        self.assertIn(1, results.documents[0].tolist())
+
+        # scoring a single document ID still refers to the same document
+        scores = retriever.get_scores(self.query)
+        np.testing.assert_allclose(scores[0], 0.3960841, rtol=1e-5)
+        self.assertEqual(scores[1], 0.0)
+
+    def test_append_matches_full_rebuild(self):
+        """Scores after appending equal the scores of a single full rebuild"""
+        for method in ["lucene", "robertson", "atire", "bm25l", "bm25+"]:
+            appended = self._build_appended(method=method)
+            rebuilt = self._build_full(method=method)
+
+            np.testing.assert_array_equal(
+                appended.get_scores(self.query),
+                rebuilt.get_scores(self.query),
+                err_msg=f"Mismatch for method={method}",
+            )
+
+            appended_res = appended.retrieve([self.query], k=4, show_progress=False)
+            rebuilt_res = rebuilt.retrieve([self.query], k=4, show_progress=False)
+            np.testing.assert_array_equal(
+                appended_res.documents, rebuilt_res.documents
+            )
+            np.testing.assert_array_equal(appended_res.scores, rebuilt_res.scores)
+
+    def test_append_then_reload_is_stable(self):
+        """Saving and reloading an appended index keeps results and ID order"""
+        retriever = self._build_appended()
+        expected = retriever.retrieve([self.query], k=4, show_progress=False)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            retriever.save(tmpdir, show_progress=False)
+            reloaded = BM25.load(tmpdir)
+
+            self.assertEqual(reloaded.vocab_dict, retriever.vocab_dict)
+            actual = reloaded.retrieve([self.query], k=4, show_progress=False)
+
+            np.testing.assert_array_equal(actual.documents, expected.documents)
+            np.testing.assert_array_equal(actual.scores, expected.scores)
+
+            # the reloaded index can still be appended to
+            reloaded.append([["ash"]], show_progress=False)
+            self.assertEqual(reloaded.scores["num_docs"], 5)
+
+    def test_append_with_tokenized_batches(self):
+        """Appending tokenized batches with an evolving vocabulary works"""
+        tokenizer = bm25s.tokenization.Tokenizer()
+
+        def tokenize(texts, update_vocab):
+            return tokenizer.tokenize(
+                texts,
+                update_vocab=update_vocab,
+                return_as="tuple",
+                show_progress=False,
+            )
+
+        retriever = BM25(backend="numpy")
+        retriever.index(tokenize(["oak oak", "ash"], update_vocab=True), show_progress=False)
+        retriever.append(tokenize(["oak ash reed reed"], update_vocab=True), show_progress=False)
+        retriever.append(tokenize(["reed"], update_vocab=True), show_progress=False)
+
+        rebuilt = BM25(backend="numpy")
+        rebuilt.index(
+            tokenize(["oak oak", "ash", "oak ash reed reed", "reed"], update_vocab=False),
+            show_progress=False,
+        )
+
+        np.testing.assert_array_equal(
+            retriever.get_scores(self.query), rebuilt.get_scores(self.query)
+        )
+
+    def test_append_requires_stats(self):
+        """Appending to an index built without statistics raises an error"""
+        retriever = BM25(backend="numpy")
+        retriever.index(self.initial_corpus, show_progress=False, store_stats=False)
+
+        with self.assertRaises(ValueError) as context:
+            retriever.append([["reed"]], show_progress=False)
+        self.assertIn("per-document statistics", str(context.exception))
+
+    def test_append_rejects_unknown_token_ids(self):
+        """Appending raw token IDs outside the current ID space raises an error"""
+        retriever = BM25(backend="numpy")
+        retriever.index(self.initial_corpus, show_progress=False)
+
+        with self.assertRaises(ValueError) as context:
+            retriever.append([[999]])
+        self.assertIn("out of range", str(context.exception))
+
+    def test_append_keeps_attached_corpus_aligned(self):
+        """Appending keeps the corpus returned by retrieve aligned with the doc IDs"""
+        retriever = BM25(backend="numpy", corpus=["doc0", "doc1"])
+        retriever.index(self.initial_corpus, show_progress=False)
+
+        # the retriever owns a corpus, so the new entries must be provided
+        with self.assertRaises(ValueError) as context:
+            retriever.append([["reed"]], show_progress=False)
+        self.assertIn("needs the matching", str(context.exception))
+        # the failed append left the index untouched
+        self.assertEqual(retriever.scores["num_docs"], 2)
+        self.assertEqual(retriever.corpus, ["doc0", "doc1"])
+
+        retriever.append([self.appended_corpus[0]], documents=["doc2"], show_progress=False)
+        retriever.append([self.appended_corpus[1]], documents=["doc3"], show_progress=False)
+
+        results = retriever.retrieve([self.query], k=4, show_progress=False)
+        for doc_id, document in zip([2, 0, 3, 1], results.documents[0]):
+            self.assertEqual(document, f"doc{doc_id}")
+
+    def test_append_failure_does_not_mutate_index(self):
+        """A rejected append leaves the index usable and unchanged"""
+        retriever = BM25(backend="numpy")
+        retriever.index(self.initial_corpus, show_progress=False)
+
+        with self.assertRaises(ValueError):
+            retriever.append([[12345]])
+
+        self.assertEqual(retriever.scores["num_docs"], 2)
+        self.assertEqual(
+            set(retriever.vocab_dict), {"oak", "ash", ""}
+        )
+
+        retriever.append([["reed"]], show_progress=False)
+        self.assertEqual(retriever.scores["num_docs"], 3)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -56,6 +56,9 @@ from .scoring import (
     _calculate_doc_freqs,
     _build_idf_array,
     _build_nonoccurrence_array,
+    _build_stats_from_corpus_token_ids,
+    _build_scores_and_indices_for_stats,
+    _doc_frequencies_from_stats,
     _np_csc_python,
     _np_csc_jit_ready,
 )
@@ -220,6 +223,10 @@ class BM25:
         self._original_version = __version__
         self.csc_backend = csc_backend
 
+        # Per-document statistics (tf + lengths) kept so that `append` can extend the
+        # index later; populated by `index` and by `load` when they were saved.
+        self.doc_stats = None
+
         if backend == "auto":
             self.backend = "numba" if NUMBA_AVAILABLE else "numpy"
         else:
@@ -329,6 +336,7 @@ class BM25:
         corpus_token_ids: List[List[int]],
         show_progress=True,
         leave_progress=False,
+        store_stats=True,
     ):
         """
         Low-level function to build the BM25 index from token IDs, used by the `index` method,
@@ -348,6 +356,12 @@ class BM25:
 
         leave_progress : bool
             If True, the progress bars will remain after the function completes.
+
+        store_stats : bool
+            If True, the per-document term-frequency statistics are stored on the index
+            (`self.doc_stats`). They hold no raw text, only word frequencies and lengths,
+            but they allow `append` to add documents later and to rebuild the score
+            matrix without revisiting the original documents.
         """
         if self.csc_backend not in ["scipy", "numpy"]:
             raise ValueError(
@@ -357,6 +371,13 @@ class BM25:
         avg_doc_len = np.array([len(doc_ids) for doc_ids in corpus_token_ids]).mean()
         n_docs = len(corpus_token_ids)
         n_vocab = len(unique_token_ids)
+
+        # Step 0: optionally remember the per-document statistics (tf + lengths), so
+        # that new documents can be appended later without revisiting the corpus.
+        if store_stats:
+            self._set_doc_stats_from_corpus_token_ids(corpus_token_ids)
+        else:
+            self.doc_stats = None
 
         # Step 1: Calculate the number of documents containing each token
         doc_frequencies = _calculate_doc_freqs(
@@ -409,6 +430,19 @@ class BM25:
         )
 
         # Now, we build the sparse matrix
+        return self._build_scores_matrix(
+            scores_flat=scores_flat,
+            doc_idx=doc_idx,
+            vocab_idx=vocab_idx,
+            n_docs=n_docs,
+            n_vocab=n_vocab,
+        )
+
+    def _build_scores_matrix(self, scores_flat, doc_idx, vocab_idx, n_docs, n_vocab):
+        """
+        Build the CSC score matrix (as a dict of arrays) from the per-posting scores,
+        document indices, and vocabulary indices.
+        """
         if self.csc_backend == "scipy":
             score_matrix = sp.csc_matrix(
                 (scores_flat, (doc_idx, vocab_idx)),
@@ -437,8 +471,123 @@ class BM25:
         }
         return scores
 
+    def _set_doc_stats_from_corpus_token_ids(self, corpus_token_ids):
+        """
+        Store the per-document statistics (unique token IDs, term frequencies, and
+        document lengths) used by `append` and `rebuild_scores`.
+        """
+        indptr, token_ids, tf, doc_lens = _build_stats_from_corpus_token_ids(
+            corpus_token_ids, int_dtype=self.int_dtype
+        )
+        self.doc_stats = {
+            "indptr": indptr,
+            "token_ids": token_ids,
+            "tf": tf,
+            "doc_lens": doc_lens,
+        }
+
+    def _append_doc_stats_from_corpus_token_ids(self, corpus_token_ids):
+        """
+        Extend the stored per-document statistics with a batch of new documents. The new
+        documents are appended *after* the existing ones, so that previously assigned
+        document IDs keep their meaning.
+        """
+        new_indptr, new_token_ids, new_tf, new_doc_lens = (
+            _build_stats_from_corpus_token_ids(corpus_token_ids, int_dtype=self.int_dtype)
+        )
+
+        old_indptr = self.doc_stats["indptr"]
+        offset = int(old_indptr[-1])
+
+        # drop the leading zero of the new indptr (it duplicates the last old offset)
+        appended_indptr = new_indptr[1:] + offset
+
+        self.doc_stats = {
+            "indptr": np.concatenate([old_indptr, appended_indptr]).astype(np.int64),
+            "token_ids": np.concatenate(
+                [self.doc_stats["token_ids"], new_token_ids]
+            ).astype(self.int_dtype),
+            "tf": np.concatenate([self.doc_stats["tf"], new_tf]).astype(np.int64),
+            "doc_lens": np.concatenate(
+                [self.doc_stats["doc_lens"], new_doc_lens]
+            ).astype(np.int64),
+        }
+
+    def _rebuild_scores_from_doc_stats(self, n_vocab):
+        """
+        Recompute the whole score matrix from the stored per-document statistics.
+
+        This is a full recomputation over *all* documents (old and new): document
+        frequencies, the average document length, the IDF array, and the (optional)
+        non-occurrence array are all derived again from the accumulated statistics.
+        As a result, the scores are identical to the ones obtained by rebuilding the
+        index from every document text at once, while only the new documents had to be
+        provided by the caller.
+        """
+        stats = self.doc_stats
+        stats_indptr = stats["indptr"]
+        stats_token_ids = stats["token_ids"]
+        stats_tf = stats["tf"]
+        doc_lens = stats["doc_lens"]
+
+        n_docs = len(doc_lens)
+        avg_doc_len = doc_lens.mean()
+
+        # `append` reserves a column for every vocabulary entry, so all real token IDs are
+        # below `n_vocab`; the arrays are sized exactly like in a full rebuild.
+        doc_frequencies = _doc_frequencies_from_stats(
+            stats_indptr, stats_token_ids, n_vocab
+        )
+
+        if self.method in self.methods_requiring_nonoccurrence:
+            self.nonoccurrence_array = _build_nonoccurrence_array(
+                doc_frequencies=doc_frequencies,
+                n_docs=n_docs,
+                compute_idf_fn=_select_idf_scorer(self.idf_method),
+                calculate_tfc_fn=_select_tfc_scorer(self.method),
+                l_d=avg_doc_len,
+                l_avg=avg_doc_len,
+                k1=self.k1,
+                b=self.b,
+                delta=self.delta,
+                dtype=self.dtype,
+            )
+        else:
+            self.nonoccurrence_array = None
+
+        idf_array = _build_idf_array(
+            doc_frequencies=doc_frequencies,
+            n_docs=n_docs,
+            compute_idf_fn=_select_idf_scorer(self.idf_method),
+            dtype=self.dtype,
+        )
+
+        scores_flat, doc_idx, vocab_idx = _build_scores_and_indices_for_stats(
+            stats_indptr=stats_indptr,
+            stats_token_ids=stats_token_ids,
+            stats_tf=stats_tf,
+            doc_lens=doc_lens,
+            idf_array=idf_array,
+            avg_doc_len=avg_doc_len,
+            k1=self.k1,
+            b=self.b,
+            delta=self.delta,
+            method=self.method,
+            nonoccurrence_array=self.nonoccurrence_array,
+            dtype=self.dtype,
+            int_dtype=self.int_dtype,
+        )
+
+        return self._build_scores_matrix(
+            scores_flat=scores_flat,
+            doc_idx=doc_idx,
+            vocab_idx=vocab_idx,
+            n_docs=n_docs,
+            n_vocab=n_vocab,
+        )
+
     def build_index_from_tokens(
-        self, corpus_tokens, show_progress=True, leave_progress=False
+        self, corpus_tokens, show_progress=True, leave_progress=False, store_stats=True
     ):
         """
         Low-level function to build the BM25 index from tokens, used by the `index` method.
@@ -468,6 +617,7 @@ class BM25:
             corpus_token_ids=corpus_token_ids,
             show_progress=show_progress,
             leave_progress=leave_progress,
+            store_stats=store_stats,
         )
 
         return scores, vocab_dict
@@ -478,6 +628,7 @@ class BM25:
         create_empty_token=True,
         show_progress=True,
         leave_progress=False,
+        store_stats=True,
     ):
         """
         Given a `corpus` of documents, create the BM25 index. The `corpus` can be either:
@@ -513,13 +664,23 @@ class BM25:
 
         leave_progress : bool
             If True, the progress bars will remain after the function completes.
+
+        store_stats : bool
+            If True (default), the index keeps a compact summary of each document: its
+            length and, for every token it contains, its term frequency. This contains
+            no raw text and is what allows `append` to add documents later while still
+            producing the same scores as a full rebuild. Set to False to save memory if
+            the index will never be extended.
         """
         inferred_corpus_obj = self._infer_corpus_object(corpus)
 
         if inferred_corpus_obj == "tokens":
             logger.debug(msg="Building index from tokens")
             scores, vocab_dict = self.build_index_from_tokens(
-                corpus, leave_progress=leave_progress, show_progress=show_progress
+                corpus,
+                leave_progress=leave_progress,
+                show_progress=show_progress,
+                store_stats=store_stats,
             )
         else:
             if inferred_corpus_obj == "tuple":
@@ -557,6 +718,7 @@ class BM25:
                 corpus_token_ids=corpus_token_ids,
                 leave_progress=leave_progress,
                 show_progress=show_progress,
+                store_stats=store_stats,
             )
 
         if create_empty_token:
@@ -568,6 +730,240 @@ class BM25:
 
         # we create unique token IDs from the vocab_dict for faster lookup
         self.unique_token_ids_set = set(self.vocab_dict.values())
+
+    def _entries_from_append_corpus(self, corpus):
+        """
+        Normalize an append batch, returning ``(uses_vocab_keys, entries)``.
+
+        The batch is interpreted the same way `index` interprets it: token IDs coming from
+        a ``(ids, vocab)`` tuple or an object with ``ids`` and ``vocab`` are mapped back to
+        the tokens they stand for. A bare list of token IDs is ambiguous, so it is treated
+        as vocabulary keys when every ID is already a key of this index's vocabulary
+        (e.g. an index built from integer token IDs), and otherwise as internal column
+        indices of this index.
+        """
+        inferred_corpus_obj = self._infer_corpus_object(corpus)
+
+        if inferred_corpus_obj == "tokens":
+            return True, [list(entry) for entry in corpus]
+
+        if inferred_corpus_obj == "token_ids":
+            entries = [list(entry) for entry in corpus]
+            if self.vocab_dict is not None:
+                known = set(self.vocab_dict)
+                if all(token_id in known for entry in entries for token_id in entry):
+                    return True, entries
+            return False, entries
+
+        if inferred_corpus_obj == "tuple":
+            corpus_token_ids, corpus_vocab = corpus
+        elif inferred_corpus_obj == "object":
+            corpus_token_ids = corpus.ids
+            corpus_vocab = corpus.vocab
+        else:
+            raise ValueError(
+                "Internal error: Found an invalid corpus object, indicating `_inferred_corpus_object` is not working correctly."
+            )
+
+        # Map the external token IDs back to the tokens they stand for, so that they can
+        # be looked up in (or added to) this index's vocabulary.
+        id_to_token = {value: key for key, value in corpus_vocab.items()}
+        return True, [
+            [id_to_token[token_id] for token_id in tokens]
+            for tokens in corpus_token_ids
+        ]
+
+    def _validate_attached_corpus_extension(self, documents, n_new_docs):
+        """
+        Validate the values that `retrieve` should return for newly appended documents,
+        so that the corpus held by the retriever stays aligned with the document IDs.
+        """
+        corpus = self.corpus
+        if corpus is None:
+            if documents is not None:
+                raise ValueError(
+                    "`documents` was provided but this retriever has no attached corpus; "
+                    "pass the corpus through `BM25(..., corpus=...)` instead."
+                )
+            return None
+
+        if documents is None:
+            raise ValueError(
+                "This retriever has an attached corpus, so `append` needs the matching "
+                "`documents` to keep the returned documents aligned with the document "
+                "IDs (one entry per appended document, in the same order)."
+            )
+
+        documents = list(documents)
+        if len(documents) != n_new_docs:
+            raise ValueError(
+                f"`documents` has {len(documents)} entries but {n_new_docs} documents "
+                "are being appended; they must be aligned."
+            )
+
+        return documents
+
+    def _extend_attached_corpus(self, documents):
+        """
+        Extend the corpus held by the retriever with the values validated by
+        `_validate_attached_corpus_extension`.
+        """
+        if documents is None:
+            return
+
+        corpus = self.corpus
+
+        # JsonlCorpus and ndarray-backed corpora are fixed-size and cannot be extended in
+        # place, so they are materialized into a list first.
+        if not isinstance(corpus, list):
+            corpus = list(corpus)
+            self.corpus = corpus
+
+        corpus.extend(documents)
+
+    def append(
+        self,
+        corpus: Union[Iterable, Tuple, tokenization.Tokenized],
+        show_progress=True,
+        leave_progress=False,
+        create_empty_token=None,
+        documents=None,
+    ):
+        """
+        Append new documents to an already built index, without changing the document
+        IDs that were assigned by the original `index` call.
+
+        The existing index only keeps the *statistics* of its documents (the term
+        frequency of each token and the length of each document), not the raw texts.
+        Those statistics are enough to recompute document frequencies, IDF values and
+        average document length over the *whole* corpus, so appending new documents
+        gives exactly the same scores as rebuilding the index from every text at once:
+        no per-document score of the old documents is frozen or adjusted afterwards.
+
+        New tokens are added at the end of the vocabulary. Existing tokens keep their ID.
+
+        Parameters
+        ----------
+        corpus : Iterable or Tuple or tokenization.Tokenized
+            The new documents, in the same formats accepted by `index` (list of list of
+            tokens, a ``(ids, vocab)`` tuple, an object with ``ids`` and ``vocab``
+            attributes, or a list of list of token IDs matching the current vocabulary).
+
+        show_progress : bool
+            If True, a progress bar will be shown. If False, no progress bar will be shown.
+
+        leave_progress : bool
+            If True, the progress bars will remain after the function completes.
+
+        create_empty_token : bool
+            If True, keep an empty token, "", in the vocabulary (see `index`); it is
+            placed after all real tokens. If None (default), the current behaviour of the
+            index is kept. If False, an empty token that has no score column is dropped.
+
+        documents : Iterable[Any]
+            The values returned by `retrieve` for the new documents, aligned with
+            `corpus`. Required when the retriever holds a `corpus` (see the `corpus`
+            argument of `BM25`), because that list must stay aligned with the document
+            IDs; it is then extended in place.
+
+        Raises
+        ------
+        ValueError
+            If the index was built without storing the per-document statistics
+            (``store_stats=False``), in which case appending is not possible without
+            revisiting the original documents, or if a `corpus` is attached to the
+            retriever but `documents` was not provided.
+        """
+        if getattr(self, "doc_stats", None) is None:
+            raise ValueError(
+                "Cannot append to this index because the per-document statistics were "
+                "not stored. Rebuild the index with `store_stats=True` (the default of "
+                "`index`) so that new documents can be appended later."
+            )
+
+        is_token_based, new_corpus_entries = self._entries_from_append_corpus(corpus)
+
+        if is_token_based and not self.vocab_dict:
+            raise ValueError(
+                "This index has no vocabulary loaded, so the tokens of the appended "
+                "documents cannot be resolved to token IDs. Reload it with "
+                "`load_vocab=True` (the default of `BM25.load`), or append raw token IDs "
+                "matching the index instead."
+            )
+
+        if len(new_corpus_entries) == 0:
+            return
+
+        # Retrieval returns `corpus[i]`, so if the retriever holds a corpus it has to grow
+        # in lockstep with the index; otherwise old document IDs would start pointing at
+        # the wrong entries.
+        new_documents = self._validate_attached_corpus_extension(
+            documents, n_new_docs=len(new_corpus_entries)
+        )
+
+        n_cols = len(self.scores["indptr"]) - 1
+
+        # The empty token is a placeholder for empty queries. It may or may not own a
+        # score column depending on how the index was built, so it is handled apart from
+        # the real tokens: it keeps its old ID when that ID is a valid column, and is
+        # otherwise placed after all real tokens.
+        vocab_dict = dict(self.vocab_dict)
+        empty_token_id = vocab_dict.pop("", None)
+
+        # First free column of the score matrix. Tokens that already have an ID (for
+        # example because the vocabulary came from a tokenizer) may reach beyond the
+        # current columns, so the columns up to them have to be reserved.
+        next_token_id = n_cols
+        for token_id in vocab_dict.values():
+            if token_id >= next_token_id:
+                next_token_id = token_id + 1
+
+        if not is_token_based:
+            # The IDs must already be column indices of this index, otherwise we would
+            # silently attach new documents to the wrong vocabulary entries.
+            max_id = max((max(doc) for doc in new_corpus_entries if doc), default=-1)
+            if max_id >= next_token_id:
+                raise ValueError(
+                    f"Token ID {max_id} is out of range for this index, which has "
+                    f"{next_token_id} tokens. Token IDs passed to `append` must use the "
+                    "same ID space as the indexed corpus; to add new tokens, pass the "
+                    "tokens themselves instead."
+                )
+            new_corpus_token_ids = new_corpus_entries
+        else:
+            new_corpus_token_ids = []
+            for tokens in tqdm(
+                new_corpus_entries,
+                desc="BM25S Convert tokens to indices",
+                disable=not show_progress,
+                leave=leave_progress,
+            ):
+                doc_ids = []
+                for token in tokens:
+                    token_id = vocab_dict.get(token)
+                    if token_id is None:
+                        token_id = next_token_id
+                        vocab_dict[token] = token_id
+                    if token_id >= next_token_id:
+                        next_token_id = token_id + 1
+                    doc_ids.append(token_id)
+                new_corpus_token_ids.append(doc_ids)
+
+        if empty_token_id is not None and empty_token_id < n_cols:
+            # the empty token already owns a column: leave it exactly where it was
+            vocab_dict[""] = empty_token_id
+        elif empty_token_id is not None and create_empty_token is not False:
+            # keep the placeholder, but move it after all real tokens
+            vocab_dict[""] = next_token_id
+        elif create_empty_token:
+            vocab_dict[""] = next_token_id
+
+        self._append_doc_stats_from_corpus_token_ids(new_corpus_token_ids)
+
+        self.vocab_dict = vocab_dict
+        self.unique_token_ids_set = set(self.vocab_dict.values())
+        self.scores = self._rebuild_scores_from_doc_stats(n_vocab=next_token_id)
+        self._extend_attached_corpus(new_documents)
 
     def get_tokens_ids(self, query_tokens: List[str]) -> List[int]:
         """
@@ -948,6 +1344,7 @@ class BM25:
         vocab_name="vocab.index.json",
         params_name="params.index.json",
         nnoc_name="nonoccurrence_array.index.npy",
+        stats_name="doc_stats.index.npz",
         corpus_name="corpus.jsonl",
         allow_pickle=False,
         show_progress=True,
@@ -993,6 +1390,10 @@ class BM25:
         nnoc_name : str
             The name of the file that will contain the non-occurrence array.
 
+        stats_name : str
+            The name of the file that will contain the per-document statistics (term
+            frequencies and document lengths) needed by `append`.
+
         allow_pickle : bool
             If True, the arrays will be saved using pickle. If False, the arrays will be saved
             in a more efficient format, but they will not be readable by older versions of numpy.
@@ -1022,6 +1423,21 @@ class BM25:
         np.save(data_path, self.scores["data"], allow_pickle=allow_pickle)
         np.save(indices_path, self.scores["indices"], allow_pickle=allow_pickle)
         np.save(indptr_path, self.scores["indptr"], allow_pickle=allow_pickle)
+
+        # save the per-document statistics so that documents can be appended later
+        stats_path = save_dir / stats_name
+        doc_stats = getattr(self, "doc_stats", None)
+        if doc_stats is not None:
+            np.savez(
+                stats_path,
+                indptr=np.asarray(doc_stats["indptr"], dtype=np.int64),
+                token_ids=np.asarray(doc_stats["token_ids"], dtype=self.int_dtype),
+                tf=np.asarray(doc_stats["tf"], dtype=np.int64),
+                doc_lens=np.asarray(doc_stats["doc_lens"], dtype=np.int64),
+            )
+        elif stats_path.exists():
+            # do not leave stale statistics from a previous save behind
+            stats_path.unlink()
 
         # save nonoccurrence array if it exists
         if self.nonoccurrence_array is not None:
@@ -1157,6 +1573,7 @@ class BM25:
         vocab_name="vocab.index.json",
         params_name="params.index.json",
         nnoc_name="nonoccurrence_array.index.npy",
+        stats_name="doc_stats.index.npz",
         corpus_name="corpus.jsonl",
         load_corpus=False,
         mmap=False,
@@ -1195,6 +1612,10 @@ class BM25:
 
         nnoc_name : str
             The name of the file that contains the non-occurrence array.
+
+        stats_name : str
+            The name of the file that contains the per-document statistics. If it is
+            present, the loaded index can be extended with `append`.
 
         corpus_name : str
             The name of the file that contains the corpus.
@@ -1274,6 +1695,20 @@ class BM25:
             num_docs=num_docs,
             allow_pickle=allow_pickle,
         )
+
+        # Load the per-document statistics, if the index was saved with them. They enable
+        # `append` to extend the index without revisiting the original documents.
+        stats_path = save_dir / stats_name
+        if stats_path.exists():
+            with np.load(stats_path, allow_pickle=False) as stats:
+                bm25_obj.doc_stats = {
+                    "indptr": stats["indptr"].astype(np.int64),
+                    "token_ids": stats["token_ids"].astype(bm25_obj.int_dtype),
+                    "tf": stats["tf"].astype(np.int64),
+                    "doc_lens": stats["doc_lens"].astype(np.int64),
+                }
+        else:
+            bm25_obj.doc_stats = None
 
         if load_corpus:
             # load the model from the snapshot

@@ -243,6 +243,139 @@ def _get_counts_from_token_ids(token_ids, dtype, int_dtype):
     return voc_ind, tf_array
 
 
+def _build_stats_from_corpus_token_ids(corpus_token_ids, int_dtype="int32"):
+    """
+    Convert a corpus of token ID lists into the compact per-document statistics that
+    are needed to (re)compute BM25 scores: for each document, the set of unique token
+    IDs it contains, together with the term frequency (tf) of each of those tokens.
+
+    The output is stored in a CSR-like layout:
+
+    - ``indptr``: ``n_docs + 1`` offsets, where document ``d`` owns the slice
+      ``[indptr[d], indptr[d + 1])``.
+    - ``token_ids``: the unique token IDs of each document (in first-occurrence order).
+    - ``tf``: the number of occurrences of each of those tokens in the document.
+    - ``doc_lens``: the length (number of tokens) of each document, i.e. the sum of its
+      ``tf`` values.
+
+    These statistics are lossless with respect to BM25 scoring: document lengths are
+    stored explicitly and the document frequencies of the vocabulary can be recovered by
+    counting how many documents contain each token ID. This means an index can be updated
+    (or its scores entirely recomputed) without ever revisiting the original texts.
+    """
+    n_docs = len(corpus_token_ids)
+
+    indptr = np.zeros(n_docs + 1, dtype=np.int64)
+    doc_lens = np.zeros(n_docs, dtype=np.int64)
+    token_ids_chunks = []
+    tf_chunks = []
+
+    for doc_idx, token_ids in enumerate(corpus_token_ids):
+        token_counter = Counter(token_ids)
+        n_unique = len(token_counter)
+
+        token_ids_chunks.append(
+            np.fromiter(token_counter.keys(), dtype=int_dtype, count=n_unique)
+        )
+        tf_chunks.append(np.fromiter(token_counter.values(), dtype=np.int64, count=n_unique))
+
+        indptr[doc_idx + 1] = indptr[doc_idx] + n_unique
+        doc_lens[doc_idx] = len(token_ids)
+
+    if len(token_ids_chunks) == 0:
+        token_ids = np.empty(0, dtype=int_dtype)
+        tf = np.empty(0, dtype=np.int64)
+    else:
+        token_ids = np.concatenate(token_ids_chunks)
+        tf = np.concatenate(tf_chunks)
+
+    return indptr, token_ids, tf, doc_lens
+
+
+def _doc_frequencies_from_stats(stats_indptr, stats_token_ids, n_vocab) -> dict:
+    """
+    Rebuild the ``doc_frequencies`` dictionary (token ID -> number of documents that
+    contain it) from the per-document statistics produced by
+    `_build_stats_from_corpus_token_ids`.
+
+    The returned dictionary always contains every token ID in ``[0, n_vocab)``, so that
+    the length of the resulting arrays matches a full rebuild of the index.
+    """
+    n_vocab = int(n_vocab)
+
+    if len(stats_token_ids) == 0:
+        counts = np.zeros(n_vocab, dtype=np.int64)
+    else:
+        counts = np.bincount(
+            np.asarray(stats_token_ids, dtype=np.int64), minlength=n_vocab
+        )
+        if len(counts) > n_vocab:
+            counts = counts[:n_vocab]
+
+    return {token_id: int(counts[token_id]) for token_id in range(n_vocab)}
+
+
+def _build_scores_and_indices_for_stats(
+    stats_indptr,
+    stats_token_ids,
+    stats_tf,
+    doc_lens,
+    idf_array,
+    avg_doc_len,
+    k1,
+    b,
+    delta,
+    nonoccurrence_array,
+    method="robertson",
+    dtype="float32",
+    int_dtype="int32",
+):
+    """
+    Equivalent of `_build_scores_and_indices_for_matrix`, but computing the scores from
+    the stored per-document statistics instead of the raw token ID lists.
+
+    The arithmetic performed here mirrors `_build_scores_and_indices_for_matrix` exactly
+    (same operations, same dtypes, same order of documents), so that an index updated
+    incrementally produces the very same score matrix as an index rebuilt from scratch
+    over all documents.
+    """
+    n_docs = len(doc_lens)
+    array_size = int(stats_indptr[-1])
+
+    scores = np.empty(array_size, dtype=dtype)
+    doc_indices = np.empty(array_size, dtype=int_dtype)
+    voc_indices = np.empty(array_size, dtype=int_dtype)
+
+    calculate_tfc = _select_tfc_scorer(method)
+    uses_nonoccurrence = method in ("bm25l", "bm25+")
+
+    for doc_idx in range(n_docs):
+        start = int(stats_indptr[doc_idx])
+        end = int(stats_indptr[doc_idx + 1])
+
+        voc_ind_doc = np.asarray(stats_token_ids[start:end], dtype=int_dtype)
+        tf_array = np.asarray(stats_tf[start:end], dtype=dtype)
+        doc_len = int(doc_lens[doc_idx])
+
+        tfc = calculate_tfc(
+            tf_array=tf_array, l_d=doc_len, l_avg=avg_doc_len, k1=k1, b=b, delta=delta
+        )
+        idf = idf_array[voc_ind_doc]
+        scores_doc = idf * tfc
+
+        if uses_nonoccurrence:
+            scores_doc = scores_doc - nonoccurrence_array[voc_ind_doc]
+
+        doc_len_out = len(scores_doc)
+        start_out, end_out = start, start + doc_len_out
+
+        doc_indices[start_out:end_out] = doc_idx
+        voc_indices[start_out:end_out] = voc_ind_doc
+        scores[start_out:end_out] = scores_doc
+
+    return scores, doc_indices, voc_indices
+
+
 def _build_scores_and_indices_for_matrix(
     corpus_token_ids,
     idf_array,
