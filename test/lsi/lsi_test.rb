@@ -222,4 +222,100 @@ class LSITest < Minitest::Test
     lsi.add_item @str3, 'Cat'
     refute lsi.items.empty?
   end
+
+  def test_rebuild_when_pruned_down_to_a_single_document
+    lsi = ClassifierReborn::LSI.new auto_rebuild: false
+    lsi.add_item 'harbor route atlas', 'Maps'
+    lsi.add_item 'rain cloud fog', 'Weather'
+    lsi.add_item 'piano guitar music', 'Music'
+    lsi.build_index
+    refute lsi.needs_rebuild?
+
+    lsi.remove_item 'harbor route atlas'
+    lsi.remove_item 'rain cloud fog'
+
+    # A one-document index is still a usable index and must be rebuilt so
+    # the term space no longer contains words from removed documents.
+    assert lsi.needs_rebuild?
+    lsi.build_index
+    refute lsi.needs_rebuild?
+    assert_equal %i[piano guitar music].sort, lsi.word_list.instance_variable_get(:@location_table).keys.sort
+    assert_nil lsi.word_list[:harbor]
+    assert_nil lsi.word_list[:rain]
+  end
+
+  def test_single_document_index_keeps_classification_working
+    lsi = ClassifierReborn::LSI.new auto_rebuild: false
+    lsi.add_item 'piano guitar music', 'Music'
+    lsi.build_index
+
+    assert_equal 'Music', lsi.classify('piano')
+    assert_includes lsi.search('music'), 'piano guitar music'
+  end
+
+  def test_terms_removed_with_documents_cannot_win_a_category
+    lsi = ClassifierReborn::LSI.new auto_rebuild: false
+    lsi.add_item 'harbor route atlas', 'Maps'
+    lsi.add_item 'rain cloud fog', 'Weather'
+    lsi.add_item 'piano guitar music', 'Music'
+    lsi.build_index
+    lsi.remove_item 'harbor route atlas'
+    lsi.remove_item 'rain cloud fog'
+    lsi.build_index
+
+    # Words that only existed in the removed documents have no vote in the
+    # current term space, so they must not produce a plausible-looking result.
+    assert_nil lsi.classify('harbor')
+    assert_nil lsi.classify('rain')
+    assert_nil lsi.classify_with_score('harbor')
+    assert_equal [], lsi.scored_categories('rain')
+    assert_equal [], lsi.search('harbor')
+  end
+
+  def test_readded_document_reenters_the_term_space
+    lsi = ClassifierReborn::LSI.new auto_rebuild: false
+    lsi.add_item 'harbor route atlas', 'Maps'
+    lsi.add_item 'rain cloud fog', 'Weather'
+    lsi.add_item 'piano guitar music', 'Music'
+    lsi.build_index
+    lsi.remove_item 'harbor route atlas'
+    lsi.remove_item 'rain cloud fog'
+    lsi.build_index
+    assert_nil lsi.word_list[:harbor]
+
+    lsi.add_item 'harbor dock route', 'Maps'
+    lsi.build_index
+
+    refute_nil lsi.word_list[:harbor]
+    assert_equal 'Maps', lsi.classify('harbor')
+    assert_equal 'Music', lsi.classify('piano')
+  end
+
+  def test_auto_rebuild_after_removal_prunes_term_space
+    lsi = ClassifierReborn::LSI.new
+    lsi.add_item 'harbor route atlas', 'Maps'
+    lsi.add_item 'rain cloud fog', 'Weather'
+    lsi.add_item 'piano guitar music', 'Music'
+    refute lsi.needs_rebuild?
+
+    lsi.remove_item 'harbor route atlas'
+    lsi.remove_item 'rain cloud fog'
+
+    refute lsi.needs_rebuild?
+    assert_nil lsi.word_list[:harbor]
+    assert_equal 'Music', lsi.classify('piano')
+    assert_nil lsi.classify('harbor')
+
+    lsi.add_item 'harbor dock route', 'Maps'
+    assert_equal 'Maps', lsi.classify('harbor')
+  end
+
+  def test_empty_index_queries_return_nothing_without_error
+    lsi = ClassifierReborn::LSI.new
+    refute lsi.needs_rebuild?
+    assert_equal [], lsi.search('anything')
+    assert_equal [], lsi.scored_categories('anything')
+    assert_nil lsi.classify('anything')
+    assert_nil lsi.classify_with_score('anything')
+  end
 end

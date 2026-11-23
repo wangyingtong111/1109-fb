@@ -67,8 +67,15 @@ module ClassifierReborn
     # Returns true if the index needs to be rebuilt.  The index needs
     # to be built after all informaton is added, but before you start
     # using it for search, classification and cluster detection.
+    #
+    # An index holding a single document is still a valid, usable index, so
+    # it must be rebuilt just like any other. Otherwise deleting documents
+    # down to one would leave a stale term space (words belonging only to the
+    # removed documents would still occupy vector dimensions) and queries made
+    # up entirely of those removed words would receive a plausible-looking but
+    # meaningless category.
     def needs_rebuild?
-      (@items.size > 1) && (@version != @built_at_version)
+      !@items.empty? && (@version != @built_at_version)
     end
 
     # Adds an item to the index. item is assumed to be a string, but
@@ -123,6 +130,7 @@ module ClassifierReborn
 
       @items.delete item
       @version += 1
+      build_index if @auto_rebuild
     end
 
     # Returns an array of items that are indexed.
@@ -158,7 +166,8 @@ module ClassifierReborn
 
         ntdm.each_over_axis(1).with_index do |col_vec, i|
           doc_list[i].lsi_vector = col_vec
-          doc_list[i].lsi_norm = col_vec / Numo::Linalg.norm(col_vec)
+          col_norm = Numo::Linalg.norm(col_vec)
+          doc_list[i].lsi_norm = col_norm.zero? ? col_vec : col_vec / col_norm
         end
       elsif $SVD == :gsl
         tdm = GSL::Matrix.alloc(*tda).trans
@@ -167,7 +176,7 @@ module ClassifierReborn
         ntdm.size[1].times do |col|
           vec = GSL::Vector.alloc(ntdm.column(col)).row
           doc_list[col].lsi_vector = vec
-          doc_list[col].lsi_norm = vec.normalize
+          doc_list[col].lsi_norm = vec.zero? ? vec : vec.normalize
         end
       else
         tdm = Matrix.rows(tda).trans
@@ -219,6 +228,8 @@ module ClassifierReborn
       return [] if needs_rebuild?
 
       content_node = node_for_content(doc, &block)
+      return [] if content_node.word_hash.keys.none? { |word| @word_list[word] }
+
       result =
         @items.keys.collect do |item|
           val = if $SVD == :numo
@@ -242,7 +253,9 @@ module ClassifierReborn
       return [] if needs_rebuild?
 
       content_node = node_for_content(doc, &block)
-      if ($SVD == :gsl && content_node.raw_norm.isnan?.all?) ||
+      if content_node.word_hash.keys.none? { |word| @word_list[word] }
+        []
+      elsif ($SVD == :gsl && content_node.raw_norm.isnan?.all?) ||
           ($SVD == :numo && content_node.raw_norm.isnan.all?)
         puts "There are no documents that are similar to #{doc}"
       else
@@ -298,14 +311,18 @@ module ClassifierReborn
       result[0..max_nearest - 1]
     end
 
-    # Return the most obvious category with the score
+    # Return the most obvious category with the score, or nil when no
+    # indexed category can vote on the document (for example when every word
+    # in the document belongs to terms removed along with deleted documents).
     def classify_with_score(doc, cutoff = 0.30, &block)
       scored_categories(doc, cutoff, &block).last
     end
 
-    # Return the most obvious category without the score
+    # Return the most obvious category without the score, or nil when no
+    # indexed category can vote on the document.
     def classify(doc, cutoff = 0.30, &block)
-      scored_categories(doc, cutoff, &block).last.first
+      best = scored_categories(doc, cutoff, &block).last
+      best && best.first
     end
 
     # This function uses a voting system to categorize documents, based on

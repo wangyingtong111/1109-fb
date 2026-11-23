@@ -99,14 +99,16 @@ module ClassifierReborn
       end
 
       if $SVD == :numo
-        @raw_norm   = vec / Numo::Linalg.norm(vec)
+        norm = Numo::Linalg.norm(vec)
+        @raw_norm   = norm.zero? ? vec : vec / norm
         @raw_vector = vec
       elsif $SVD == :gsl
-        @raw_norm   = vec.normalize
+        @raw_norm   = vec.zero? ? vec : vec.normalize
         @raw_vector = vec
       else
-        @raw_norm   = Vector[*vec].normalize
-        @raw_vector = Vector[*vec]
+        vector      = Vector[*vec]
+        @raw_norm   = vector.zero? ? vector : vector.normalize
+        @raw_vector = vector
       end
     end
   end
