@@ -57,6 +57,39 @@ def _calculate_doc_freqs(
     return doc_frequencies
 
 
+def _calculate_doc_freqs_from_term_freqs(
+    doc_term_freqs, unique_tokens, show_progress=True, leave_progress=False
+):
+    """
+    Same as `_calculate_doc_freqs`, but over compressed documents.
+
+    Each document is a ``(token_ids, term_frequencies, doc_length)`` tuple in which
+    `token_ids` holds the distinct tokens of that document only. Alongside the document
+    frequencies, this returns the total corpus length and the number of stored
+    (document, token) entries; both are needed later and would otherwise require a
+    second pass over the corpus.
+    """
+    unique_tokens = set(unique_tokens)
+    doc_frequencies = {token: 0 for token in unique_tokens}
+    total_doc_len = 0
+
+    for token_ids, _, doc_len in tqdm(
+        doc_term_freqs,
+        leave=leave_progress,
+        disable=not show_progress,
+        desc="BM25S Count Tokens",
+    ):
+        total_doc_len += doc_len
+
+        # Each distinct token of the document counts once, no matter its term frequency.
+        for token in token_ids:
+            if token in doc_frequencies:
+                doc_frequencies[token] += 1
+
+    n_entries = sum(doc_frequencies.values())
+    return doc_frequencies, total_doc_len, n_entries
+
+
 def _build_idf_array(
     doc_frequencies: dict,
     n_docs: int,
@@ -243,11 +276,37 @@ def _get_counts_from_token_ids(token_ids, dtype, int_dtype):
     return voc_ind, tf_array
 
 
-def _build_scores_and_indices_for_matrix(
-    corpus_token_ids,
+def _iter_doc_term_freqs(corpus_token_ids, dtype="float32", int_dtype="int32"):
+    """
+    Lazily convert each document's token IDs into its compact term-frequency
+    representation.
+
+    Yields a ``(token_ids, term_frequencies, doc_length)`` tuple per document, where
+    ``token_ids`` only contains the distinct tokens of the document. The original
+    sequence of token IDs is never kept around, so the corpus can be consumed exactly
+    once, even if it is a one-shot iterable.
+    """
+    for token_ids in corpus_token_ids:
+        token_counter = Counter(token_ids)
+        # `sum(...)` equals `len(token_ids)` but also works if the document is an
+        # iterator that has already been consumed by `Counter`.
+        doc_length = sum(token_counter.values())
+
+        voc_ind = np.fromiter(
+            token_counter.keys(), dtype=int_dtype, count=len(token_counter)
+        )
+        tf_array = np.fromiter(
+            token_counter.values(), dtype=dtype, count=len(token_counter)
+        )
+
+        yield voc_ind, tf_array, doc_length
+
+
+def _build_scores_and_indices_for_doc_term_freqs(
+    doc_term_freqs,
+    n_entries,
     idf_array,
     avg_doc_len,
-    doc_frequencies,
     k1,
     b,
     delta,
@@ -258,33 +317,29 @@ def _build_scores_and_indices_for_matrix(
     show_progress=True,
     leave_progress=False,
 ):
-    array_size = sum(doc_frequencies.values())
+    """
+    Build the flat score / document / vocabulary index arrays from a stream of
+    per-document ``(token_ids, term_frequencies, doc_length)`` tuples.
 
+    `n_entries` must be the exact number of (document, distinct token) pairs, which
+    is also the total number of documents across all `doc_frequencies` entries.
+    """
     # We create 3 arrays to store the scores, document indices, and vocabulary indices
-    # The length is at most n_tokens, remaining elements will be truncated at the end
-    scores = np.empty(array_size, dtype=dtype)
-    doc_indices = np.empty(array_size, dtype=int_dtype)
-    voc_indices = np.empty(array_size, dtype=int_dtype)
+    scores = np.empty(n_entries, dtype=dtype)
+    doc_indices = np.empty(n_entries, dtype=int_dtype)
+    voc_indices = np.empty(n_entries, dtype=int_dtype)
 
     calculate_tfc = _select_tfc_scorer(method)
 
     i = 0
-    for doc_idx, token_ids in enumerate(
+    for doc_idx, (voc_ind_doc, tf_array, doc_len) in enumerate(
         tqdm(
-            corpus_token_ids,
+            doc_term_freqs,
             desc="BM25S Compute Scores",
             disable=not show_progress,
             leave=leave_progress,
         )
     ):
-        doc_len = len(token_ids)
-
-        # Get the term frequency array for the document
-        # Note: tokens might contain duplicates, we use Counter to get the term freq
-        voc_ind_doc, tf_array = _get_counts_from_token_ids(
-            token_ids, dtype=dtype, int_dtype=int_dtype
-        )
-
         # Calculate the BM25 score for each token in the document
         tfc = calculate_tfc(
             tf_array=tf_array, l_d=doc_len, l_avg=avg_doc_len, k1=k1, b=b, delta=delta
@@ -307,6 +362,42 @@ def _build_scores_and_indices_for_matrix(
         scores[start:end] = scores_doc
 
     return scores, doc_indices, voc_indices
+
+
+def _build_scores_and_indices_for_matrix(
+    corpus_token_ids,
+    idf_array,
+    avg_doc_len,
+    doc_frequencies,
+    k1,
+    b,
+    delta,
+    nonoccurrence_array,
+    method="robertson",
+    dtype="float32",
+    int_dtype="int32",
+    show_progress=True,
+    leave_progress=False,
+):
+    array_size = sum(doc_frequencies.values())
+
+    return _build_scores_and_indices_for_doc_term_freqs(
+        doc_term_freqs=_iter_doc_term_freqs(
+            corpus_token_ids, dtype=dtype, int_dtype=int_dtype
+        ),
+        n_entries=array_size,
+        idf_array=idf_array,
+        avg_doc_len=avg_doc_len,
+        k1=k1,
+        b=b,
+        delta=delta,
+        nonoccurrence_array=nonoccurrence_array,
+        method=method,
+        dtype=dtype,
+        int_dtype=int_dtype,
+        show_progress=show_progress,
+        leave_progress=leave_progress,
+    )
 
 
 def _compute_relevance_from_scores_legacy(

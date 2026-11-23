@@ -53,7 +53,10 @@ from .scoring import (
     _select_tfc_scorer,
     _select_idf_scorer,
     _build_scores_and_indices_for_matrix,
+    _build_scores_and_indices_for_doc_term_freqs,
     _calculate_doc_freqs,
+    _calculate_doc_freqs_from_term_freqs,
+    _iter_doc_term_freqs,
     _build_idf_array,
     _build_nonoccurrence_array,
     _np_csc_python,
@@ -326,7 +329,7 @@ class BM25:
     def build_index_from_ids(
         self,
         unique_token_ids: List[int],
-        corpus_token_ids: List[List[int]],
+        corpus_token_ids: Iterable[List[int]],
         show_progress=True,
         leave_progress=False,
     ):
@@ -340,8 +343,9 @@ class BM25:
         unique_token_ids : List[int]
             List of unique token IDs.
 
-        corpus_token_ids : List[List[int]]
-            List of list of token IDs for each document.
+        corpus_token_ids : Iterable[List[int]]
+            Iterable of list of token IDs for each document. It is consumed exactly once,
+            so generators and other one-shot iterables are supported.
 
         show_progress : bool
             If True, a progress bar will be shown. If False, no progress bar will be shown.
@@ -354,17 +358,73 @@ class BM25:
                 f"Invalid csc_backend value: {self.csc_backend}. Choose from 'scipy', 'numpy'."
             )
 
-        avg_doc_len = np.array([len(doc_ids) for doc_ids in corpus_token_ids]).mean()
-        n_docs = len(corpus_token_ids)
+        # Compress each document into its term frequencies as it arrives, then release
+        # the expanded token IDs. The source is never iterated a second time.
+        doc_term_freqs = _iter_doc_term_freqs(
+            corpus_token_ids, dtype=self.dtype, int_dtype=self.int_dtype
+        )
+
+        return self.build_index_from_term_freqs(
+            unique_token_ids=unique_token_ids,
+            doc_term_freqs=doc_term_freqs,
+            show_progress=show_progress,
+            leave_progress=leave_progress,
+        )
+
+    def build_index_from_term_freqs(
+        self,
+        unique_token_ids: List[int],
+        doc_term_freqs,
+        show_progress=True,
+        leave_progress=False,
+    ):
+        """
+        Low-level function to build the BM25 index from compressed documents.
+
+        Each element of `doc_term_freqs` must be a ``(token_ids, term_frequencies,
+        doc_length)`` tuple, where `token_ids` holds the distinct tokens of one document.
+        Exactly one tuple is expected per document, in corpus order, so an empty document
+        (empty token IDs / frequencies and length 0) still occupies its own document ID.
+
+        Only this compressed representation is buffered, which lets the caller stream a
+        one-shot source while keeping the index identical to the one built from a
+        materialized corpus.
+        """
+        if self.csc_backend not in ["scipy", "numpy"]:
+            raise ValueError(
+                f"Invalid csc_backend value: {self.csc_backend}. Choose from 'scipy', 'numpy'."
+            )
+
+        doc_term_freqs = [
+            (
+                np.asarray(token_ids, dtype=self.int_dtype),
+                np.asarray(tf_array, dtype=self.dtype),
+                int(doc_len),
+            )
+            for token_ids, tf_array, doc_len in tqdm(
+                doc_term_freqs,
+                desc="BM25S Compress Tokens",
+                leave=leave_progress,
+                disable=not show_progress,
+            )
+        ]
+
+        n_docs = len(doc_term_freqs)
         n_vocab = len(unique_token_ids)
 
-        # Step 1: Calculate the number of documents containing each token
-        doc_frequencies = _calculate_doc_freqs(
-            corpus_tokens=corpus_token_ids,
+        # Step 1: Calculate the number of documents containing each token, together with
+        # the corpus length statistics and the number of stored (doc, token) entries.
+        doc_frequencies, total_doc_len, n_entries = _calculate_doc_freqs_from_term_freqs(
+            doc_term_freqs=doc_term_freqs,
             unique_tokens=unique_token_ids,
             show_progress=show_progress,
             leave_progress=leave_progress,
         )
+
+        # Empty documents contribute nothing to the total length but are still counted
+        # in n_docs, preserving their document IDs. NumPy scalars are used so that the
+        # degenerate all-empty corpus keeps producing NaN instead of raising.
+        avg_doc_len = np.float64(total_doc_len) / np.float64(n_docs)
 
         # preliminary: if the method is one of BM25L or BM25+, we need to calculate the non-occurrence array
         if self.method in self.methods_requiring_nonoccurrence:
@@ -392,20 +452,22 @@ class BM25:
         )
 
         # Step 3 Calculate the BM25 scores for each token in each document
-        scores_flat, doc_idx, vocab_idx = _build_scores_and_indices_for_matrix(
-            corpus_token_ids=corpus_token_ids,
-            idf_array=idf_array,
-            avg_doc_len=avg_doc_len,
-            doc_frequencies=doc_frequencies,
-            k1=self.k1,
-            b=self.b,
-            delta=self.delta,
-            show_progress=show_progress,
-            leave_progress=leave_progress,
-            dtype=self.dtype,
-            int_dtype=self.int_dtype,
-            method=self.method,
-            nonoccurrence_array=self.nonoccurrence_array,
+        scores_flat, doc_idx, vocab_idx = (
+            _build_scores_and_indices_for_doc_term_freqs(
+                doc_term_freqs=doc_term_freqs,
+                n_entries=n_entries,
+                idf_array=idf_array,
+                avg_doc_len=avg_doc_len,
+                k1=self.k1,
+                b=self.b,
+                delta=self.delta,
+                show_progress=show_progress,
+                leave_progress=leave_progress,
+                dtype=self.dtype,
+                int_dtype=self.int_dtype,
+                method=self.method,
+                nonoccurrence_array=self.nonoccurrence_array,
+            )
         )
 
         # Now, we build the sparse matrix
@@ -443,32 +505,61 @@ class BM25:
         """
         Low-level function to build the BM25 index from tokens, used by the `index` method.
         You can override this function if you want to build the index in a different way.
+
+        `corpus_tokens` may be a one-shot iterable: it is read exactly once. Each document
+        is immediately compressed to its distinct tokens and their counts, which is what
+        gets staged until the vocabulary has been built.
         """
-        unique_tokens = get_unique_tokens(
+        doc_counters = []
+        unique_tokens = set()
+
+        for doc_tokens in tqdm(
             corpus_tokens,
-            show_progress=show_progress,
-            leave_progress=leave_progress,
             desc="BM25S Create Vocab",
-        )
+            disable=not show_progress,
+            leave=leave_progress,
+        ):
+            token_counter = Counter(doc_tokens)
+            unique_tokens.update(token_counter.keys())
+            doc_counters.append(token_counter)
+
         vocab_dict = {token: i for i, token in enumerate(unique_tokens)}
         unique_token_ids = [vocab_dict[token] for token in unique_tokens]
 
-        corpus_token_ids = [
-            [vocab_dict[token] for token in tokens]
-            for tokens in tqdm(
-                corpus_tokens,
+        # Replace each staged counter by its compact arrays as we go, so the counters
+        # are freed progressively instead of being held until the end.
+        for i, token_counter in enumerate(
+            tqdm(
+                doc_counters,
                 desc="BM25S Convert tokens to indices",
                 leave=leave_progress,
                 disable=not show_progress,
             )
-        ]
+        ):
+            doc_counters[i] = (
+                np.fromiter(
+                    (vocab_dict[token] for token in token_counter),
+                    dtype=self.int_dtype,
+                    count=len(token_counter),
+                ),
+                np.fromiter(
+                    token_counter.values(),
+                    dtype=self.dtype,
+                    count=len(token_counter),
+                ),
+                sum(token_counter.values()),
+            )
 
-        scores = self.build_index_from_ids(
+        doc_term_freqs = doc_counters
+
+        scores = self.build_index_from_term_freqs(
             unique_token_ids=unique_token_ids,
-            corpus_token_ids=corpus_token_ids,
+            doc_term_freqs=doc_term_freqs,
             show_progress=show_progress,
             leave_progress=leave_progress,
         )
+        del doc_term_freqs
+        del doc_counters
 
         return scores, vocab_dict
 
@@ -521,6 +612,54 @@ class BM25:
             scores, vocab_dict = self.build_index_from_tokens(
                 corpus, leave_progress=leave_progress, show_progress=show_progress
             )
+        elif inferred_corpus_obj == "token_ids":
+            logger.debug(msg="Building index from token IDs")
+            # The corpus may be a one-shot iterable: compress each document while
+            # collecting the vocabulary, so it is only traversed once.
+            unique_ids = set()
+            doc_term_freqs = []
+            for doc_ids in tqdm(
+                corpus,
+                desc="BM25S Convert tokens to indices",
+                leave=leave_progress,
+                disable=not show_progress,
+            ):
+                token_counter = Counter(doc_ids)
+                unique_ids.update(token_counter.keys())
+                doc_term_freqs.append(
+                    (
+                        np.fromiter(
+                            token_counter.keys(),
+                            dtype=self.int_dtype,
+                            count=len(token_counter),
+                        ),
+                        np.fromiter(
+                            token_counter.values(),
+                            dtype=self.dtype,
+                            count=len(token_counter),
+                        ),
+                        sum(token_counter.values()),
+                    )
+                )
+
+            # if there's allowed empty token, we need to add it to the vocab_dict to either 0 or max+1
+            if create_empty_token:
+                if 0 not in unique_ids:
+                    unique_ids.add(0)
+                else:
+                    unique_ids.add(max(unique_ids) + 1)
+
+            # create the vocab_dict from the unique token IDs
+            vocab_dict = {token_id: i for i, token_id in enumerate(unique_ids)}
+
+            unique_token_ids = list(vocab_dict.values())
+            scores = self.build_index_from_term_freqs(
+                unique_token_ids=unique_token_ids,
+                doc_term_freqs=doc_term_freqs,
+                leave_progress=leave_progress,
+                show_progress=show_progress,
+            )
+            del doc_term_freqs
         else:
             if inferred_corpus_obj == "tuple":
                 logger.debug(msg="Building index from IDs")
@@ -529,23 +668,6 @@ class BM25:
                 logger.debug(msg="Building index from IDs objects")
                 corpus_token_ids = corpus.ids
                 vocab_dict = corpus.vocab
-            elif inferred_corpus_obj == "token_ids":
-                # we need to create a vocab_dict from the unique token IDs
-                logger.debug(msg="Building index from token IDs")
-                corpus_token_ids = corpus
-                unique_ids = set()
-                for doc_ids in corpus_token_ids:
-                    unique_ids.update(doc_ids)
-                # if there's allowed empty token, we need to add it to the vocab_dict to either 0 or max+1
-                if create_empty_token:
-                    if 0 not in unique_ids:
-                        unique_ids.add(0)
-                    else:
-                        unique_ids.add(max(unique_ids) + 1)
-                
-                # create the vocab_dict from the unique token IDs
-                vocab_dict = {token_id: i for i, token_id in enumerate(unique_ids)}
-                
             else:
                 raise ValueError(
                     "Internal error: Found an invalid corpus object, indicating `_inferred_corpus_object` is not working correctly."

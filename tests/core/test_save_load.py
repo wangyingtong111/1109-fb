@@ -7,6 +7,8 @@ import Stemmer  # optional: for stemming
 import unittest.mock
 import json
 
+import numpy as np
+
 import bm25s
 from bm25s.utils import json_functions
 
@@ -229,3 +231,95 @@ class TestSaveAndReloadWithTokenizer(unittest.TestCase):
 
         assert doc['id'] == 1
         assert score > 3 and score < 4
+
+class TestBM25SOneShotCorpus(unittest.TestCase):
+    """Indexing from a one-shot iterable must match the equivalent materialized corpus.
+
+    A tokenized batch may only be iterated once, and its backing list can be reused for
+    the next batch, so the indexer has to snap the counts it needs as documents arrive.
+    """
+
+    def _streaming_corpus(self, batches):
+        # A single list that is refilled between yields, mirroring a tokenizer that
+        # reuses its output buffer. It is cleared once the stream is exhausted.
+        buffer = []
+        for tokens in batches:
+            buffer[:] = tokens
+            yield buffer
+        buffer.clear()
+
+    def _build(self, corpus):
+        retriever = bm25s.BM25(backend="numpy")
+        retriever.index(corpus, show_progress=False)
+        return retriever
+
+    def test_scores_match_materialized_corpus(self):
+        batches = [["oak", "oak"], [], ["ash", "oak"]]
+
+        streamed = self._build(self._streaming_corpus(batches))
+        expected = self._build([["oak", "oak"], [], ["ash", "oak"]])
+
+        self.assertEqual(streamed.scores["num_docs"], 3)
+        self.assertEqual(expected.scores["num_docs"], 3)
+        self.assertEqual(streamed.vocab_dict, expected.vocab_dict)
+        np.testing.assert_array_equal(
+            streamed.scores["indptr"], expected.scores["indptr"]
+        )
+        np.testing.assert_array_equal(
+            streamed.scores["data"], expected.scores["data"]
+        )
+        np.testing.assert_array_equal(
+            streamed.scores["indices"], expected.scores["indices"]
+        )
+        np.testing.assert_allclose(
+            streamed.get_scores(["oak"]), expected.get_scores(["oak"])
+        )
+
+    def test_empty_document_keeps_its_id(self):
+        streamed = self._build(self._streaming_corpus([["oak", "oak"], [], ["ash", "oak"]]))
+
+        scores = streamed.get_scores(["oak"])
+        self.assertEqual(len(scores), 3)
+        self.assertEqual(scores[1], 0.0)
+        self.assertGreater(scores[0], 0.0)
+        self.assertGreater(scores[2], 0.0)
+
+    def test_retrieval_documents_and_scores(self):
+        streamed = self._build(self._streaming_corpus([["oak", "oak"], [], ["ash", "oak"]]))
+        expected = self._build([["oak", "oak"], [], ["ash", "oak"]])
+
+        documents, scores = streamed.retrieve([["oak"]], k=3, show_progress=False)
+        expected_documents, expected_scores = expected.retrieve(
+            [["oak"]], k=3, show_progress=False
+        )
+
+        # Document 1 is empty, so it must be the last hit with a zero score.
+        self.assertEqual(list(documents[0]), [0, 2, 1])
+        np.testing.assert_allclose(scores, expected_scores)
+        np.testing.assert_array_equal(documents, expected_documents)
+
+    def test_save_and_reload_preserves_ids_and_scores(self):
+        streamed = self._build(self._streaming_corpus([["oak", "oak"], [], ["ash", "oak"]]))
+        expected_scores = streamed.get_scores(["oak"])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            streamed.save(tmpdir, show_progress=False)
+            loaded = bm25s.BM25.load(tmpdir)
+
+        self.assertEqual(loaded.scores["num_docs"], 3)
+        self.assertEqual(loaded.vocab_dict, streamed.vocab_dict)
+        np.testing.assert_allclose(loaded.get_scores(["oak"]), expected_scores)
+
+        documents, scores = loaded.retrieve([["oak"]], k=3, show_progress=False)
+        self.assertEqual(list(documents[0]), [0, 2, 1])
+        self.assertEqual(scores[0][2], 0.0)
+
+    def test_token_id_stream_also_matches(self):
+        streamed = self._build(
+            self._streaming_corpus([[0, 0], [], [1, 0]])
+        )
+        expected = self._build([[0, 0], [], [1, 0]])
+
+        self.assertEqual(streamed.scores["num_docs"], 3)
+        np.testing.assert_allclose(streamed.get_scores([0]), expected.get_scores([0]))
+        self.assertEqual(streamed.get_scores([0])[1], 0.0)
