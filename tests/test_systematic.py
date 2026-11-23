@@ -1,11 +1,13 @@
 import operator as op
 
 import numpy as onp
+import pytest
 from numpy_utils import binary_ufunc_check, binary_ufunc_check_no_same_args, stat_check, unary_ufunc_check
 
 import autograd.numpy as np
 import autograd.numpy.random as npr
-from autograd.test_util import combo_check
+from autograd import grad, make_vjp
+from autograd.test_util import check_grads, combo_check
 
 npr.seed(0)
 
@@ -632,3 +634,57 @@ def test_pad():
     combo_check(np.pad, [0])(
         [R(2, 2)], [0, 3, (3,), (3, 2), ((3, 2),), ((1, 2), (3, 4)), ((0, 0), (0, 0))], ["constant"]
     )
+
+
+def test_pad_linear_modes():
+    # The padded values of these modes are all copied from the array itself, so
+    # padding is linear and both modes of differentiation go through.
+    widths_1d = [0, 3, (2, 1), (11, 4), (0, 9)]
+    widths_2d = [0, 3, (2, 1), ((1, 2), (3, 4)), ((7, 0), (0, 9)), ((0, 0), (0, 0))]
+    widths_3d = [0, (2, 1), ((1, 2), (3, 4), (0, 5))]
+    for mode in ["edge", "wrap", "reflect", "symmetric"]:
+        combo_check(np.pad, [0])([R(5)], widths_1d, [mode])
+        combo_check(np.pad, [0])([R(2, 2), R(3, 1)], widths_2d, [mode])
+        combo_check(np.pad, [0])([R(1, 3, 2)], widths_3d, [mode])
+
+
+def test_pad_reflect_odd():
+    # numpy derives 'odd' reflection by subtracting the mirrored values from
+    # twice the edge value, so the padded values mix two entries of the array.
+    widths_1d = [0, 3, (2, 1), (7, 5)]
+    widths_2d = [((1, 2), (3, 0)), ((9, 4), (0, 6))]
+    for mode in ["reflect", "symmetric"]:
+        combo_check(np.pad, [0])([R(5), R(2)], widths_1d, [mode], reflect_type=["odd"])
+        combo_check(np.pad, [0])([R(2, 2), R(3, 1)], widths_2d, [mode], reflect_type=["odd"])
+
+
+def test_pad_reflect_odd_asymmetric():
+    # Unequal widths put different numbers of odd-reflected values on each side,
+    # so each edge is mixed into its side with its own coefficient.
+    x = np.array([2.0, 4.0, 8.0])
+    fun = lambda x: np.sum(np.pad(x, (2, 1), mode="reflect", reflect_type="odd"))
+    expected = [-4.0, 0.0, 2.0, 4.0, 8.0, 12.0]
+    assert onp.allclose(np.pad(x, (2, 1), mode="reflect", reflect_type="odd"), expected)
+    assert onp.allclose(grad(fun)(x), [5.0, -1.0, 2.0])
+
+
+def test_pad_reflect_odd_matches_forward_mode():
+    # The reverse-mode gradient must be the transpose of the forward-mode
+    # derivative, also when several axes are padded at once.
+    x = R(3, 4)
+    fun = lambda x: np.pad(x, ((2, 1), (1, 3)), mode="reflect", reflect_type="odd")
+    vjp, y = make_vjp(fun)(x)
+    v, g = R(*x.shape), R(*onp.shape(y))
+    assert onp.allclose(onp.sum(g * fun(v)), onp.sum(vjp(g) * v))
+
+
+def test_pad_constant_still_shifts():
+    # 'constant' ignores the array and only adds a shift, which used to be the
+    # only supported mode.
+    combo_check(np.pad, [0])([R(2, 2)], [(2, 1), ((1, 2), (3, 0))], ["constant"], constant_values=[0.0, 1.5])
+
+
+def test_pad_unsupported_modes():
+    for mode in ["mean", "median", "minimum", "linear_ramp"]:
+        with pytest.raises(NotImplementedError):
+            check_grads(lambda x: np.pad(x, (1, 1), mode=mode))(R(4))

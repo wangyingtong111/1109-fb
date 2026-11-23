@@ -968,9 +968,92 @@ def _unpad(array, width):
     return array[idxs]
 
 
-def pad_vjp(ans, array, pad_width, mode, **kwargs):
-    assert mode == "constant", "Only constant mode padding is supported."
-    return lambda g: _unpad(g, pad_width)
+# Padding modes for which padding is linear in the array (no fresh values are
+# invented and no statistic of the array is added).  The other modes
+# ('maximum', 'mean', 'median', 'minimum', 'linear_ramp', ...) offset the padded
+# values by something that depends on the array, so they are affine rather than
+# linear and the transposes below would not be their adjoints.
+linear_pad_modes = ("constant", "edge", "wrap", "reflect", "symmetric")
+
+
+def pad_linear_kwargs(kwargs):
+    """Keep the kwargs that leave padding linear in the array.
+
+    ``reflect_type`` only selects which entries of the array the padded values
+    are copied from, whereas e.g. ``constant_values`` or ``end_values`` shift
+    them by a constant and so must not reach a JVP or transpose.
+    """
+    return {key: value for key, value in kwargs.items() if key == "reflect_type"}
+
+
+def _pad_pairs(pad_width, ndim):
+    """Normalise ``pad_width`` to one ``(before, after)`` pair per axis, like numpy."""
+    width = onp.asarray(pad_width)
+    if width.ndim < 3:
+        if width.size == 1:
+            shared = int(onp.round(width.ravel()[0]))
+            return ((shared, shared),) * ndim
+        if width.size == 2 and width.shape != (2, 1):
+            before, after = onp.round(width.ravel())
+            return ((int(before), int(after)),) * ndim
+    return tuple((int(onp.round(l)), int(onp.round(u))) for l, u in onp.broadcast_to(width, (ndim, 2)))
+
+
+def _pad_axis_coefs(length, before, after, mode, **kwargs):
+    """Coefficients of the padded axis, as produced by numpy for this mode.
+
+    Padding fills each side from the entries of the array nearest to it, so it
+    suffices to pad a one-hot encoding of a window at each end of the axis:
+    every padded row of that window then holds the coefficients of the entries
+    the padded value is built from.  ``reach`` bounds the entries a padded value
+    can refer to, which keeps the interior of long axes out of the computation.
+    """
+    reach = min(length, max(before, after) + 1)
+    if 2 * reach >= length:
+        keep, split = onp.arange(length), length
+    else:
+        keep = onp.concatenate((onp.arange(reach), onp.arange(length - reach, length)))
+        split = reach
+    window = onp.zeros((length, keep.size), dtype=onp.int64)
+    window[keep, onp.arange(keep.size)] = 1
+    # The counts numpy ends up copying are integers, so ask it in integers.
+    return onp.pad(window, ((before, after), (0, 0)), mode=mode, **kwargs), split
+
+
+def _pad_axis_adjoint(g, axis, before, after, mode, dtype, **kwargs):
+    length = g.shape[axis] - before - after
+    coefs, split = _pad_axis_coefs(length, before, after, mode, **kwargs)
+    moved = anp.moveaxis(g, axis, 0)
+    kept = anp.tensordot(coefs.astype(dtype, copy=False), moved, axes=([0], [0]))
+    if split != length:
+        # Entries between the two windows keep the gradient of the copied values,
+        # which the padding passes through unchanged.
+        gap = moved[before + split : before + length - split]
+        kept = anp.concatenate((kept[:split], gap, kept[split:]), axis=0)
+    return anp.moveaxis(kept, 0, axis)
+
+
+def pad_vjp(ans, array, pad_width, mode="constant", **kwargs):
+    if mode == "constant":
+        return lambda g: _unpad(g, pad_width)
+    if mode not in linear_pad_modes:
+        raise NotImplementedError(
+            f"VJP of pad is implemented for modes {linear_pad_modes}, not mode={mode!r}"
+        )
+    pairs = _pad_pairs(pad_width, anp.ndim(array))
+    pad_kwargs = pad_linear_kwargs(kwargs)
+    dtype = onp.result_type(array)
+
+    def vjp(g):
+        grad = g
+        # The axes are padded independently, so undo them in the reverse order.
+        for axis in reversed(range(anp.ndim(array))):
+            before, after = pairs[axis]
+            if before or after:
+                grad = _pad_axis_adjoint(grad, axis, before, after, mode, dtype, **pad_kwargs)
+        return grad
+
+    return vjp
 
 
 defvjp(anp.pad, pad_vjp)

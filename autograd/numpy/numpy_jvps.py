@@ -9,8 +9,10 @@ from .numpy_vjps import (
     balanced_eq,
     dot_adjoint_0,
     dot_adjoint_1,
+    linear_pad_modes,
     match_complex,
     nograd_functions,
+    pad_linear_kwargs,
     replace_zero,
     tensordot_adjoint_0,
     tensordot_adjoint_1,
@@ -301,4 +303,12 @@ def broadcast(x, target):
     return x
 
 
-defjvp(anp.pad, lambda g, ans, array, width, mode, **kwargs: anp.pad(g, width, mode))
+def pad_jvp(g, ans, array, width, mode="constant", **kwargs):
+    if mode not in linear_pad_modes:
+        raise NotImplementedError(
+            f"JVP of pad is implemented for modes {linear_pad_modes}, not mode={mode!r}"
+        )
+    return anp.pad(g, width, mode, **pad_linear_kwargs(kwargs))
+
+
+defjvp(anp.pad, pad_jvp)
