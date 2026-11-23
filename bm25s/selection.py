@@ -12,26 +12,44 @@ else:
 
 
 def _topk_numpy(query_scores, k, sorted):
-    # https://stackoverflow.com/questions/65038206/how-to-get-indices-of-top-k-values-from-a-numpy-array
-    # np.argpartition is faster than np.argsort, but do not return the values in order
-    partitioned_ind = np.argpartition(query_scores, -k)
-    # Since lit's a single query, we can take the last k elements
-    partitioned_ind = partitioned_ind.take(indices=range(-k, 0))
-    # We use the newly selected indices to find the score of the top-k values
-    partitioned_scores = np.take(query_scores, partitioned_ind)
+    # Deterministic top-k selection: the score is the primary criterion and ties
+    # are broken by the original document index (lower index wins). This makes
+    # the result independent of k, so e.g. the top-2 of a query is always a
+    # prefix of the top-3 for the same index.
+    #
+    # To stay fast on large collections we never fully sort the whole score
+    # vector: np.partition finds the k-th largest score (the cutoff) in O(n),
+    # then only the k selected items are ordered.
+    n = query_scores.shape[0]
+    if k > n:
+        k = n
+    if k == 0:
+        return query_scores[:0].copy(), np.empty(0, dtype=np.intp)
+
+    # Find the cutoff score: the k-th largest value. np.partition only
+    # partially reorders the array, which is cheaper than a full argsort.
+    kth_value = np.partition(query_scores, n - k)[n - k]
+
+    # Every document scoring strictly above the cutoff is always selected.
+    above_ind = np.flatnonzero(query_scores > kth_value)
+
+    # The remaining slots are filled with documents tied exactly at the cutoff,
+    # taking those with the smallest original document indices first so that
+    # the selection is deterministic and consistent across different k.
+    num_ties = k - above_ind.size
+    tied_ind = np.flatnonzero(query_scores == kth_value)[:num_ties]
+
+    ind = np.concatenate([above_ind, tied_ind])
+    partitioned_scores = query_scores[ind]
 
     if sorted:
-        # Since our top-k indices are not correctly ordered, we can sort them with argsort
-        # only if sorted=True (otherwise we keep it in an arbitrary order)
-        sorted_trunc_ind = np.flip(np.argsort(partitioned_scores))
-
-        # We again use np.take_along_axis as we have an array of indices that we use to
-        # decide which values to select
-        ind = partitioned_ind[sorted_trunc_ind]
+        # Sort only the k selected items: score descending is the primary key
+        # and the document index (ascending) breaks ties. np.lexsort is stable
+        # and uses the last key as primary, so the ordering is deterministic.
+        sorted_trunc_ind = np.lexsort((ind, -partitioned_scores))
+        ind = ind[sorted_trunc_ind]
         query_scores = partitioned_scores[sorted_trunc_ind]
-
     else:
-        ind = partitioned_ind
         query_scores = partitioned_scores
 
     return query_scores, ind
