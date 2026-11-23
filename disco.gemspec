@@ -1,0 +1,20 @@
+require_relative "lib/disco/version"
+
+Gem::Specification.new do |spec|
+  spec.name          = "disco"
+  spec.version       = Disco::VERSION
+  spec.summary       = "Recommendations for Ruby and Rails using collaborative filtering"
+  spec.homepage      = "https://github.com/ankane/disco"
+  spec.license       = "MIT"
+
+  spec.author        = "Andrew Kane"
+  spec.email         = "andrew@ankane.org"
+
+  spec.files         = Dir["*.{md,txt}", "{app,lib}/**/*"]
+  spec.require_path  = "lib"
+
+  spec.required_ruby_version = ">= 3.3"
+
+  spec.add_dependency "libmf", ">= 0.5"
+  spec.add_dependency "numo-narray-alt", ">= 0.10"
+end
