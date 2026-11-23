@@ -14,6 +14,14 @@ Bug fixes
 Enhancements
 ............
 
+- :class:`imblearn.over_sampling.SMOTE` supports a new
+  `small_class_strategy` parameter to handle classes that do not contain
+  enough samples to build the requested `k_neighbors` nearest neighbors.
+  Besides the historical strict behavior (`"strict"`, the default), the
+  number of neighbors can be reduced per class (`"reduce"`) and a singleton
+  class can be over-sampled by duplicating its unique sample
+  (`"duplicate"`). :pr:`TBD`
+
 Compatibility
 .............
 

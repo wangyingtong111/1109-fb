@@ -266,6 +266,24 @@ class SMOTE(BaseSMOTE):
           :class:`~sklearn.neighbors.NearestNeighbors` but could be extended to
           any compatible class.
 
+    small_class_strategy : {{"strict", "reduce", "duplicate"}}, default="strict"
+        Strategy used when a class to over-sample does not contain enough
+        samples to build the requested `k_neighbors` nearest neighbors (i.e.
+        fewer than `k_neighbors + 1` samples):
+
+        - `"strict"`: raise an error, as in the original SMOTE implementation.
+          The number of requested nearest neighbors is therefore never reduced.
+        - `"reduce"`: reduce the number of nearest neighbors used for the
+          offending class to the largest possible value, using all the other
+          samples of the same class as neighbors. A class with two samples thus
+          uses its single other sample as neighbor. This strategy cannot be
+          applied to a class containing a single sample.
+        - `"duplicate"`: behave like `"reduce"` when the class has at least two
+          samples, and when the class contains a single sample (no neighbor
+          exists), duplicate the unique sample as many times as requested.
+
+        .. versionadded:: 0.15
+
     Attributes
     ----------
     sampling_strategy_ : dict
@@ -332,18 +350,25 @@ class SMOTE(BaseSMOTE):
     Resampled dataset shape Counter({{0: 900, 1: 900}})
     """
 
+    _parameter_constraints: dict = {
+        **BaseSMOTE._parameter_constraints,
+        "small_class_strategy": [StrOptions({"strict", "reduce", "duplicate"})],
+    }
+
     def __init__(
         self,
         *,
         sampling_strategy="auto",
         random_state=None,
         k_neighbors=5,
+        small_class_strategy="strict",
     ):
         super().__init__(
             sampling_strategy=sampling_strategy,
             random_state=random_state,
             k_neighbors=k_neighbors,
         )
+        self.small_class_strategy = small_class_strategy
 
     def _fit_resample(self, X, y):
         self._validate_estimator()
@@ -357,10 +382,8 @@ class SMOTE(BaseSMOTE):
             target_class_indices = np.flatnonzero(y == class_sample)
             X_class = _safe_indexing(X, target_class_indices)
 
-            self.nn_k_.fit(X_class)
-            nns = self.nn_k_.kneighbors(X_class, return_distance=False)[:, 1:]
-            X_new, y_new = self._make_samples(
-                X_class, y.dtype, class_sample, X_class, nns, n_samples, 1.0
+            X_new, y_new = self._make_class_samples(
+                X_class, y.dtype, class_sample, n_samples
             )
             X_resampled.append(X_new)
             y_resampled.append(y_new)
@@ -372,6 +395,53 @@ class SMOTE(BaseSMOTE):
         y_resampled = np.hstack(y_resampled)
 
         return X_resampled, y_resampled
+
+    def _make_class_samples(self, X_class, y_dtype, class_sample, n_samples):
+        """Generate the synthetic samples for a single class.
+
+        The number of nearest neighbors is adapted (or the unique sample
+        duplicated) according to `small_class_strategy` when the class does not
+        hold enough samples to satisfy `k_neighbors`.
+        """
+        n_class_samples = X_class.shape[0]
+        # `nn_k_` requests the k nearest neighbors in addition to the sample
+        # itself, hence the required number of samples in the class.
+        requested_n_neighbors = self.nn_k_.n_neighbors
+
+        if n_class_samples >= requested_n_neighbors:
+            nn_k = self.nn_k_
+        elif self.small_class_strategy == "strict":
+            # Keep the original strict check performed by the nearest neighbors
+            # estimator when it is fitted below.
+            nn_k = self.nn_k_
+        elif n_class_samples == 1:
+            if self.small_class_strategy == "reduce":
+                raise ValueError(
+                    f"Class {class_sample!r} has only one sample and therefore "
+                    "does not have any nearest neighbor to generate a synthetic "
+                    "sample. Use small_class_strategy='duplicate' to duplicate "
+                    "the unique sample instead."
+                )
+            # small_class_strategy == "duplicate": repeat the unique sample.
+            if sparse.issparse(X_class):
+                X_new = sparse.vstack(
+                    [X_class] * n_samples, format=X_class.format
+                )
+            else:
+                X_new = np.repeat(X_class, n_samples, axis=0)
+            y_new = np.full(n_samples, fill_value=class_sample, dtype=y_dtype)
+            return X_new, y_new
+        else:
+            # Reduce the neighborhood to the largest possible value: every
+            # sample of the class except the sample itself is a neighbor.
+            nn_k = clone(self.nn_k_).set_params(n_neighbors=n_class_samples)
+
+        nn_k.fit(X_class)
+        nns = nn_k.kneighbors(X_class, return_distance=False)[:, 1:]
+        X_new, y_new = self._make_samples(
+            X_class, y_dtype, class_sample, X_class, nns, n_samples, 1.0
+        )
+        return X_new, y_new
 
 
 @Substitution(
