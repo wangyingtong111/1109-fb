@@ -1,8 +1,13 @@
 ## HEAD
 
+### Minor Enhancements
+
+  * `Bayes#untrain` now only revokes a sample that was actually trained for the same category, recording one contribution per `train` call.
+
 ### Documentation
 
   * Update macOS instructions in Numo docs (#199)
+  * Document the reversible-training semantics of `Bayes#untrain`.
 
 ### Development Fixes
 

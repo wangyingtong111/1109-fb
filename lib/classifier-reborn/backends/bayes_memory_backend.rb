@@ -6,10 +6,11 @@ module ClassifierReborn
 
     # This class provides Memory as the storage backend for the classifier data structures
     def initialize
-      @total_words     = 0
-      @total_trainings = 0
-      @category_counts = {}
-      @categories      = {}
+      @total_words      = 0
+      @total_trainings  = 0
+      @category_counts  = {}
+      @categories       = {}
+      @training_records = {}
     end
 
     def update_total_words(diff)
@@ -64,6 +65,37 @@ module ClassifierReborn
       @categories[category].key?(word)
     end
 
+    # Records one training contribution of the sample identified by +sample_key+
+    # to +category+. The same sample can be trained more than once, in which
+    # case each training is a separate, revocable contribution.
+    def record_training(category, sample_key)
+      records = training_records(category)
+      records[sample_key] = records.fetch(sample_key, 0) + 1
+    end
+
+    # Returns how many trained contributions of +sample_key+ are recorded for
+    # +category+ (0 when the sample was never trained for that category).
+    def training_record_count(category, sample_key)
+      records = @training_records[category]
+      records ? records.fetch(sample_key, 0) : 0
+    end
+
+    # Removes a single recorded contribution of +sample_key+ from +category+ and
+    # returns the number of contributions left. Nothing is removed when there is
+    # no contribution to remove.
+    def delete_training(category, sample_key)
+      records = @training_records[category]
+      return 0 if records.nil? || records.fetch(sample_key, 0) <= 0
+
+      remaining = records[sample_key] - 1
+      if remaining > 0
+        records[sample_key] = remaining
+      else
+        records.delete(sample_key)
+      end
+      remaining
+    end
+
     def reset
       initialize
     end
@@ -72,6 +104,10 @@ module ClassifierReborn
 
     def category_counts(category)
       @category_counts[category] ||= { training: 0, word: 0 }
+    end
+
+    def training_records(category)
+      @training_records[category] ||= {}
     end
   end
 end

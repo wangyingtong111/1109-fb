@@ -15,4 +15,21 @@ class BayesianMemoryTest < Minitest::Test
   def teardown
     TokenFilter::Stopword::STOPWORDS['en'] = @old_stopwords
   end
+
+  # A Marshal round-trip keeps the training records, so untraining still works
+  # on a classifier that was restored from disk.
+  def test_untrain_after_marshal_round_trip
+    classifier = ClassifierReborn::Bayes.new 'Maps', 'Weather'
+    classifier.train_maps 'bridge routes'
+    restored = Marshal.load(Marshal.dump(classifier))
+
+    assert_equal true, restored.untrain('Maps', 'bridge routes')
+    assert_equal Float::INFINITY, restored.classifications('bridge routes')['Maps']
+  end
+
+  private
+
+  def fresh_backend
+    ClassifierReborn::BayesMemoryBackend.new
+  end
 end

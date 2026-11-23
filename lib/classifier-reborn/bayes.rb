@@ -92,37 +92,48 @@ module ClassifierReborn
         @backend.update_total_words(count)
       end
       @backend.update_total_trainings(1)
+      @backend.record_training(category, training_sample_key(word_hash))
       @backend.update_category_training_count(category, 1)
     end
 
     # Provides a untraining method for all categories specified in Bayes#new
-    # Be very careful with this method.
+    #
+    # Untraining is the exact inverse of training: it only revokes a training
+    # contribution that was previously recorded for the *same* category, so the
+    # text given here is preprocessed exactly like it was for #train and must
+    # match a recorded sample as a whole. A sample that was trained twice counts
+    # as two contributions, and each call to #untrain revokes one of them.
+    #
+    # Anything else - an unknown category, a sample that was never trained, or a
+    # text that merely shares some words with a trained sample - changes nothing
+    # and returns +false+.
     #
     # For example:
     #     b = ClassifierReborn::Bayes.new 'This', 'That', 'the_other'
     #     b.train :this, "This text"
-    #     b.untrain :this, "This text"
+    #     b.untrain :this, "This text" # => true
+    #     b.untrain :this, "This text" # => false, nothing left to revoke
     def untrain(category, text)
       word_hash = Hasher.word_hash(text, @enable_stemmer,
                                    tokenizer: @tokenizer, token_filters: @token_filters)
-      return if word_hash.empty?
+      return false if word_hash.empty?
 
       category = CategoryNamer.prepare_name(category)
+      sample_key = training_sample_key(word_hash)
+      return false unless @backend.training_record_count(category, sample_key) > 0
+
+      @backend.delete_training(category, sample_key)
+
       word_hash.each do |word, count|
-        next if @backend.total_words < 0
-
-        orig = @backend.category_word_frequency(category, word) || 0
         @backend.update_category_word_frequency(category, word, -count)
-        if @backend.category_word_frequency(category, word) <= 0
-          @backend.delete_category_word(category, word)
-          count = orig
-        end
-
-        @backend.update_category_word_count(category, -count) if @backend.category_word_count(category) >= count
+        @backend.delete_category_word(category, word) if @backend.category_word_frequency(category, word) <= 0
+        @backend.update_category_word_count(category, -count)
         @backend.update_total_words(-count)
       end
       @backend.update_total_trainings(-1)
       @backend.update_category_training_count(category, -1)
+
+      true
     end
 
     # Returns the scores in each category the provided +text+. E.g.,
@@ -260,6 +271,17 @@ module ClassifierReborn
     end
 
     private
+
+    # Identifies a training sample by the word hash that is actually stored,
+    # i.e. after tokenizing, filtering and stemming. Deduplication happens on
+    # this key only: a text that merely overlaps with a trained sample gets a
+    # different key and therefore cannot revoke it.
+    #
+    # String#dump keeps the key unambiguous and printable even though tokens may
+    # contain separators or other control characters.
+    def training_sample_key(word_hash)
+      word_hash.sort.map { |word, count| "#{word.to_s.dump}:#{count}" }.join(',')
+    end
 
     def populate_initial_categories
       @initial_categories.each do |c|

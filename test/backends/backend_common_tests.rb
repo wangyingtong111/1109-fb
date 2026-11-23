@@ -56,15 +56,38 @@ module BackendCommonTests
     refute @backend.word_in_category?(:Interesting, 'foo')
   end
 
+  def test_training_records
+    refute @backend.training_record_count(:Interesting, 'foo').positive?
+    @backend.record_training(:Interesting, 'foo')
+    @backend.record_training(:Interesting, 'foo')
+    @backend.record_training(:Interesting, 'bar')
+    assert_equal 2, @backend.training_record_count(:Interesting, 'foo')
+    assert_equal 1, @backend.training_record_count(:Interesting, 'bar')
+    assert_equal 1, @backend.delete_training(:Interesting, 'foo')
+    assert_equal 1, @backend.training_record_count(:Interesting, 'foo')
+    assert_equal 0, @backend.delete_training(:Interesting, 'foo')
+    refute @backend.training_record_count(:Interesting, 'foo').positive?
+    assert_equal 1, @backend.training_record_count(:Interesting, 'bar')
+
+    # Deleting a contribution that is not recorded is a no-op, it does not make
+    # the count negative.
+    assert_equal 0, @backend.delete_training(:Interesting, 'foo')
+    assert_equal 0, @backend.delete_training(:Weather, 'foo')
+    refute @backend.training_record_count(:Interesting, 'foo').positive?
+    assert_equal 1, @backend.training_record_count(:Interesting, 'bar')
+  end
+
   def test_reset
     @backend.update_total_words(10)
     @backend.update_total_trainings(10)
     @backend.add_category(:Interesting)
     @backend.update_category_training_count(:Interesting, 10)
     @backend.update_category_word_count(:Interesting, 10)
+    @backend.record_training(:Interesting, 'foo')
     @backend.reset
     assert @backend.total_words.zero?
     assert @backend.total_trainings.zero?
     assert @backend.category_keys.empty?
+    refute @backend.training_record_count(:Interesting, 'foo').positive?
   end
 end

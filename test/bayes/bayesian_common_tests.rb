@@ -128,10 +128,123 @@ module BayesianCommonTests
     @classifier.train_uninteresting 'here are some bad words, I hate you'
     @classifier.add_category 'colors'
     @classifier.train_colors 'red orange green blue seven'
-    classification_of_bad_data = @classifier.classify 'seven'
-    @classifier.untrain_colors 'seven'
-    classification_after_untrain = @classifier.classify 'seven'
-    refute_equal classification_of_bad_data, classification_after_untrain
+    refute_equal Float::INFINITY, @classifier.classify_with_score('seven')[1]
+
+    @classifier.untrain_colors 'red orange green blue seven'
+
+    assert_equal Float::INFINITY, @classifier.classify_with_score('seven')[1]
+    assert_equal Float::INFINITY, @classifier.classifications('seven')['Colors']
+  end
+
+  # "Maps" was trained twice with the same sample, "Weather" once.
+  # Revoking an unknown sample must leave every number and score untouched.
+  def test_untrain_of_an_unknown_sample_changes_nothing
+    classifier, backend = recoverable_classifier('Maps', 'Weather')
+    classifier.train_maps 'bridge routes'
+    classifier.train_maps 'bridge routes'
+    classifier.train_weather 'rain fog'
+    before = model_snapshot(classifier, backend)
+
+    assert_equal false, classifier.untrain('Maps', 'bridge unknown')
+
+    assert_equal before, model_snapshot(classifier, backend)
+    assert_equal 2, backend.category_training_count(:Maps)
+    assert_equal 1, backend.category_training_count(:Weather)
+    assert_equal 4, backend.category_word_count(:Maps)
+    assert_equal 6, backend.total_words
+    assert_equal 3, backend.total_trainings
+  end
+
+  # The real sample still has one contribution left over after revoking one.
+  def test_untrain_revokes_a_single_recorded_contribution
+    classifier, backend = recoverable_classifier('Maps', 'Weather')
+    classifier.train_maps 'bridge routes'
+    classifier.train_maps 'bridge routes'
+    classifier.train_weather 'rain fog'
+
+    assert classifier.untrain('Maps', 'bridge routes')
+
+    assert_equal 1, backend.category_training_count(:Maps)
+    assert_equal 2, backend.category_word_count(:Maps)
+    assert_equal 1, backend.category_word_frequency(:Maps, :bridg)
+    assert_equal 1, backend.category_word_frequency(:Maps, :rout)
+    assert backend.word_in_category?(:Maps, :bridg)
+    assert backend.word_in_category?(:Maps, :rout)
+    assert_equal 1, backend.category_training_count(:Weather)
+    assert_equal 4, backend.total_words
+    assert_equal 2, backend.total_trainings
+    scores = classifier.classifications('bridge routes')
+
+    # The remaining Maps contribution is proportional to a single training, so
+    # the scores match a classifier that only ever saw the sample once.
+    reference, = recoverable_classifier('Maps', 'Weather')
+    reference.train_maps 'bridge routes'
+    reference.train_weather 'rain fog'
+    assert_equal reference.classifications('bridge routes'), scores
+  end
+
+  # Partial word overlap is not the sample that was trained.
+  def test_untrain_ignores_partial_overlap_with_a_trained_sample
+    classifier, backend = recoverable_classifier('Maps', 'Weather')
+    classifier.train_maps 'bridge routes'
+    classifier.train_weather 'rain fog'
+    before = model_snapshot(classifier, backend)
+
+    assert_equal false, classifier.untrain('Maps', 'bridge')
+    assert_equal false, classifier.untrain('Weather', 'bridge routes')
+    assert_equal false, classifier.untrain('Maps', 'bridge routes and tunnels')
+
+    assert_equal before, model_snapshot(classifier, backend)
+  end
+
+  def test_untrain_does_not_revoke_a_sample_of_another_category
+    classifier, backend = recoverable_classifier('Maps', 'Weather')
+    classifier.train_maps 'bridge routes'
+    before = model_snapshot(classifier, backend)
+
+    assert_equal false, classifier.untrain('Weather', 'bridge routes')
+
+    assert_equal before, model_snapshot(classifier, backend)
+    assert_equal 1, backend.category_training_count(:Maps)
+    assert_equal 0, backend.category_training_count(:Weather)
+  end
+
+  # Training the same sample twice records two contributions, so revoking works
+  # twice as well - and not a third time.
+  def test_untrain_twice_revokes_one_contribution_per_call
+    classifier, backend = recoverable_classifier('Maps')
+    classifier.train_maps 'bridge routes'
+    classifier.train_maps 'bridge routes'
+
+    assert classifier.untrain('Maps', 'bridge routes')
+    assert_equal 1, backend.category_training_count(:Maps)
+    assert_equal 1, backend.total_trainings
+    assert_equal 2, backend.category_word_count(:Maps)
+
+    assert classifier.untrain('Maps', 'bridge routes')
+    assert_equal 0, backend.category_training_count(:Maps)
+    assert_equal 0, backend.total_trainings
+    assert_equal 0, backend.category_word_count(:Maps)
+    assert backend.total_words.zero?
+    refute backend.word_in_category?(:Maps, :bridg)
+    refute backend.word_in_category?(:Maps, :rout)
+
+    # No contributions are left, so the same text cannot be revoked again.
+    assert_equal false, classifier.untrain('Maps', 'bridge routes')
+    assert_equal 0, backend.category_training_count(:Maps)
+    assert backend.total_words.zero?
+  end
+
+  def test_untrain_uses_the_same_preprocessing_as_training
+    classifier, backend = recoverable_classifier('Maps')
+    classifier.train_maps 'Bridge Routes'
+
+    assert classifier.untrain('Maps', 'bridge routes')
+
+    assert_equal 0, backend.category_training_count(:Maps)
+    assert_equal 0, backend.category_word_count(:Maps)
+    assert backend.total_words.zero?
+    assert backend.total_trainings.zero?
   end
 
   def test_skip_empty_training_and_classification
@@ -192,6 +305,34 @@ module BayesianCommonTests
   end
 
   private
+
+  # Returns a classifier and the backend it stores its model in, so that the
+  # untraining tests can inspect the raw counters as well as the scores. Each
+  # call gets its own, isolated backend.
+  def recoverable_classifier(*categories)
+    backend = fresh_backend
+    [ClassifierReborn::Bayes.new(*categories, backend: backend), backend]
+  end
+
+  # Everything untraining is allowed to change, so that "nothing changed" can
+  # be asserted on the word frequencies, the document priors and the scores.
+  def model_snapshot(classifier, backend)
+    words = %i[bridg rout rain fog unknown]
+    categories = backend.category_keys.sort
+    {
+      total_words: backend.total_words,
+      total_trainings: backend.total_trainings,
+      categories: categories,
+      training_counts: categories.map { |c| backend.category_training_count(c) },
+      word_counts: categories.map { |c| backend.category_word_count(c) },
+      frequencies: categories.map do |category|
+        words.map do |word|
+          [backend.word_in_category?(category, word), backend.category_word_frequency(category, word)]
+        end
+      end,
+      scores: classifier.classifications('bridge routes rain fog')
+    }
+  end
 
   def another_classifier
     ClassifierReborn::Bayes.new %w[Interesting Uninteresting], backend: @alternate_backend

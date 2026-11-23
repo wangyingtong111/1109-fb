@@ -100,10 +100,46 @@ module ClassifierReborn
       @redis.hexists(category, word)
     end
 
+    # Records one training contribution of the sample identified by +sample_key+
+    # to +category+. The same sample can be trained more than once, in which
+    # case each training is a separate, revocable contribution.
+    def record_training(category, sample_key)
+      @redis.hincrby(:training_records, training_record_field(category, sample_key), 1)
+    end
+
+    # Returns how many trained contributions of +sample_key+ are recorded for
+    # +category+ (0 when the sample was never trained for that category).
+    def training_record_count(category, sample_key)
+      @redis.hget(:training_records, training_record_field(category, sample_key)).to_i
+    end
+
+    # Removes a single recorded contribution of +sample_key+ from +category+ and
+    # returns the number of contributions left. Nothing is removed when there is
+    # no contribution to remove.
+    def delete_training(category, sample_key)
+      field = training_record_field(category, sample_key)
+      remaining = @redis.hget(:training_records, field).to_i
+      return 0 if remaining <= 0
+
+      remaining = @redis.hincrby(:training_records, field, -1).to_i
+      @redis.hdel(:training_records, field) if remaining <= 0
+      remaining
+    end
+
     def reset
       @redis.flushdb
       @redis.set(:total_words, 0)
       @redis.set(:total_trainings, 0)
+    end
+
+    private
+
+    # Category word frequencies are stored in a hash named after the category,
+    # so the training records are kept in their own hash, one field per
+    # category/sample pair. Both parts are escaped, so the field is unambiguous
+    # whatever characters the category or the tokens contain.
+    def training_record_field(category, sample_key)
+      "#{category.to_s.dump}:#{sample_key}"
     end
   end
 end

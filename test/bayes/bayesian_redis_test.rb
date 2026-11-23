@@ -21,6 +21,21 @@ class BayesianRedisTest < Minitest::Test
     if defined? @backend
       @backend.reset
       @alternate_backend.reset
+      Array(@scratch_backends).each(&:reset)
     end
+  end
+
+  private
+
+  # Every classifier in these tests needs its own keyspace, so each one gets a
+  # backend on its own Redis database, all of which are flushed in teardown.
+  def fresh_backend
+    backend = ClassifierReborn::BayesRedisBackend.new(db: next_redis_db)
+    (@scratch_backends ||= []) << backend
+    backend
+  end
+
+  def next_redis_db
+    @redis_db = (@redis_db || 1) + 1
   end
 end

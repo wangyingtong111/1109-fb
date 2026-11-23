@@ -239,6 +239,34 @@ In this case, each stopwords file name needs to be the same as the corresponding
 ClassifierReborn::Hasher.add_custom_stopword_path("/path/to/additional/stopwords/directory")
 ```
 
+## Untraining
+
+`untrain` undoes a training contribution. It is deliberately strict: it only revokes a
+sample that was previously trained for the *same* category, and the text is preprocessed
+exactly like it was during training (tokenizer, token filters, stemmer, stopwords), so
+`"Bridge Routes"` and `"bridge routes"` refer to the same sample.
+
+A sample that was trained twice counts as two contributions, and each `untrain` call
+revokes one of them. Anything else — an unknown category, a sample that was never
+trained, or a text that merely shares some words with a trained sample — changes nothing
+and returns `false`.
+
+```ruby
+classifier = ClassifierReborn::Bayes.new 'Maps', 'Weather'
+classifier.train 'Maps', 'bridge routes'
+classifier.train 'Maps', 'bridge routes'
+classifier.train 'Weather', 'rain fog'
+
+classifier.untrain 'Maps', 'bridge unknown' #=> false, nothing is changed
+classifier.untrain 'Maps', 'bridge routes'  #=> true, one contribution revoked
+
+# 'bridge' and 'routes' still exist once for Maps, and so does Weather's sample.
+```
+
+To be able to tell which samples were trained, the classifier keeps one record per
+distinct training sample and category. This costs memory (or Redis space) proportional to
+the number of distinct samples, not to the size of the vocabulary.
+
 ## Knowing the Score
 
 When you ask a Bayesian classifier to classify text against a set of trained categories it does so by generating a score (as a Float) for each possible category.
