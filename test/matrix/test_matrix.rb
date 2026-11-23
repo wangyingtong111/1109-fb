@@ -646,6 +646,90 @@ class TestMatrix < Test::Unit::TestCase
     assert_equal Matrix.empty(0,3), Matrix.combine(Matrix.empty(0,3), Matrix.empty(0,3)) { raise }
   end
 
+  def test_combine_broadcast
+    samples = Matrix[[1, 2, 3], [4, 5, 6]]   # 2x3
+    stats   = Matrix[[1, 2, 3]]              # 1x3 column statistics
+    weights = Matrix[[10], [100]]            # 2x1 per-row weights
+    transform = ->(sample, stat, weight) { (sample - stat) * weight }
+
+    # Broadcasting expands a single statistic row and a single weight column
+    assert_equal Matrix[[0, 0, 0], [300, 300, 300]],
+      Matrix.combine(samples, stats, weights, broadcast: true, &transform)
+    assert_equal Matrix[[0, 0, 0], [300, 300, 300]],
+      samples.combine(stats, weights, broadcast: true, &transform)
+
+    # The block always receives the original, unexpanded cell values
+    arguments = []
+    Matrix.combine(samples, stats, weights, broadcast: true) do |sample, stat, weight|
+      arguments << [sample, stat, weight]
+      sample
+    end
+    assert_equal [[1, 1, 10], [2, 2, 10], [3, 3, 10],
+                  [4, 1, 100], [5, 2, 100], [6, 3, 100]], arguments
+
+    # A 1x1 matrix is repeated over every entry
+    assert_equal Matrix[[8, 9, 10], [11, 12, 13]],
+      samples.combine(Matrix[[7]], broadcast: true) {|a, b| a + b}
+
+    # Vectors are treated as single-column matrices
+    assert_equal Matrix[[0, 0, 0], [300, 300, 300]],
+      Matrix.combine(samples, stats, Vector[10, 100], broadcast: true, &transform)
+
+    # Broadcasting can be requested without a block, through the enumerator
+    assert_equal Matrix[[0, 0, 0], [300, 300, 300]],
+      Matrix.combine(samples, stats, weights, broadcast: true).each(&transform)
+
+    # A training slice without rows keeps its columns and never calls the block
+    no_samples = Matrix.empty(0, 3)
+    no_weights = Matrix.empty(0, 1)
+    result = Matrix.combine(no_samples, stats, no_weights, broadcast: true) { raise }
+    assert_equal Matrix.empty(0, 3), result
+    assert_equal 0, result.row_count
+    assert_equal 3, result.column_count
+
+    # A zero-column slice keeps its rows in the same way
+    assert_equal Matrix.empty(2, 0),
+      Matrix.combine(Matrix.empty(2, 0), Matrix.empty(1, 0), broadcast: true) { raise }
+
+    # Incompatible shapes cannot be broadcast
+    assert_raise(Matrix::ErrDimensionMismatch) do
+      Matrix.combine(Matrix[[1, 2], [3, 4]], Matrix[[1, 2, 3]], broadcast: true) {|a, b| a}
+    end
+    assert_raise(Matrix::ErrDimensionMismatch) do
+      Matrix.combine(Matrix.empty(0, 3), Matrix.empty(0, 2), broadcast: true) {|a, b| a}
+    end
+    assert_raise(Matrix::ErrDimensionMismatch) do
+      Matrix.combine(Matrix.empty(2, 0), Matrix.empty(0, 0), broadcast: true) {|a, b| a}
+    end
+  end
+
+  def test_combine_strict_by_default
+    samples = Matrix[[1, 2, 3], [4, 5, 6]]
+    stats   = Matrix[[1, 2, 3]]
+    weights = Matrix[[10], [100]]
+
+    # The old equal-shape contract is unchanged: no implicit broadcasting
+    assert_raise(Matrix::ErrDimensionMismatch) do
+      Matrix.combine(samples, stats, weights) { raise }
+    end
+    assert_raise(Matrix::ErrDimensionMismatch) do
+      samples.combine(stats, weights) { raise }
+    end
+    assert_raise(Matrix::ErrDimensionMismatch) do
+      Matrix.combine(samples, stats, weights, broadcast: false) { raise }
+    end
+
+    # Equal-shape inputs still combine entrywise in strict mode
+    assert_equal Matrix[[0, 0, 0], [300, 300, 300]],
+      Matrix.combine(samples, Matrix[[1, 2, 3], [1, 2, 3]],
+                     Matrix[[10, 10, 10], [100, 100, 100]]) {|s, c, w| (s - c) * w}
+
+    # Strict mode also rejects empty matrices whose shapes merely broadcast
+    assert_raise(Matrix::ErrDimensionMismatch) do
+      Matrix.combine(Matrix.empty(0, 3), Matrix.empty(0, 1)) { raise }
+    end
+  end
+
   def test_set_element
     src = Matrix[
       [1, 2, 3, 4],

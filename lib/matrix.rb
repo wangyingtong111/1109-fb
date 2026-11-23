@@ -277,44 +277,120 @@ class Matrix
   end
 
   # :call-seq:
-  #   Matrix.combine(*matrices) { |*elements| ... }
+  #   Matrix.combine(*matrices, broadcast: false) { |*elements| ... }
   #
-  # Create a matrix by combining matrices entrywise, using the given block
+  # Create a matrix by combining matrices entrywise, using the given block.
+  #
+  # The block is called once per entry of the resulting matrix and receives
+  # the corresponding (unexpanded) element of every given matrix, in order.
   #
   #   x = Matrix[[6, 6], [4, 4]]
   #   y = Matrix[[1, 2], [3, 4]]
   #   Matrix.combine(x, y) {|a, b| a - b} # => Matrix[[5, 4], [1, 0]]
   #
-  def Matrix.combine(*matrices)
-    return to_enum(__method__, *matrices) unless block_given?
+  # By default (+broadcast: false+) every matrix must have exactly the same
+  # shape, as in older versions; no automatic broadcasting is performed:
+  #
+  #   stats   = Matrix[[1, 2, 3]]                 # 1x3 column statistics
+  #   weights = Matrix[[10], [100]]              # 2x1 per-row weights
+  #   samples = Matrix[[1, 2, 3], [4, 5, 6]]     # 2x3 samples
+  #   Matrix.combine(samples, stats, weights) {|s, c, w| (s - c) * w}
+  #     # => raises Matrix::ErrDimensionMismatch
+  #
+  # Pass +broadcast: true+ to expand matrices the way NumPy does: dimensions
+  # of size 1 (and only those) are repeated to match the other matrices, so
+  # a single row is reused for every sample and a single column for every
+  # feature. Empty dimensions are preserved, hence a training slice with no
+  # rows keeps its column count and the block is never called:
+  #
+  #   Matrix.combine(samples, stats, weights, broadcast: true) {|s, c, w| (s - c) * w}
+  #     # => Matrix[[0, 0, 0], [300, 300, 300]]
+  #   no_samples = Matrix.empty(0, 3)
+  #   no_weights = Matrix.empty(0, 1)
+  #   Matrix.combine(no_samples, stats, no_weights, broadcast: true) { raise }
+  #     # => Matrix.empty(0, 3)
+  #
+  def Matrix.combine(*matrices, broadcast: false, &block)
+    return to_enum(__method__, *matrices, broadcast: broadcast) unless block_given?
 
     return Matrix.empty if matrices.empty?
     matrices.map!(&CoercionHelper.method(:coerce_to_matrix))
-    x = matrices.first
-    matrices.each do |m|
-      raise ErrDimensionMismatch unless x.row_count == m.row_count && x.column_count == m.column_count
+
+    if broadcast
+      target_row_count, target_column_count = Matrix.send(:broadcast_shape, matrices)
+      indices = matrices.map do |m|
+        Matrix.send(:broadcast_indices, m, target_row_count, target_column_count)
+      end
+    else
+      x = matrices.first
+      matrices.each do |m|
+        raise ErrDimensionMismatch unless x.row_count == m.row_count && x.column_count == m.column_count
+      end
+      target_row_count = x.row_count
+      target_column_count = x.column_count
+      indices = nil
     end
 
-    rows = Array.new(x.row_count) do |i|
-      Array.new(x.column_count) do |j|
-        yield matrices.map{|m| m[i,j]}
+    # A block with a fixed arity greater than one (a strict lambda such as
+    # +->(a, b, c)+) wants one argument per matrix; every other block keeps
+    # the historical contract of receiving the whole array of elements
+    # (Ruby then auto-splats it for ordinary multi-argument blocks).
+    splat = block.arity > 1
+    rows = Array.new(target_row_count) do |i|
+      Array.new(target_column_count) do |j|
+        elements = if indices
+          matrices.each_with_index.map {|m, k| m[indices[k][0][i], indices[k][1][j]]}
+        else
+          matrices.map {|m| m[i, j]}
+        end
+        splat ? block.call(*elements) : block.call(elements)
       end
     end
-    new rows, x.column_count
+    new rows, target_column_count
   end
 
   # :call-seq:
-  #   combine(*other_matrices) { |*elements| ... }
+  #   combine(*other_matrices, broadcast: false) { |*elements| ... }
   #
   # Creates new matrix by combining with <i>other_matrices</i> entrywise,
-  # using the given block.
+  # using the given block. See Matrix.combine for the meaning of
+  # +broadcast+.
   #
   #   x = Matrix[[6, 6], [4, 4]]
   #   y = Matrix[[1, 2], [3, 4]]
   #   x.combine(y) {|a, b| a - b} # => Matrix[[5, 4], [1, 0]]
-  def combine(*matrices, &block)
-    Matrix.combine(self, *matrices, &block)
+  def combine(*matrices, broadcast: false, &block)
+    Matrix.combine(self, *matrices, broadcast: broadcast, &block)
   end
+
+  # Computes the shape all +matrices+ can be expanded to using NumPy style
+  # broadcasting: along each axis every size must be either 1 or one common
+  # size. A size of 1 is repeated, empty sizes (0) are kept and take
+  # precedence over 1, so the column count of a matrix without rows is
+  # preserved and no entries have to be produced for it. Raises
+  # ErrDimensionMismatch otherwise.
+  def Matrix.broadcast_shape(matrices) # :nodoc:
+    [matrices.map(&:row_count), matrices.map(&:column_count)].map do |sizes|
+      distinct_sizes = sizes.uniq - [1]
+      if distinct_sizes.size > 1
+        raise ErrDimensionMismatch, "matrices with sizes #{sizes.uniq.join(", ")} on an axis cannot be broadcast together"
+      end
+      distinct_sizes.first || 1
+    end
+  end
+  private_class_method :broadcast_shape
+
+  # Returns the row and column index lookup tables needed to read a matrix
+  # of shape (row_count x column_count) as if it had the target shape. An
+  # axis whose source size is 1 always maps to index 0, which realizes the
+  # repetition of a single statistic row or a single weight column.
+  def Matrix.broadcast_indices(matrix, row_count, column_count) # :nodoc:
+    [
+      Array.new(row_count) {|i| matrix.row_count == 1 ? 0 : i},
+      Array.new(column_count) {|j| matrix.column_count == 1 ? 0 : j},
+    ]
+  end
+  private_class_method :broadcast_indices
 
   #
   # Matrix.new is private; use ::rows, ::columns, ::[], etc... to create.

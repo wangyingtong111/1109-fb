@@ -2,6 +2,10 @@
 
 List of new feature changes (excluding most bug fixes and optimizations)
 
+## Unreleased
+
+* `Matrix.combine` and `Matrix#combine` accept an explicit `broadcast:` keyword to expand dimensions of size 1 (NumPy style); strict equal-shape combining remains the default.
+
 ## v0.4.0
 
 * Add `Matrix#rotate_entries` [#19]
