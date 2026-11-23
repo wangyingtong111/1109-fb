@@ -80,15 +80,15 @@ Once the validation runs are completed following report will be generated.
 
 ```
 --------------- Run Report ----------------
-Run     Total   Correct Incorrect  Accuracy
--------------------------------------------
-  1      1000       972        28   0.97200
-  2      1000       973        27   0.97300
-  3      1000       981        19   0.98100
-  4      1000       981        19   0.98100
-  5      1000       967        33   0.96700
--------------------------------------------
-All      5000      4874       126   0.97480
+Run     Total   Correct Incorrect Abstained  Answered  Accuracy  Coverage
+-------------------------------------------------------------------------
+  1      1000       972        28         0      1000   0.97200   1.00000
+  2      1000       973        27         0      1000   0.97300   1.00000
+  3      1000       981        19         0      1000   0.98100   1.00000
+  4      1000       981        19         0      1000   0.98100   1.00000
+  5      1000       967        33         0      1000   0.96700   1.00000
+-------------------------------------------------------------------------
+All      5000      4874       126         0      5000   0.97480   1.00000
 
 ----------------------- Confusion Matrix -----------------------
 Predicted ->          Ham         Spam        Total       Recall
@@ -132,10 +132,51 @@ F1 score           : 0.9115168539325843
 
 The first table in the above report is a summary of each individual runs (of k-folds) followed by the overall accumulated summary line at the end.
 
+The run report carries the following counters.
+
+* `Total` is every validation sample in the run.
+* `Correct` and `Incorrect` count samples the model actually answered.
+* `Abstained` counts samples the model refused to answer, for example a threshold enabled `Bayes` classifier whose best score was below the threshold (it returns `nil` from `classify`).
+* `Answered` is `Correct + Incorrect`, i.e. everything that was not an abstention.
+* `Accuracy` is `Correct / Total`, so an abstention counts against overall accuracy.
+* `Coverage` is `Answered / Total`, the share of samples the model committed to. A separate answered-only accuracy (`Correct / Answered`) is available from `build_run_report` as `:answered_accuracy`.
+
 The second table is a standard multi-class [Confusion Matrix](https://en.wikipedia.org/wiki/Confusion_matrix).
 Along with the cross-matching counts of actual and predicted classes it also shows per class recall column and per class precision row at the ends.
 
 At the end there are various derived statistical measures listed for each class taken as the positive class one at a time (in [one-vs.-rest](https://en.wikipedia.org/wiki/Multiclass_classification#One-vs.-rest) manner).
+
+## Abstentions and Unseen True Classes
+
+A validation fold can contain a true class that the other folds never trained, so the rebuilt classifier does not know that category.
+Confusion matrices are always keyed by the true class as the row, and an unknown true class is kept as its own row instead of being dropped or raised on.
+When a threshold enabled classifier refuses a sample, the refusal is recorded under a dedicated `ABSTAINED` prediction column.
+
+```ruby
+ClassifierReborn::ClassifierValidator::ABSTAINED
+#=> Abstained
+```
+
+`ABSTAINED` is a singleton object (`AbstainedPrediction.instance`), not a `String` or a `Symbol`.
+It therefore has an identity that cannot collide with any real class label a caller might use, even if one of the actual categories is itself named `"Abstained"` (or `"拒判"`).
+The real category and the model's non-answer stay separate cells in the matrix; the abstention column simply has no matching true-class row, so its precision is reported as `0.0`.
+
+Fold matrices are merged by accumulating their raw cell counts (never by averaging), and rows and columns are ordered deterministically with `ABSTAINED` last.
+Consequently, merging the same folds in any order yields the exact same matrix and the exact same denominators.
+For example, two folds with three and one validation samples respectively, where the first fold has one correct, one incorrect and one abstention and the second fold correctly predicts a category never seen by the first fold's training data, accumulate as follows.
+
+```
+--------------- Run Report ----------------
+Run     Total   Correct Incorrect Abstained  Answered  Accuracy  Coverage
+-------------------------------------------------------------------------
+  1           3        1        1         1         2   0.33333   0.66667
+  2           1        1        0         0         1   1.00000   1.00000
+-------------------------------------------------------------------------
+All          4        2        1         1         3   0.50000   0.75000
+```
+
+That is, full sample accuracy `2/4 = 1/2`, answered accuracy `2/3`, and coverage `3/4`, regardless of which fold is merged first.
+
 
 ## Custom Validation
 
@@ -178,9 +219,9 @@ This will yield the following report.
 
 ```
 --------------- Run Report ----------------
-Run     Total   Correct Incorrect  Accuracy
--------------------------------------------
-All      1000       966        34   0.96600
+Run     Total   Correct Incorrect Abstained  Answered  Accuracy  Coverage
+-------------------------------------------------------------------------
+All      1000       966        34         0      1000   0.96600   1.00000
 
 ----------------------- Confusion Matrix -----------------------
 Predicted ->          Ham         Spam        Total       Recall
@@ -231,7 +272,14 @@ Suppose we only want to generate the run reports, but no multi-class confusion m
 ```ruby
 run_report = build_run_report(conf_mat)
 pp run_report
-#=> {:total=>1000, :correct=>966, :incorrect=>34, :accuracy=>0.966}
+#=> {:total=>1000,
+#    :correct=>966,
+#    :incorrect=>34,
+#    :abstained=>0,
+#    :answered=>1000,
+#    :accuracy=>0.966,
+#    :answered_accuracy=>0.966,
+#    :coverage=>1.0}
 ```
 
 This data can be used to print the report in a custom manner or utilize corresponding provided print method.
@@ -243,8 +291,8 @@ print_run_report(run_report, "Custom", true)
 This will print the following report where the last argument is set to `true` to print the header.
 
 ```
-Run        Total   Correct Incorrect  Accuracy
-Custom      1000       966        34   0.96600
+Run        Total   Correct Incorrect Abstained  Answered  Accuracy  Coverage
+Custom      1000       966        34         0      1000   0.96600   1.00000
 ```
 
 Now, suppose we only want to generate the multi-class confusion matrix report, but no run reports or other derived statics.

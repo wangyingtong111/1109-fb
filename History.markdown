@@ -1,5 +1,9 @@
 ## HEAD
 
+### Minor Enhancements
+
+  * Keep threshold rejections (abstentions) in validation confusion matrices under a dedicated `ABSTAINED` sentinel, retain unseen true classes as confusion rows, and extend the run report with abstention, answered, answered accuracy and coverage counters. Fold reports merge by accumulating raw counts independent of merge order.
+
 ### Documentation
 
   * Update macOS instructions in Numo docs (#199)
