@@ -468,6 +468,37 @@ class TestMatrix < Test::Unit::TestCase
     assert_equal(2, @m1.rank)
   end
 
+  def test_rank_with_tolerance
+    rows = [[1.0, 1.0, 0.0], [1.0, 1.0 + 1e-10, 1e-10], [0.0, 0.0, 0.0]]
+    [1e-180, 1.0, 1e180].each do |scale|
+      m = Matrix[*rows.map {|row| row.map {|e| e * scale } }]
+      assert_equal(1, m.rank(tolerance: 1e-8), "scale=#{scale}")
+      assert_equal(1, m.transpose.rank(tolerance: 1e-8), "transpose, scale=#{scale}")
+    end
+    # exact computation is unaffected by the tiny difference
+    exact = Matrix[*rows.map {|row| row.map {|e| Rational(e) } }]
+    assert_equal(2, exact.rank)
+    assert_equal(2, exact.transpose.rank)
+  end
+
+  def test_rank_with_tolerance_detects_second_direction
+    rows = [[1.0, 1.0, 0.0], [1.0, 1.0 + 1e-4, 1e-4], [0.0, 0.0, 0.0]]
+    [1e-180, 1.0, 1e180].each do |scale|
+      m = Matrix[*rows.map {|row| row.map {|e| e * scale } }]
+      assert_equal(2, m.rank(tolerance: 1e-8), "scale=#{scale}")
+      assert_equal(2, m.transpose.rank(tolerance: 1e-8), "transpose, scale=#{scale}")
+    end
+  end
+
+  def test_rank_with_tolerance_zero_matrix
+    assert_equal(0, Matrix[[0.0, 0.0], [0.0, 0.0]].rank(tolerance: 1e-8))
+    assert_equal(0, Matrix.zero(3, 2).rank(tolerance: 1e-8))
+  end
+
+  def test_rank_with_tolerance_invalid
+    assert_raise(ArgumentError) { Matrix[[1.0]].rank(tolerance: -1e-8) }
+  end
+
   def test_trace
     assert_equal(1+5+9, Matrix[[1,2,3],[4,5,6],[7,8,9]].trace)
   end

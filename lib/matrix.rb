@@ -1423,7 +1423,22 @@ class Matrix
   #   Matrix[[7,6], [3,9]].rank
   #   #  => 2
   #
-  def rank
+  # An optional relative +tolerance+ may be given for Float computations.
+  # When given, gaussian elimination with partial pivoting is used and any
+  # pivot whose absolute value is not greater than
+  # <tt>tolerance * (largest absolute entry of the matrix)</tt> is treated
+  # as zero.  Since the tolerance is relative to the magnitude of the
+  # original matrix, scaling the whole matrix by any factor (e.g. changing
+  # units) does not change the result, and the elimination is carried out
+  # on a normalized copy so that intermediate products can not overflow or
+  # underflow.  When +tolerance+ is not given (the default), exact
+  # arithmetic is used as before.
+  #
+  #   Matrix[[1, 1], [1, 1 + 1e-10]].rank(tolerance: 1e-8)
+  #   #  => 1
+  #
+  def rank(tolerance: nil)
+    return rank_with_tolerance(tolerance) if tolerance
     # We currently use Bareiss' multistep integer-preserving gaussian elimination
     # (see comments on determinant)
     a = to_a
@@ -1447,6 +1462,45 @@ class Matrix
         pivot_row += 1
         previous_pivot = pivot
       end
+    end
+    pivot_row
+  end
+
+  # Rank computation using gaussian elimination with partial pivoting and
+  # a tolerance relative to the largest absolute entry of the matrix.
+  private def rank_with_tolerance(tolerance)
+    tolerance = Float(tolerance)
+    raise ArgumentError, "tolerance must be non-negative" if tolerance < 0
+    a = to_a.map {|row| row.map {|e| Float(e) } }
+    max_abs = 0.0
+    a.each {|row| row.each {|e| max_abs = e.abs if e.abs > max_abs } }
+    return 0 if max_abs == 0.0
+    # Normalize so entries are at most 1 in absolute value; this keeps
+    # intermediate products from overflowing or underflowing, whatever the
+    # original magnitude of the matrix.  The threshold stays relative to
+    # the original matrix magnitude.
+    a.each {|row| row.map! {|e| e / max_abs } }
+    last_column = column_count - 1
+    last_row = row_count - 1
+    pivot_row = 0
+    0.upto(last_column) do |k|
+      break if pivot_row > last_row
+      switch_row = (pivot_row .. last_row).max_by {|row| a[row][k].abs }
+      # Degeneracy may only become apparent after previous eliminations,
+      # so the (eliminated) pivot candidate is checked against the
+      # threshold at every step.
+      next if a[switch_row][k].abs <= tolerance
+      a[switch_row], a[pivot_row] = a[pivot_row], a[switch_row] unless pivot_row == switch_row
+      pivot = a[pivot_row][k]
+      (pivot_row+1).upto(last_row) do |i|
+        ai = a[i]
+        factor = ai[k] / pivot
+        ai[k] = 0.0
+        (k+1).upto(last_column) do |j|
+          ai[j] -= factor * a[pivot_row][j]
+        end
+      end
+      pivot_row += 1
     end
     pivot_row
   end
