@@ -425,8 +425,13 @@ class Tokenizer(object):
         self.check_initialized()
         word = strdecode(word)
         freq = int(freq) if freq is not None else self.suggest_freq(word, False)
+        # Net out the word's previous contribution so that re-adding an
+        # existing word is an idempotent overwrite instead of repeatedly
+        # inflating self.total (which would perturb unrelated DAG routes).
+        # A deleted word keeps its prefix entry with freq 0, so its old
+        # contribution is still removed correctly.
+        self.total += freq - self.FREQ.get(word, 0)
         self.FREQ[word] = freq
-        self.total += freq
         if tag:
             self.user_word_tag_tab[word] = tag
         for ch in xrange(len(word)):
