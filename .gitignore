@@ -1,0 +1,23 @@
+/.bundle/
+/.yardoc
+/_yardoc/
+/coverage/
+/doc/
+/pkg/
+/spec/reports/
+/tmp/
+
+# Local agent config is per-machine, except the CLAUDE.md pointer at AGENTS.md.
+/.claude/*
+!/.claude/CLAUDE.md
+
+# A conditional Gemfile (tooling gated on Ruby version) has no single
+# lockfile valid across the 2.4-4.0 matrix; resolve per-Ruby instead.
+Gemfile.lock
+
+# Auto-tuning scorecards/baselines are per-machine (absolute timings), so they
+# are generated locally, not committed. The frozen evaluator that produces them
+# (benchmarks/harness.rb, benchmarks/tuning/) IS committed. The loop's round
+# journal is a local running log (the durable per-win record is the git history).
+/benchmarks/tuning/*.json
+/benchmarks/tuning/log.md
