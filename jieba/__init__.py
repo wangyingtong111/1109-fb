@@ -8,6 +8,7 @@ import re
 import tempfile
 import threading
 import time
+from bisect import bisect_right
 from hashlib import md5
 from math import log
 
@@ -335,22 +336,95 @@ class Tokenizer(object):
                     else:
                         yield x
 
-    def cut_for_search(self, sentence, HMM=True):
+    def _find_crossing_words(self, sentence, tokens, extra_max_len):
         """
-        Finer segmentation for search engines.
+        Find dictionary words that straddle the main segmentation
+        (i.e. span at least one boundary between two main tokens).
+
+        Returns a dict mapping the index of the main token that contains
+        the start of the extra word to a list of (word, start, end)
+        tuples, ordered by (start, end).
+
+        Punctuation (any non-han token) is a hard boundary: extra words
+        never span across it.
         """
-        words = self.cut(sentence, HMM=HMM)
-        for w in words:
+        boundaries = set()
+        for _, s, e in tokens:
+            boundaries.add(s)
+            boundaries.add(e)
+        starts = [t[1] for t in tokens]
+        N = len(sentence)
+        extras = {}
+        for s in xrange(N):
+            max_end = min(s + extra_max_len, N)
+            for e in xrange(s + 2, max_end + 1):
+                frag = sentence[s:e]
+                if frag not in self.FREQ:
+                    # FREQ is a prefix dict: no longer word can match here
+                    break
+                if not self.FREQ[frag]:
+                    continue
+                if not re_han_default.match(frag) or \
+                        re_han_default.match(frag).group(0) != frag:
+                    # punctuation / whitespace is a hard boundary
+                    continue
+                # must cross at least one main-token boundary
+                if not any(s < b < e for b in boundaries):
+                    continue
+                # index of the main token containing position s
+                idx = bisect_right(starts, s) - 1
+                extras.setdefault(idx, []).append((frag, s, e))
+        return extras
+
+    def _search_tokenize(self, sentence, HMM=True, extra_max_len=None):
+        """
+        Internal generator for search-engine segmentation.
+        Yields (word, start, end) tuples.
+
+        Besides the main words (which are always kept) and the short
+        subwords (gram2/gram3) inside each main word, it can also emit
+        dictionary phrases that cross the main segmentation boundaries
+        when ``extra_max_len`` is set; only phrases no longer than
+        ``extra_max_len`` characters are emitted.
+        """
+        sentence = strdecode(sentence)
+        tokens = []
+        start = 0
+        for w in self.cut(sentence, HMM=HMM):
+            tokens.append((w, start, start + len(w)))
+            start += len(w)
+        if extra_max_len and extra_max_len >= 2:
+            extras = self._find_crossing_words(sentence, tokens, extra_max_len)
+        else:
+            extras = {}
+        for idx, (w, s, e) in enumerate(tokens):
             if len(w) > 2:
                 for i in xrange(len(w) - 1):
                     gram2 = w[i:i + 2]
                     if self.FREQ.get(gram2):
-                        yield gram2
+                        yield (gram2, s + i, s + i + 2)
             if len(w) > 3:
                 for i in xrange(len(w) - 2):
                     gram3 = w[i:i + 3]
                     if self.FREQ.get(gram3):
-                        yield gram3
+                        yield (gram3, s + i, s + i + 3)
+            yield (w, s, e)
+            for ext in extras.get(idx, ()):
+                yield ext
+
+    def cut_for_search(self, sentence, HMM=True, extra_max_len=None):
+        """
+        Finer segmentation for search engines.
+
+        Parameter:
+            - HMM: Whether to use the Hidden Markov Model.
+            - extra_max_len: optional maximum length (in characters) of
+              additional dictionary phrases that straddle the main
+              segmentation boundaries. When omitted (None), only the
+              classic in-word gram2/gram3 subwords are emitted.
+        """
+        for w, s, e in self._search_tokenize(sentence, HMM=HMM,
+                                             extra_max_len=extra_max_len):
             yield w
 
     def lcut(self, *args, **kwargs):
@@ -473,7 +547,8 @@ class Tokenizer(object):
             self.add_word(word, freq)
         return freq
 
-    def tokenize(self, unicode_sentence, mode="default", HMM=True):
+    def tokenize(self, unicode_sentence, mode="default", HMM=True,
+                 extra_max_len=None):
         """
         Tokenize a sentence and yields tuples of (word, start, end)
 
@@ -481,6 +556,10 @@ class Tokenizer(object):
             - sentence: the str(unicode) to be segmented.
             - mode: "default" or "search", "search" is for finer segmentation.
             - HMM: whether to use the Hidden Markov Model.
+            - extra_max_len: (search mode only) optional maximum length of
+              additional dictionary phrases that straddle the main
+              segmentation boundaries. The word order corresponds to
+              ``cut_for_search`` with the same arguments.
         """
         if not isinstance(unicode_sentence, text_type):
             raise ValueError("jieba: the input parameter should be unicode.")
@@ -491,20 +570,9 @@ class Tokenizer(object):
                 yield (w, start, start + width)
                 start += width
         else:
-            for w in self.cut(unicode_sentence, HMM=HMM):
-                width = len(w)
-                if len(w) > 2:
-                    for i in xrange(len(w) - 1):
-                        gram2 = w[i:i + 2]
-                        if self.FREQ.get(gram2):
-                            yield (gram2, start + i, start + i + 2)
-                if len(w) > 3:
-                    for i in xrange(len(w) - 2):
-                        gram3 = w[i:i + 3]
-                        if self.FREQ.get(gram3):
-                            yield (gram3, start + i, start + i + 3)
-                yield (w, start, start + width)
-                start += width
+            for w, s, e in self._search_tokenize(
+                    unicode_sentence, HMM=HMM, extra_max_len=extra_max_len):
+                yield (w, s, e)
 
     def set_dictionary(self, dictionary_path):
         with self.lock:
