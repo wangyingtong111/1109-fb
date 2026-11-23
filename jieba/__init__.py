@@ -46,6 +46,32 @@ re_han_default = re.compile("([\u4E00-\u9FD5a-zA-Z0-9+#&\._%\-]+)", re.U)
 re_skip_default = re.compile("(\r\n|\s)", re.U)
 
 
+def _merge_alnum(words, ends):
+    """
+    Join runs of single alphanumeric characters, the same way
+    ``__cut_DAG_NO_HMM`` buffers them.  ``ends`` keeps the right end of each
+    word so that ties can still be compared after merging.
+    """
+    merged = []
+    merged_ends = []
+    buf = ''
+    for word, end in zip(words, ends):
+        if len(word) == 1 and re_eng.match(word):
+            buf += word
+        else:
+            if buf:
+                merged.append(buf)
+                merged_ends.append(prev)
+                buf = ''
+            merged.append(word)
+            merged_ends.append(end)
+        prev = end
+    if buf:
+        merged.append(buf)
+        merged_ends.append(prev)
+    return merged, merged_ends
+
+
 def setLogLevel(log_level):
     default_logger.setLevel(log_level)
 
@@ -245,6 +271,109 @@ class Tokenizer(object):
         if buf:
             yield buf
             buf = ''
+
+    def _kbest_route(self, sentence, DAG, k):
+        """
+        Compute the k best routes through the DAG.
+
+        Scores are exactly the ones used by ``calc`` (log frequency minus
+        log total), and ties keep the rule of ``calc``: the path whose first
+        cut is farther right wins, then the rest of the cuts are compared in
+        the same way.  Only ``k`` continuations are kept per position, so the
+        amount of work depends on ``k`` and the size of the DAG, not on the
+        number of feasible segmentations.
+        """
+        N = len(sentence)
+        logtotal = log(self.total)
+        # routes[i] holds up to k triples (score, end, rank), where end is the
+        # right end of the first word and rank selects the continuation in
+        # routes[end + 1].  routes[N] is the empty continuation.
+        routes = [None] * (N + 1)
+        routes[N] = [(0.0, N, 0)]
+        for idx in xrange(N - 1, -1, -1):
+            candidates = []
+            for x in DAG[idx]:
+                score = log(self.FREQ.get(sentence[idx:x + 1]) or 1) - logtotal
+                for rank, (suffix_score, _, _) in enumerate(routes[x + 1]):
+                    candidates.append((score + suffix_score, x, rank))
+            # Larger first cut wins ties; the continuation list is already
+            # ordered by the same rule, so its rank breaks the remaining ties.
+            candidates.sort(key=lambda c: (-c[0], -c[1], c[2]))
+            routes[idx] = candidates[:k]
+        return routes
+
+    def _kbest_paths(self, sentence, routes, k):
+        N = len(sentence)
+        paths = []
+        for score, end, rank in routes[0][:k]:
+            words = []
+            ends = []
+            pos = 0
+            while pos < N:
+                words.append(sentence[pos:end + 1])
+                ends.append(end)
+                pos = end + 1
+                if pos < N:
+                    _, end, rank = routes[pos][rank]
+            paths.append((score, words, ends))
+        return paths
+
+    def cut_kbest(self, sentence, k=3):
+        """
+        Return the k best segmentations of ``sentence`` without HMM.
+
+        Each result is a list of words, ordered by the score that the
+        dictionary gives on the DAG (the same score ``cut`` uses).  Equal
+        scores prefer the path whose first cut is farther right, and the
+        following cuts are compared the same way.  ``k=1`` yields exactly the
+        same segmentation as ``cut(sentence, HMM=False)``.
+        """
+        sentence = strdecode(sentence)
+        if k is None or k <= 0:
+            return []
+        # Each entry is (words, score, right ends of the words so far).
+        candidates = [([], 0.0, ())]
+        offset = 0
+        for blk in re_han_default.split(sentence):
+            if not blk:
+                continue
+            if re_han_default.match(blk):
+                DAG = self.get_DAG(blk)
+                routes = self._kbest_route(blk, DAG, k)
+                block_candidates = []
+                for score, words, ends in self._kbest_paths(blk, routes, k):
+                    merged_words, merged_ends = _merge_alnum(words, ends)
+                    block_candidates.append(
+                        (merged_words, score, tuple(merged_ends)))
+            else:
+                words = []
+                for x in re_skip_default.split(blk):
+                    if re_skip_default.match(x):
+                        words.append(x)
+                    else:
+                        words.extend(x)
+                ends = []
+                pos = 0
+                for w in words:
+                    pos += len(w)
+                    ends.append(pos - 1)
+                block_candidates = [(words, 0.0, tuple(ends))]
+            combined = []
+            for words, score, ends in candidates:
+                for block_words, block_score, block_ends in block_candidates:
+                    combined.append((
+                        words + block_words,
+                        score + block_score,
+                        ends + tuple(offset + end for end in block_ends)))
+            combined.sort(key=lambda c: (-c[1], tuple(-end for end in c[2])))
+            candidates = combined[:k]
+            offset += len(blk)
+        return [words for words, _, _ in candidates]
+
+    lcut_kbest = cut_kbest
+    cut_k_best = cut_kbest
+    lcut_k_best = cut_kbest
+    kbest = cut_kbest
 
     def __cut_DAG(self, sentence):
         DAG = self.get_DAG(sentence)
@@ -526,6 +655,11 @@ add_word = dt.add_word
 calc = dt.calc
 cut = dt.cut
 lcut = dt.lcut
+cut_kbest = dt.cut_kbest
+lcut_kbest = dt.lcut_kbest
+cut_k_best = dt.cut_kbest
+lcut_k_best = dt.cut_kbest
+kbest = dt.cut_kbest
 cut_for_search = dt.cut_for_search
 lcut_for_search = dt.lcut_for_search
 del_word = dt.del_word

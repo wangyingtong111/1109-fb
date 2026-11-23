@@ -41,6 +41,7 @@ jieba
 --------
 * `jieba.cut` 方法接受四个输入参数: 需要分词的字符串；cut_all 参数用来控制是否采用全模式；HMM 参数用来控制是否使用 HMM 模型；use_paddle 参数用来控制是否使用paddle模式下的分词模式，paddle模式采用延迟加载方式，通过enable_paddle接口安装paddlepaddle-tiny，并且import相关代码；
 * `jieba.cut_for_search` 方法接受两个参数：需要分词的字符串；是否使用 HMM 模型。该方法适合用于搜索引擎构建倒排索引的分词，粒度比较细
+* `jieba.cut_kbest` 方法接受两个参数：需要分词的字符串；返回的候选数 k（默认 3）。它在不使用 HMM 的 DAG 上按用户词典给出的原分数返回前 k 个分词结果（`list` 的 `list`），`k=1` 与原 `jieba.cut(..., HMM=False)` 完全一致，计算量只随 k 和 DAG 规模增长。分数相同时优先第一个切点更靠右的路径，之后的切点依次按同样规则比较。
 * 待分词的字符串可以是 unicode 或 UTF-8 字符串、GBK 字符串。注意：不建议直接输入 GBK 字符串，可能无法预料地错误解码成 UTF-8
 * `jieba.cut` 以及 `jieba.cut_for_search` 返回的结构都是一个可迭代的 generator，可以使用 for 循环来获得分词后得到的每一个词语(unicode)，或者用
 * `jieba.lcut` 以及 `jieba.lcut_for_search` 直接返回 list
@@ -522,6 +523,7 @@ Main Functions
 --------
 * The `jieba.cut` function accepts three input parameters: the first parameter is the string to be cut; the second parameter is `cut_all`, controlling the cut mode; the third parameter is to control whether to use the Hidden Markov Model.
 * `jieba.cut_for_search` accepts two parameter: the string to be cut; whether to use the Hidden Markov Model. This will cut the sentence into short words suitable for search engines.
+* `jieba.cut_kbest` accepts the string to be cut and `k` (default 3). It returns the `k` best segmentations (a list of lists of words) computed on the DAG without HMM, using the score the dictionary already gives; `k=1` matches `jieba.cut(..., HMM=False)`, and the work grows with `k` and the DAG size only. Ties go to the path whose first cut is farther right, then the following cuts are compared the same way.
 * The input string can be an unicode/str object, or a str/bytes object which is encoded in UTF-8 or GBK. Note that using GBK encoding is not recommended because it may be unexpectly decoded as UTF-8.
 * `jieba.cut` and `jieba.cut_for_search` returns an generator, from which you can use a `for` loop to get the segmentation result (in unicode).
 * `jieba.lcut` and `jieba.lcut_for_search` returns a list.
