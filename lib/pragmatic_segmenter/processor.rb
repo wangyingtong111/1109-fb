@@ -14,8 +14,9 @@ module PragmaticSegmenter
   class Processor
 
     attr_reader :text
-    def initialize(language: Languages::Common)
+    def initialize(language: Languages::Common, abbreviation: nil)
       @language = language
+      @abbreviation = abbreviation
     end
 
     def process(text:)
@@ -115,7 +116,11 @@ module PragmaticSegmenter
     end
 
     def replace_abbreviations
-      @text = abbreviations_replacer.new(text: @text, language: @language).replace
+      @text = abbreviations_replacer.new(
+        text: @text,
+        language: @language,
+        abbreviation: @abbreviation
+      ).replace
     end
 
     def between_punctuation_processor

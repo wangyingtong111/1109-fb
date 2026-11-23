@@ -8,11 +8,12 @@ module PragmaticSegmenter
   class Segmenter
     attr_reader :text, :language, :doc_type
 
-    def initialize(text:, language: 'en', doc_type: nil, clean: true)
+    def initialize(text:, language: 'en', doc_type: nil, clean: true, abbreviation: nil)
       return unless text
       @language = language
       @language_module = Languages.get_language_by_code(language)
       @doc_type = doc_type
+      @abbreviation = abbreviation
 
       if clean
         @text = cleaner.new(text: text, doc_type: @doc_type, language: @language_module).clean
@@ -23,7 +24,7 @@ module PragmaticSegmenter
 
     def segment
       return [] unless @text
-      processor.new(language: @language_module).process(text: @text)
+      processor.new(language: @language_module, abbreviation: @abbreviation).process(text: @text)
     end
 
     private

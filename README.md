@@ -52,6 +52,31 @@ text = "This is a sentence\ncut off in the middle because pdf."
 ps = PragmaticSegmenter::Cleaner.new(text: text, doc_type: 'pdf')
 ps.clean
 # => "This is a sentence cut off in the middle because pdf."
+
+# Declare the usage context of abbreviations from the document side.
+# Technical documents mix figure numbers, units of measure and ordinary
+# titles. The built-in language defaults are left untouched; these rules are
+# layered on top for this document only.
+#   :number_abbreviations      -> e.g. "Fig." : the period is part of the
+#                                  following figure/number reference
+#   :unit_abbreviations        -> e.g. "ms."  : the period may close a sentence
+#                                  when an explicit new sentence follows, but
+#                                  stays mid-sentence before a lower case word
+#                                  or a digit
+#   :prepositive_abbreviations -> e.g. honorifics whose period never closes a
+#                                  sentence, even before a capitalized word
+#   :abbreviations             -> ordinary abbreviations (protected before a
+#                                  lower case continuation)
+text = "The value is 2.0 ms. Next run passed. Refer to Fig. 2. Another source."
+ps = PragmaticSegmenter::Segmenter.new(
+  text: text,
+  abbreviation: {
+    unit_abbreviations: ['ms'],
+    number_abbreviations: ['fig']
+  }
+)
+ps.segment
+# => ["The value is 2.0 ms.", "Next run passed.", "Refer to Fig. 2.", "Another source."]
 ```
 
 ## Live Demo
