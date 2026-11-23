@@ -813,6 +813,99 @@ defvjp(anp.atleast_2d, grad_reshape_list)
 defvjp(anp.atleast_3d, grad_reshape_list)
 
 
+einsum_symbols = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+
+def einsum_diagonal_groups(subscripts):
+    """Groups of axis positions in one operand's subscripts that share a repeated label.
+
+    For instance the operand subscripts "...ii" share a label between their last two
+    axes, so this returns [(n - 2, n - 1)]. An einsum contraction along a repeated
+    label only ever touches the (generalized) diagonal of that operand.
+    """
+    positions = {}
+    for i, sub in enumerate(subscripts):
+        positions.setdefault(sub, []).append(i)
+    return [tuple(axes) for axes in positions.values() if len(axes) > 1]
+
+
+def unique_einsum_subscripts(subscripts, used_subscripts):
+    """Relabel repeated occurrences of subscripts so that every axis gets a distinct label.
+
+    An einsum output may name each label at most once, so an operand with a repeated
+    label (a diagonal) can't be used verbatim as the output subscript of its own
+    gradient. Labelling its axes as if they were independent keeps the einsum
+    well-formed; the entries that aren't on the diagonal are then zeroed out by
+    `mask_einsum_diagonal`, which is exactly the gradient of taking a diagonal.
+    """
+    free = [sub for sub in einsum_symbols if sub not in set(used_subscripts)]
+    seen, unique = set(), ""
+    for sub in subscripts:
+        if sub in seen:
+            if not free:
+                raise NotImplementedError(
+                    "Ran out of einsum subscripts while differentiating an operand "
+                    "with repeated subscripts."
+                )
+            sub = free.pop(0)
+        else:
+            seen.add(sub)
+        unique += sub
+    return unique
+
+
+def mask_einsum_diagonal(g, diagonal_groups):
+    """Keep only the entries whose axes in each group of `diagonal_groups` share an index."""
+    if not diagonal_groups:
+        return g
+    shape = anp.shape(g)
+    axis_indices = onp.indices(shape)
+    mask = onp.ones(shape, dtype=bool)
+    for group in diagonal_groups:
+        for axis in group[1:]:
+            mask &= axis_indices[group[0]] == axis_indices[axis]
+    return g * mask
+
+
+def einsum_subs_vjp(g, in_subs, out_subs, operands, op_num):
+    """VJP of einsum(in_subs -> out_subs) with respect to `operands[op_num]`."""
+    in_subs_list = in_subs.split(",")
+    subs_wrt = in_subs_list[op_num]
+    rest_of_ops = operands[:op_num] + operands[op_num + 1 :]
+    rest_of_subs = in_subs_list[:op_num] + in_subs_list[op_num + 1 :]
+
+    # A label may not be named twice in an einsum output, so an operand with a repeated
+    # label (e.g. "...ii", which takes a diagonal) gets its axes treated as independent
+    # for the gradient einsum. `diagonal_groups` remembers which axes were shared so the
+    # entries off the diagonal can be zeroed out afterwards.
+    diagonal_groups = einsum_diagonal_groups(subs_wrt)
+    out_subs_wrt = unique_einsum_subscripts(subs_wrt, in_subs + out_subs) if diagonal_groups else subs_wrt
+
+    # subscripts that only appear in subs_wrt (and not in other subscript lists
+    # or in the output) are implicitly being summed out, as if contracted
+    # against a tensor of ones. we make that tensor of ones explicit to handle
+    # the necessary vjp broadcasting inside einsum.
+    other_named_subs = set("".join([out_subs] + rest_of_subs))
+    naked_summed = [i for i, sub in enumerate(subs_wrt) if sub not in other_named_subs]
+    # A relabelled axis whose original label is named elsewhere got a label of its own
+    # that nothing else supplies, so the ones tensor has to carry it too.
+    relabelled = [
+        i for i, sub in enumerate(subs_wrt) if out_subs_wrt[i] != sub and sub in other_named_subs
+    ]
+    ones_dims = naked_summed + relabelled
+
+    new_input_subs_list = [out_subs] + rest_of_subs
+    new_operands = [g] + list(rest_of_ops)
+    if ones_dims:
+        ones_subs = "".join(out_subs_wrt[i] for i in ones_dims)
+        ones = onp.ones(onp.array(operands[op_num].shape)[ones_dims])
+        new_input_subs_list.append(ones_subs)
+        new_operands.append(ones)
+
+    new_subscripts = ",".join(new_input_subs_list) + "->" + out_subs_wrt
+    return mask_einsum_diagonal(anp.einsum(new_subscripts, *new_operands), diagonal_groups)
+
+
 def grad_einsum(argnum, ans, operands_, kwargs):
     result_meta = anp.metadata(operands_[argnum])
 
@@ -820,35 +913,20 @@ def grad_einsum(argnum, ans, operands_, kwargs):
         operands = operands_
         if isinstance(operands[0], str):  # using "ijk" convention.
             in_subs, out_subs, _ = anp.parse_einsum_input(*operands)
-            string, operands = operands[0], operands[1:]
-
-            in_subs_list = in_subs.split(",")
-            op_num = argnum - 1
-            subs_wrt = in_subs_list[op_num]
-            rest_of_ops = operands[:op_num] + operands[op_num + 1 :]
-            rest_of_subs = in_subs_list[:op_num] + in_subs_list[op_num + 1 :]
-
-            # subscripts that only appear in subs_wrt (and not in other subscript lists
-            # or in the output) are implicitly being summed out, as if contracted
-            # against a tensor of ones. we make that tensor of ones explicit to handle
-            # the necessary vjp broadcasting inside einsum.
-            other_named_subs = set("".join([out_subs] + rest_of_subs))
-            naked_summed = [(i, sub) for i, sub in enumerate(subs_wrt) if sub not in other_named_subs]
-            if naked_summed:
-                naked_summed_dims, ones_subs = zip(*naked_summed)
-                ones_subs = "".join(ones_subs)
-                ones = onp.ones(onp.array(operands[op_num].shape)[list(naked_summed_dims)])
-                new_input_subs = ",".join([out_subs, ones_subs] + rest_of_subs)
-                new_operands = (g, ones) + rest_of_ops
-            else:
-                new_input_subs = ",".join([out_subs] + rest_of_subs)
-                new_operands = (g,) + rest_of_ops
-
-            new_subscripts = new_input_subs + "->" + subs_wrt
-            return unbroadcast(anp.einsum(new_subscripts, *new_operands), result_meta)
+            return unbroadcast(einsum_subs_vjp(g, in_subs, out_subs, operands[1:], argnum - 1), result_meta)
         else:  # using (op0, sublist0, op1, sublist1, ..., sublistout) convention
             if len(operands) % 2 == 0:
                 raise NotImplementedError("Need sublistout argument")
+            if einsum_diagonal_groups(operands[argnum + 1]):
+                # Repeated labels need the same treatment as in the string convention.
+                # Only the subscript strings are taken from the parse: it returns unboxed
+                # values, which would cut the other differentiable operands off the graph.
+                in_subs, out_subs, _ = anp.parse_einsum_input(*operands)
+                return unbroadcast_einsum(
+                    einsum_subs_vjp(g, in_subs, out_subs, operands[0:-1:2], argnum // 2),
+                    result_meta,
+                    operands[argnum + 1],
+                )
             operands = list(operands)
             rest_of_ops = (
                 [operands[-1]] + operands[:argnum] + operands[(argnum + 2) : -1] + [operands[argnum + 1]]

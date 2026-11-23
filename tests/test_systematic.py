@@ -474,6 +474,49 @@ def test_einsum_no_output_indices():
     combo_check(np.einsum, [1, 2])(["ij,k"], [R(3, 4)], [R(3)])
 
 
+def test_einsum_repeated_subscript():
+    combo_check(np.einsum, [1])(["ii->i", "ii->"], [R(1, 1), R(2, 2), R(3, 3)])
+
+
+def test_einsum_repeated_subscript_nonsquare():
+    combo_check(np.einsum, [1])(["iij->ij"], [R(2, 2, 3)])
+    combo_check(np.einsum, [1])(["iii->i"], [R(2, 2, 2), R(3, 3, 3)])
+
+
+def test_einsum_repeated_subscript_ellipsis():
+    combo_check(np.einsum, [1])(["...ii->...i", "...ii->..."], [R(2, 3, 3), R(0, 3, 3)])
+
+
+def test_einsum_repeated_subscript_ellipsis_nonsquare():
+    combo_check(np.einsum, [1])(["...iij->...ij"], [R(2, 3, 3, 4)])
+
+
+def test_einsum_repeated_subscript_two_args():
+    combo_check(np.einsum, [1, 2])(["...ii,...ij->...j"], [R(2, 3, 3)], [R(2, 3, 4)])
+
+
+def test_einsum_repeated_subscript_two_args_square():
+    combo_check(np.einsum, [1, 2])(["ii,ij->j", "ii,jk->ijk"], [R(3, 3)], [R(3, 4)])
+
+
+def test_einsum_repeated_subscript_naked_sum_other_arg():
+    combo_check(np.einsum, [1, 2])(["ii,i->"], [R(3, 3)], [R(3)])
+
+
+def test_einsum2_repeated_subscript():
+    combo_check(np.einsum, [0, 2])(
+        [R(2, 3, 3)],
+        [(Ellipsis, 0, 0)],
+        [R(2, 3, 4)],
+        [(Ellipsis, 0, 1)],
+        [(Ellipsis, 1)],
+    )
+
+
+def test_einsum2_repeated_subscript_naked_sum():
+    combo_check(np.einsum, [0])([R(3, 3)], [(0, 0)], [()])
+
+
 def test_trace():
     combo_check(np.trace, [0])([R(5, 5), R(4, 5), R(5, 4), R(3, 4, 5)], offset=[-1, 0, 1])
 
