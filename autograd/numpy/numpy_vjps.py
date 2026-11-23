@@ -3,6 +3,7 @@ from functools import partial
 import numpy as onp
 
 from autograd.extend import SparseObject, VJPNode, defvjp, defvjp_argnum, primitive, register_notrace, vspace
+from autograd.tracer import getval
 
 from ..util import func
 from . import numpy_wrapper as anp
@@ -295,45 +296,158 @@ def grad_diff(ans, a, n=1, axis=-1):
 defvjp(anp.diff, grad_diff)
 
 
-def grad_gradient(ans, x, *vargs, **kwargs):
-    axis = kwargs.pop("axis", None)
-    if vargs or kwargs:
-        raise NotImplementedError("The only optional argument currently supported for np.gradient is axis.")
+def _gradient_axes(axis, nd):
     if axis is None:
-        axis = range(x.ndim)
-    elif type(axis) is int:
-        axis = [axis]
-    else:
-        axis = list(axis)
+        return tuple(range(nd))
+    if isinstance(axis, (int, onp.integer)):
+        return (int(axis) % nd,)
+    return tuple(int(a) % nd for a in axis)
 
-    x_dtype = x.dtype
+
+def _gradient_spacings(x, vargs, axes):
+    """Reproduce numpy's handling of the spacing arguments of np.gradient.
+
+    The sample positions are constants (we never differentiate with respect to
+    them), so they are unboxed and processed with plain numpy.
+    """
+    len_axes = len(axes)
+    n = len(vargs)
+    if n == 0:
+        return [1.0] * len_axes
+    if n == 1 and onp.ndim(getval(vargs[0])) == 0:
+        # a single scalar applies to every axis
+        return [getval(vargs[0])] * len_axes
+    if n != len_axes:
+        raise TypeError("invalid number of arguments")
+
+    spacings = []
+    for i, distances in enumerate(vargs):
+        distances = onp.asarray(getval(distances))
+        if distances.ndim == 0:
+            spacings.append(distances)
+            continue
+        elif distances.ndim != 1:
+            raise ValueError("distances must be either scalars or 1d")
+        if len(distances) != x.shape[axes[i]]:
+            raise ValueError("when 1d, distances must match the length of the corresponding dimension")
+        if onp.issubdtype(distances.dtype, onp.integer):
+            # avoid modular arithmetic in np.diff
+            distances = distances.astype(onp.float64)
+        diffx = onp.diff(distances)
+        # constant spacing is equivalent to the scalar case
+        if (diffx == diffx[0]).all():
+            diffx = diffx[0]
+        spacings.append(diffx)
+
+    return spacings
+
+
+def _gradient_axis_adjoint(g, n, spacing, edge_order):
+    """Adjoint, along a single axis, of the linear map computed by np.gradient.
+
+    ``g`` holds the cotangent of the gradient along that axis and has shape
+    ``(n,) + rest``; an array of the same shape is returned.
+    """
+    coef_dtype = anp.result_type(g)
+    if not onp.issubdtype(coef_dtype, onp.inexact):
+        coef_dtype = onp.float64
+
+    rest = g.shape[1:]
+    as_coef = lambda c: onp.asarray(c, dtype=coef_dtype)
+    zero_pad = lambda k: onp.zeros((k,) + rest, dtype=coef_dtype)
+    column = lambda c: c.reshape((-1,) + (1,) * len(rest))
+
+    # second order central differences at the interior points
+    uniform = onp.ndim(spacing) == 0
+    if uniform:
+        h = spacing
+        inner_a, inner_b, inner_c = as_coef(-0.5 / h), as_coef(0.0), as_coef(0.5 / h)
+    else:
+        dx1, dx2 = spacing[:-1], spacing[1:]
+        inner_a = as_coef(-dx2 / (dx1 * (dx1 + dx2)))
+        inner_b = as_coef((dx2 - dx1) / (dx1 * dx2))
+        inner_c = as_coef(dx1 / (dx2 * (dx1 + dx2)))
+
+    # cotangent of the interior points is scattered back onto their neighbours
+    inner = g[1:-1]
+    out = anp.concatenate([column(inner_a) * inner, zero_pad(2)], axis=0)
+    out = out + anp.concatenate([zero_pad(1), column(inner_b) * inner, zero_pad(1)], axis=0)
+    out = out + anp.concatenate([zero_pad(2), column(inner_c) * inner], axis=0)
+
+    # one-sided stencils at the two endpoints. Each endpoint cotangent is
+    # scattered back onto the m samples its stencil touches.
+    second_order_edges = edge_order != 1
+    m = 3 if second_order_edges else 2
+    if uniform:
+        if second_order_edges:
+            head_coef = [-1.5 / h, 2.0 / h, -0.5 / h]
+            tail_coef = [0.5 / h, -2.0 / h, 1.5 / h]
+        else:
+            head_coef = [-1.0 / h, 1.0 / h]
+            tail_coef = [-1.0 / h, 1.0 / h]
+    else:
+        if second_order_edges:
+            dx1, dx2 = spacing[0], spacing[1]
+            head_coef = [
+                -(2.0 * dx1 + dx2) / (dx1 * (dx1 + dx2)),
+                (dx1 + dx2) / (dx1 * dx2),
+                -dx1 / (dx2 * (dx1 + dx2)),
+            ]
+            dx1, dx2 = spacing[-2], spacing[-1]
+            tail_coef = [
+                dx2 / (dx1 * (dx1 + dx2)),
+                -(dx1 + dx2) / (dx1 * dx2),
+                (2.0 * dx2 + dx1) / (dx2 * (dx1 + dx2)),
+            ]
+        else:
+            head_coef = [-1.0 / spacing[0], 1.0 / spacing[0]]
+            tail_coef = [-1.0 / spacing[-1], 1.0 / spacing[-1]]
+
+    def scatter(coef, edge_cotangent):
+        # one coefficient per stencil sample, broadcast over the trailing axes
+        coef = as_coef(coef).reshape((-1,) + (1,) * len(rest))
+        return coef * edge_cotangent
+
+    out = out + anp.concatenate([scatter(head_coef, g[0]), zero_pad(n - m)], axis=0)
+    out = out + anp.concatenate([zero_pad(n - m), scatter(tail_coef, g[n - 1])], axis=0)
+    return out
+
+def grad_gradient(ans, x, *vargs, **kwargs):
+    kwargs = dict(kwargs)
+    axis = kwargs.pop("axis", None)
+    edge_order = kwargs.pop("edge_order", 1)
+    if kwargs:
+        raise NotImplementedError(
+            "The only optional arguments currently supported for np.gradient "
+            "are axis and edge_order."
+        )
+    if edge_order > 2:
+        raise ValueError("'edge_order' greater than 2 not supported")
+
     x_shape = x.shape
-    nd = x.ndim
+    x_dtype = x.dtype
+    axes = _gradient_axes(axis, x.ndim)
+    spacings = _gradient_spacings(x, vargs, axes)
+    # np.gradient returns a bare array (instead of a tuple) for a single axis
+    single_output = len(axes) == 1
 
     def vjp(g):
-        if anp.ndim(g) == nd:
-            # add axis if gradient was along one axis only
-            g = g[anp.newaxis]
+        if single_output:
+            g = (g,)
 
-        # accumulate gradient
-        out = anp.zeros(x_shape, dtype=x_dtype)
+        # accumulate the contributions of every gradient axis
+        out = onp.zeros(x_shape, dtype=x_dtype)
 
-        for i, a in enumerate(axis):
-            # swap gradient axis to the front
-            g_swap = anp.swapaxes(g[i], 0, a)[:, anp.newaxis]
-
-            out_axis = anp.concatenate(
-                (
-                    -g_swap[0] - 0.5 * g_swap[1],
-                    g_swap[0] - 0.5 * g_swap[2],
-                    (-1.0) * anp.gradient(g_swap, axis=0)[2:-2, 0],
-                    0.5 * g_swap[-3] - g_swap[-1],
-                    0.5 * g_swap[-2] + g_swap[-1],
-                ),
-                axis=0,
-            )
-
-            out = out + anp.swapaxes(out_axis, 0, a)
+        for i, (g_axis, a, spacing) in enumerate(zip(g, axes, spacings)):
+            n = x_shape[a]
+            if n < edge_order + 1:
+                raise ValueError(
+                    "Shape of array too small to calculate a numerical gradient, "
+                    "at least (edge_order + 1) elements are required."
+                )
+            g_swap = anp.moveaxis(g_axis, a, 0)
+            out_axis = _gradient_axis_adjoint(g_swap, n, spacing, edge_order)
+            out = out + anp.moveaxis(out_axis, 0, a)
 
         return out
 

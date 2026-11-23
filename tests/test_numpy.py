@@ -1074,3 +1074,96 @@ def test_gradient():
 
     for a in [None, 0, 1, -1, (0, 1), (0, -1)]:
         check_grads(np.gradient, 0)(npr.randn(10, 10, 10), axis=a)
+
+
+def test_gradient_edge_order():
+    for n in [3, 4, 10]:
+        for a in [None, 0]:
+            f = lambda x: np.gradient(x, edge_order=2) if a is None else np.gradient(x, edge_order=2, axis=a)
+            check_grads(f, modes=["rev", "fwd"])(npr.randn(n))
+    for a in [None, 0, 1, (0, 1)]:
+        check_grads(lambda x: np.gradient(x, edge_order=2, axis=a), modes=["rev", "fwd"])(npr.randn(5, 5))
+
+
+def test_gradient_uneven_spacing():
+    import numpy as onp
+
+    grid = onp.array([0.0, 1.0, 3.0, 6.0, 10.0, 15.0, 21.0])
+    x = npr.randn(7)
+
+    # A single array of sample positions, for both edge orders.
+    for edge_order in [1, 2]:
+        check_grads(lambda y: np.gradient(y, grid, edge_order=edge_order), modes=["rev", "fwd"])(x)
+
+    # A scalar spacing, and a mixture of scalars and coordinate arrays per axis.
+    check_grads(lambda y: np.gradient(y, 0.25), modes=["rev", "fwd"])(x)
+    check_grads(lambda y: np.gradient(y, 0.25, edge_order=2), modes=["rev", "fwd"])(x)
+
+    mat = npr.randn(6, 7)
+    grid0 = onp.sort(npr.rand(6)) * 4.0
+    grid1 = onp.sort(npr.rand(7)) * 4.0
+    check_grads(lambda y: np.gradient(y, grid0, grid1, edge_order=2), modes=["rev", "fwd"])(mat)
+    check_grads(lambda y: np.gradient(y, grid0, 0.5, edge_order=2), modes=["rev", "fwd"])(mat)
+    check_grads(lambda y: np.gradient(y, grid1, grid0, edge_order=2, axis=(1, 0)), modes=["rev", "fwd"])(mat)
+
+
+def test_gradient_matches_numpy_and_full_vjp():
+    # Uneven sampling times, so the second-order boundary stencils actually
+    # depend on the grid rather than collapsing to the uniform-grid formula.
+    import numpy as onp
+
+    grid = onp.array([0.0, 1.0, 3.0, 6.0])
+    x = onp.array([1.0, 2.0, 4.0, 8.0])
+    weights = onp.array([0.4, -1.2, 0.7, 2.0])
+
+    assert onp.allclose(np.gradient(x, grid, edge_order=2), onp.gradient(x, grid, edge_order=2))
+
+    fun = lambda y: np.dot(np.gradient(y, grid, edge_order=2), weights)
+
+    # Reference Jacobian by central differences on the plain numpy implementation.
+    jac = onp.zeros((4, 4))
+    eps = 1e-6
+    for i in range(4):
+        step = onp.zeros(4)
+        step[i] = eps
+        jac[:, i] = (
+            onp.gradient(x + step, grid, edge_order=2) - onp.gradient(x - step, grid, edge_order=2)
+        ) / (2 * eps)
+
+    vjp = grad(fun)(x)
+    assert onp.allclose(vjp, jac.T @ weights)
+
+    # Forward/reverse inner products agree along the direction [1, 0, -1, 2].
+    direction = onp.array([1.0, 0.0, -1.0, 2.0])
+    numeric = (
+        onp.gradient(x + eps * direction, grid, edge_order=2)
+        - onp.gradient(x - eps * direction, grid, edge_order=2)
+    ) / (2 * eps)
+    assert onp.isclose(onp.dot(vjp, direction), onp.dot(weights, numeric))
+
+    # Perturbing only the first endpoint exercises the boundary stencil.
+    endpoint = onp.array([1.0, 0.0, 0.0, 0.0])
+    numeric = (
+        onp.gradient(x + eps * endpoint, grid, edge_order=2)
+        - onp.gradient(x - eps * endpoint, grid, edge_order=2)
+    ) / (2 * eps)
+    assert onp.isclose(onp.dot(vjp, endpoint), onp.dot(weights, numeric))
+
+    # That endpoint contribution is genuinely determined by the actual grid,
+    # i.e. it differs from the value the uniform-grid stencil would give.
+    assert not onp.isclose(vjp[0], weights[0] * (-1.5) + weights[1] * (2.0) + weights[2] * (-0.5))
+
+
+def test_gradient_short_axis_raises():
+    # An axis too short for the second-order template must keep raising the
+    # same error that the forward pass raises.
+    import numpy as onp
+
+    msg = "Shape of array too small to calculate a numerical gradient"
+    short = onp.array([1.0, 2.0])
+    with pytest.raises(ValueError, match=msg):
+        np.gradient(short, edge_order=2)
+    with pytest.raises(ValueError, match=msg):
+        grad(lambda y: np.sum(np.gradient(y, edge_order=2)))(short)
+    with pytest.raises(ValueError, match=msg):
+        grad(lambda y: np.sum(np.gradient(y, edge_order=2)))(npr.randn(2, 5))

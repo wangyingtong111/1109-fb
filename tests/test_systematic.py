@@ -272,6 +272,7 @@ def test_diff():
 def test_gradient():
     combo_check(np.gradient, [0])([R(5, 5), R(5, 5, 5)], axis=[None, 0, 1, -1])
     combo_check(np.gradient, [0])([R(5, 5, 5)], axis=[(0, 1), (0, -1)])
+    combo_check(np.gradient, [0])([R(5, 5), R(5, 5, 5)], axis=[None, 0, 1], edge_order=[1, 2])
 
 
 def test_tile():
