@@ -52,6 +52,27 @@ text = "This is a sentence\ncut off in the middle because pdf."
 ps = PragmaticSegmenter::Cleaner.new(text: text, doc_type: 'pdf')
 ps.clean
 # => "This is a sentence cut off in the middle because pdf."
+
+# Segment and locate each sentence inside the original input text
+text = "Élan.\n\nDr. Li\narrived. Dr. Li\narrived."
+ps = PragmaticSegmenter::Segmenter.new(text: text)
+ps.segment
+# => ["Élan.", "Dr. Li", "arrived.", "Dr. Li", "arrived."]
+ps.segment_with_indices
+# => [{:segment=>"Élan.", :start_index=>0, :end_index=>5},
+#     {:segment=>"Dr. Li", :start_index=>7, :end_index=>14},
+#     {:segment=>"arrived.", :start_index=>14, :end_index=>22},
+#     {:segment=>"Dr. Li", :start_index=>23, :end_index=>30},
+#     {:segment=>"arrived.", :start_index=>30, :end_index=>38}]
+#
+# `start_index` and `end_index` are half-open character offsets into the
+# original, unmodified text (use `original_text[start_index...end_index]`).
+# A line break removed while cleaning stays covered by the sentence it used to
+# belong to, while the whitespace separating two sentences (including blank
+# lines) is never included. The two identical "Dr. Li" segments therefore map
+# to different intervals, and each slice still contains its original newline.
+ps.segment_with_ranges
+# => [{:segment=>"Élan.", :range=>0...5}, ...]
 ```
 
 ## Live Demo
