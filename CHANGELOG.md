@@ -7,6 +7,9 @@ and this gem adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+- `FuzzyMatch.metaphone_words` and `FuzzyMatch.word_spans` encode real word parts separately and return character offsets in the original string, including Unicode combining marks. Caller-declared connector punctuation is the only extra splitting rule; concatenated words are not split by prefix guessing.
+
 ## [0.10.0] - 2026-05-09
 
 ### Added

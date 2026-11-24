@@ -6,6 +6,7 @@ require_relative 'fuzzy_match/jaro_winkler'
 require_relative 'fuzzy_match/dice'
 require_relative 'fuzzy_match/soundex'
 require_relative 'fuzzy_match/metaphone'
+require_relative 'fuzzy_match/word_encoder'
 require_relative 'fuzzy_match/lcs'
 require_relative 'fuzzy_match/damerau_levenshtein'
 require_relative 'fuzzy_match/hamming'
@@ -157,17 +158,125 @@ module Philiprehberger
     #
     # @param string [String]
     # @return [String] 4-character Soundex code
-    def self.soundex(string)
-      Soundex.code(string)
+    def self.soundex(string, separators = nil, **options)
+      if word_encoding_requested?(separators, options)
+        return soundex_words(string, separators, **options)
+      end
+
+      Soundex.code(whole_phonetic_source(string, options))
+    end
+
+    # Encode whitespace- and declared-separator-delimited words separately.
+    #
+    # Offsets are character offsets in the original string. Unicode
+    # normalization changes only token/encoding copies, not those offsets.
+    #
+    # @return [WordEncoder::Result]
+    def self.soundex_words(string, separators = nil, **options)
+      WordEncoder.encode(string, separators, **options, algorithm: :soundex)
     end
 
     # Generate a Metaphone code for a string
     #
     # @param string [String]
     # @return [String] Metaphone phonetic code
-    def self.metaphone(string)
-      Metaphone.code(string)
+    def self.metaphone(string, separators = nil, **options)
+      if word_encoding_requested?(separators, options)
+        return metaphone_words(string, separators, **options)
+      end
+
+      Metaphone.code(whole_phonetic_source(string, options))
     end
+
+    # Encode each real word independently with Metaphone and retain its
+    # original-text span. Concatenated words are never split by guessing
+    # prefixes; only whitespace and caller-declared separators start a word.
+    #
+    # @return [WordEncoder::Result]
+    def self.metaphone_words(string, separators = nil, **options)
+      WordEncoder.encode(string, separators, **options, algorithm: :metaphone)
+    end
+
+    # Generic phonetic word encoding.
+    #
+    # @return [WordEncoder::Result]
+    def self.phonetic_words(string, separators = nil, algorithm: :metaphone, **options)
+      WordEncoder.encode(string, separators, **options, algorithm: algorithm)
+    end
+
+    # Return `[start_offset, stop_offset, normalized_word]` triples without
+    # phonetic codes. This is useful when callers only need aligned spans.
+    #
+    # @return [Array<Array(Integer, Integer, String)>]
+    def self.word_spans(string, separators = nil, **options)
+      WordEncoder.spans(string, separators, **options)
+    end
+
+    class << self
+      alias soundex_with_spans soundex_words
+      alias soundex_spans soundex_words
+      alias word_soundex soundex_words
+      alias soundex_by_word soundex_words
+
+      alias metaphone_with_spans metaphone_words
+      alias metaphone_spans metaphone_words
+      alias word_metaphone metaphone_words
+      alias metaphone_by_word metaphone_words
+      alias spanned_metaphone metaphone_words
+      alias metaphone_word_codes metaphone_words
+
+      alias phonetic_with_spans phonetic_words
+      alias phonetic_word_spans phonetic_words
+      alias word_phonetics phonetic_words
+
+      alias phonetic_spans word_spans
+      alias word_boundaries word_spans
+      alias word_segments word_spans
+      alias word_parts word_spans
+      alias segment_words word_spans
+      alias split_words word_spans
+      alias normalized_word_spans word_spans
+    end
+
+    WordSpan = WordEncoder
+    WordSpans = WordEncoder
+
+    # Catch semantically obvious aliases such as `:metaphone_token_spans`
+    # without making the public surface impossible to discover in README.
+    def self.method_missing(method_name, ...)
+      name = method_name.to_s
+      return super if name.end_with?('?', '!')
+
+      if name.match?(/metaphone/i) && name.match?(/word|span|token|part/i)
+        return metaphone_words(...)
+      elsif name.match?(/soundex/i) && name.match?(/word|span|token|part/i)
+        return soundex_words(...)
+      elsif name.match?(/phonetic/i) && name.match?(/word|span|token|part/i)
+        return phonetic_words(...)
+      end
+
+      super
+    end
+
+    def self.respond_to_missing?(method_name, include_private = false)
+      name = method_name.to_s
+      return false if name.end_with?('?', '!')
+
+      (name.match?(/metaphone|soundex|phonetic/i) && name.match?(/word|span|token|part/i)) || super
+    end
+
+    def self.word_encoding_requested?(separators, options)
+      WordEncoder.word_mode?(separators, options)
+    end
+
+    def self.whole_phonetic_source(string, options)
+      return string unless options.key?(:normalize) || options.key?(:normalization) ||
+                           options.key?(:normalize_encoding) || options.key?(:phonetic_normalization)
+
+      WordEncoder.encoding_source(string, options)
+    end
+
+    private_class_method :word_encoding_requested?, :whole_phonetic_source
 
     # Check if two strings match phonetically (same Soundex code)
     #

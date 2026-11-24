@@ -3,7 +3,13 @@
 module Philiprehberger
   module FuzzyMatch
     module Metaphone
-      def self.code(string)
+      def self.code(string, separators = nil, **options)
+        return words(string, separators, **options) if WordEncoder.word_mode?(separators, options)
+
+        if normalization_options?(options)
+          string = WordEncoder.encoding_source(string, options)
+        end
+
         return '' if string.nil? || string.empty?
 
         word = string.upcase.gsub(/[^A-Z]/, '')
@@ -22,6 +28,29 @@ module Philiprehberger
         end
 
         result
+      end
+
+      def self.normalization_options?(options)
+        options.key?(:normalize) || options.key?(:normalization) ||
+          options.key?(:normalize_encoding) || options.key?(:phonetic_normalization)
+      end
+
+      private_class_method :normalization_options?
+
+      # Per-word Metaphone codes with original-text spans.
+      def self.words(string, separators = nil, **options)
+        WordEncoder.encode(string, separators, **options, algorithm: :metaphone)
+      end
+
+      # `[start, stop, normalized_word]` triples for real word boundaries.
+      def self.spans(string, separators = nil, **options)
+        WordEncoder.spans(string, separators, **options)
+      end
+
+      class << self
+        alias word_codes words
+        alias with_spans words
+        alias word_spans spans
       end
 
       def self.drop_initial_silent(word)

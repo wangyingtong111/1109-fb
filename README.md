@@ -122,6 +122,50 @@ Philiprehberger::FuzzyMatch.metaphone('Smith')    # => "SM0"
 Philiprehberger::FuzzyMatch.phonetic_match?('Robert', 'Rupert')  # => true
 ```
 
+### Word-Aware Metaphone and Original-Text Spans
+
+Store names can be encoded one real word at a time. Whitespace is always a
+boundary; additional connector punctuation is split only when the caller
+declares it. Concatenated words such as `shopknight` are never split by
+guessing prefixes.
+
+```ruby
+# [start_offset, exclusive_end_offset, NFC/downcased_word]
+Philiprehberger::FuzzyMatch.word_spans('shop knight', '‐')
+# => [[0, 4, "shop"], [5, 11, "knight"]]
+
+cafe = "Café‐knight" # decomposed Café + hyphen + knight
+Philiprehberger::FuzzyMatch.word_spans(cafe, separators: '‐')
+# => [[0, 5, "café"], [6, 12, "knight"]]
+
+# Offsets always slice the original string, including the combining mark.
+cafe[0...5] # => "Café"
+
+# Without declaring U+2010 as a separator, the connector stays in one span.
+Philiprehberger::FuzzyMatch.word_spans(cafe)
+# => [[0, 12, "café‐knight"]]
+
+# Word-local Metaphone applies KN initial-silent handling to "knight".
+words = Philiprehberger::FuzzyMatch.metaphone_words('shop knight')
+words.codes          # => ["XP", "NT"]
+words.triples        # => [[0, 4, "shop"], [5, 11, "knight"]]
+words[1][:code]      # => "NT"
+words[1][:span]      # => 5...11
+
+# shopknight remains one whole encoding; no prefix-based segmentation.
+Philiprehberger::FuzzyMatch.metaphone_words('shopknight').first[:code]
+# => "XPKNT"
+
+# The legacy whole-string entry still returns a String by default.
+Philiprehberger::FuzzyMatch.metaphone('shop knight') # => "XPKNT"
+Philiprehberger::FuzzyMatch.metaphone_with_spans('shop knight') # word result
+```
+
+`metaphone_with_spans`, `metaphone_spans`, `word_metaphone`,
+`phonetic_words`, `phonetic_spans`, and the corresponding `soundex_words`
+aliases are also available. Supported separator options are `separators:`,
+`separator:`, `delimiters:`, `split_on:`, and `split_hyphens: true`.
+
 ### Similarity Matrix
 
 ```ruby
@@ -213,6 +257,8 @@ Philiprehberger::FuzzyMatch.weighted_score('kitten', 'sitting',
 | `.top_n(query, candidates, n:, algorithm: :jaro_winkler, min_similarity: 0.0)` | Top-N matches as `{ value:, similarity: }` sorted by similarity descending, with optional similarity floor |
 | `.soundex(string)` | Generate 4-character Soundex code |
 | `.metaphone(string)` | Generate Metaphone phonetic code |
+| `.metaphone_words(string, separators:)` | Per-word Metaphone codes with original offsets and spans |
+| `.word_spans(string, separators:)` | `[start, stop, normalized_word]` triples using original character offsets |
 | `.phonetic_match?(a, b)` | Check if two strings match phonetically |
 | `.hamming(a, b)` | Hamming distance for equal-length strings (integer) |
 | `.token_sort_ratio(a, b)` | Token-sorted Jaro-Winkler similarity (0.0 to 1.0) |
