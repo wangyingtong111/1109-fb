@@ -45,6 +45,38 @@ module Philiprehberger
       Lcs.ratio(str_a, str_b)
     end
 
+    # Alignment behind the longest common subsequence
+    #
+    # Returns the actual matched positions, not just the count: one entry per
+    # matched pair, each carrying the inclusive character range it covers in
+    # the original string.
+    #
+    # ```ruby
+    # FuzzyMatch.lcs_alignment('Anne', 'Anene')
+    # # => [{ a_range: 0..0, b_range: 0..0, a_text: 'A', b_text: 'A' },
+    # #     { a_range: 1..1, b_range: 1..1, a_text: 'n', b_text: 'n' },
+    # #     { a_range: 2..2, b_range: 3..3, a_text: 'n', b_text: 'n' },
+    # #     { a_range: 3..3, b_range: 4..4, a_text: 'e', b_text: 'e' }]
+    # ```
+    #
+    # Matching runs over grapheme clusters, so a decomposed `"A" + U+030A`
+    # pairs with a precomposed `"Å"` and reports a range that covers the whole
+    # cluster on each side. Case folding used for the comparison never leaks
+    # into the ranges: they always index the untouched original strings.
+    #
+    # Repeated symbols follow one fixed convention (greedy common prefix and
+    # suffix, then the earliest optimal split point, ties to the first
+    # occurrence), so the positions are byte-for-byte reproducible across runs
+    # and the pairs always increase on both sides.
+    #
+    # @param str_a [String]
+    # @param str_b [String]
+    # @return [Array<Hash>] matched pairs with `:a_range`, `:b_range`,
+    #   `:a_text`, `:b_text`
+    def self.lcs_alignment(str_a, str_b)
+      Lcs.alignment(str_a, str_b)
+    end
+
     # Damerau-Levenshtein edit distance (counts transpositions as 1 edit)
     #
     # @param str_a [String]

@@ -138,6 +138,82 @@ RSpec.describe Philiprehberger::FuzzyMatch do
     end
   end
 
+  describe '.lcs_alignment' do
+    def pairs(str_a, str_b)
+      described_class.lcs_alignment(str_a, str_b).map { |pair| [pair[:a_range], pair[:b_range]] }
+    end
+
+    it 'returns four ordered position pairs for Anne/Anene' do
+      expect(pairs('Anne', 'Anene')).to eq([[0..0, 0..0], [1..1, 1..1], [2..2, 3..3], [3..3, 4..4]])
+    end
+
+    it 'exposes the matched substrings alongside the ranges' do
+      alignment = described_class.lcs_alignment('Anne', 'Anene')
+
+      expect(alignment.map { |pair| pair[:a_text] }).to eq(%w[A n n e])
+      expect(alignment.map { |pair| pair[:b_text] }).to eq(%w[A n n e])
+      expect(alignment.first.keys).to contain_exactly(:a_range, :b_range, :a_text, :b_text)
+    end
+
+    it 'pairs a decomposed glyph with its precomposed counterpart' do
+      str_a = 'Åaa'
+      str_b = 'Åaaa'
+
+      alignment = described_class.lcs_alignment(str_a, str_b)
+
+      expect(alignment.map { |pair| [pair[:a_range], pair[:b_range]] })
+        .to eq([[0..1, 0..0], [2..2, 1..1], [3..3, 2..2]])
+      expect(alignment.map { |pair| [pair[:a_text], pair[:b_text]] })
+        .to eq([%w[Å Å], %w[a a], %w[a a]])
+      expect(str_a[alignment.first[:a_range]]).to eq('Å')
+      expect(str_b[alignment.first[:b_range]]).to eq('Å')
+    end
+
+    it 'matches .lcs for length' do
+      expect(described_class.lcs_alignment('kitten', 'sitting').length)
+        .to eq(described_class.lcs('kitten', 'sitting'))
+      expect(described_class.lcs_alignment('Åaa', 'Åaaa').length)
+        .to eq(described_class.lcs('Åaa', 'Åaaa'))
+    end
+
+    it 'ignores case while reporting the original glyphs' do
+      alignment = described_class.lcs_alignment('ANN', 'ann')
+
+      expect(alignment.map { |pair| [pair[:a_range], pair[:b_range]] })
+        .to eq([[0..0, 0..0], [1..1, 1..1], [2..2, 2..2]])
+      expect(alignment.map { |pair| pair[:a_text] }).to eq(%w[A N N])
+    end
+
+    it 'is stable across repeated runs for equal-length strings with several paths' do
+      runs = Array.new(25) { pairs('aba', 'aab') }
+
+      expect(runs.uniq.length).to eq(1)
+      expect(runs.first.length).to eq(2)
+    end
+
+    it 'keeps both sides strictly increasing' do
+      alignment = described_class.lcs_alignment('mississippi', 'misisipi')
+
+      alignment.each_cons(2) do |left, right|
+        expect(left[:a_range].last).to be < right[:a_range].first
+        expect(left[:b_range].last).to be < right[:b_range].first
+      end
+    end
+
+    it 'mirrors the pairs when arguments are swapped' do
+      forward = pairs('Anene', 'Anne')
+      backward = pairs('Anne', 'Anene').map { |a_range, b_range| [b_range, a_range] }
+
+      expect(forward).to eq(backward)
+    end
+
+    it 'returns an empty array for empty or disjoint inputs' do
+      expect(described_class.lcs_alignment('', '')).to eq([])
+      expect(described_class.lcs_alignment('abc', '')).to eq([])
+      expect(described_class.lcs_alignment('abc', 'xyz')).to eq([])
+    end
+  end
+
   describe '.ratio' do
     it 'returns 1.0 for identical strings' do
       expect(described_class.ratio('hello', 'hello')).to eq(1.0)

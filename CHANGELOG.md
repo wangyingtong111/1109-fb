@@ -7,6 +7,11 @@ and this gem adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-11-25
+
+### Added
+- `FuzzyMatch.lcs_alignment(a, b)` — explains the longest common subsequence as ordered position pairs (`a_range:`, `b_range:`, `a_text:`, `b_text:`) over the original strings, with a stable tie-break convention for repeated symbols and grapheme-cluster matching so decomposed and precomposed glyphs pair up. Computed in O(n + m) space (Hirschberg), never storing the score matrix; `lcs`/`lcs_ratio` keep their rolling computation.
+
 ## [0.10.0] - 2026-05-09
 
 ### Added

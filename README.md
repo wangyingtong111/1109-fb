@@ -53,6 +53,48 @@ Philiprehberger::FuzzyMatch.lcs('kitten', 'sitting')       # => 4
 Philiprehberger::FuzzyMatch.lcs_ratio('kitten', 'sitting')  # => ~0.615
 ```
 
+#### LCS Alignment
+
+`lcs_alignment` returns the positions behind the length, not just the count.
+Every entry pairs one range in the first string with one range in the second:
+
+```ruby
+Philiprehberger::FuzzyMatch.lcs_alignment('Anne', 'Anene')
+# => [{ a_range: 0..0, b_range: 0..0, a_text: "A", b_text: "A" },
+#     { a_range: 1..1, b_range: 1..1, a_text: "n", b_text: "n" },
+#     { a_range: 2..2, b_range: 3..3, a_text: "n", b_text: "n" },
+#     { a_range: 3..3, b_range: 4..4, a_text: "e", b_text: "e" }]
+
+Philiprehberger::FuzzyMatch.lcs_alignment('Anne', 'Anene').length
+# => 4 == Philiprehberger::FuzzyMatch.lcs('Anne', 'Anene')
+```
+
+The pairs are strictly increasing on both sides: slicing either original
+string with the returned ranges reproduces the matched subsequence. Alignment
+runs on grapheme clusters, so a decomposed glyph pairs with its precomposed
+form, and the reported range covers the whole glyph on each side. Case folding
+only affects the comparison — the ranges always index the original text:
+
+```ruby
+decomposed = "Åaa"   # A + combining ring, then "aa"
+precomposed = "Åaaa"  # Å, then "aaa"
+
+Philiprehberger::FuzzyMatch.lcs_alignment(decomposed, precomposed)
+# => [{ a_range: 0..1, b_range: 0..0, a_text: "Å", b_text: "Å" },
+#     { a_range: 2..2, b_range: 1..1, a_text: "a", b_text: "a" },
+#     { a_range: 3..3, b_range: 2..2, a_text: "a", b_text: "a" }]
+```
+
+Repeated symbols follow one fixed convention — greedy common prefix and suffix,
+then the earliest optimal split, ties to the first occurrence — and the two
+sides are put in a canonical order first. The same input therefore always
+yields the same positions, and swapping the arguments mirrors the pairs instead
+of choosing a different equally long path.
+
+The explanation never stores the score matrix: split points come from rolling
+LCS rows (Hirschberg), so peak memory stays O(n + m) while `lcs`/`lcs_ratio`
+keep using their plain rolling computation.
+
 ### Best Match
 
 ```ruby
@@ -203,6 +245,7 @@ Philiprehberger::FuzzyMatch.weighted_score('kitten', 'sitting',
 | `.damerau_ratio(a, b)` | Normalized Damerau-Levenshtein similarity (0.0 to 1.0) |
 | `.lcs(a, b)` | Longest common subsequence length (integer) |
 | `.lcs_ratio(a, b)` | Normalized LCS similarity (0.0 to 1.0) |
+| `.lcs_alignment(a, b)` | Longest common subsequence as ordered `{ a_range:, b_range:, a_text:, b_text: }` pairs |
 | `.ratio(a, b)` | Normalized Levenshtein ratio (0.0 to 1.0) |
 | `.partial_ratio(a, b)` | Substring-style similarity: max Levenshtein ratio over windows of the longer string (0.0 to 1.0) |
 | `.best(query, candidates, threshold: 0.0)` | Best match as `{ match:, score: }` |
