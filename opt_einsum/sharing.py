@@ -4,10 +4,10 @@ Copyright (c) 2018 Uber Technologies
 """
 
 import contextlib
+import contextvars
 import functools
 import numbers
-import threading
-from collections import Counter, defaultdict
+from collections import Counter
 from collections import Counter as CounterType
 from collections.abc import Generator
 from typing import Any
@@ -28,28 +28,33 @@ __all__ = [
     "to_backend_cache_wrap",
 ]
 
-_SHARING_STACK: dict[int, list[CacheType]] = defaultdict(list)
+# The sharing stack is stored in a ``ContextVar`` so that it is scoped to
+# the current execution context: each thread *and* each asyncio task (or
+# other ``contextvars``-based scope) sees its own stack, even when several
+# tasks share a single event loop thread. The stack is replaced (not
+# mutated) on push/pop so that contexts copied from one another do not
+# alias the same underlying list.
+_SHARING_STACK: contextvars.ContextVar[tuple[CacheType, ...]] = contextvars.ContextVar(
+    "opt_einsum_sharing_stack", default=()
+)
 
 
 def currently_sharing() -> bool:
-    """Check if we are currently sharing a cache -- thread specific."""
-    return threading.get_ident() in _SHARING_STACK
+    """Check if we are currently sharing a cache -- thread and task specific."""
+    return bool(_SHARING_STACK.get())
 
 
 def get_sharing_cache() -> CacheType:
-    """Return the most recent sharing cache -- thread specific."""
-    return _SHARING_STACK[threading.get_ident()][-1]
+    """Return the most recent sharing cache -- thread and task specific."""
+    return _SHARING_STACK.get()[-1]
 
 
 def _add_sharing_cache(cache: CacheType) -> Any:
-    _SHARING_STACK[threading.get_ident()].append(cache)
+    _SHARING_STACK.set(_SHARING_STACK.get() + (cache,))
 
 
 def _remove_sharing_cache() -> None:
-    tid = threading.get_ident()
-    _SHARING_STACK[tid].pop()
-    if not _SHARING_STACK[tid]:
-        del _SHARING_STACK[tid]
+    _SHARING_STACK.set(_SHARING_STACK.get()[:-1])
 
 
 @contextlib.contextmanager
