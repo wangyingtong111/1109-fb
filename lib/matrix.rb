@@ -1943,6 +1943,7 @@ end
 #
 # Vector functions:
 # * #inner_product(v), #dot(v)
+# * #weighted_inner_product(v, metric), #metric_inner_product(v, metric)
 # * #cross_product(v), #cross(v)
 # * #collect
 # * #collect!
@@ -2314,6 +2315,67 @@ class Vector
   alias_method :dot, :inner_product
 
   #
+  # Returns the weighted inner product of this vector with +v+ under the
+  # positive semidefinite Hermitian metric +metric+, defined as
+  #
+  #   x.weighted_inner_product(y, g) # => xᴴ g y
+  #                                  #   = Σᵢ Σⱼ conj(xᵢ) * g[i, j] * yⱼ
+  #
+  # The components of the left operand (this vector) are conjugated, so
+  # the result keeps its complex phase and swapping the two vectors under
+  # the same metric yields its complex conjugate:
+  #
+  #   y.weighted_inner_product(x, g) == x.weighted_inner_product(y, g).conj
+  #
+  #   x = Vector[1, Complex::I]
+  #   y = Vector[1, 1]
+  #   x.weighted_inner_product(y, Matrix.diagonal(2, 3))
+  #     # => (2-3i)
+  #   g = Matrix[[1, -Complex::I], [Complex::I, 1]]
+  #   x.weighted_inner_product(y, g)  # => (2-2i)
+  #   y.weighted_inner_product(x, g)  # => (2+2i)
+  #
+  # +metric+ must be a square Matrix matching the vector dimension, and it
+  # must be Hermitian and positive semidefinite. A legitimate zero
+  # direction (a zero eigenvalue) is accepted and may make the result zero;
+  # a negative direction is rejected. The metric is validated with the
+  # entries' own exact arithmetic and is never converted to floats first.
+  #
+  # Raises ErrDimensionMismatch when +v+ or +metric+ has the wrong
+  # dimension, and ArgumentError when +metric+ is not Hermitian or has a
+  # negative direction.
+  #
+  def weighted_inner_product(v, metric)
+    if v.is_a?(Matrix) && metric.is_a?(Vector)
+      v, metric = metric, v
+    end
+    raise TypeError, "Expected a Vector, got a #{v.class}" unless v.is_a?(Vector)
+    raise TypeError, "Expected a Matrix metric, got a #{metric.class}" unless metric.is_a?(Matrix)
+    raise ErrDimensionMismatch if size != v.size
+
+    n = size
+    if metric.row_count != n || metric.column_count != n
+      raise ErrDimensionMismatch,
+        "Metric dimension #{metric.row_count}x#{metric.column_count} does not match vector dimension #{n}"
+    end
+    unless metric.hermitian?
+      raise ArgumentError, "Metric must be a Hermitian matrix"
+    end
+    unless hermitian_semidefinite?(metric)
+      raise ArgumentError, "Metric must be positive semidefinite but has a negative direction"
+    end
+
+    p = 0
+    @elements.each_with_index do |xi, i|
+      v.each_with_index do |yj, j|
+        p += xi.conj * metric[i, j] * yj
+      end
+    end
+    p
+  end
+  alias_method :metric_inner_product, :weighted_inner_product
+
+  #
   # Returns the cross product of this vector with the others.
   #   Vector[1, 0, 0].cross_product Vector[0, 1, 0]  # => Vector[0, 0, 1]
   #
@@ -2491,5 +2553,75 @@ class Vector
   #
   def inspect
     "Vector" + @elements.inspect
+  end
+
+  private
+
+  #
+  # Checks whether the (already known Hermitian, square) matrix +m+ is
+  # positive semidefinite, using a symmetrically pivoted LDLᴴ factorization.
+  # All arithmetic is performed on the entries themselves: exact inputs
+  # (integers, rationals, ...) are never converted to floats, so a
+  # legitimate zero direction is kept exactly zero while every negative
+  # direction produces a strictly negative real pivot.
+  #
+  def hermitian_semidefinite?(m)
+    n = m.row_count
+    return true if n.zero?
+
+    a = Array.new(n) {|i| Array.new(n) {|j| m[i, j] } }
+
+    k = 0
+    while k < n
+      # Symmetric pivot: a diagonal entry with the largest modulus.
+      pivot = k
+      best = a[k][k].abs
+      (k + 1 ... n).each do |r|
+        modulus = a[r][r].abs
+        if modulus > best
+          best = modulus
+          pivot = r
+        end
+      end
+      if pivot != k
+        a[k], a[pivot] = a[pivot], a[k]
+        (0 ... n).each do |r|
+          a[r][k], a[r][pivot] = a[r][pivot], a[r][k]
+        end
+      end
+
+      d = a[k][k]
+      if !d.imag.zero?
+        # Only reachable if the matrix was not actually Hermitian.
+        return false
+      end
+
+      if d.zero?
+        # With a zero pivot, Hermitian semidefiniteness requires the whole
+        # remaining block to have zero row (and column) k.
+        (k + 1 ... n).each do |j|
+          return false unless a[k][j].zero? && a[j][k].zero?
+        end
+        k += 1
+        next
+      end
+
+      return false if d.real.negative?
+
+      # LDLᴴ step on the trailing block. The multipliers are computed from
+      # the unchanged pivot column before anything is overwritten, then
+      # every entry of the trailing block is rewritten so the working
+      # matrix stays exactly Hermitian and exact arithmetic is preserved:
+      #   l[i] = a[i,k] / d
+      #   a'[i,j] = a[i,j] - l[i] * conj(l[j]) * d
+      multipliers = (k + 1 ... n).map {|i| a[i][k].quo(d) }
+      (k + 1 ... n).each_with_index do |i, ii|
+        (k + 1 ... n).each_with_index do |j, jj|
+          a[i][j] -= multipliers[ii] * multipliers[jj].conj * d
+        end
+      end
+      k += 1
+    end
+    true
   end
 end

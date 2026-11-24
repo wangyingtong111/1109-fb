@@ -263,6 +263,98 @@ class TestVector < Test::Unit::TestCase
     assert_equal(1+4+9, @v1.dot(@v1))
   end
 
+  def test_weighted_inner_product_diagonal_metric
+    i = Complex::I
+    x = Vector[1, i]
+    y = Vector[1, 1]
+    assert_equal(Complex(2, -3), x.weighted_inner_product(y, Matrix.diagonal(2, 3)))
+    assert_equal(Complex(2, -3), x.metric_inner_product(y, Matrix.diagonal(2, 3)))
+  end
+
+  def test_weighted_inner_product_hermitian_metric
+    i = Complex::I
+    x = Vector[1, i]
+    y = Vector[1, 1]
+    metric = Matrix[[1, -i], [i, 1]]
+    assert_equal(Complex(2, -2), x.weighted_inner_product(y, metric))
+    # Swapping the vectors conjugates the result.
+    assert_equal(Complex(2, 2), y.weighted_inner_product(x, metric))
+    assert_equal(y.weighted_inner_product(x, metric),
+      x.weighted_inner_product(y, metric).conj)
+    # A legitimate zero direction gives zero.
+    z = Vector[1, -i]
+    assert_equal(0, z.weighted_inner_product(z, metric))
+  end
+
+  def test_weighted_inner_product_conjugate_symmetry
+    i = Complex::I
+    a = Matrix[[2, 1 + i], [1 - i, 3]]
+    x = Vector[1 + 2*i, 3]
+    y = Vector[4, i]
+    assert_equal(y.weighted_inner_product(x, a),
+      x.weighted_inner_product(y, a).conj)
+  end
+
+  def test_weighted_inner_product_real_metric
+    assert_equal(11, Vector[1, 2].weighted_inner_product(Vector[3, 4], Matrix.diagonal(1, 1)))
+    # A zero metric only has zero directions and is therefore valid.
+    assert_equal(0, Vector[1, 2].weighted_inner_product(Vector[3, 4], Matrix.zero(2)))
+  end
+
+  def test_weighted_inner_product_exact_arithmetic
+    # Exact Rational inputs stay exact and are never converted to floats.
+    i = Complex::I
+    metric = Matrix.diagonal(1.quo(3), 2.quo(3))
+    assert_equal(Complex(1.quo(3), -2.quo(3)),
+      Vector[1, i].weighted_inner_product(Vector[1, 1], metric))
+  end
+
+  def test_weighted_inner_product_reversed_arguments
+    i = Complex::I
+    x = Vector[1, i]
+    y = Vector[1, 1]
+    metric = Matrix[[1, -i], [i, 1]]
+    assert_equal(Complex(2, 2), y.metric_inner_product(metric, x))
+  end
+
+  def test_weighted_inner_product_dimension_mismatch
+    assert_raise(Vector::ErrDimensionMismatch) do
+      Vector[1, 2].weighted_inner_product(Vector[1, 2, 3], Matrix.diagonal(1, 2))
+    end
+    assert_raise(Vector::ErrDimensionMismatch) do
+      Vector[1, 2].weighted_inner_product(Vector[1, 2], Matrix.diagonal(1, 2, 3))
+    end
+    assert_raise(Vector::ErrDimensionMismatch) do
+      Vector[1, 2, 3].weighted_inner_product(Vector[1, 2, 3], Matrix[[1, 0, 0], [0, 1, 0]])
+    end
+  end
+
+  def test_weighted_inner_product_non_hermitian_metric
+    i = Complex::I
+    assert_raise(ArgumentError) do
+      Vector[1, i].weighted_inner_product(Vector[1, 1], Matrix[[1, 2*i], [i, 1]])
+    end
+  end
+
+  def test_weighted_inner_product_indefinite_metric
+    i = Complex::I
+    # Non-negative diagonal but with a clear negative direction.
+    metric = Matrix[[0, i], [-i, 0]]
+    assert_raise(ArgumentError) do
+      Vector[1, i].weighted_inner_product(Vector[1, 1], metric)
+    end
+    assert_raise(ArgumentError) do
+      Vector[1, i].weighted_inner_product(Vector[1, 1], Matrix.diagonal(-1, 1))
+    end
+  end
+
+  def test_weighted_inner_product_type_errors
+    i = Complex::I
+    metric = Matrix[[1, 0], [0, 1]]
+    assert_raise(TypeError) { Vector[1, i].weighted_inner_product(42, metric) }
+    assert_raise(TypeError) { Vector[1, i].weighted_inner_product(Vector[1, 1], [[1, 0], [0, 1]]) }
+  end
+
   def test_r
     assert_equal(5, Vector[3, 4].r)
   end
