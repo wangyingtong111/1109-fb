@@ -17,12 +17,15 @@ class FuzzyMatch
       @engine = alt_engine
     end
     
-    def score_class
+    def score_class(engine = nil)
+      engine ||= self.engine
       case engine
-      when :pure_ruby
+      when :pure_ruby, 'pure_ruby'
         Score::PureRuby
-      when :amatch
+      when :amatch, 'amatch'
         Score::Amatch
+      when ::Class
+        engine
       else
         raise ::ArgumentError, "[fuzzy_match] #{engine.inspect} is not a recognized engine."
       end
@@ -50,7 +53,26 @@ class FuzzyMatch
   attr_reader :identities
   attr_reader :stop_words
   attr_accessor :read
+  attr_writer :score_class
   attr_reader :default_options
+
+  # The engine explicitly selected for this matcher, if any.  Without an
+  # instance setting, continue to expose the current global engine.
+  def engine
+    @engine || self.class.engine
+  end
+
+  def engine=(engine)
+    @engine = engine
+    @score_class = nil
+  end
+
+  # The score implementation used by this matcher.  When no engine or score
+  # class was supplied to the initializer, keep resolving the global engine on
+  # every query so existing matchers retain the old global behavior.
+  def score_class
+    @score_class || self.class.score_class(@engine)
+  end
 
   # haystack - a bunch of records that will compete to see who best matches the needle
   #
@@ -70,6 +92,8 @@ class FuzzyMatch
 
     # rules
     @read = o.delete(:read) || o.delete(:haystack_reader)
+    @engine = o.delete(:engine)
+    @score_class = o.delete(:score_class) || o.delete(:scorer)
     @groupings = (o.delete(:groupings) || o.delete(:blockings) || []).map { |regexp| Rule::Grouping.make(regexp) }.flatten
     @identities = (o.delete(:identities) || []).map { |regexp| Rule::Identity.new(regexp) }
     @stop_words = o.delete(:stop_words) || []
@@ -113,7 +137,13 @@ class FuzzyMatch
   
   def find(needle, options = {})
     options = default_options.merge options
-    
+
+    # Resolve the backend selection once for this query.  Explicit instance
+    # settings stay pinned; unpinned matchers read the global engine here, at
+    # query entry, rather than observing changes made by re-entrant callbacks.
+    query_score_class = options[:score_class] || @score_class
+    query_engine = options[:engine] || @engine || self.class.engine
+
     threshold = options[:threshold]
     gather_last_result = options[:gather_last_result]
     is_find_all_with_score = options[:find_all_with_score]
@@ -247,12 +277,15 @@ EOS
       possibly_identical = joint.dup
     end
     
-    similarities = possibly_identical.map { |straw| needle.similarity straw }.sort.reverse
+    query_score_class ||= self.class.score_class(query_engine)
+    similarities = possibly_identical.map do |straw|
+      needle.similarity straw, :score_class => query_score_class
+    end.sort.reverse
         
     if gather_last_result
       last_result.timeline << <<-EOS
 The competition was sorted in order of similarity to the needle.
-\t#{similarities[0,9].map { |s| "#{s.record2.similarity(needle).inspect}" }.join("\n\t")}
+\t#{similarities[0,9].map { |s| "#{s.record2.similarity(needle, :score_class => query_score_class).inspect}" }.join("\n\t")}
 EOS
     end
     

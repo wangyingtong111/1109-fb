@@ -36,8 +36,8 @@ class FuzzyMatch
       @words ||= clean.downcase.split(WORD_BOUNDARY).freeze
     end
 
-    def similarity(other)
-      Similarity.new self, other
+    def similarity(other, options = {})
+      Similarity.new self, other, options
     end
 
     def whole

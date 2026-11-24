@@ -2,10 +2,11 @@ class FuzzyMatch
   class Similarity
     attr_reader :record1
     attr_reader :record2
-    
-    def initialize(record1, record2)
+
+    def initialize(record1, record2, options = {})
       @record1 = record1
       @record2 = record2
+      @score_class = options[:score_class]
     end
     
     def <=>(other)
@@ -18,7 +19,11 @@ class FuzzyMatch
     end
     
     def best_score
-      @best_score ||= FuzzyMatch.score_class.new(record1.clean, record2.clean)
+      @best_score ||= score_class.new(record1.clean, record2.clean)
+    end
+
+    def score_class
+      @score_class || FuzzyMatch.score_class
     end
 
     def satisfy?(needle, threshold)

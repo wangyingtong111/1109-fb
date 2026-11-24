@@ -163,6 +163,12 @@ You can optionally use [`amatch`](http://flori.github.com/amatch/) by [Florian F
     require 'amatch' # note that you have to require this... fuzzy_match won't require it for you
     FuzzyMatch.engine = :amatch
 
+When comparing engines in the same process, pin an engine to a matcher instance:
+
+    pure_matcher = FuzzyMatch.new(haystack, :engine => :pure_ruby)
+
+Changing `FuzzyMatch.engine` later will not change that matcher's scores. Matchers created without an `:engine` option continue to follow the global engine for each query.
+
 Otherwise, pure ruby versions of the string similarity algorithms derived from the [answer to a StackOverflow question](http://stackoverflow.com/questions/653157/a-better-similarity-ranking-algorithm-for-variable-length-strings) and [the text gem](https://github.com/threedaymonk/text/blob/master/lib/text/levenshtein.rb) are used. Thanks [marzagao](http://stackoverflow.com/users/10997/marzagao) and [threedaymonk](https://github.com/threedaymonk)!
 
 ## Real-world usage

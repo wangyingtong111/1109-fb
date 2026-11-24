@@ -39,7 +39,12 @@ ERB
     end
     
     def explain
-      $stdout.puts ::ERB.new(EXPLANATION, 0, '%<').result(binding)
+      erb = begin
+        ::ERB.new(EXPLANATION, 0, '%<')
+      rescue ::ArgumentError
+        ::ERB.new(EXPLANATION, :trim_mode => '%')
+      end
+      $stdout.puts erb.result(binding)
     end
   end
 end
