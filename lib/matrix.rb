@@ -790,10 +790,189 @@ class Matrix
   #   #  => 9 -6
   #   #     -3 7
   #
+  # For matrices of Integers or Rationals the result is computed exactly.
+  # A regular matrix uses a fraction-free Gauss-Jordan elimination, so that
+  # the identity A * adj(A) = det(A) * I holds without any cofactor
+  # evaluation. A singular matrix of rank n - 1 requires a single cofactor
+  # evaluation; if the rank is at most n - 2 the adjugate is the zero matrix.
+  # Other (generic numeric) entry types keep the entrywise cofactor path.
+  #
   def adjugate
     raise ErrDimensionMismatch unless square?
-    Matrix.build(row_count, column_count) do |row, column|
-      cofactor(column, row)
+    if all? {|e| e.is_a?(Integer) || e.is_a?(Rational)}
+      adjugate_exact
+    else
+      Matrix.build(row_count, column_count) do |row, column|
+        cofactor(column, row)
+      end
+    end
+  end
+
+  #
+  # Private. Use Matrix#adjugate
+  #
+  # Exact adjugate for a square matrix of Integers/Rationals.
+  # Never falls back to the entrywise cofactor computation:
+  # * rank n:     fraction-free Gauss-Jordan on [A | I] gives adj(A) directly
+  # * rank n - 1: one cofactor evaluation, plus the two one-dimensional
+  #               null spaces of A and A^t, give the whole adjugate
+  # * rank <= n-2: the adjugate is the zero matrix
+  #
+  private def adjugate_exact
+    n = row_count
+    return Matrix.empty if n == 0
+    # adj([a]) = [1], including adj([0]) = [1]
+    return new_matrix [[1]] if n == 1
+
+    rank, row_perm, pivot_columns = adjugate_rank_info
+    return self.class.zero(n) if rank <= n - 2
+    return adjugate_regular if rank == n
+
+    # Rank is n - 1: the null spaces of A and A^t are one-dimensional.
+    # r is the only non-pivot row and c the only non-pivot column; both
+    # identify a cofactor that is guaranteed to be non-zero.
+    r = row_perm.last
+    c = (0 ... n).find {|j| !pivot_columns.include?(j)}
+    c_rc = cofactor(r, c)
+
+    rows_idx = (0 ... n).reject {|i| i == r}
+    cols_idx = (0 ... n).reject {|j| j == c}
+    minor = rows_idx.map {|i| cols_idx.map {|j| @rows[i][j]}}
+
+    # Right null vector v with v[c] == 1: minor * v_I = -A_I,c
+    v = Array.new(n, 0.to_r)
+    v[c] = 1.to_r
+    solve_exact(minor, rows_idx.map {|i| -@rows[i][c]}).each_with_index do |x, t|
+      v[cols_idx[t]] = x
+    end
+
+    # Left null vector w (w^t * A = 0) with w[r] == 1:
+    # minor^t * w_I = -A_r,J
+    w = Array.new(n, 0.to_r)
+    w[r] = 1.to_r
+    solve_exact(minor.transpose, cols_idx.map {|j| -@rows[r][j]}).each_with_index do |x, t|
+      w[rows_idx[t]] = x
+    end
+
+    # Each column of adj(A) lies in the null space of A and each row in the
+    # null space of A^t, so adj(A) = c_rc * v * w^t (with v[c] = w[r] = 1):
+    # adj(A)[i, j] = cofactor(j, i) = c_rc * v[i] * w[j]
+    new_matrix Array.new(n) {|i|
+      Array.new(n) {|j| adjugate_canonical(c_rc * v[i] * w[j])}
+    }
+  end
+
+  #
+  # Private. Use Matrix#adjugate
+  #
+  # Rank-revealing fraction-free (Bareiss) elimination with row pivoting.
+  # Returns [rank, permutation of the original row indices, pivot columns].
+  #
+  private def adjugate_rank_info
+    n = row_count
+    a = to_a
+    row_perm = (0 ... n).to_a
+    pivot_columns = []
+    pivot_row = 0
+    previous_pivot = 1
+    n.times do |k|
+      switch_row = (pivot_row ... n).find {|row| a[row][k] != 0}
+      next unless switch_row
+      if switch_row != pivot_row
+        a[pivot_row], a[switch_row] = a[switch_row], a[pivot_row]
+        row_perm[pivot_row], row_perm[switch_row] =
+          row_perm[switch_row], row_perm[pivot_row]
+      end
+      pivot = a[pivot_row][k]
+      (pivot_row + 1 ... n).each do |i|
+        ai = a[i]
+        (k + 1 ... n).each do |j|
+          ai[j] = (pivot * ai[j] - ai[k] * a[pivot_row][j]) / previous_pivot
+        end
+      end
+      pivot_columns << k
+      previous_pivot = pivot
+      pivot_row += 1
+    end
+    [pivot_row, row_perm, pivot_columns]
+  end
+
+  #
+  # Private. Use Matrix#adjugate
+  #
+  # Fraction-free Gauss-Jordan elimination on the augmented matrix [A | I].
+  # The right-hand block ends up as sign * adj(A), where sign records the
+  # row swaps; all divisions stay exact, so Integer entries stay Integer.
+  #
+  private def adjugate_regular
+    n = row_count
+    a = @rows.each_with_index.map {|row, i|
+      row + Array.new(n) {|j| i == j ? 1 : 0}
+    }
+    sign = 1
+    previous_pivot = 1
+    n.times do |k|
+      pivot_row = (k ... n).find {|i| a[i][k] != 0}
+      # adjugate_exact only calls this for a full-rank matrix
+      raise ErrNotRegular unless pivot_row
+      if pivot_row != k
+        a[k], a[pivot_row] = a[pivot_row], a[k]
+        sign = -sign
+      end
+      pivot = a[k][k]
+      n.times do |i|
+        next if i == k
+        aik = a[i][k]
+        (k + 1 ... 2 * n).each do |j|
+          a[i][j] = (pivot * a[i][j] - aik * a[k][j]) / previous_pivot
+        end
+        a[i][k] = 0
+      end
+      previous_pivot = pivot
+    end
+    new_matrix a.map {|row|
+      row[n ... 2 * n].map {|e| adjugate_canonical(e * sign)}
+    }
+  end
+
+  #
+  # Private. Use Matrix#adjugate
+  #
+  # Exact solution of b * x = rhs through rational Gauss-Jordan elimination.
+  # b is assumed invertible.
+  #
+  private def solve_exact(b, rhs)
+    size = b.size
+    m = b.each_with_index.map {|row, i|
+      row.map(&:to_r) + [rhs[i].to_r]
+    }
+    size.times do |k|
+      pivot_row = (k ... size).find {|i| m[i][k] != 0}
+      raise ErrNotRegular unless pivot_row
+      m[k], m[pivot_row] = m[pivot_row], m[k] if pivot_row != k
+      inverse_pivot = 1 / m[k][k]
+      (k .. size).each {|j| m[k][j] *= inverse_pivot}
+      size.times do |i|
+        next if i == k
+        factor = m[i][k]
+        next if factor == 0
+        (k .. size).each {|j| m[i][j] -= factor * m[k][j]}
+      end
+    end
+    m.map {|row| adjugate_canonical(row[size])}
+  end
+
+  #
+  # Private. Use Matrix#adjugate
+  #
+  # Collapses Rationals equal to an Integer so Integer input matrices yield
+  # Integer adjugates.
+  #
+  private def adjugate_canonical(value)
+    if value.is_a?(Rational) && value.denominator == 1
+      value.numerator
+    else
+      value
     end
   end
 

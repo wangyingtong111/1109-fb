@@ -5,6 +5,20 @@ require 'matrix'
 class SubMatrix < Matrix
 end
 
+# Counts how many times Matrix#cofactor is evaluated, so that the exact
+# adjugate paths can be checked against the number of cofactor evaluations.
+class CofactorCountingMatrix < Matrix
+  def initialize(*)
+    super
+    @cofactor_count = 0
+  end
+  attr_reader :cofactor_count
+  def cofactor(row, column)
+    @cofactor_count += 1
+    super
+  end
+end
+
 class TestMatrix < Test::Unit::TestCase
   def setup
     @m1 = Matrix[[1,2,3], [4,5,6]]
@@ -334,6 +348,7 @@ class TestMatrix < Test::Unit::TestCase
   def test_adjugate
     assert_equal(Matrix.empty, Matrix.empty.adjugate)
     assert_equal(Matrix[[1]], Matrix[[5]].adjugate)
+    assert_equal(Matrix[[1]], Matrix[[0]].adjugate)
     assert_equal(Matrix[[9,-6],[-3,7]], Matrix[[7,6],[3,9]].adjugate)
     assert_equal(Matrix[[45,3,-7],[6,-1,0],[-7,0,0]], Matrix[[0,0,1],[0,7,6],[1,3,9]].adjugate)
     assert_equal(Matrix.identity(5), (@a5.adjugate * @a5) / @a5.det)
@@ -341,6 +356,115 @@ class TestMatrix < Test::Unit::TestCase
     assert_equal((@a3 * @b3).adjugate, @b3.adjugate * @a3.adjugate)
     assert_equal(4**(@a3.row_count-1) * @a3.adjugate, (4 * @a3).adjugate)
     assert_raise(ExceptionForMatrix::ErrDimensionMismatch) { @m1.adjugate }
+  end
+
+  # Entrywise adjugate as computed by the original cofactor-based algorithm.
+  def cofactor_adjugate(matrix)
+    n = matrix.row_count
+    Matrix.build(n, n) {|row, column| matrix.cofactor(column, row)}
+  end
+
+  def test_adjugate_exact_regular
+    # Integer matrices stay exact (no Rationals introduced)
+    m = CofactorCountingMatrix.rows([[7,6],[3,9]])
+    adj = m.adjugate
+    assert_equal(Matrix[[9,-6],[-3,7]], adj)
+    assert(adj.all? {|e| e.is_a?(Integer)})
+    assert_equal(0, m.cofactor_count)
+    # A * adj(A) = det(A) * I, exactly
+    assert_equal(Matrix.scalar(2, m.det), m * adj)
+
+    # Rational matrix: exact result, identical to det * inverse
+    r = CofactorCountingMatrix.rows([[Rational(1,2), Rational(2,3)],
+                                    [Rational(4,5), Rational(1,7)]])
+    r_adj = r.adjugate
+    assert_equal(r.det * r.inverse, r_adj)
+    assert_equal(cofactor_adjugate(Matrix.rows(r.to_a)), r_adj)
+    assert_equal(Matrix.scalar(2, r.det), r * r_adj)
+    assert_equal(0, r.cofactor_count)
+
+    # Larger random Integer/Rational matrices cross-checked cofactor by cofactor
+    srand(1234)
+    20.times do
+      n = rand(1..6)
+      rational = [true, false].sample
+      rows = Array.new(n) { Array.new(n) {
+        rational ? Rational(rand(-5..5), rand(1..4)) : rand(-8..8)
+      }}
+      matrix = Matrix.rows(rows)
+      next if matrix.det == 0
+      counted = CofactorCountingMatrix.rows(rows)
+      got = counted.adjugate
+      assert_equal(cofactor_adjugate(matrix), got)
+      assert_equal(Matrix.scalar(n, matrix.det), matrix * got)
+      assert_equal(0, counted.cofactor_count)
+    end
+  end
+
+  def test_adjugate_rank_one_less
+    # Rank n-1: the whole adjugate from a single cofactor evaluation.
+    rows = [[1,0,1],[0,2,2],[1,0,1]]
+    m = CofactorCountingMatrix.rows(rows)
+    adj = m.adjugate
+    expected = Matrix[[2,0,-2],[2,0,-2],[-2,0,2]]
+    assert_equal(expected, adj)
+    assert_equal(cofactor_adjugate(Matrix.rows(rows)), adj)
+    assert_equal(1, m.cofactor_count)
+    assert_equal(Matrix.zero(3), m * adj)
+
+    # Every entry matches the original algorithm, entry by entry.
+    expected.each_with_index(:all) do |_, i, j|
+      assert_equal(Matrix.rows(rows).cofactor(j, i), adj[i, j])
+    end
+
+    # A second rank n-1 shape with a different pivot layout.
+    rows2 = [[2,1,0],[4,2,0],[0,1,3]]
+    m2 = Matrix.rows(rows2)
+    assert_equal(m2.row_count - 1, m2.rank)
+    counted2 = CofactorCountingMatrix.rows(rows2)
+    adj2 = counted2.adjugate
+    assert_equal(cofactor_adjugate(m2), adj2)
+    assert_equal(1, counted2.cofactor_count)
+    assert_equal(Matrix.zero(3), m2 * adj2)
+  end
+
+  def test_adjugate_rank_two_less
+    # Rank at most n-2: the adjugate is the zero matrix without any
+    # cofactor evaluation.
+    rows = [[1,0,1],[0,0,0],[1,0,1]]
+    m = CofactorCountingMatrix.rows(rows)
+    assert_equal(Matrix.zero(3), m.adjugate)
+    assert_equal(0, m.cofactor_count)
+
+    # The all-zero matrix as well.
+    z = CofactorCountingMatrix.rows(Array.new(4) { Array.new(4, 0) })
+    assert_equal(Matrix.zero(4), z.adjugate)
+    assert_equal(0, z.cofactor_count)
+
+    # And a 2x2 rank-0 matrix.
+    z2 = CofactorCountingMatrix.rows([[0,0],[0,0]])
+    assert_equal(Matrix.zero(2), z2.adjugate)
+    assert_equal(0, z2.cofactor_count)
+  end
+
+  def test_adjugate_generic_numeric_path
+    # Generic numeric objects (Float here) keep the entrywise cofactor path.
+    f = CofactorCountingMatrix.rows([[1.0, 2.0],[3.0, 4.0]])
+    assert_equal(Matrix[[4.0, -2.0],[-3.0, 1.0]], f.adjugate)
+    assert_equal(4, f.cofactor_count)
+
+    # A singular (rank n-1) Float matrix also uses the generic entrywise path.
+    fs = CofactorCountingMatrix.rows([[1.0, 2.0],[2.0, 4.0]])
+    assert_equal(cofactor_adjugate(Matrix.rows(fs.to_a)), fs.adjugate)
+    assert_equal(4, fs.cofactor_count)
+  end
+
+  def test_adjugate_returns_subclass
+    # The optimized path must preserve the matrix class.
+    m = SubMatrix.rows([[1,0,1],[0,2,2],[1,0,1]])
+    assert_instance_of(SubMatrix, m.adjugate)
+    r = SubMatrix.rows([[Rational(1,2), 1],[0, Rational(2,3)]])
+    assert_instance_of(SubMatrix, r.adjugate)
   end
 
   def test_laplace_expansion
