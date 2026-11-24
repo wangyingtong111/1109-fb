@@ -69,6 +69,132 @@ def test_sharing_value(eq: str, backend: BackendType) -> None:
     assert (actual == expected).all()
 
 
+@pytest.mark.parametrize("optimize_kwargs", [{"optimize": False}, {"use_blas": False}])
+def test_sharing_dtype_out_identity_and_repair(optimize_kwargs: dict) -> None:
+    """dtype/casting must be honored while sharing, and writing into ``out``
+    must not be skipped on a cache hit: repeating the exact same call after
+    manually corrupting ``out`` must restore the correct result and return the
+    very same output array.
+    """
+    # the int8 reduction overflows (true sum 200 vs int8 wrap-around -56), so
+    # the accumulation dtype materially changes the result
+    x = np.full(100, 2, dtype=np.int8)
+    eq = "a->"
+    true_sum = int(x.astype(np.int64).sum())
+
+    expected_i64 = contract(eq, x, dtype=np.int64, **optimize_kwargs)
+    expected_f64 = contract(eq, x, dtype=np.float64, **optimize_kwargs)
+
+    with shared_intermediates():
+        # first contract the same inputs in int64, then request float64 into
+        # an existing output buffer -- the cached int64 result must not leak
+        result_i64 = contract(eq, x, dtype=np.int64, **optimize_kwargs)
+        assert result_i64.dtype == np.int64
+        assert int(result_i64) == true_sum
+
+        out = np.zeros((), dtype=np.float64)
+        result_f64 = contract(eq, x, out=out, dtype=np.float64, **optimize_kwargs)
+        assert result_f64 is out
+        assert out.dtype == np.float64
+        assert float(out) == float(expected_f64)
+        assert np.array_equal(result_i64, expected_i64)
+
+        # corrupt the output, then issue the identical call again
+        out.fill(np.nan)
+        repeated = contract(eq, x, out=out, dtype=np.float64, **optimize_kwargs)
+        assert repeated is out
+        assert out.dtype == np.float64
+        assert float(out) == float(expected_f64)
+
+
+def test_sharing_dtype_and_casting_key_separation() -> None:
+    """Changing dtype or casting produces a distinct computation and must not
+    hit a non-equivalent cached result, while semantically identical options
+    and explicit defaults must keep sharing intermediates.
+    """
+    x = np.full(100, 2, dtype=np.int8)
+    eq = "a->"
+
+    with shared_intermediates() as cache:
+        r_i64 = contract(eq, x, optimize=False, dtype=np.int64)
+        r_f64 = contract(eq, x, optimize=False, dtype=np.float64)
+        r_f64_dtype_obj = contract(eq, x, optimize=False, dtype=np.dtype("float64"))
+        r_f64_explicit_defaults = contract(
+            eq, x, optimize=False, dtype=np.float64, casting="safe", order="K"
+        )
+
+        assert r_i64.dtype == np.int64 and int(r_i64) == 200
+        assert r_f64.dtype == np.float64 and float(r_f64) == 200.0
+        assert float(r_f64_dtype_obj) == 200.0
+        assert float(r_f64_explicit_defaults) == 200.0
+
+        einsum_keys = [k for k in cache if k[0] == "einsum"]
+        option_keys = {k[-1] for k in einsum_keys}
+        # int64 vs float64 are distinct entries ...
+        assert (("dtype", np.dtype("int64")),) in option_keys
+        assert (("dtype", np.dtype("float64")),) in option_keys
+        # ... whereas np.float64 / np.dtype('float64') and explicit defaults
+        # must not fragment the cache
+        assert option_keys == {
+            (("dtype", np.dtype("int64")),),
+            (("dtype", np.dtype("float64")),),
+        }
+        # ``out`` must never appear in a cache key
+        assert all(all(item[0] != "out" for item in k[-1]) for k in einsum_keys)
+
+    with shared_intermediates() as cache:
+        out = np.zeros((), dtype=np.int8)
+        # a different casting mode changes the computation, hence the key
+        result = contract(eq, x, out=out, optimize=False, dtype=np.int8, casting="unsafe")
+        assert result is out
+        assert np.array_equal(
+            out, np.einsum(eq, x, dtype=np.int8, casting="unsafe")
+        )
+        option_keys = {k[-1] for k in cache if k[0] == "einsum"}
+        assert (
+            ("casting", "unsafe"),
+            ("dtype", np.dtype("int8")),
+        ) in option_keys
+
+
+def test_sharing_out_does_not_poison_intermediates() -> None:
+    """Equivalent equations without ``out`` keep sharing intermediates with
+    contractions that used ``out``, and cached tensors stay independent of the
+    user-supplied output buffer.
+    """
+    rng = np.random.default_rng(0)
+    a = rng.integers(-5, 6, size=(3, 4)).astype(np.int8)
+    b = rng.integers(-5, 6, size=(4, 5)).astype(np.int8)
+    c = rng.integers(-5, 6, size=(5, 6)).astype(np.int8)
+    eq = "ab,bc,cd->ad"
+
+    expected = contract(eq, a, b, c, use_blas=False, dtype=np.int64)
+
+    with shared_intermediates() as cache:
+        out = np.zeros((3, 6), dtype=np.int64)
+        result = contract(eq, a, b, c, out=out, use_blas=False, dtype=np.int64)
+        assert result is out
+        assert np.array_equal(out, expected)
+
+        cached_ops_after_out = count_cached_ops(cache)["einsum"]
+
+        # the equivalent call without ``out`` must hit the same intermediates
+        shared = contract(eq, a, b, c, use_blas=False, dtype=np.int64)
+        assert count_cached_ops(cache)["einsum"] == cached_ops_after_out
+        assert shared.dtype == np.int64
+        assert np.array_equal(shared, expected)
+        assert shared is not out
+
+        # mutating the user output must not alter the cached intermediate
+        out[:] = -1
+        assert np.array_equal(shared, expected)
+
+        # a repaired repeated call still returns the same output identity
+        repeated = contract(eq, a, b, c, out=out, use_blas=False, dtype=np.int64)
+        assert repeated is out
+        assert np.array_equal(out, expected)
+
+
 @pytest.mark.parametrize("backend", backends)
 def test_complete_sharing(backend: BackendType) -> None:
     eq = "ab,bc,cd->"

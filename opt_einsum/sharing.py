@@ -15,7 +15,7 @@ from typing import Any
 from opt_einsum.parser import alpha_canonicalize, parse_einsum_input
 from opt_einsum.typing import ArrayType
 
-CacheKeyType = tuple[str, str, int, tuple[int, ...]] | tuple[str, int]
+CacheKeyType = tuple[Any, ...]
 CacheType = dict[CacheKeyType, ArrayType]
 
 __all__ = [
@@ -154,18 +154,70 @@ def tensordot_cache_wrap(tensordot: Any) -> Any:
     return cached_tensordot
 
 
+def _normalize_cache_value(value: Any) -> Any:
+    """Normalize a value so semantically identical options hash identically.
+
+    In particular, ``np.int64`` and ``np.dtype('int64')`` compare equal but
+    have different hashes, which would otherwise fragment the cache between
+    otherwise identical contractions.
+    """
+    try:
+        import numpy as np
+
+        if isinstance(value, np.dtype):
+            return value
+        if isinstance(value, type):
+            # non-dtype types (e.g. ``bool`` used as a flag) are left as is
+            try:
+                return np.dtype(value)
+            except TypeError:
+                pass
+    except ImportError:
+        pass
+    return value
+
+
+def _einsum_option_key(**kwargs: Any) -> tuple[tuple[str, Any], ...]:
+    """Build a hashable key from the computation options of an einsum call.
+
+    ``out`` is deliberately excluded: it only specifies where the result is
+    written, not how the contraction is computed. Outputs are always populated
+    from the cached result, so contractions differing only by ``out`` must
+    still share intermediates.
+
+    Default-valued options are also excluded so equivalent calls with and
+    without explicit defaults share the same cache entry.
+    """
+    key = {}
+    for name, value in kwargs.items():
+        if value is None:
+            continue
+        if name == "order" and value == "K":
+            continue
+        if name == "casting" and value == "safe":
+            continue
+        key[name] = _normalize_cache_value(value)
+    return tuple(sorted(key.items()))
+
+
 def einsum_cache_wrap(einsum: Any) -> Any:
     """Decorates an ``einsum()`` implementation to be memoized inside a
     :func:`shared_intermediates` context.
     """
 
     @functools.wraps(einsum)
-    def cached_einsum(*args, **kwargs):
+    def cached_einsum(*args: Any, **kwargs: Any) -> ArrayType:
         if not currently_sharing():
             return einsum(*args, **kwargs)
 
         # hash modulo commutativity by computing a canonical ordering and names
         backend = kwargs.pop("backend", "numpy")
+        # ``out`` never takes part in the cache key: the memoized contraction
+        # is always computed without an output buffer and its result copied
+        # into ``out`` afterwards. This keeps cached intermediates pristine and
+        # ensures repeated calls with the same (or a corrupted) ``out`` always
+        # restore the correct values.
+        out = kwargs.pop("out", None)
         equation = args[0]
         inputs, output, operands = parse_einsum_input(args)
         inputs = inputs.split(",")
@@ -178,8 +230,17 @@ def einsum_cache_wrap(einsum: Any) -> Any:
         canonical_inputs = ",".join(input_ for input_, _ in canonical)
         canonical_equation = alpha_canonicalize(canonical_inputs + "->" + output)
 
-        key = "einsum", backend, canonical_equation, canonical_ids
-        return _memoize(key, einsum, equation, *operands, backend=backend)
+        # dtype / casting / order change the actual computation, so they must
+        # be part of the key -- otherwise e.g. an int64 contraction could be
+        # wrongly returned for a float64 one.
+        option_key = _einsum_option_key(**kwargs)
+        key = "einsum", backend, canonical_equation, canonical_ids, option_key
+        result = _memoize(key, einsum, equation, *operands, backend=backend, **kwargs)
+
+        if out is not None:
+            out[...] = result
+            return out
+        return result
 
     return cached_einsum
 
