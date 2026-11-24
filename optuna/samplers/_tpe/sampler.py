@@ -230,6 +230,16 @@ class TPESampler(BaseSampler):
                 this feature is currently scheduled for v7.0.0, but this schedule is subject to
                 change. Use :meth:`~optuna.trial.Trial.set_constraint` instead.
                 See https://github.com/optuna/optuna/releases/tag/v5.0.0.
+        categorical_relations:
+            Optional domain-specific costs between categorical choices.  The
+            mapping is keyed by parameter name, and each value may be a
+            callable ``cost(source, target)``, a pair mapping such as
+            ``{("blue", "navy"): 0.2}``, a nested mapping, or a flat cost row.
+            Relation weights are proportional to ``exp(-cost)`` and are
+            normalized per observed kernel.  The unobserved prior remains
+            uniform.  If this argument is :obj:`None`, TPE uses its legacy
+            exact-match categorical kernel.  ``categorical_distance_func`` is
+            accepted as a descriptive alias.
         consider_prior:
             Enhance the stability of Parzen estimator by imposing a Gaussian prior when
             :obj:`True`. The prior is only effective if the sampling distribution is
@@ -344,6 +354,9 @@ class TPESampler(BaseSampler):
         warn_independent_sampling: bool | None = None,
         constant_liar: bool = True,
         constraints_func: Callable[[FrozenTrial], Sequence[float]] | None = None,
+        categorical_relations: Any | None = None,
+        categorical_distance_func: Any | None = None,
+        **kwargs: Any,
     ) -> None:
         consider_prior = _warn_if_deprecated_argument(
             "`consider_prior`", consider_prior, True, "4.3.0", "6.0.0"
@@ -373,6 +386,12 @@ class TPESampler(BaseSampler):
             # The ``multivariate`` field remains only for historical reasons and is unused,
             # so any value is fine here.
             multivariate=True,
+            categorical_relations=(
+                categorical_relations
+                if categorical_relations is not None
+                else categorical_distance_func
+            ),
+            **kwargs,
         )
 
         self._n_startup_trials = n_startup_trials

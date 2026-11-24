@@ -166,6 +166,94 @@ def test_calculate_shape_check_categorical(
     assert len(mpe._mixture_distribution.weights) == len(mus) + 1  # NOTE(sawa3030): +1 for prior
 
 
+def test_categorical_relation_allocates_mass_by_cost() -> None:
+    costs = {"blue": 0.0, "navy": 0.2, "salmon": 1.0}
+    parameters = _ParzenEstimatorParameters(
+        prior_weight=1.0,
+        consider_magic_clip=True,
+        consider_endpoints=False,
+        weights=default_weights,
+        multivariate=True,
+        categorical_relations={"color": costs},
+    )
+
+    def observed_weights(choices: list[str]) -> tuple[np.ndarray, np.ndarray]:
+        observations = {"color": np.asarray([float(choices.index("blue"))])}
+        distribution = _ParzenEstimator(
+            observations,
+            {"color": distributions.CategoricalDistribution(choices)},
+            parameters,
+        )._mixture_distribution.distributions[0]
+        assert isinstance(distribution, _BatchedCategoricalDistributions)
+        return distribution.weights[0], distribution.weights[1]
+
+    choices = ["blue", "navy", "salmon"]
+    observed, prior = observed_weights(choices)
+    expected = np.exp(-np.asarray([costs[name] for name in choices]))
+    expected /= expected.sum()
+    np.testing.assert_allclose(observed, expected)
+    assert observed[choices.index("navy")] > observed[choices.index("salmon")]
+    np.testing.assert_allclose(prior, np.full(3, 1.0 / 3.0))
+    np.testing.assert_allclose(observed.sum(), 1.0)
+
+    reordered = ["navy", "blue", "salmon"]
+    reordered_observed, reordered_prior = observed_weights(reordered)
+    by_name = dict(zip(reordered, reordered_observed))
+    assert by_name.keys() == costs.keys()
+    np.testing.assert_allclose([by_name[name] for name in choices], expected)
+    np.testing.assert_allclose(reordered_prior, np.full(3, 1.0 / 3.0))
+
+
+def test_categorical_relation_supports_pair_mapping_and_default() -> None:
+    parameters = _ParzenEstimatorParameters(
+        prior_weight=1.0,
+        consider_magic_clip=True,
+        consider_endpoints=False,
+        weights=default_weights,
+        multivariate=True,
+        categorical_relations={("blue", "navy"): 0.2, ("blue", "salmon"): 1.0},
+        missing_relation_cost=8.0,
+    )
+    choices = ["blue", "navy", "salmon", "red"]
+    mpe = _ParzenEstimator(
+        {"color": np.asarray([0.0])},
+        {"color": distributions.CategoricalDistribution(choices)},
+        parameters,
+    )
+    distribution = mpe._mixture_distribution.distributions[0]
+    assert isinstance(distribution, _BatchedCategoricalDistributions)
+    weights = distribution.weights
+    np.testing.assert_allclose(weights.sum(axis=1), 1.0)
+    assert weights[0, 1] > weights[0, 2] > weights[0, 3]
+
+    single = _ParzenEstimator(
+        {"color": np.asarray([0.0])},
+        {"color": distributions.CategoricalDistribution(["blue"])},
+        parameters,
+    )
+    single_distribution = single._mixture_distribution.distributions[0]
+    assert isinstance(single_distribution, _BatchedCategoricalDistributions)
+    np.testing.assert_allclose(single_distribution.weights, np.ones((2, 1)))
+
+
+def test_missing_categorical_relation_uses_legacy_kernel() -> None:
+    parameters = _ParzenEstimatorParameters(
+        prior_weight=1.0,
+        consider_magic_clip=True,
+        consider_endpoints=False,
+        weights=default_weights,
+        multivariate=True,
+    )
+    mpe = _ParzenEstimator(
+        {"c": np.asarray([1.0])},
+        {"c": distributions.CategoricalDistribution([0.0, 1.0, 2.0])},
+        parameters,
+    )
+    categorical = mpe._mixture_distribution.distributions[0]
+    assert isinstance(categorical, _BatchedCategoricalDistributions)
+    np.testing.assert_allclose(categorical.weights[0], [0.2, 0.6, 0.2])
+
+
 @pytest.mark.parametrize("mus", (np.asarray([]), np.asarray([0.4]), np.asarray([-0.4, 0.4])))
 def test_invalid_prior_weight(mus: np.ndarray) -> None:
     parameters = _ParzenEstimatorParameters(
