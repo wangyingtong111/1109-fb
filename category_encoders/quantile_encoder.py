@@ -18,6 +18,156 @@ import category_encoders.utils as util
 from category_encoders.ordinal import OrdinalEncoder
 
 
+def _weighted_quantiles_of_sorted_groups(
+    target: np.ndarray,
+    cumulative_weight: np.ndarray,
+    group_ends: np.ndarray,
+    offsets: np.ndarray,
+    totals: np.ndarray,
+    quantile: float,
+) -> np.ndarray:
+    """Quantiles of contiguous, target-sorted groups of frequency-weighted rows.
+
+    The rows are sorted by group and then by ascending target, so a group is the
+    range ending at ``group_ends[i]``. ``offsets[i]`` is the cumulative weight
+    before the group and ``totals[i]`` its summed weight. The quantile is taken
+    from the virtual expanded sample of size ``totals[i]`` with numpy's default
+    ('linear') interpolation between the two neighbouring ranks.
+    """
+    position = quantile * np.maximum(totals - 1.0, 0.0)
+    lower = np.floor(position)
+    upper = np.ceil(position)
+    # The value whose expanded positions [cumulative_weight[i] - weight_i,
+    # cumulative_weight[i]) contain the (fractional) rank; capped at the group's
+    # last row because searchsorted looks at the whole array.
+    lower_index = np.minimum(
+        np.searchsorted(cumulative_weight, offsets + lower, 'right'), group_ends
+    )
+    upper_index = np.minimum(
+        np.searchsorted(cumulative_weight, offsets + upper, 'right'), group_ends
+    )
+    lower_value = target[lower_index]
+    upper_value = target[upper_index]
+    return lower_value + (position - lower) * (upper_value - lower_value)
+
+
+def _weighted_quantile(values: np.ndarray, weights: np.ndarray, quantile: float) -> float:
+    """Quantile of ``values`` where each value is repeated ``weights`` times.
+
+    Frequency weights are interpreted as an implicit repetition of the rows, so
+    for positive integer weights the result equals ``numpy.quantile`` on the
+    expanded sample, using the same (linear) interpolation. Zero-weight rows are
+    ignored entirely, which keeps them from influencing the result.
+    """
+    values = np.asarray(values, dtype=float)
+    weights = np.asarray(weights, dtype=float)
+
+    positive = weights > 0
+    values = values[positive]
+    weights = weights[positive]
+    if values.size == 0:
+        return np.nan
+
+    order = np.argsort(values, kind='stable')
+    values = values[order]
+    weights = weights[order]
+
+    cumulative_weight = np.cumsum(weights)
+    totals = cumulative_weight[-1:]
+    quantiles = _weighted_quantiles_of_sorted_groups(
+        values,
+        cumulative_weight,
+        np.array([values.size - 1]),
+        np.zeros(1),
+        totals,
+        quantile,
+    )
+    return float(quantiles[0])
+
+
+def _weighted_group_statistics(
+    codes: np.ndarray,
+    target: np.ndarray,
+    weights: np.ndarray,
+    quantile: float,
+) -> tuple[pd.DataFrame, int]:
+    """Per-code quantile/sum/count of the target using frequency weights.
+
+    Only rows with a positive weight are taken into account, so zero-weight rows
+    neither contribute to the statistics of a category nor lift the prior. The
+    statistics are reindexed to every observed code, so a category that only has
+    zero-weight rows is still known but has a count of zero.
+
+    Returns the statistics and the number of codes with a positive weight.
+    """
+    codes = np.asarray(codes)
+    target = np.asarray(target, dtype=float)
+    weights = np.asarray(weights, dtype=float)
+
+    # A stats row per observed code, even if all of its rows carry zero weight.
+    known = pd.notna(codes)
+    all_codes = np.unique(codes[known])
+
+    positive = weights > 0
+    codes = codes[known & positive]
+    target = target[known & positive]
+    weights = weights[known & positive]
+    if codes.size == 0:
+        empty = pd.DataFrame(
+            {'quantile': np.nan, 'sum': 0.0, 'count': 0.0}, index=all_codes, dtype=float
+        )
+        return empty, 0
+
+    # Sort by code and then by target, so each category is a contiguous run of
+    # targets in ascending order.
+    order = np.lexsort((target, codes))
+    codes, target, weights = codes[order], target[order], weights[order]
+
+    cumulative_weight = np.cumsum(weights)
+    cumulative_target = np.cumsum(target * weights)
+    group_ends = np.flatnonzero(np.r_[codes[1:] != codes[:-1], True])
+    # Totals and offsets of each category, relative to the global cumulative sums.
+    previous_ends = np.r_[0, group_ends[:-1] + 1] - 1
+    offsets = np.where(previous_ends >= 0, cumulative_weight[previous_ends], 0.0)
+    totals = cumulative_weight[group_ends] - offsets
+
+    quantiles = _weighted_quantiles_of_sorted_groups(
+        target, cumulative_weight, group_ends, offsets, totals, quantile
+    )
+
+    total_of_previous = np.where(previous_ends >= 0, cumulative_target[previous_ends], 0.0)
+    stats = pd.DataFrame(
+        {
+            'quantile': quantiles,
+            'sum': cumulative_target[group_ends] - total_of_previous,
+            'count': totals,
+        },
+        index=codes[group_ends],
+    )
+    stats = stats.reindex(all_codes)
+    return stats[['quantile', 'sum', 'count']], len(group_ends)
+
+
+def _validate_sample_weight(sample_weight, n_samples: int) -> np.ndarray:
+    """Validate frequency weights passed to ``fit`` and return them as an array.
+
+    Weights are taken positionally (they are not aligned on the pandas index),
+    matching scikit-learn's ``sample_weight`` convention.
+    """
+    weights = np.asarray(sample_weight, dtype=float).reshape(-1)
+    if weights.shape[0] != n_samples:
+        raise ValueError(
+            f'sample_weight has {weights.shape[0]} entries but the target has {n_samples} rows.'
+        )
+    if not np.isfinite(weights).all():
+        raise ValueError('sample_weight must contain only finite values.')
+    if (weights < 0).any():
+        raise ValueError('sample_weight cannot contain negative values.')
+    if not (weights > 0).any():
+        raise ValueError('sample_weight must contain at least one positive value.')
+    return weights
+
+
 class QuantileEncoder(util.SupervisedTransformerMixin, util.BaseEncoder):
     """Quantile Encoding for categorical features.
 
@@ -60,6 +210,16 @@ class QuantileEncoder(util.SupervisedTransformerMixin, util.BaseEncoder):
     encoded with their own category statistics: all their categories are
     encoded with the prior quantile instead, which prevents overfitting on
     identifier-like columns.
+
+    Frequency weights can be passed as ``sample_weight`` to ``fit`` (and
+    ``fit_transform``). A row with weight ``w`` then counts as ``w`` copies of
+    that row, so the data does not have to be materialized row by row. The
+    per-category quantiles, the global prior quantile used for unknown/missing
+    categories, and the counts used for the ``m`` smoothing are all computed
+    from that same weighted data; rows with zero weight are ignored. For
+    integer weights this reproduces fitting on the expanded data, using the
+    same linear interpolation as :func:`numpy.quantile`. Without
+    ``sample_weight`` the behaviour is unchanged.
 
     Example
     -------
@@ -147,8 +307,12 @@ class QuantileEncoder(util.SupervisedTransformerMixin, util.BaseEncoder):
         self.quantile = quantile
         self.m = m
 
-    def _fit(self, X: pd.DataFrame, y: pd.Series, **kwargs) -> None:
+    def _fit(
+        self, X: pd.DataFrame, y: pd.Series, sample_weight: np.ndarray | None = None, **kwargs
+    ) -> None:
         y = y.astype(float)
+        if sample_weight is not None:
+            sample_weight = _validate_sample_weight(sample_weight, len(y))
 
         self.ordinal_encoder = OrdinalEncoder(
             verbose=self.verbose,
@@ -158,15 +322,23 @@ class QuantileEncoder(util.SupervisedTransformerMixin, util.BaseEncoder):
         )
         self.ordinal_encoder = self.ordinal_encoder.fit(X)
         X_ordinal = self.ordinal_encoder.transform(X)
-        self.mapping = self.fit_quantile_encoding(X_ordinal, y)
+        self.mapping = self.fit_quantile_encoding(X_ordinal, y, sample_weight=sample_weight)
 
-    def fit_quantile_encoding(self, X: pd.DataFrame, y: pd.Series) -> dict[str, pd.Series]:
+    def fit_quantile_encoding(
+        self, X: pd.DataFrame, y: pd.Series, sample_weight: np.ndarray | None = None
+    ) -> dict[str, pd.Series]:
         """Calculate the quantile encoding mapping.
 
         Parameters
         ----------
         X: training data.
         y: target data.
+        sample_weight: optional frequency weights, one per row of ``y``. A row with
+            weight ``w`` is equivalent to ``w`` copies of that row, without
+            materializing them. Rows with zero weight are ignored. The per-category
+            quantiles, the global prior quantile and the shrinkage counts are all
+            computed from this same weighted data, so the result matches fitting on
+            the expanded data.
 
         Returns
         -------
@@ -174,25 +346,63 @@ class QuantileEncoder(util.SupervisedTransformerMixin, util.BaseEncoder):
         """
         mapping = {}
 
-        # Calculate global statistics
-        prior = np.quantile(y, self.quantile)
+        if sample_weight is None:
+            weights = np.ones(len(y), dtype=float)
+        else:
+            weights = np.asarray(sample_weight, dtype=float).reshape(-1)
+        weighted = sample_weight is not None
+        if weighted and not 0 <= self.quantile <= 1:
+            raise ValueError(f'Quantiles must be in the range [0, 1], got {self.quantile}.')
+
+        # Calculate global statistics. With weights this is the quantile of the
+        # weighted sample, so zero-weight rows cannot move the prior.
+        prior = (
+            _weighted_quantile(y.to_numpy(dtype=float), weights, self.quantile)
+            if weighted
+            else np.quantile(y, self.quantile)
+        )
 
         for switch in self.ordinal_encoder.category_mapping:
             col = switch.get('col')
             values = switch.get('mapping')
 
-            # Calculate sum, count and quantile of the target for each unique value
-            # in the feature col
-            stats = y.groupby(X[col]).agg([lambda x: np.quantile(x, self.quantile), 'sum', 'count'])
-            stats.columns = ['quantile', 'sum', 'count']
+            if weighted:
+                stats, n_positive_codes = _weighted_group_statistics(
+                    X[col].to_numpy(), y.to_numpy(dtype=float), weights, self.quantile
+                )
+                # Categories with no positively weighted row (they only occur on
+                # zero-weight rows) have no statistics of their own and fall back to
+                # the prior, exactly like unseen categories in the expanded data.
+                has_data = stats['count'] > 0
+                estimate = pd.Series(prior, index=stats.index, dtype=float)
+                counts = stats.loc[has_data, 'count']
+                estimate.loc[has_data] = (
+                    counts * stats.loc[has_data, 'quantile'] + prior * self.m
+                ) / (counts + self.m)
+                # Ignore unique columns. This helps to prevent overfitting on id-like
+                # columns. Frequency weights repeat rows, so a column is only id-like
+                # when every weighted row is its own category with weight 1.
+                n_positive_rows = int((weights > 0).sum())
+                is_id_like = (
+                    n_positive_codes == n_positive_rows
+                    and bool((weights[weights > 0] == 1).all())
+                )
+            else:
+                # Calculate sum, count and quantile of the target for each unique value
+                # in the feature col
+                stats = y.groupby(X[col]).agg(
+                    [lambda x: np.quantile(x, self.quantile), 'sum', 'count']
+                )
+                stats.columns = ['quantile', 'sum', 'count']
 
-            # Calculate the m-probability estimate of the quantile
-            estimate = (stats['count'] * stats['quantile'] + prior * self.m) / (
-                stats['count'] + self.m
-            )
+                # Calculate the m-probability estimate of the quantile
+                estimate = (stats['count'] * stats['quantile'] + prior * self.m) / (
+                    stats['count'] + self.m
+                )
+                is_id_like = len(stats) == len(y)
 
             # Ignore unique columns. This helps to prevent overfitting on id-like columns
-            if len(stats) == len(y):
+            if is_id_like:
                 estimate[:] = prior
 
             estimate = util.finalize_encoding_mapping(
@@ -264,6 +474,10 @@ class SummaryEncoder(BaseEstimator):
     which every category is unique (id-like columns) are encoded with the
     prior quantile at every quantile, which prevents overfitting on
     identifier-like columns.
+
+    Frequency weights passed as ``sample_weight`` to ``fit`` (and
+    ``fit_transform``) are forwarded to every underlying ``QuantileEncoder``;
+    see :class:`QuantileEncoder` for the exact semantics.
 
     Example
     -------
@@ -348,7 +562,7 @@ class SummaryEncoder(BaseEstimator):
         self.m = m
         self.encoder_list = None
 
-    def fit(self, X: util.X_type, y: util.y_type) -> SummaryEncoder:
+    def fit(self, X: util.X_type, y: util.y_type, **kwargs) -> SummaryEncoder:
         """Fits the encoder according to X and y by fitting the individual encoders.
 
         Parameters
@@ -358,6 +572,9 @@ class SummaryEncoder(BaseEstimator):
             and n_features is the number of features.
         y : array-like, shape = [n_samples]
             Target values.
+        kwargs : dict
+            additional fit parameters forwarded to every underlying
+            :class:`QuantileEncoder`, e.g. ``sample_weight``.
 
         Returns
         -------
@@ -393,7 +610,7 @@ class SummaryEncoder(BaseEstimator):
                 quantile=quantile,
                 m=self.m,
             )
-            enc.fit(X.copy(), y)
+            enc.fit(X.copy(), y, **kwargs)
             encoder_list.append(enc)
             self.drop_cols += enc.invariant_cols
         self.feature_names_out_ = reduce(
@@ -460,14 +677,14 @@ class SummaryEncoder(BaseEstimator):
         tags.target_tags.required = True
         return tags
 
-    def fit_transform(self, X: util.X_type, y: util.y_type | None = None):
+    def fit_transform(self, X: util.X_type, y: util.y_type | None = None, **fit_params):
         """Fit and transform using target.
 
         This also uses the target for transforming, not only for training.
         """
         if y is None:
             raise TypeError('fit_transform() missing argument: ' 'y' '')
-        return self.fit(X, y).transform(X, y)
+        return self.fit(X, y, **fit_params).transform(X, y)
 
     def get_feature_names(self) -> np.ndarray:
         """Deprecated method to get feature names. Use `get_feature_names_out` instead."""

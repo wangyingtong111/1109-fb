@@ -1,6 +1,15 @@
 v.2.11.2
 ========
 
+* Feat: ``QuantileEncoder`` (and ``SummaryEncoder``, which forwards the
+  argument) now accepts frequency weights as ``sample_weight`` in ``fit`` /
+  ``fit_transform``. A row with weight ``w`` counts as ``w`` copies of that row
+  without expanding the data: the per-category quantiles, the global prior
+  quantile used for unknown/missing categories, and the counts used by the
+  ``m`` smoothing are all computed from the same weighted data, so integer
+  weights reproduce fitting on the expanded sample with the same linear
+  interpolation. Rows with zero weight are ignored and cannot raise the prior.
+  Passing no ``sample_weight`` keeps the previous behaviour unchanged.
 * Fix: ``composite_cols`` no longer raises the "separator occurs in the data"
   ``ValueError`` for column groups containing missing values on pandas >= 3,
   where ``astype(str)`` keeps missing values as NaN. The separator-collision

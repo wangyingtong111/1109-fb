@@ -110,6 +110,158 @@ class TestQuantileEncoder(unittest.TestCase):
         np.testing.assert_allclose(result['categories'], 3.0, atol=0.01)
 
 
+class TestQuantileEncoderSampleWeight(unittest.TestCase):
+    """Frequency weights must reproduce fitting on the expanded data."""
+
+    def test_weighted_quantiles_match_expanded_sample(self):
+        """Category and global quantiles equal the expanded six-row sample.
+
+        Targets 0, 10, 20 with weights 1, 4, 1 stand for the six rows
+        0, 10, 10, 10, 10, 20. The quantile of category 'a' and the prior used
+        for unknown categories must both match numpy's linear interpolation on
+        those rows.
+        """
+        df = pd.DataFrame({'c': ['a', 'a', 'a', 'b']})
+        target = np.array([0.0, 10.0, 20.0, 1000.0])
+        expanded = np.array([0.0, 10.0, 10.0, 10.0, 10.0, 20.0])
+
+        for quantile in [0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0]:
+            enc = encoders.QuantileEncoder(cols=['c'], quantile=quantile, m=0.0)
+            enc.fit(df, target, sample_weight=np.array([1, 4, 1, 0]))
+            result = enc.transform(pd.DataFrame({'c': ['a', 'unseen']}))
+
+            expected = np.quantile(expanded, quantile)
+            np.testing.assert_allclose(result['c'].to_numpy(), [expected, expected])
+
+    def test_zero_weight_extreme_does_not_raise_unknown_fallback(self):
+        """A zero-weight extreme target must not lift the prior for unknown categories."""
+        df = pd.DataFrame({'c': ['a', 'a', 'a', 'b']})
+        target = np.array([0.0, 10.0, 20.0, 1e6])
+
+        weighted = encoders.QuantileEncoder(cols=['c'], quantile=0.75, m=0.0).fit(
+            df, target, sample_weight=np.array([1, 4, 1, 0])
+        )
+        prior = np.quantile([0.0, 10.0, 10.0, 10.0, 10.0, 20.0], 0.75)
+
+        result = weighted.transform(pd.DataFrame({'c': ['never-seen']}))
+        self.assertEqual(result['c'].iloc[0], prior)
+        self.assertLess(result['c'].iloc[0], 100.0)
+
+    def test_weighted_matches_expanded_fit_end_to_end(self):
+        """Weighted fitting equals fitting on the repeated rows, including smoothing."""
+        df = pd.DataFrame({'c': ['a', 'a', 'a', 'b']})
+        target = np.array([0.0, 10.0, 20.0, 1000.0])
+        weights = np.array([1, 4, 1, 0])
+
+        mask = weights > 0
+        expanded_df = pd.DataFrame({'c': np.repeat(df['c'].to_numpy()[mask], weights[mask])})
+        expanded_target = np.repeat(target[mask], weights[mask])
+
+        unseen = pd.DataFrame({'c': ['a', 'b', 'new']})
+        for quantile in [0.1, 0.5, 0.9]:
+            for m in [0.0, 1.0, 10.0]:
+                weighted = encoders.QuantileEncoder(cols=['c'], quantile=quantile, m=m).fit(
+                    df, target, sample_weight=weights
+                )
+                expanded = encoders.QuantileEncoder(cols=['c'], quantile=quantile, m=m).fit(
+                    expanded_df, expanded_target
+                )
+                np.testing.assert_allclose(
+                    weighted.transform(unseen)['c'].to_numpy(),
+                    expanded.transform(unseen)['c'].to_numpy(),
+                    err_msg=f'quantile={quantile}, m={m}',
+                )
+
+    def test_unweighted_output_unchanged(self):
+        """Passing explicit unit weights keeps the unweighted result."""
+        df = pd.DataFrame({'categories': ['a', 'b', 'c', 'a', 'b', 'c', 'a', 'b']})
+        target = np.array([1, 2, 0, 4, 5, 0, 6, 7])
+
+        for quantile in [0.25, 0.5, 1.0]:
+            plain = encoders.QuantileEncoder(quantile=quantile).fit_transform(df, target)
+            unit = encoders.QuantileEncoder(quantile=quantile).fit_transform(
+                df, target, sample_weight=np.ones(len(target))
+            )
+            pd.testing.assert_frame_equal(plain, unit)
+
+    def test_weighted_fit_transform_passes_weights(self):
+        """fit_transform forwards sample_weight to fit."""
+        df = pd.DataFrame({'c': ['a', 'a', 'a']})
+        target = np.array([0.0, 10.0, 20.0])
+        weights = np.array([1, 4, 1])
+
+        expected = encoders.QuantileEncoder(cols=['c'], quantile=0.5, m=0.0).fit_transform(
+            df, target, sample_weight=weights
+        )
+        np.testing.assert_allclose(expected['c'].to_numpy(), 10.0)
+
+    def test_invalid_sample_weight_is_rejected(self):
+        """Weights must be one-dimensional, finite, non-negative and not all zero."""
+        df = pd.DataFrame({'c': ['a', 'a', 'b']})
+        target = np.array([0.0, 1.0, 2.0])
+        encoder = encoders.QuantileEncoder(cols=['c'])
+
+        with self.assertRaises(ValueError):
+            encoder.fit(df, target, sample_weight=np.array([1.0, 1.0]))
+        with self.assertRaises(ValueError):
+            encoder.fit(df, target, sample_weight=np.array([1.0, -1.0, 1.0]))
+        with self.assertRaises(ValueError):
+            encoder.fit(df, target, sample_weight=np.array([0.0, 0.0, 0.0]))
+        with self.assertRaises(ValueError):
+            encoder.fit(df, target, sample_weight=np.array([1.0, np.inf, 1.0]))
+
+    def test_category_with_only_zero_weight_rows_falls_back_to_prior(self):
+        """A category seen only on zero-weight rows is known but encodes as the prior."""
+        df = pd.DataFrame({'c': ['a', 'a', 'z']})
+        target = np.array([0.0, 10.0, 1e6])
+
+        encoder = encoders.QuantileEncoder(cols=['c'], quantile=0.5, m=0.0).fit(
+            df, target, sample_weight=np.array([1.0, 1.0, 0.0])
+        )
+        result = encoder.transform(pd.DataFrame({'c': ['a', 'z']}))
+        self.assertEqual(result['c'].iloc[0], 5.0)
+        self.assertEqual(result['c'].iloc[1], 5.0)
+
+    def test_id_like_detection_follows_expanded_rows(self):
+        """A weighted column collapses to the prior only if the expanded rows are unique.
+
+        Five distinct categories with unit weights are id-like and collapse to
+        the prior. Repeating one of them makes the expanded sample non-unique,
+        so no category collapses any more.
+        """
+        df = pd.DataFrame({'id': [f'row{i}' for i in range(5)]})
+        target = np.array([0.0, 1.0, 0.0, 1.0, 9.0])
+
+        unit = encoders.QuantileEncoder(cols=['id'], quantile=0.5).fit(
+            df, target, sample_weight=np.ones(5)
+        )
+        np.testing.assert_allclose(unit.transform(df)['id'].to_numpy(), np.quantile(target, 0.5))
+
+        repeated = encoders.QuantileEncoder(cols=['id'], quantile=0.5).fit(
+            df, target, sample_weight=np.array([1, 1, 2, 1, 1])
+        )
+        expanded_target = np.repeat(target, [1, 1, 2, 1, 1])
+        expanded = encoders.QuantileEncoder(cols=['id'], quantile=0.5).fit(
+            pd.DataFrame({'id': np.repeat(df['id'].to_numpy(), [1, 1, 2, 1, 1])}),
+            expanded_target,
+        )
+        np.testing.assert_allclose(
+            repeated.transform(df)['id'].to_numpy(), expanded.transform(df)['id'].to_numpy()
+        )
+        self.assertGreater(repeated.transform(df)['id'].nunique(), 1)
+
+    def test_series_weights_are_taken_positionally(self):
+        """A pandas Series of weights is not aligned on its index."""
+        df = pd.DataFrame({'c': ['a', 'a', 'a']})
+        target = np.array([0.0, 10.0, 20.0])
+        weights = pd.Series([1, 4, 1], index=[7, 8, 9])
+
+        encoder = encoders.QuantileEncoder(cols=['c'], quantile=0.5, m=0.0).fit(
+            df, target, sample_weight=weights
+        )
+        self.assertEqual(encoder.transform(pd.DataFrame({'c': ['a']}))['c'].iloc[0], 10.0)
+
+
 class TestSummaryEncoder(unittest.TestCase):
     """Tests for summary encoder."""
 
@@ -160,6 +312,26 @@ class TestSummaryEncoder(unittest.TestCase):
             np.testing.assert_allclose(
                 quantile_results[self.col].values,
                 summary_results[col_name].values,
+            )
+
+    def test_sample_weight_is_forwarded_to_every_quantile(self):
+        """SummaryEncoder passes frequency weights on to each QuantileEncoder."""
+        df = pd.DataFrame({'c': ['a', 'a', 'a', 'b']})
+        target = np.array([0.0, 10.0, 20.0, 1000.0])
+        weights = np.array([1, 4, 1, 0])
+        unseen = pd.DataFrame({'c': ['a', 'new']})
+
+        summary = encoders.SummaryEncoder(cols=['c'], quantiles=[0.25, 0.5, 0.75], m=0.0).fit(
+            df, target, sample_weight=weights
+        )
+        summary_result = summary.transform(unseen)
+        for quantile in [0.25, 0.5, 0.75]:
+            quantile_result = encoders.QuantileEncoder(
+                cols=['c'], quantile=quantile, m=0.0
+            ).fit(df, target, sample_weight=weights)
+            np.testing.assert_allclose(
+                summary_result[f'c_{round(quantile * 100)}'].to_numpy(),
+                quantile_result.transform(unseen)['c'].to_numpy(),
             )
 
 
