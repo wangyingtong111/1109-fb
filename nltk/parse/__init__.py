@@ -67,6 +67,8 @@ from nltk.parse.earleychart import (
     IncrementalChartParser,
     IncrementalLeftCornerChartParser,
     IncrementalTopDownChartParser,
+    Prediction,
+    PredictionStatus,
 )
 from nltk.parse.evaluate import DependencyEvaluator
 from nltk.parse.featurechart import (

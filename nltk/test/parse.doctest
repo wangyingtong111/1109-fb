@@ -433,6 +433,106 @@ Earley Chart Parser
       (VP (Verb saw) (NP (NP John) (PP with (NP (Det a) (Noun dog))))))
 
 
+Unit tests for Earley next-terminal prediction
+----------------------------------------------
+
+``EarleyChartParser.predict`` suggests the terminal tokens that can
+follow a possibly incomplete prefix while still reaching a root parse.
+The grammar below has a nullable ``N`` and two alternatives for ``S``:
+an ``A 'tea'`` branch and an ``'other' 'coffee'`` branch.
+
+    >>> from nltk.parse import PredictionStatus
+
+    >>> predict_grammar = CFG.fromstring("""
+    ... S -> A 'tea' | 'other' 'coffee'
+    ... A -> 'hot' N
+    ... N ->
+    ... """)
+    >>> predictor = nltk.parse.EarleyChartParser(predict_grammar)
+
+With no input, either sentence branch can be started:
+
+    >>> predictor.predict([])
+    Prediction(status='partial', terminals=('hot', 'other'))
+
+After reading "hot" only the branch through A survives, so "tea" is
+suggested but "coffee" (which only follows "other") is not:
+
+    >>> predictor.predict(['hot'])
+    Prediction(status='partial', terminals=('tea',))
+
+A full sentence is reported as complete rather than partial:
+
+    >>> predictor.predict(['hot', 'tea'])
+    Prediction(status='complete', terminals=())
+    >>> predictor.predict(['hot', 'tea']).is_complete()
+    True
+    >>> predictor.predict(['other', 'coffee']).is_complete()
+    True
+
+The other branch suggests its own continuation:
+
+    >>> predictor.predict(['other'])
+    Prediction(status='partial', terminals=('coffee',))
+
+A prefix that no partial parse can extend is a dead end:
+
+    >>> predictor.predict(['tea'])
+    Prediction(status='dead_end', terminals=())
+    >>> predictor.predict(['tea']).is_dead_end()
+    True
+    >>> predictor.predict(['hot']).status == PredictionStatus.PARTIAL
+    True
+
+A complete sentence may still be extendable; the continuations are then
+reported together with the complete status:
+
+    >>> extendable = CFG.fromstring("S -> 'a' | 'a' 'b'")
+    >>> nltk.parse.EarleyChartParser(extendable).predict(['a'])
+    Prediction(status='complete', terminals=('b',))
+
+Recursion and multi-level empty productions must not make the hints
+stop at a nonterminal.  Here ``A`` is left-recursive, ``C`` derives the
+empty string through ``E``, and ``D`` is itself nullable.
+
+    >>> nested_grammar = CFG.fromstring("""
+    ... S -> A 'x'
+    ... A -> A B | C D
+    ... B -> 'b'
+    ... C -> E
+    ... E ->
+    ... D -> 'd' |
+    ... """)
+    >>> nested = nltk.parse.EarleyChartParser(nested_grammar)
+    >>> nested.predict([])
+    Prediction(status='partial', terminals=('b', 'd', 'x'))
+    >>> nested.predict(['b'])
+    Prediction(status='partial', terminals=('b', 'x'))
+    >>> nested.predict(['b', 'd'])
+    Prediction(status='dead_end', terminals=())
+    >>> nested.predict(['x']).is_complete()
+    True
+
+An unproductive nonterminal never leaks a (nonterminal) hint, since
+only reachable terminals are returned:
+
+    >>> unproductive = CFG.fromstring("""
+    ... S -> 'a' B | 'c'
+    ... B -> 'b'
+    ... U -> U 'u'
+    ... """)
+    >>> up = nltk.parse.EarleyChartParser(unproductive)
+    >>> up.predict([])
+    Prediction(status='partial', terminals=('a', 'c'))
+    >>> up.predict(['a'])
+    Prediction(status='partial', terminals=('b',))
+
+Full-sentence parsing keeps its old interface and still works:
+
+    >>> list(predictor.parse(['hot', 'tea']))
+    [Tree('S', [Tree('A', ['hot', Tree('N', [])]), 'tea'])]
+
+
 Unit tests for LARGE context-free grammars
 ------------------------------------------
 

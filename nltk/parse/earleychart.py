@@ -27,6 +27,7 @@ algorithm, originally formulated by Jay Earley (1970).
 
 from time import perf_counter
 
+from nltk.grammar import is_nonterminal, is_terminal
 from nltk.parse.chart import (
     DEFAULT_MAX_TIME,
     BottomUpPredictCombineRule,
@@ -42,6 +43,7 @@ from nltk.parse.chart import (
     LeafInitRule,
     SingleEdgeFundamentalRule,
     TopDownInitRule,
+    TreeEdge,
 )
 from nltk.parse.featurechart import (
     FeatureBottomUpPredictCombineRule,
@@ -172,6 +174,148 @@ class FeatureIncrementalChart(IncrementalChart, FeatureChart):
                 self._get_type_if_possible(getattr(edge, key)()) for key in restr_keys
             )
             index[end].setdefault(vals, []).append(edge)
+
+
+# ////////////////////////////////////////////////////////////
+# Predictive completion ("next terminal" hints)
+# ////////////////////////////////////////////////////////////
+
+
+class PredictionStatus:
+    """
+    The three ways a token prefix can stand relative to the grammar,
+    as reported by :meth:`EarleyChartParser.predict`:
+
+    - ``COMPLETE``: the prefix already spans the whole chart as a root
+      parse.  It may still be extendable, but at least one full sentence
+      has been recognised.
+    - ``PARTIAL``: the prefix does not yet form a complete sentence, but
+      there are active partial parses that can still reach the root;
+      :attr:`Prediction.terminals` lists the terminals that may come next.
+    - ``DEAD_END``: no active partial parse can be extended to a root
+      parse.  No terminal can continue the input into a valid sentence.
+    """
+
+    COMPLETE = "complete"
+    PARTIAL = "partial"
+    DEAD_END = "dead_end"
+
+
+class Prediction:
+    """
+    The result of :meth:`EarleyChartParser.predict`: the status of the
+    parsed prefix together with the set of terminals that can continue
+    it towards a complete root parse.
+
+    :ivar status: One of the constants on :class:`PredictionStatus`.
+    :type status: str
+    :ivar terminals: A tuple of the terminal tokens that may legally be
+        entered next.  Empty for a ``DEAD_END`` (and, when nothing can
+        follow a complete sentence, for a ``COMPLETE`` result).
+    :type terminals: tuple
+    """
+
+    __slots__ = ("status", "terminals")
+
+    def __init__(self, status, terminals):
+        self.status = status
+        self.terminals = tuple(terminals)
+
+    def is_complete(self):
+        """True if the prefix already yields at least one full root parse."""
+        return self.status == PredictionStatus.COMPLETE
+
+    def is_dead_end(self):
+        """True if no terminal can continue the prefix to a root parse."""
+        return self.status == PredictionStatus.DEAD_END
+
+    def __repr__(self):
+        return f"Prediction(status={self.status!r}, terminals={self.terminals!r})"
+
+    def __eq__(self, other):
+        return (
+            isinstance(other, Prediction)
+            and self.status == other.status
+            and self.terminals == other.terminals
+        )
+
+    def __hash__(self):
+        return hash((self.status, self.terminals))
+
+
+def _nullable_nonterminals(grammar):
+    """
+    Return the set of nullable nonterminals of ``grammar``: those that
+    derive the empty string.  The fixed-point calculation also closes
+    over indirect and recursive empty productions (e.g. ``A -> B``,
+    ``B ->`` and ``A -> A``).
+    """
+    nullable = set()
+    changed = True
+    while changed:
+        changed = False
+        for production in grammar.productions():
+            lhs = production.lhs()
+            if lhs in nullable:
+                continue
+            # A production with an empty RHS is directly nullable; a
+            # production whose RHS consists entirely of nullable
+            # nonterminals is transitively nullable.
+            if all(
+                is_nonterminal(symbol) and symbol in nullable
+                for symbol in production.rhs()
+            ):
+                nullable.add(lhs)
+                changed = True
+    return nullable
+
+
+def _first_terminals(grammar, nullable):
+    """
+    Compute a FIRST table mapping each nonterminal to the set of
+    terminals with which one of its derivations can start.  Nullable
+    symbols are skipped so that FIRST looks through chains of empty
+    (including multi-level and recursive) productions instead of
+    stopping at the first nonterminal.
+    """
+    first = {nonterminal: set() for nonterminal in grammar._categories}
+    changed = True
+    while changed:
+        changed = False
+        for production in grammar.productions():
+            lhs_first = first[production.lhs()]
+            for symbol in production.rhs():
+                if is_terminal(symbol):
+                    if symbol not in lhs_first:
+                        lhs_first.add(symbol)
+                        changed = True
+                else:
+                    symbol_first = first.get(symbol, set())
+                    if not symbol_first.issubset(lhs_first):
+                        lhs_first.update(symbol_first)
+                        changed = True
+                # A nullable symbol may derive the empty string, so the
+                # following symbol can also be a first terminal.
+                if not (is_nonterminal(symbol) and symbol in nullable):
+                    break
+    return first
+
+
+def _first_of_sequence(rhs, dot, first, nullable):
+    """
+    Return the terminals that can start the suffix ``rhs[dot:]``,
+    looking through leading nullable nonterminals.  An all-nullable
+    suffix contributes no terminal.
+    """
+    terminals = set()
+    for symbol in rhs[dot:]:
+        if is_terminal(symbol):
+            terminals.add(symbol)
+            break
+        terminals.update(first.get(symbol, set()))
+        if symbol not in nullable:
+            break
+    return terminals
 
 
 # ////////////////////////////////////////////////////////////
@@ -403,6 +547,90 @@ class IncrementalChartParser(ChartParser):
 class EarleyChartParser(IncrementalChartParser):
     def __init__(self, grammar, **parser_args):
         IncrementalChartParser.__init__(self, grammar, EARLEY_STRATEGY, **parser_args)
+        # Lazily built nullable/FIRST tables used by predict(); the
+        # grammar of a parser is immutable, so they are computed once.
+        self._prediction_tables = None
+
+    def _get_prediction_tables(self):
+        if self._prediction_tables is None:
+            nullable = _nullable_nonterminals(self._grammar)
+            first = _first_terminals(self._grammar, nullable)
+            self._prediction_tables = (nullable, first)
+        return self._prediction_tables
+
+    def predict(self, tokens):
+        """
+        Suggest the terminal tokens that may legally follow ``tokens``
+        in a sentence, without requiring the input to be a complete
+        sentence.  This supports interactive syntax entry, where the
+        user may stop typing in the middle of a sentence and ask which
+        words can come next.
+
+        The chart is parsed exactly as for :meth:`chart_parse` (whose
+        interface is unchanged); the active partial parses remaining at
+        the final chart position are then expanded with the grammar's
+        nullable and FIRST tables.  Only terminals reachable from a
+        partial parse that can still grow into a parse rooted at the
+        grammar's start symbol are returned, so hints from dead branches
+        are excluded.  Empty (including multi-level and recursive)
+        productions are looked through, and hints are never nonterminals.
+
+        Three outcomes are distinguished by the returned
+        :class:`Prediction`:
+
+        - :attr:`PredictionStatus.COMPLETE`: ``tokens`` already spans a
+          full root parse.  Any continuation terminals are still listed;
+          a complete sentence need not be extendable.
+        - :attr:`PredictionStatus.PARTIAL`: no complete root parse yet,
+          but at least one continuation terminal keeps a root parse
+          possible.
+        - :attr:`PredictionStatus.DEAD_END`: the prefix cannot be
+          extended to any root parse (the terminal tuple is empty).
+
+        :param tokens: the (possibly partial) sentence typed so far.
+        :type tokens: list(str)
+        :rtype: Prediction
+        :raises ValueError: if a token is not covered by the grammar,
+            just as :meth:`chart_parse` does.
+        """
+        grammar = self._grammar
+        nullable, first = self._get_prediction_tables()
+
+        # Full-sentence parsing keeps its old interface: the same chart
+        # is built, and we simply read additional information off it.
+        chart = self.chart_parse(tokens)
+        final = chart.num_leaves()
+
+        # A complete edge starting at position 0 with the root symbol as
+        # its lhs means the whole prefix is already a valid sentence.
+        is_complete = any(
+            edge.is_complete()
+            and isinstance(edge, TreeEdge)
+            and edge.start() == 0
+            and edge.lhs() == grammar.start()
+            for edge in chart.select(end=final)
+        )
+
+        # In the top-down Earley chart every tree edge is reachable from
+        # a root production, so the incomplete edges waiting at the final
+        # position are precisely the live partial parses.  Expand the
+        # symbols after each dot through nullable rules to the next
+        # terminal; this never stops at a nonterminal.
+        terminals = set()
+        for edge in chart.select(end=final, is_complete=False):
+            if isinstance(edge, LeafEdge):
+                continue
+            terminals.update(
+                _first_of_sequence(edge.rhs(), edge.dot(), first, nullable)
+            )
+
+        if is_complete:
+            status = PredictionStatus.COMPLETE
+        elif terminals:
+            status = PredictionStatus.PARTIAL
+        else:
+            status = PredictionStatus.DEAD_END
+        return Prediction(status, sorted(terminals))
 
 
 class IncrementalTopDownChartParser(IncrementalChartParser):
