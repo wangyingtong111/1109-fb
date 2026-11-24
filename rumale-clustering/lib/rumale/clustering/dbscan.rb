@@ -20,7 +20,15 @@ module Rumale
     class DBSCAN < ::Rumale::Base::Estimator
       include ::Rumale::Base::ClusterAnalyzer
 
-      # Return the core sample indices.
+      # Label value of a sample that has not been visited yet.
+      UNVISITED = -2
+      # Label value of a sample that is noise.
+      NOISE = -1
+      private_constant :UNVISITED, :NOISE
+
+      # Return the indices of the core samples.
+      # A core sample is a sample whose eps-neighborhood contains at least min_samples samples,
+      # so border samples and noise samples are not included.
       # @return [Numo::Int32] (shape: [n_core_samples])
       attr_reader :core_sample_ids
 
@@ -78,17 +86,25 @@ module Rumale
       end
 
       def partial_fit(x)
-        cluster_id = 0
         metric_mat = calc_pairwise_metrics(x)
         n_samples = metric_mat.shape[0]
         @core_sample_ids = []
-        @labels = Numo::Int32.zeros(n_samples) - 2
+        @labels = Numo::Int32.zeros(n_samples) + UNVISITED
+        cluster_id = -1
         n_samples.times do |query_id|
-          next if @labels[query_id] >= -1
+          next unless @labels[query_id] == UNVISITED
 
-          cluster_id += 1 if expand_cluster?(metric_mat, query_id, cluster_id)
+          neighbor_ids = region_query(metric_mat[query_id, true])
+          if neighbor_ids.size < @params[:min_samples]
+            @labels[query_id] = NOISE
+          else
+            cluster_id += 1
+            @core_sample_ids.push(query_id)
+            @labels[query_id] = cluster_id
+            expand_cluster(metric_mat, neighbor_ids, cluster_id)
+          end
         end
-        @core_sample_ids = Numo::Int32[*@core_sample_ids.flatten]
+        @core_sample_ids = Numo::Int32.cast(@core_sample_ids.sort)
         nil
       end
 
@@ -96,25 +112,23 @@ module Rumale
         @params[:metric] == 'precomputed' ? x : ::Rumale::PairwiseMetric.euclidean_distance(x)
       end
 
-      def expand_cluster?(metric_mat, query_id, cluster_id)
-        target_ids = region_query(metric_mat[query_id, true])
-        if target_ids.size < @params[:min_samples]
-          @labels[query_id] = -1
-          false
-        else
-          @labels[target_ids] = cluster_id
-          @core_sample_ids.push(target_ids.dup)
-          target_ids.delete(query_id)
-          while (m = target_ids.shift)
-            neighbor_ids = region_query(metric_mat[m, true])
-            next if neighbor_ids.size < @params[:min_samples]
+      # Assign the samples reachable from the core samples of a cluster.
+      # Only samples that have not been assigned to any cluster yet are labeled,
+      # so a border sample shared by multiple clusters stays in the first cluster that reaches it
+      # and is never used as a path to another cluster.
+      def expand_cluster(metric_mat, neighbor_ids, cluster_id)
+        until neighbor_ids.empty?
+          sample_id = neighbor_ids.shift
+          if @labels[sample_id] == NOISE
+            @labels[sample_id] = cluster_id
+          elsif @labels[sample_id] == UNVISITED
+            @labels[sample_id] = cluster_id
+            next_ids = region_query(metric_mat[sample_id, true])
+            next if next_ids.size < @params[:min_samples]
 
-            neighbor_ids.each do |n|
-              target_ids.push(n) if @labels[n] < -1
-              @labels[n] = cluster_id if @labels[n] <= -1
-            end
+            @core_sample_ids.push(sample_id)
+            neighbor_ids.concat(next_ids.select { |id| @labels[id] <= NOISE })
           end
-          true
         end
       end
 
