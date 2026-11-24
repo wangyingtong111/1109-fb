@@ -2,7 +2,7 @@ from typing import Any
 
 import numpy as np
 
-from src.utils.general_utils import convert_box_xywh2xyxy
+from src.utils.general_utils import boxes_union_area, convert_box_xywh2xyxy
 
 
 class Tube(object):
@@ -25,8 +25,6 @@ class Tube(object):
         if 'confidence' in self.track.keys():
             self.confidence = self.__compute_tube_confidence(self.track['confidence'])
 
-        self.volume = self.__compute_tube_volume()
-
         self.__kwargs = kwargs
         for k, v in kwargs.items():
             super().__setattr__(k, v)
@@ -34,6 +32,8 @@ class Tube(object):
         # convert tube boxes from xywh to xyxy format
         boxes = convert_box_xywh2xyxy(self.get_boxes())
         self.track['bbox'] = boxes
+
+        self.volume = self.__compute_tube_volume()
 
     def __len__(self) -> int:
         return len(self.track)
@@ -94,14 +94,18 @@ class Tube(object):
         return boxes
 
     def __compute_tube_volume(self) -> float:
-        """Compute tube volume. It is the summation of pixels of all bouding boxes that the tube contains.
+        """Compute tube volume. It is the summation, over the frames, of the area
+        covered by the union of the boxes of each frame. Overlapping boxes in the
+        same frame are not counted twice.
 
         Returns:
             float: tube volume
         """
+        frames = self.get_frames()
         boxes = self.get_boxes()
-        areas = np.prod(boxes[:, 2:], axis=1)
-        vol = areas.sum()
+        vol = 0.0
+        for frame in np.unique(frames):
+            vol += boxes_union_area(boxes[frames == frame])
         return vol
 
     def get_tube_volume(self) -> float:

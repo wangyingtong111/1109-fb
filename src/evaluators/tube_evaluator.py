@@ -5,6 +5,7 @@ from src.evaluators.pascal_voc_evaluator import (calculate_ap_11_point_interp,
                                                  calculate_ap_every_point)
 from src.tube import Tube
 from src.utils.enumerators import MethodAveragePrecision
+from src.utils.general_utils import boxes_union_area
 from src.utils.read_files import File
 
 
@@ -223,6 +224,10 @@ class TubeEvaluator():
         compute de intersection volume between __all__ N x M pairs of boxes.
         The boxes in track must be (xmin, ymin, xmax, ymax)
 
+        On each frame, the boxes of a tube are treated as the union of the
+        rectangles they cover, so regions where boxes of the same tube overlap
+        are not counted twice.
+
         Args:
             tube1, tube2 (Tube): two `Tubes`. Contains tracks with N & M boxes, respectively.
 
@@ -232,19 +237,23 @@ class TubeEvaluator():
 
         inter_frames = self._get_intersection_frames(tube1, tube2)
 
-        inter = 0
+        inter = 0.0
 
         if inter_frames is not None:
             for inter_frame in inter_frames:
                 box1 = tube1.get_frame_boxes(inter_frame)
                 box2 = tube2.get_frame_boxes(inter_frame)
 
-                width_height = np.minimum(box1[:, None, 2:], box2[:, 2:]) - np.maximum(
-                    box1[:, None, :2], box2[:, :2])  # [N,M,2]
+                # pairwise intersection boxes [N, M]
+                x1 = np.maximum(box1[:, None, 0], box2[:, 0])
+                y1 = np.maximum(box1[:, None, 1], box2[:, 1])
+                x2 = np.minimum(box1[:, None, 2], box2[:, 2])
+                y2 = np.minimum(box1[:, None, 3], box2[:, 3])
 
-                width_height.clip(min=0, out=width_height)  # [N,M,2]
-                inter += width_height.prod(axis=2)  # [N,M]
-                del width_height
+                inter_boxes = np.stack([x1, y1, x2, y2], axis=-1).reshape(-1, 4)
+                # the intersection of the two covered regions is the union of the
+                # pairwise intersection boxes; overlapping ones are counted once
+                inter += boxes_union_area(inter_boxes)
 
         return inter
 

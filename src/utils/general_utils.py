@@ -50,6 +50,40 @@ def convert_box_xyxy2xywh(box):
     return arr
 
 
+def boxes_union_area(boxes):
+    """Compute the area covered by the union of a set of boxes.
+
+    Overlapping regions are counted only once, so the result is the same
+    as if the boxes were merged into a single (possibly disjoint) shape.
+
+    Args:
+        boxes (numpy.ndarray): array of shape (N, 4) with boxes in
+            (xmin, ymin, xmax, ymax) format. Degenerate boxes
+            (xmin >= xmax or ymin >= ymax) cover no area.
+
+    Returns:
+        float: area of the union of the boxes.
+    """
+    boxes = np.asarray(boxes, dtype=float)
+    if boxes.size == 0:
+        return 0.0
+    # grid cells defined by the boxes edges
+    xs = np.unique(boxes[:, [0, 2]])
+    ys = np.unique(boxes[:, [1, 3]])
+    if xs.size < 2 or ys.size < 2:
+        return 0.0
+    # center of each cell
+    cx = (xs[:-1, None] + xs[1:, None]) / 2.0  # (nx, 1)
+    cy = (ys[None, :-1] + ys[None, 1:]) / 2.0  # (1, ny)
+    # a cell is covered if its center lies inside any box
+    covered = np.any(
+        (boxes[None, None, :, 0] <= cx[..., None]) & (boxes[None, None, :, 2] >= cx[..., None]) &
+        (boxes[None, None, :, 1] <= cy[..., None]) & (boxes[None, None, :, 3] >= cy[..., None]),
+        axis=2)
+    cell_areas = (xs[1:, None] - xs[:-1, None]) * (ys[None, 1:] - ys[None, :-1])
+    return float((cell_areas * covered).sum())
+
+
 # size => (width, height) of the image
 # box => (X1, X2, Y1, Y2) of the bounding box
 def convert_to_relative_values(size, box):
