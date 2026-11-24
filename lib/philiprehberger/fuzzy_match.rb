@@ -296,6 +296,61 @@ module Philiprehberger
       end
     end
 
+    # Hybrid text + phonetic similarity for every candidate.
+    #
+    # Each candidate is scored from two components:
+    # - +:text+     — a string similarity score (default Levenshtein +#ratio+).
+    #   Unavailable when either side is empty.
+    # - +:phonetic+ — 1.0 when both sides produce a usable phonetic code and the
+    #   codes match, 0.0 when both codes exist but differ. A missing/empty code
+    #   means the phonetic component is *unavailable*, not zero.
+    #
+    # Only available components participate. Their configured weights are
+    # renormalized over the components that actually have values, so a candidate
+    # without a usable phonetic code is scored on text alone at the text weight's
+    # full effective strength (e.g. text 0.8 with weights 0.6/0.4 stays 0.8).
+    # A candidate with a real phonetic mismatch keeps its phonetic 0.0 in the
+    # mix (e.g. text 0.8, phonetic 0.0 → 0.8*0.6 + 0.0*0.4 = 0.48).
+    #
+    # Candidates with no usable component at all (e.g. an empty/nil value that
+    # has neither text nor a phonetic code) are returned separately in
+    # +:unscored+ (status +:unscored+) and never take part in the ranking.
+    # Scored entries are sorted by score descending, ties broken by original
+    # input order (stable), matching the existing same-score convention.
+    #
+    # @param query [String]
+    # @param candidates [Array<String>]
+    # @param text_weight [Float] weight of the text component (default 0.6)
+    # @param phonetic_weight [Float] weight of the phonetic component (default 0.4)
+    # @param text_algorithm [Symbol] :jaro_winkler, :dice, or :levenshtein (default)
+    # @param phonetic_algorithm [Symbol] :soundex (default) or :metaphone
+    # @return [Hash] +{ results:, unscored:, weights: }+
+    # @raise [Error] when a weight is negative or an algorithm is unknown
+    def self.hybrid_match(query, candidates,
+                          text_weight: 0.6, phonetic_weight: 0.4,
+                          text_algorithm: :levenshtein, phonetic_algorithm: :soundex)
+      weights = { text: text_weight.to_f, phonetic: phonetic_weight.to_f }
+      validate_hybrid_weights(weights)
+
+      results = []
+      unscored = []
+
+      candidates.each_with_index do |candidate, index|
+        entry = hybrid_entry(query, candidate.to_s, index, weights, text_algorithm, phonetic_algorithm)
+        if entry[:status] == :unscored
+          unscored << entry
+        else
+          results << entry
+        end
+      end
+
+      {
+        results: results.sort_by { |entry| [-entry[:score], entry[:index]] },
+        unscored: unscored,
+        weights: weights
+      }
+    end
+
     # Group and deduplicate similar strings
     #
     # @param array [Array<String>] strings to deduplicate
@@ -341,6 +396,80 @@ module Philiprehberger
       end
     end
 
-    private_class_method :score_for
+    # Build one hybrid-match entry, deciding which components actually
+    # participate and renormalizing their weights over the available ones.
+    #
+    # @return [Hash] a scored entry, or an +:unscored+ entry when no component
+    #   has a usable value
+    def self.hybrid_entry(query, candidate, index, weights, text_algorithm, phonetic_algorithm)
+      base = {
+        value: candidate,
+        index: index,
+        components: [],
+        component_scores: {},
+        applied_weights: {}
+      }
+
+      if text_available?(query, candidate)
+        add_component(base, :text, score_for(query, candidate, algorithm: text_algorithm), weights[:text])
+      end
+
+      phonetic = phonetic_component(query, candidate, phonetic_algorithm)
+      add_component(base, :phonetic, phonetic[:score], weights[:phonetic]) if phonetic[:available]
+
+      return base.merge(status: :unscored, score: nil) if base[:components].empty?
+
+      total_weight = base[:components].sum { |name| base[:applied_weights][name] }
+      score = base[:components].sum do |name|
+        base[:component_scores][name] * base[:applied_weights][name]
+      end / total_weight
+
+      base.merge(status: :scored, score: score.round(4))
+    end
+
+    # Record a participating component plus its configured weight.
+    def self.add_component(entry, name, score, weight)
+      entry[:components] << name
+      entry[:component_scores][name] = score
+      entry[:applied_weights][name] = weight
+    end
+
+    # The text component needs non-empty content on both sides.
+    def self.text_available?(query, candidate)
+      !query.to_s.empty? && !candidate.to_s.empty?
+    end
+
+    # Phonetic component: unavailable when either side lacks a usable code,
+    # otherwise 1.0 for equal codes and 0.0 for differing codes.
+    #
+    # @return [Hash] +{ available:, score: }+
+    def self.phonetic_component(query, candidate, algorithm)
+      coder = case algorithm
+              when :soundex then ->(string) { Soundex.code(string) }
+              when :metaphone then ->(string) { Metaphone.code(string) }
+              else raise Error, "Unknown phonetic algorithm: #{algorithm}"
+              end
+
+      query_code = coder.call(query)
+      candidate_code = coder.call(candidate)
+      return { available: false, score: nil } if query_code.empty? || candidate_code.empty?
+
+      { available: true, score: query_code == candidate_code ? 1.0 : 0.0 }
+    end
+
+    # Reject negative hybrid weights; an all-zero configuration cannot be
+    # renormalized over any participating component.
+    def self.validate_hybrid_weights(weights)
+      weights.each do |name, weight|
+        raise Error, "Weight for #{name} cannot be negative, got #{weight}" if weight.negative?
+      end
+
+      return unless weights.values.all?(&:zero?)
+
+      raise Error, 'At least one hybrid weight must be positive'
+    end
+
+    private_class_method :score_for, :hybrid_entry, :add_component,
+                         :text_available?, :phonetic_component, :validate_hybrid_weights
   end
 end

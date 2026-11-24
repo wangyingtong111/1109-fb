@@ -190,6 +190,52 @@ Philiprehberger::FuzzyMatch.weighted_score('kitten', 'sitting',
 # Weights must sum to 1.0
 ```
 
+### Hybrid Text + Phonetic Matching
+
+Score each candidate from a **text** component (weight 0.6) and a **phonetic**
+component (weight 0.4). Every entry reports which components actually
+participated, their raw scores, and the weights applied, so each result can be
+recomputed by hand.
+
+```ruby
+results = Philiprehberger::FuzzyMatch.hybrid_match('rube', ['rube', 'ruble', '12346', ''])
+# => {
+#      results:   [ ...scored entries, highest score first... ],
+#      unscored:  [ ...entries with no usable component... ],
+#      weights:   { text: 0.6, phonetic: 0.4 }
+#    }
+```
+
+- **Both components available** — the configured weights apply directly. A
+  phonetic mismatch is a real `0.0`, so text `0.8` + phonetic `0.0` becomes
+  `0.8*0.6 + 0.0*0.4 = 0.48`.
+- **One component unavailable** — its weight is dropped and the remaining
+  weights are renormalized. A candidate with no usable phonetic code but a text
+  score of `0.8` is scored on text alone and stays `0.8` (not
+  `0.8*0.6 = 0.48`).
+- **No usable component** (e.g. an empty/nil candidate) — listed separately in
+  `:unscored` with `status: :unscored` and a `nil` score; it never enters the
+  ranking.
+- Scored entries are sorted by score descending; ties keep the original input
+  order (stable), matching the existing same-score convention.
+
+```ruby
+# Each scored entry exposes its full breakdown
+entry = results[:results].first
+entry[:value]            # => "rube"
+entry[:score]            # => 1.0
+entry[:status]           # => :scored
+entry[:components]       # => [:text, :phonetic]
+entry[:component_scores] # => { text: 1.0, phonetic: 1.0 }
+entry[:applied_weights]  # => { text: 0.6, phonetic: 0.4 }
+
+# Options
+Philiprehberger::FuzzyMatch.hybrid_match(query, candidates,
+  text_weight: 0.7, phonetic_weight: 0.3,
+  text_algorithm: :jaro_winkler,      # :jaro_winkler, :dice, or :levenshtein
+  phonetic_algorithm: :metaphone)     # :soundex (default) or :metaphone
+```
+
 ## API
 
 ### `Philiprehberger::FuzzyMatch`
@@ -218,6 +264,7 @@ Philiprehberger::FuzzyMatch.weighted_score('kitten', 'sitting',
 | `.token_sort_ratio(a, b)` | Token-sorted Jaro-Winkler similarity (0.0 to 1.0) |
 | `.token_set_ratio(a, b)` | Token-set-based similarity (0.0 to 1.0) |
 | `.weighted_score(a, b, weights:)` | Weighted multi-algorithm score (0.0 to 1.0) |
+| `.hybrid_match(query, candidates, text_weight: 0.6, phonetic_weight: 0.4, text_algorithm: :levenshtein, phonetic_algorithm: :soundex)` | Per-candidate text + phonetic score with component breakdown, weight renormalization, and separate unscored entries (stable ranking) |
 | `.similarity_matrix(strings, algorithm:, threshold:)` | Pairwise similarity hash-of-hashes for batch comparison |
 | `.deduplicate(array, threshold:, algorithm:)` | Group and deduplicate similar strings |
 

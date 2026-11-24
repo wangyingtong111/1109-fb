@@ -7,6 +7,9 @@ and this gem adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+- `FuzzyMatch.hybrid_match(query, candidates, text_weight: 0.6, phonetic_weight: 0.4, text_algorithm: :levenshtein, phonetic_algorithm: :soundex)` — per-candidate hybrid text + phonetic scoring that reports which components participated. Missing components (e.g. no usable phonetic code) are renormalized over the available weights instead of being treated as zero, candidates with no usable component are returned separately as unscored, and scored results keep the stable same-score ordering.
+
 ## [0.10.0] - 2026-05-09
 
 ### Added
