@@ -16,7 +16,8 @@ class BoundingBox:
                  img_size=None,
                  bb_type=BBType.GROUND_TRUTH,
                  confidence=None,
-                 format=BBFormat.XYWH):
+                 format=BBFormat.XYWH,
+                 entity_id=None):
         """ Constructor.
 
         Parameters
@@ -49,6 +50,14 @@ class BoundingBox:
                 BBFormat.XYWH: <left> <top> <width> <height>
                 BBFomat.XYX2Y2: <left> <top> <right> <bottom>.
                 BBFomat.YOLO: <x_center> <y_center> <width> <height>. (relative)
+            entity_id : hashable (optional)
+                Identifier of the physical entity represented by the bounding box. Boxes sharing
+                the same (image_name, entity_id) describe the same entity, even when they carry
+                different (leaf) class labels or identical geometry. It is used to merge sibling
+                leaf annotations (e.g. 'maple' and 'oak') into a single parent-class instance
+                (e.g. 'tree') during hierarchical evaluation. Entity ids are scoped per image:
+                the same id in another image represents an independent instance. If None, every
+                box is treated as its own entity.
         """
 
         self._image_name = image_name
@@ -56,6 +65,7 @@ class BoundingBox:
         self._confidence = confidence
         self._class_id = class_id
         self._format = format
+        self._entity_id = entity_id
         if bb_type == BBType.DETECTED and confidence is None:
             raise IOError(
                 'For bb_type=\'Detected\', it is necessary to inform the confidence value.')
@@ -217,6 +227,27 @@ class BoundingBox:
     def set_bb_type(self, bb_type):
         self._bb_type = bb_type
 
+    def get_entity_id(self):
+        """ Get the identifier of the physical entity represented by the bounding box.
+
+        Returns
+        -------
+        hashable
+            Identifier of the entity within the image, or None if the box does not declare one.
+        """
+        return self._entity_id
+
+    def set_entity_id(self, entity_id):
+        """ Set the identifier of the physical entity represented by the bounding box.
+
+        Parameters
+        ----------
+            entity_id : hashable
+                Identifier of the entity within the image. Boxes with the same
+                (image_name, entity_id) represent the same physical entity.
+        """
+        self._entity_id = entity_id
+
     def get_class_id(self):
         """ Get the class of the object the bounding box represents.
 
@@ -321,21 +352,20 @@ class BoundingBox:
         Returns
         -------
         BoundingBox
-            Cloned BoundingBox object.
+            Cloned BoundingBox object. The clone is independent from the original bounding box,
+            including its coordinates, class id and entity id.
         """
         absBB = bounding_box.get_absolute_bounding_box(format=BBFormat.XYWH)
-        # return (self._x,self._y,self._x2,self._y2)
-        new_bounding_box = BoundingBox(bounding_box.get_image_name(),
-                                       bounding_box.get_class_id(),
-                                       absBB[0],
-                                       absBB[1],
-                                       absBB[2],
-                                       absBB[3],
-                                       type_coordinates=bounding_box.getCoordinatesType(),
-                                       img_size=bounding_box.getImageSize(),
-                                       bb_type=bounding_box.getbb_type(),
-                                       confidence=bounding_box.getConfidence(),
-                                       format=BBFormat.XYWH)
+        new_bounding_box = BoundingBox(
+            image_name=bounding_box.get_image_name(),
+            class_id=bounding_box.get_class_id(),
+            coordinates=(absBB[0], absBB[1], absBB[2], absBB[3]),
+            type_coordinates=bounding_box.get_coordinates_type(),
+            img_size=bounding_box.get_image_size(),
+            bb_type=bounding_box.get_bb_type(),
+            confidence=bounding_box.get_confidence(),
+            format=BBFormat.XYWH,
+            entity_id=bounding_box.get_entity_id())
         return new_bounding_box
 
     @staticmethod

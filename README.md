@@ -56,6 +56,7 @@ Ideally, in order to have trustworthy benchmarking among different approaches, i
     - [AP@.5 and AP@.75](#ap5-and-ap75)
     - [AP@[.5:.05:.95]](#ap50595)
     - [AP<sub>S</sub>, AP<sub>M</sub> and AP<sub>L</sub>](#AP-s-AP-M-AP-L)  
+  - [Hierarchical (parent-class / leaf-class) evaluation](#hierarchical-parent-class--leaf-class-evaluation)
   - [**Spatio-Temporal Tube Average Precision (STT-AP)**](#spatio-temporal-tube-average-precision-stt-ap)
   - [How to use this project](#how-to-use-this-project)
     - [Requirements](#requirements)
@@ -189,6 +190,44 @@ This metric expands the AP@.5 and AP@.75 metrics by computing the AP@ with ten d
 These three metrics, also referred to as AP Across Scales, apply the AP@[.5,.05:.95] taking into consideration the size of the ground-truth object. AP<sub>S</sub> only evaluates the ground-truth objects of small sizes (area < 32^2 pixels); AP<sub>M</sub> considers only ground-truth objects of medium sizes (32^2 < area < 96^2 pixels); AP<sub>L</sub> considers large ground-truth objects (area > 96^2) only.
 
 When evaluating objects of a given size, objects of the other sizes (both ground-truth and predicted) are not considered in the evaluation. This metric is also part of the COCO evaluation dataset.
+
+
+## Hierarchical (parent-class / leaf-class) evaluation
+
+Fine-grained (leaf) labels can be grouped into coarser parent classes — e.g. `maple` and `oak` both belong to `tree`. The hierarchical evaluator keeps the **leaf-level report and the parent-level report at the same time**, running an independent matching and scoring pass for each view:
+
+* the **leaf view** is computed on the original boxes and labels and is numerically identical to calling `get_pascalvoc_metrics` directly;
+* the **parent view** maps every label to its parent class *on cloned boxes*, so the original boxes and labels are never modified and can keep being used for any other evaluation.
+
+A physical entity may carry more than one leaf annotation with identical geometry (a tree annotated once as `maple` and once as `oak`). Ground-truth boxes that share the same `(image_name, entity_id)` and map to the same parent represent **one** parent-class instance. They therefore count as a single positive, and all predictions matching that entity compete for it: the highest-confidence match scores one true positive and every further prediction on the same entity is a false positive. Entity ids are scoped per image, so the same id in another image is an independent instance. Boxes without an `entity_id` are treated as distinct entities, in which case the parent view reduces to the standard per-box matching.
+
+```python
+from src.bounding_box import BoundingBox
+from src.evaluators.hierarchical_evaluator import get_hierarchical_pascalvoc_metrics
+from src.utils.enumerators import BBFormat, BBType
+
+# entity_id groups sibling leaf annotations of the same physical entity
+gt = [
+    BoundingBox('A', 'maple', (10, 20, 30, 40), bb_type=BBType.GROUND_TRUTH,
+                format=BBFormat.XYWH, entity_id=1),
+    BoundingBox('A', 'oak',   (10, 20, 30, 40), bb_type=BBType.GROUND_TRUTH,
+                format=BBFormat.XYWH, entity_id=1),  # same entity, same geometry
+    BoundingBox('A', 'maple', (10, 20, 30, 40), bb_type=BBType.GROUND_TRUTH,
+                format=BBFormat.XYWH, entity_id=2),  # another entity, same coordinates
+]
+det = [BoundingBox('A', 'oak', (10, 20, 30, 40), bb_type=BBType.DETECTED,
+                   confidence=0.9, format=BBFormat.XYWH)]
+
+res = get_hierarchical_pascalvoc_metrics(
+    gt, det, class_to_parent={'maple': 'tree', 'oak': 'tree'}, iou_threshold=0.5)
+
+res['parent']['per_class']['tree']  # 2 positives, 1 TP, 0 FP (siblings merged)
+res['leaf']['per_class']            # maple: 2 positives, 0 TP; oak: 1 positive, 1 TP
+res['parent']['entities']           # per-parent entities and their leaf boxes,
+                                    # so the denominators of both views can be recomputed
+```
+
+Use `map_bounding_boxes_to_parent(boxes, class_to_parent)` to obtain the parent-labelled clones on their own. Pass `keep_unmapped=False` to exclude classes that are absent from the mapping from the parent view.
 
 
 ## **Spatio-Temporal Tube Average Precision (STT-AP)**
