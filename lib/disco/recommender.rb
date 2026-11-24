@@ -11,9 +11,15 @@ module Disco
       @top_items = top_items
     end
 
-    def fit(train_set, validation_set: nil)
+    def fit(train_set, validation_set: nil, events: nil)
       train_set = to_dataset(train_set)
       validation_set = to_dataset(validation_set) if validation_set
+
+      # versioned events are resolved up front, before any model state is reset,
+      # so invalid input (including same-version conflicts) never destroys a
+      # model that was already fitted
+      event_mode = events.nil? ? train_set.any? { |v| v.key?(:event) } : events
+      train_set = resolve_events(train_set) if event_mode
 
       check_training_set(train_set)
 
@@ -407,6 +413,61 @@ module Disco
       unless ratings.all? { |r| r[:rating].is_a?(Numeric) }
         raise ArgumentError, "Rating must be numeric"
       end
+    end
+
+    # Collapse a replay stream of versioned events into the effective ratings.
+    #
+    # Rows are grouped by user, item and event id. Independent event ids (or
+    # rows without an event id) stay separate even when they share the same
+    # user and item. For each event, the row with the highest version wins; a
+    # withdrawn winner removes the whole event. The result depends only on the
+    # contents of the stream, not the order rows arrive in, so replay order
+    # can never change the training samples or popularity counts.
+    #
+    # Raises before any model state changes.
+    def resolve_events(events)
+      groups = {}
+      order = []
+
+      events.each_with_index do |row, index|
+        raise ArgumentError, "Missing user_id" if row[:user_id].nil?
+        raise ArgumentError, "Missing item_id" if row[:item_id].nil?
+
+        version = row[:version]
+        raise ArgumentError, "Missing version" if version.nil?
+
+        # rows without an event id are always independent observations
+        event_key = row[:event].nil? ? [:__disco_independent_event__, index] : row[:event]
+        key = [row[:user_id], row[:item_id], event_key]
+
+        unless groups.key?(key)
+          groups[key] = []
+          order << key
+        end
+        groups[key] << row
+      end
+
+      effective = []
+      order.each do |key|
+        group = groups.fetch(key)
+        max_version = group.map { |r| r[:version] }.max
+        winners = group.select { |r| r[:version] == max_version }
+
+        if winners.uniq { |r| [r[:rating], r[:withdrawn]] }.size > 1
+          raise ArgumentError,
+            "Conflicting events with version #{max_version} for user #{key[0].inspect}, item #{key[1].inspect}"
+        end
+
+        winner = winners.first
+        next if winner[:withdrawn]
+
+        raise ArgumentError, "Missing rating" if winner[:rating].nil?
+        raise ArgumentError, "Rating must be numeric" unless winner[:rating].is_a?(Numeric)
+
+        effective << winner
+      end
+
+      effective
     end
 
     def check_training_set(train_set)

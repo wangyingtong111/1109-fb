@@ -35,6 +35,24 @@ recommender.fit([
 
 > IDs can be integers, strings, or any other data type
 
+#### Versioned events
+
+Offline replay can deliver more than one version of the same rating event. Pass events with an `event` id and a `version`, and Disco resolves them before fitting. For each event, only the highest version is kept; a row marked `withdrawn: true` at the highest version removes the whole event.
+
+```ruby
+recommender.fit([
+  {user_id: 1, item_id: 1, event: "e1", version: 2, rating: 5},
+  {user_id: 1, item_id: 1, event: "e1", version: 1, rating: 1},
+  {user_id: 1, item_id: 1, event: "e2", version: 1, rating: 3},
+  {user_id: 1, item_id: 1, event: "e3", version: 2, withdrawn: true},
+  {user_id: 1, item_id: 1, event: "e3", version: 1, rating: 1}
+])
+```
+
+The same `user_id`/`item_id` pair can have multiple independent events (different `event` ids), and each surviving event becomes a separate training sample and a separate popularity count. Resolution depends only on the contents of the stream, not the order rows arrive in, so replaying events in a different order produces the same model and the same `top_items` counts.
+
+Rows without an `event` key keep the original behavior. Pass `events: true` to force event mode, or `events: false` to disable it. Conflicting rows that share an event id and highest version raise an `ArgumentError` before the existing model is reset, so a model that was already fitted remains queryable.
+
 If users don’t rate items directly (for instance, they’re purchasing items or reading posts), this is known as implicit feedback. Leave out the rating.
 
 ```ruby
@@ -255,6 +273,8 @@ Or a Rover data frame
 ```ruby
 Rover.read_csv("ratings.csv")
 ```
+
+Versioned event rows additionally use `event`, `version`, and optionally `withdrawn` (see [Versioned events](#versioned-events)).
 
 ## Performance
 

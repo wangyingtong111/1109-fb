@@ -1,3 +1,7 @@
+## Unreleased
+
+- Added versioned event input mode for `fit`: rows with an `event` id are resolved by highest `version`, support whole-event withdrawal with `withdrawn: true`, keep independent events for the same user/item as separate samples, and raise on same-version conflicts before resetting a fitted model
+
 ## 1.0.0 (2026-04-17)
 
 - Switched to `numo-narray-alt`

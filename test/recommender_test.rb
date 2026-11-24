@@ -381,6 +381,155 @@ class RecommenderTest < Minitest::Test
     assert_equal "Multiple observations for user 1, item 2", error.message
   end
 
+  def test_versioned_events_keeps_highest_version
+    recommender = Disco::Recommender.new(factors: 2, top_items: true)
+    recommender.fit([
+      {user_id: "a", item_id: "tea", event: "e1", version: 2, rating: 5},
+      {user_id: "a", item_id: "tea", event: "e1", version: 1, rating: 1},
+      {user_id: "b", item_id: "rice", event: "other", version: 1, rating: 1}
+    ])
+
+    assert_in_delta 3.0, recommender.global_mean
+    snapshot = JSON.parse(recommender.to_json)
+    tea_count = snapshot["item_count"][snapshot["item_ids"].index("tea")]
+    assert_equal 1, tea_count
+  end
+
+  def test_versioned_events_independent_events_and_tombstone
+    rows = [
+      {user_id: "a", item_id: "tea", event: "e1", version: 2, rating: 5},
+      {user_id: "a", item_id: "tea", event: "e1", version: 1, rating: 1},
+      {user_id: "a", item_id: "tea", event: "e2", version: 1, rating: 3},
+      # withdrawal arrives before the older version, but still wins
+      {user_id: "a", item_id: "tea", event: "e3", version: 2, withdrawn: true},
+      {user_id: "a", item_id: "tea", event: "e3", version: 1, rating: 1},
+      {user_id: "b", item_id: "rice", event: "other", version: 1, rating: 1}
+    ]
+
+    recommender = Disco::Recommender.new(factors: 2, top_items: true)
+    recommender.fit(rows)
+
+    # same training samples as feeding only 5, 3 and 1
+    assert_in_delta 3.0, recommender.global_mean
+    reference = Disco::Recommender.new(factors: 2, top_items: true)
+    reference.fit([
+      {user_id: "a", item_id: "tea", rating: 5},
+      {user_id: "a", item_id: "tea", rating: 3},
+      {user_id: "b", item_id: "rice", rating: 1}
+    ])
+    assert_in_delta reference.global_mean, recommender.global_mean
+
+    # two independent a/tea events, not merged into one
+    snapshot = JSON.parse(recommender.to_json)
+    tea_count = snapshot["item_count"][snapshot["item_ids"].index("tea")]
+    assert_equal 2, tea_count
+
+    # the withdrawn event never enters the rated set
+    assert_equal [snapshot["item_ids"].index("tea")], snapshot["rated"].first
+  end
+
+  def test_versioned_events_replay_order
+    rows = [
+      {user_id: "a", item_id: "tea", event: "e1", version: 2, rating: 5},
+      {user_id: "a", item_id: "tea", event: "e1", version: 1, rating: 1},
+      {user_id: "a", item_id: "tea", event: "e2", version: 1, rating: 3},
+      {user_id: "a", item_id: "tea", event: "e3", version: 2, withdrawn: true},
+      {user_id: "a", item_id: "tea", event: "e3", version: 1, rating: 1},
+      {user_id: "b", item_id: "rice", event: "other", version: 1, rating: 1}
+    ]
+
+    snapshot_counts = 5.times.map do
+      recommender = Disco::Recommender.new(factors: 2, top_items: true)
+      recommender.fit(rows.shuffle)
+      snapshot = JSON.parse(recommender.to_json)
+      [recommender.global_mean, snapshot["item_count"][snapshot["item_ids"].index("tea")]]
+    end
+
+    assert_equal 1, snapshot_counts.uniq.size
+    assert_in_delta 3.0, snapshot_counts.first.first
+    assert_equal 2, snapshot_counts.first.last
+  end
+
+  def test_versioned_events_same_version_conflict
+    recommender = Disco::Recommender.new
+    recommender.fit([
+      {user_id: "a", item_id: "tea", rating: 5},
+      {user_id: "b", item_id: "rice", rating: 1}
+    ])
+
+    item_ids = recommender.item_ids
+    prediction = recommender.predict([{user_id: "a", item_id: "tea"}]).first
+
+    error = assert_raises ArgumentError do
+      recommender.fit([
+        {user_id: "a", item_id: "tea", event: "e1", version: 1, rating: 5},
+        {user_id: "a", item_id: "tea", event: "e1", version: 1, rating: 2}
+      ])
+    end
+    assert_match "Conflicting events", error.message
+
+    # raised before the model was reset
+    assert_equal item_ids, recommender.item_ids
+    assert_in_delta prediction, recommender.predict([{user_id: "a", item_id: "tea"}]).first
+  end
+
+  def test_versioned_events_identical_same_version
+    recommender = Disco::Recommender.new(factors: 2, top_items: true)
+    recommender.fit([
+      {user_id: "a", item_id: "tea", event: "e1", version: 1, rating: 5},
+      {user_id: "a", item_id: "tea", event: "e1", version: 1, rating: 5},
+      {user_id: "b", item_id: "rice", event: "o", version: 1, rating: 1}
+    ])
+
+    assert_in_delta 3.0, recommender.global_mean
+    snapshot = JSON.parse(recommender.to_json)
+    assert_equal 1, snapshot["item_count"][snapshot["item_ids"].index("tea")]
+  end
+
+  def test_versioned_events_missing_version
+    error = assert_raises ArgumentError do
+      Disco::Recommender.new.fit([
+        {user_id: "a", item_id: "tea", event: "e1", rating: 5}
+      ])
+    end
+    assert_equal "Missing version", error.message
+  end
+
+  def test_versioned_events_all_withdrawn_keeps_model
+    recommender = Disco::Recommender.new
+    recommender.fit([{user_id: "a", item_id: "tea", rating: 5}])
+    item_ids = recommender.item_ids
+
+    error = assert_raises ArgumentError do
+      recommender.fit([
+        {user_id: "a", item_id: "tea", event: "e1", version: 2, withdrawn: true}
+      ])
+    end
+    assert_equal "No training data", error.message
+    assert_equal item_ids, recommender.item_ids
+  end
+
+  def test_versioned_events_explicit_option
+    recommender = Disco::Recommender.new(factors: 2, top_items: true)
+    recommender.fit([
+      {user_id: "a", item_id: "tea", event: "e1", version: 2, rating: 5},
+      {user_id: "a", item_id: "tea", event: "e1", version: 1, rating: 1},
+      {user_id: "b", item_id: "rice", event: "other", version: 1, rating: 1}
+    ], events: true)
+
+    assert_in_delta 3.0, recommender.global_mean
+  end
+
+  def test_versioned_events_validation_set_unchanged
+    recommender = Disco::Recommender.new(factors: 2, epochs: 2, verbose: false)
+    recommender.fit([
+      {user_id: "a", item_id: "tea", event: "e1", version: 2, rating: 5},
+      {user_id: "b", item_id: "rice", event: "o", version: 1, rating: 1}
+    ], validation_set: [{user_id: "a", item_id: "rice", rating: 2}])
+
+    assert_includes recommender.item_ids, "rice"
+  end
+
   def test_not_fit
     recommender = Disco::Recommender.new
     error = assert_raises do
