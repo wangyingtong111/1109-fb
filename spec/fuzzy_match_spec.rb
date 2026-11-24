@@ -125,6 +125,32 @@ describe FuzzyMatch do
       d.find('baz').should be_nil
       d.find('baze').should be_nil
     end
+
+    it %{confirms identity through any one of several SKU matches} do
+      identity = %r{sku=([a-z0-9-]+)(\{\})?}i
+      d = FuzzyMatch.new ['sku=AC1-2{}'], :identities => [identity]
+      d.find('sku=ab-12 sku=ac1-2{}').should == 'sku=AC1-2{}'
+    end
+
+    it %{rejects a match whose SKU combinations all differ} do
+      identity = %r{sku=([a-z0-9-]+)(\{\})?}i
+      d = FuzzyMatch.new ['sku=ab1-2{}'], :identities => [identity]
+      d.find('sku=ab-12 sku=ac1-2{}').should be_nil
+    end
+
+    it %{distinguishes a missing optional capture from an empty one} do
+      identity = %r{sku=([a-z0-9-]+)(\{\})?}i
+      d = FuzzyMatch.new ['sku=ab-12{}'], :identities => [identity]
+      d.find('sku=ab-12').should be_nil
+    end
+
+    it %{leaves one-sided matches to the ordinary candidate judgment} do
+      identity = %r{sku=([a-z0-9-]+)(\{\})?}i
+      d = FuzzyMatch.new ['widget sku=ab-12'], :identities => [identity]
+      # the haystack record matches the identity but the needle does not,
+      # so the identity provides no information and similarity takes over
+      d.find('widget').should == 'widget sku=ab-12'
+    end
   end
 
   describe 'groupings' do

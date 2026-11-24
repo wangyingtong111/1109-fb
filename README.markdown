@@ -88,6 +88,8 @@ Adding an identity like `/(f)-?(\d50)/i` ensures that "Ford F-150" and "Ford F-2
 
 Note that identities do not establish certainty. They just say whether two records **could** be identical... then string similarity takes over.
 
+A string can match an identity regexp more than once (for example a title that lists both a current article number and a previous one). Each match's captures form one complete combination, and two records could be identical if **any** complete combination appears in both strings. Captures from different matches are never split apart and recombined. A group that captures an empty string (`""`) counts as a different value from a group that did not participate in a match (`nil`). If only one of the two strings matches the regexp, the identity provides no information and the ordinary similarity judgment takes over.
+
 ### Stop words
 
 Ignore common and/or meaningless words when doing string similarity.
