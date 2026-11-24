@@ -7,6 +7,9 @@ and this gem adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+- `FuzzyMatch.similarity_matrix_by_id(records, id_key:, text_key:, scorer:, algorithm:, threshold:)` — similarity matrix keyed by record ID so records sharing the same text keep their own rows/columns. Below-threshold edges are stored as `nil` (distinguishable from unknown IDs, which raise `KeyError` on `fetch`). Custom scorers may declare `reusable?`/`symmetric?` to opt into per-call caching of ordered pairs and reverse-direction reuse; non-symmetric scorers are always evaluated in both directions.
+
 ## [0.10.0] - 2026-05-09
 
 ### Added

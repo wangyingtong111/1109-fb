@@ -325,6 +325,88 @@ module Philiprehberger
       matrix
     end
 
+    # Build a similarity matrix keyed by record ID instead of by text.
+    #
+    # Records that share the same text still get their own row and column,
+    # because rows/columns are keyed by ID. Every ordered pair of IDs appears
+    # in the result: pairs scoring below +threshold+ are stored as +nil+
+    # (a filtered edge), while IDs that were never passed in simply have no
+    # row, so `matrix.fetch(unknown_id)` raises KeyError. That keeps
+    # "below threshold" distinguishable from "no such record".
+    #
+    # Scoring:
+    # - Without +scorer+, the built-in +algorithm+ is used; it is pure and
+    #   symmetric, so each unordered text pair is scored once per call.
+    # - A custom +scorer+ is any callable accepting `(text_a, text_b)`.
+    #   If it responds to `reusable?` and that returns true, results for the
+    #   same ordered text pair are reused within this call. If it responds
+    #   to `symmetric?` and that returns true, the reverse direction is
+    #   reused as well. A scorer that cannot guarantee symmetry is always
+    #   evaluated in both directions.
+    #
+    # @param records [Array<Hash, #public_send>] records to compare
+    # @param id_key [Symbol, String] hash key or method name for the record ID
+    # @param text_key [Symbol, String] hash key or method name for the text
+    # @param scorer [#call, nil] optional custom scorer
+    # @param algorithm [Symbol] :jaro_winkler (default), :dice, or :levenshtein
+    # @param threshold [Float, nil] pairs scoring below are stored as nil
+    # @return [Hash{Object => Hash{Object => Float, nil}}]
+    # @raise [Error] when two records share the same ID
+    def self.similarity_matrix_by_id(records, id_key:, text_key:, scorer: nil, algorithm: :jaro_winkler,
+                                     threshold: nil)
+      entries = records.map do |record|
+        [record_field(record, id_key), record_field(record, text_key).to_s]
+      end
+
+      ids = entries.map(&:first)
+      duplicates = ids.tally.select { |_, count| count > 1 }.keys
+      raise Error, "Duplicate record IDs: #{duplicates.map(&:inspect).join(', ')}" unless duplicates.empty?
+
+      reusable = scorer ? (scorer.respond_to?(:reusable?) && scorer.reusable?) : true
+      symmetric = scorer ? (scorer.respond_to?(:symmetric?) && scorer.symmetric?) : true
+      score_fn = scorer || ->(a, b) { score_for(a, b, algorithm: algorithm) }
+
+      cache = {}
+      compute = lambda do |text_a, text_b|
+        key = symmetric ? [text_a, text_b].sort : [text_a, text_b]
+        if (reusable || symmetric) && cache.key?(key)
+          cache[key]
+        else
+          value = score_fn.call(text_a, text_b).round(4)
+          cache[key] = value if reusable || symmetric
+          value
+        end
+      end
+
+      matrix = {}
+      entries.each do |id_a, text_a|
+        row = {}
+        entries.each do |id_b, text_b|
+          score = compute.call(text_a, text_b)
+          row[id_b] = threshold.nil? || score >= threshold ? score : nil
+        end
+        matrix[id_a] = row
+      end
+      matrix
+    end
+
+    # Read a field from a Hash (symbol or string keys) or any object
+    # responding to the field name.
+    def self.record_field(record, key)
+      if record.is_a?(Hash)
+        return record[key] if record.key?(key)
+
+        alternate = key.is_a?(Symbol) ? key.to_s : key.to_sym
+        return record[alternate] if record.key?(alternate)
+
+        raise Error, "Record is missing field #{key.inspect}: #{record.inspect}"
+      end
+
+      record.public_send(key)
+    end
+
+    private_class_method :record_field
+
     # Dispatch a similarity score for the given algorithm symbol.
     #
     # @param str_a [String]

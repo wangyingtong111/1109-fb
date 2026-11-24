@@ -137,6 +137,32 @@ matrix = Philiprehberger::FuzzyMatch.similarity_matrix(strings, threshold: 0.8)
 Philiprehberger::FuzzyMatch.similarity_matrix(strings, algorithm: :dice)
 ```
 
+### Similarity Matrix by Record ID
+
+Like `.similarity_matrix`, but rows and columns are keyed by record ID, so
+records that share the same text still get their own row and column. Every
+ordered pair of IDs is present: pairs scoring below `threshold` are stored
+as `nil` (a filtered edge), while unknown IDs simply have no row, so
+`matrix.fetch(id)` raises `KeyError` for IDs that were never passed in.
+
+```ruby
+records = [
+  { id: 1, name: 'oak' },
+  { id: 2, name: 'oak' }, # same name, different record
+  { id: 3, name: 'elm' }
+]
+
+matrix = Philiprehberger::FuzzyMatch.similarity_matrix_by_id(records, id_key: :id, text_key: :name)
+matrix[1][3] # score for record 1 -> record 3
+matrix[2][3] # record 2 has its own edges despite sharing the name "oak"
+```
+
+A custom `scorer:` (any callable taking `(text_a, text_b)`) can replace the
+built-in algorithm. If the scorer responds to `reusable?` and returns true,
+results for the same ordered text pair are computed once per call. If it
+responds to `symmetric?` and returns true, the reverse direction is reused
+too; otherwise both directions are always evaluated.
+
 ### Deduplication
 
 ```ruby
@@ -219,6 +245,7 @@ Philiprehberger::FuzzyMatch.weighted_score('kitten', 'sitting',
 | `.token_set_ratio(a, b)` | Token-set-based similarity (0.0 to 1.0) |
 | `.weighted_score(a, b, weights:)` | Weighted multi-algorithm score (0.0 to 1.0) |
 | `.similarity_matrix(strings, algorithm:, threshold:)` | Pairwise similarity hash-of-hashes for batch comparison |
+| `.similarity_matrix_by_id(records, id_key:, text_key:, scorer:, algorithm:, threshold:)` | Pairwise similarity matrix keyed by record ID; below-threshold edges are `nil`, unknown IDs raise on `fetch` |
 | `.deduplicate(array, threshold:, algorithm:)` | Group and deduplicate similar strings |
 
 All methods are case-insensitive by default.
