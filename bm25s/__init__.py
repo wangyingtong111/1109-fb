@@ -277,6 +277,7 @@ class BM25:
         num_docs: int,
         query_tokens_ids: np.ndarray,
         dtype: np.dtype,
+        query_weights: np.ndarray = None,
     ) -> np.ndarray:
         """
         This internal static function calculates the relevance scores for a given query,
@@ -298,6 +299,11 @@ class BM25:
             Array of token IDs to score.
         dtype (np.dtype)
             Data type for score calculation.
+        query_weights (np.ndarray, optional)
+            Array of weights, one per entry in `query_tokens_ids`. Each term's full
+            score contribution (including the BM25+/BM25L non-occurrence base) is
+            multiplied by its weight. If None, every term keeps a weight of 1, which
+            reproduces the original unweighted retrieval behavior.
 
         Returns
         -------
@@ -315,7 +321,11 @@ class BM25:
         scores = np.zeros(num_docs, dtype=dtype)
         for i in range(len(query_tokens_ids)):
             start, end = indptr_starts[i], indptr_ends[i]
-            np.add.at(scores, indices[start:end], data[start:end])
+            if query_weights is None:
+                term_data = data[start:end]
+            else:
+                term_data = data[start:end] * query_weights[i]
+            np.add.at(scores, indices[start:end], term_data)
 
             # # The following code is slower with numpy, but faster after JIT compilation
             # for j in range(start, end):
@@ -578,8 +588,47 @@ class BM25:
             self.vocab_dict[token] for token in query_tokens if token in self.vocab_dict
         ]
 
+    def get_tokens_ids_and_weights(
+        self,
+        query_tokens: List[str],
+        query_weights: List[float] = None,
+    ) -> Tuple[List[int], np.ndarray]:
+        """
+        For a given list of tokens (and optional per-token weights), return the
+        vocabulary token IDs together with the weights aligned to them. Tokens that
+        are not in the vocabulary (such as the unindexed term ``ghost``) are dropped,
+        together with their weights, so the two returned sequences always have the
+        same length.
+
+        When `query_weights` is None, every surviving token is assigned a weight of
+        1, which reproduces the original unweighted behavior. Duplicate query tokens
+        are kept: each occurrence contributes its own weight, so their weights add up.
+        """
+        if query_weights is None:
+            query_tokens_ids = self.get_tokens_ids(query_tokens)
+            weights = np.ones(len(query_tokens_ids), dtype=np.dtype(self.dtype))
+            return query_tokens_ids, weights
+
+        query_weights = np.asarray(query_weights, dtype=np.dtype(self.dtype))
+        if query_weights.ndim != 1 or len(query_weights) != len(query_tokens):
+            raise ValueError(
+                "query_weights must be a 1D sequence with the same length as "
+                f"the query tokens (got {len(query_weights)} weights for "
+                f"{len(query_tokens)} tokens)."
+            )
+
+        query_tokens_ids = []
+        kept_weights = []
+        for token, weight in zip(query_tokens, query_weights):
+            if token in self.vocab_dict:
+                query_tokens_ids.append(self.vocab_dict[token])
+                kept_weights.append(weight)
+
+        weights = np.asarray(kept_weights, dtype=np.dtype(self.dtype))
+        return query_tokens_ids, weights
+
     def get_scores_from_ids(
-        self, query_tokens_ids: List[int], weight_mask=None
+        self, query_tokens_ids: List[int], weight_mask=None, query_weights=None
     ) -> np.ndarray:
         data = self.scores["data"]
         indices = self.scores["indices"]
@@ -589,6 +638,20 @@ class BM25:
         dtype = np.dtype(self.dtype)
         int_dtype = np.dtype(self.int_dtype)
         query_tokens_ids: np.ndarray = np.asarray(query_tokens_ids, dtype=int_dtype)
+
+        if query_weights is not None:
+            query_weights = np.asarray(query_weights, dtype=dtype)
+            if query_weights.ndim != 1 or len(query_weights) != len(query_tokens_ids):
+                raise ValueError(
+                    "query_weights must be a 1D sequence with the same length as "
+                    f"the query token IDs (got {len(query_weights)} weights for "
+                    f"{len(query_tokens_ids)} token IDs)."
+                )
+
+        # An empty query (for example, one made only of out-of-vocabulary tokens)
+        # has no term contributions, so every document receives a zero score.
+        if len(query_tokens_ids) == 0:
+            return np.zeros(num_docs, dtype=dtype)
 
         max_token_id = int(query_tokens_ids.max(initial=0))
 
@@ -605,13 +668,18 @@ class BM25:
             num_docs=num_docs,
             query_tokens_ids=query_tokens_ids,
             dtype=np.dtype(dtype),
+            query_weights=query_weights,
         )
 
         # if there's a non-occurrence array, we need to add the non-occurrence score
-        # back to the scores
+        # back to the scores. The same per-term weight applies to this complete
+        # term contribution, so BM25+/BM25L documents matching no term keep the
+        # weighted base score instead of an unweighted one.
         if self.nonoccurrence_array is not None:
-            nonoccurrence_scores = self.nonoccurrence_array[query_tokens_ids].sum()
-            scores += nonoccurrence_scores
+            nonoccurrence_scores = self.nonoccurrence_array[query_tokens_ids]
+            if query_weights is not None:
+                nonoccurrence_scores = nonoccurrence_scores * query_weights
+            scores += nonoccurrence_scores.sum()
 
         if weight_mask is not None:
             # Apply document weights to the complete score, including non-occurrence.
@@ -620,26 +688,47 @@ class BM25:
         return scores
 
     def get_scores(
-        self, query_tokens_single: List[str], weight_mask=None
+        self, query_tokens_single: List[str], weight_mask=None, query_weights=None
     ) -> np.ndarray:
         if not isinstance(query_tokens_single, list):
             raise ValueError("The query_tokens must be a list of tokens.")
 
+        if len(query_tokens_single) == 0:
+            return np.zeros(self.scores["num_docs"], dtype=self.dtype)
+
         if isinstance(query_tokens_single[0], str):
-            query_tokens_ids = self.get_tokens_ids(query_tokens_single)
+            query_tokens_ids, query_weights = self.get_tokens_ids_and_weights(
+                query_tokens_single, query_weights=query_weights
+            )
         elif isinstance(query_tokens_single[0], int):
-            # already are token IDs, no need to convert
+            # already are token IDs, no need to convert. Out-of-vocabulary IDs are
+            # expected to have been filtered before calling this method; when
+            # query_weights is None, the original unweighted behavior is preserved.
             query_tokens_ids = query_tokens_single
+            if query_weights is not None:
+                query_weights = np.asarray(
+                    query_weights, dtype=np.dtype(self.dtype)
+                )
+                if len(query_weights) != len(query_tokens_ids):
+                    raise ValueError(
+                        "query_weights must have the same length as the query token IDs "
+                        f"(got {len(query_weights)} weights for {len(query_tokens_ids)} token IDs)."
+                    )
         else:
             raise ValueError(
                 "The query_tokens must be a list of tokens or a list of token IDs."
             )
 
-        return self.get_scores_from_ids(query_tokens_ids, weight_mask=weight_mask)
+        return self.get_scores_from_ids(
+            query_tokens_ids,
+            weight_mask=weight_mask,
+            query_weights=query_weights,
+        )
 
     def _get_top_k_results(
         self,
         query_tokens_single: List[str],
+        query_weights: List[float] = None,
         k: int = 1000,
         backend="auto",
         sorted: bool = False,
@@ -656,7 +745,11 @@ class BM25:
             )
             scores_q = np.zeros(self.scores["num_docs"], dtype=self.dtype)
         else:
-            scores_q = self.get_scores(query_tokens_single, weight_mask=weight_mask)
+            scores_q = self.get_scores(
+                query_tokens_single,
+                weight_mask=weight_mask,
+                query_weights=query_weights,
+            )
 
         if backend.startswith("numba"):
             if NUMBA_AVAILABLE is False:
@@ -686,6 +779,7 @@ class BM25:
         chunksize: int = 50,
         backend_selection: str = "auto",
         weight_mask: np.ndarray = None,
+        query_weights: List[List[float]] = None,
     ):
         """
         Retrieve the top-k documents for each query (tokenized).
@@ -742,6 +836,17 @@ class BM25:
             A weight mask to filter the documents. If provided, the scores for the masked
             documents will be set to 0 to avoid returning them in the results.
 
+        query_weights : List[List[float]], optional
+            Per-term weights aligned with the token lists in `query_tokens`: one weight
+            list per query, with one entry for each token of that query. A term's full
+            BM25 contribution, including the BM25+/BM25L non-occurrence base score, is
+            multiplied by its weight, so the complete score uses one consistent weight
+            convention. Tokens that are not in the vocabulary are dropped together with
+            their weights, and duplicate tokens are kept so their weights accumulate.
+            If None, every term has weight 1, reproducing the original unweighted
+            retrieval. This is applied before `weight_mask`, so document-level scaling
+            remains available on top of term-level weighting.
+
         Returns
         -------
         Results or np.ndarray
@@ -773,6 +878,22 @@ class BM25:
         if n_threads == -1:
             n_threads = os.cpu_count()
 
+        if query_weights is not None:
+            if len(query_weights) != len(query_tokens):
+                raise ValueError(
+                    "query_weights must contain one weight list per query "
+                    f"(got {len(query_weights)} weight lists for {len(query_tokens)} queries)."
+                )
+            for query_idx, (q_tokens, q_weights) in enumerate(
+                zip(query_tokens, query_weights)
+            ):
+                if len(q_weights) != len(q_tokens):
+                    raise ValueError(
+                        f"query_weights[{query_idx}] must have the same length as the "
+                        f"corresponding query tokens (got {len(q_weights)} weights for "
+                        f"{len(q_tokens)} tokens)."
+                    )
+
         # if it's a list of list of tokens ids (int), we remove any integer not in the vocab_dict
         if is_list_of_list_of_type(query_tokens, type_=int):
             if not hasattr(self, "unique_token_ids_set") or self.unique_token_ids_set is None:
@@ -781,12 +902,24 @@ class BM25:
                     "run retriever.load(load_vocab=True) before calling retrieve on list of list of token IDs (int)."
                 )
             query_tokens_filtered = []
-            for query in query_tokens:
-                query_filtered = [
-                    token_id
-                    for token_id in query
-                    if token_id in self.unique_token_ids_set
-                ]
+            query_weights_filtered = [] if query_weights is not None else None
+            for query_idx, query in enumerate(query_tokens):
+                if query_weights is None:
+                    query_filtered = [
+                        token_id
+                        for token_id in query
+                        if token_id in self.unique_token_ids_set
+                    ]
+                else:
+                    query_filtered = []
+                    weights_filtered = []
+                    for token_id, term_weight in zip(
+                        query, query_weights[query_idx]
+                    ):
+                        if token_id in self.unique_token_ids_set:
+                            query_filtered.append(token_id)
+                            weights_filtered.append(term_weight)
+                    query_weights_filtered.append(weights_filtered)
                 if len(query_filtered) == 0:
                     if "" not in self.vocab_dict:
                         raise ValueError(
@@ -801,6 +934,7 @@ class BM25:
                 query_tokens_filtered.append(query_filtered)
 
             query_tokens = query_tokens_filtered
+            query_weights = query_weights_filtered
 
         if isinstance(query_tokens, tuple) and not _is_tuple_of_list_of_tokens(
             query_tokens
@@ -857,7 +991,15 @@ class BM25:
             if is_list_of_list_of_type(query_tokens, type_=int):
                 query_tokens_ids = query_tokens
             elif is_list_of_list_of_type(query_tokens, type_=str):
-                query_tokens_ids = [self.get_tokens_ids(q) for q in query_tokens]
+                if query_weights is None:
+                    query_tokens_ids = [self.get_tokens_ids(q) for q in query_tokens]
+                else:
+                    paired = [
+                        self.get_tokens_ids_and_weights(q, weights)
+                        for q, weights in zip(query_tokens, query_weights)
+                    ]
+                    query_tokens_ids = [ids for ids, _ in paired]
+                    query_weights = [weights for _, weights in paired]
             else:
                 raise ValueError(
                     "The query_tokens must be a list of list of tokens (str for stemmed words, int for token ids matching corpus) or a tuple of two lists: the first list is the list of unique token IDs, and the second list is the list of token IDs for each document."
@@ -879,6 +1021,7 @@ class BM25:
                 int_dtype=self.int_dtype,
                 nonoccurrence_array=self.nonoccurrence_array,
                 weight_mask=weight_mask,
+                query_weights=query_weights,
             )
 
             if return_as == "tuple":
@@ -900,15 +1043,23 @@ class BM25:
             weight_mask=weight_mask,
         )
 
+        if query_weights is None:
+            query_weights_iter = [None] * len(query_tokens)
+        else:
+            query_weights_iter = query_weights
+
         if n_threads == 0:
             # Use a simple map function to retrieve the results
-            out = tqdm(map(topk_fn, query_tokens), **tqdm_kwargs)
+            out = tqdm(
+                map(topk_fn, query_tokens, query_weights_iter), **tqdm_kwargs
+            )
         else:
             # Use concurrent.futures.ProcessPoolExecutor to parallelize the computation
             with ThreadPoolExecutor(max_workers=n_threads) as executor:
                 process_map = executor.map(
                     topk_fn,
                     query_tokens,
+                    query_weights_iter,
                     chunksize=chunksize,
                 )
                 out = list(tqdm(process_map, **tqdm_kwargs))
@@ -1413,6 +1564,7 @@ class BM25:
             num_docs=num_docs,
             query_tokens_ids=dummy_query_tokens_ids,
             dtype=np.dtype(self.dtype),
+            query_weights=None,
         )
     
     def warmup_numba_csc(self):

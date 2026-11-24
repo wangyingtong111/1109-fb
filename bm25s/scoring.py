@@ -349,11 +349,16 @@ def _compute_relevance_from_scores_jit_ready(
     num_docs: int,
     query_tokens_ids: np.ndarray,
     dtype: np.dtype,
+    query_weights: np.ndarray = None,
 ) -> np.ndarray:
     """
     This internal static function calculates the relevance scores for a given query,
     by using the BM25 scores that have been precomputed in the BM25 eager index.
     This version is ready for JIT compilation with numba, but is slow if not compiled.
+
+    When `query_weights` is provided, each term's full score contribution is multiplied
+    by its weight before being accumulated, keeping the same weighting convention for
+    both ordinary and non-occurrence (BM25L/BM25+) score components.
     """
     indptr_starts = indptr[query_tokens_ids]
     indptr_ends = indptr[query_tokens_ids + 1]
@@ -363,7 +368,10 @@ def _compute_relevance_from_scores_jit_ready(
         start, end = indptr_starts[i], indptr_ends[i]
         # The following code is slower with numpy, but faster after JIT compilation
         for j in range(start, end):
-            scores[indices[j]] += data[j]
+            if query_weights is None:
+                scores[indices[j]] += data[j]
+            else:
+                scores[indices[j]] += data[j] * query_weights[i]
 
     return scores
 

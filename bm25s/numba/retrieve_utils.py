@@ -15,6 +15,7 @@ _compute_relevance_from_scores_jit_ready = njit()(_compute_relevance_from_scores
 def _retrieve_internal_jitted(
     query_tokens_ids_flat: np.ndarray,
     query_pointers: np.ndarray,
+    query_weights_flat: np.ndarray,
     k: int,
     sorted: bool,
     dtype: np.dtype,
@@ -33,6 +34,7 @@ def _retrieve_internal_jitted(
 
     for i in prange(N):
         query_tokens_single = query_tokens_ids_flat[query_pointers[i] : query_pointers[i + 1]]
+        query_weights_single = query_weights_flat[query_pointers[i] : query_pointers[i + 1]]
 
         # query_tokens_single = np.asarray(query_tokens_single, dtype=int_dtype)
         scores_single = _compute_relevance_from_scores_jit_ready(
@@ -42,13 +44,17 @@ def _retrieve_internal_jitted(
             indices=indices,
             num_docs=num_docs,
             dtype=dtype,
+            query_weights=query_weights_single,
         )
 
         # if there's a non-occurrence array, we need to add the non-occurrence score
-        # back to the scores
+        # back to the scores. The per-term weights apply to this complete term
+        # contribution as well, so the two backends stay exactly consistent.
         if nonoccurrence_array is not None:
-            nonoccurrence_scores = nonoccurrence_array[query_tokens_single].sum()
-            scores_single += nonoccurrence_scores
+            nonoccurrence_scores = (
+                nonoccurrence_array[query_tokens_single] * query_weights_single
+            )
+            scores_single += nonoccurrence_scores.sum()
 
         if weight_mask is not None:
             scores_single = scores_single * weight_mask
@@ -82,6 +88,7 @@ def _retrieve_numba_functional(
     dtype="float32",
     int_dtype="int32",
     weight_mask=None,
+    query_weights=None,
 ):
     from numba import get_num_threads, set_num_threads
 
@@ -125,9 +132,22 @@ def _retrieve_numba_functional(
     query_pointers = np.cumsum([0] + [len(q) for q in query_tokens_ids], dtype=int_dtype)
     query_tokens_ids_flat = np.concatenate(query_tokens_ids).astype(int_dtype)
 
+    # query_weights is aligned with query_tokens_ids (out-of-vocabulary tokens have
+    # already been filtered together with their weights). Default to unit weights so
+    # unweighted retrieval is unchanged.
+    if query_weights is None:
+        query_weights_flat = np.ones(
+            len(query_tokens_ids_flat), dtype=np.dtype(dtype)
+        )
+    else:
+        query_weights_flat = np.concatenate(
+            [np.asarray(q_weights) for q_weights in query_weights]
+        ).astype(np.dtype(dtype))
+
     retrieved_scores, retrieved_indices = retrieve_internal(
         query_pointers=query_pointers,
         query_tokens_ids_flat=query_tokens_ids_flat,
+        query_weights_flat=query_weights_flat,
         k=k,
         sorted=sorted,
         dtype=np.dtype(dtype),
