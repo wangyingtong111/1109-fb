@@ -801,6 +801,16 @@ class MiniFTS
     combined.nil? ? {} : combined
   end
 
+  # Merges only highlight evidence for a matched term. Hash#merge! would let the
+  # later query leaf replace the earlier field list; the same term can match in
+  # several fields across OR/AND leaves. Keep every field once, ordered like the
+  # configured index fields. This must not feed scoring or query coverage.
+  def merge_match_data!(match, incoming_match)
+    match.merge!(incoming_match) do |_matched_term, fields, incoming_fields|
+      (fields | incoming_fields).sort_by { |field| @field_ids[field] }
+    end
+  end
+
   def combine_or(a, b)
     b.each do |doc_id, b_value|
       existing = a[doc_id]
@@ -808,7 +818,7 @@ class MiniFTS
         a[doc_id] = b_value
       else
         existing[R_SCORE] += b_value[R_SCORE]
-        existing[R_MATCH].merge!(b_value[R_MATCH])
+        merge_match_data!(existing[R_MATCH], b_value[R_MATCH])
         assign_unique_terms(existing[R_TERMS], b_value[R_TERMS])
       end
     end
@@ -825,7 +835,7 @@ class MiniFTS
       combined[doc_id] = [
         existing[R_SCORE] + b_value[R_SCORE],
         existing[R_TERMS],
-        existing[R_MATCH].merge!(b_value[R_MATCH])
+        merge_match_data!(existing[R_MATCH], b_value[R_MATCH])
       ]
     end
     combined
