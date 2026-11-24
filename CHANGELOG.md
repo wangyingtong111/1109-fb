@@ -1,3 +1,12 @@
+## [Unreleased]
+
+- Added a positional completion mode to `auto_suggest` (`positional: true`).
+  It preserves the query's word order and repeated positions, filling each
+  slot with exactly one matching indexed term; every completed phrase is
+  reported once per contributing document, and each suggestion carries the
+  `:documents` (document IDs) it was derived from. The default suggestion
+  behavior is unchanged.
+
 ## [1.0.1] - 2026-07-18
 
 - Require MFA for gem pushes (`rubygems_mfa_required` gemspec metadata). No

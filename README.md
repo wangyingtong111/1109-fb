@@ -114,6 +114,33 @@ ms.auto_suggest("zen ar")
 #     { suggestion: "zen art", terms: [...], score: 1.21 }]
 ```
 
+### Positional completion
+
+Pass `positional: true` for a mode that completes the query **position by
+position**. The query's word order and repeated words become slots, and each
+slot is filled with exactly one indexed term that matches it (using the same
+prefix/fuzzy options as a normal search):
+
+```ruby
+documents = [
+  { "id" => 1, "text" => "red apple applet" },
+  { "id" => 2, "text" => "red apple" },
+]
+
+ms.auto_suggest("red red app", positional: true)
+# => [{ suggestion: "red red applet", terms: ["red", "red", "applet"],
+#      documents: [1], score: ... },
+#     { suggestion: "red red apple", terms: ["red", "red", "apple"],
+#      documents: [1, 2], score: ... }]
+```
+
+Every slot must be completable in a document for that document to contribute,
+and each document contributes the same final phrase at most once (even if the
+phrase can be built through several matches). The `:documents` key lists the
+IDs behind each suggestion. As with other options, it can be made the default
+via the constructor's `auto_suggest_options: { positional: true }`. Without it,
+suggestions behave exactly as before.
+
 ## Adding, removing, and updating documents
 
 ```ruby

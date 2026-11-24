@@ -366,8 +366,18 @@ class MiniFTS
   # Provides auto-suggestions for +query_string+: modified queries derived from
   # it, each with a relevance score, sorted by descending score. By default
   # prefix-searches the last term and combines terms with AND.
+  #
+  # With +positional: true+, suggestions are instead built position by position:
+  # the query's token order and repeated slots are preserved, and each slot is
+  # filled with exactly one indexed term that matches it (per the prefix/fuzzy
+  # options). Every combination found in a document becomes a candidate phrase,
+  # but each document contributes the same final phrase at most once. Unlike the
+  # default mode, every result also carries +:documents+, the IDs of the
+  # documents that contributed that phrase.
   def auto_suggest(query_string, options = {})
     options = @options[:auto_suggest_options].merge(options)
+
+    return positional_auto_suggest(query_string, options) if options[:positional]
 
     suggestions = {}
 
@@ -910,6 +920,88 @@ class MiniFTS
     term_boost = boost_term_opt.respond_to?(:call) ? boost_term_opt.call(term, i, terms) : 1
 
     { term: term, fuzzy: fuzzy, prefix: prefix, term_boost: term_boost }
+  end
+
+  # Positional variant of {#auto_suggest}. Each query term becomes a slot that
+  # is filled with exactly one indexed term matching it, preserving the query's
+  # word order and its repeated slots. A document contributes a phrase only when
+  # it offers a completion for every slot, and it contributes the same final
+  # phrase at most once. Every result names the documents behind it in
+  # +:documents+.
+  def positional_auto_suggest(query_string, options)
+    options = { tokenize: @options[:tokenize], process_term: @options[:process_term] }
+              .merge(@options[:search_options])
+              .merge(options)
+
+    terms = search_query_terms(query_string, options)
+    return [] if terms.empty?
+
+    specs = terms.each_with_index.map { |term, i| term_to_query_spec(options, term, i, terms) }
+    slot_results = specs.map { |spec| execute_query_spec(spec, options) }
+
+    # The AND-combined search gives, for the documents that complete every slot,
+    # the same scoring and filtering semantics the default mode is built on. Its
+    # public-ID keys double as the filter for stale entries in the slot results.
+    doc_scores = {}
+    search(query_string, options).each { |result| doc_scores[result[:id]] = result[:score] }
+    return [] if doc_scores.empty?
+
+    slot_terms = slot_results.map do |slot|
+      terms_by_doc = {}
+      slot.each do |doc_id, record|
+        next unless doc_scores.key?(@document_ids[doc_id])
+
+        terms_by_doc[doc_id] = record[R_MATCH].keys
+      end
+      terms_by_doc
+    end
+
+    candidate_ids = slot_terms.map { |terms_by_doc| terms_by_doc.keys }.reduce(:&)
+    return [] if candidate_ids.nil? || candidate_ids.empty?
+
+    phrases = {}
+    candidate_ids.each do |doc_id|
+      score = doc_scores[@document_ids[doc_id]]
+      per_slot_terms = slot_terms.map { |terms_by_doc| terms_by_doc[doc_id] }
+      phrase_combinations(per_slot_terms).each do |phrase_terms|
+        phrase = phrase_terms.join(" ")
+        entry = phrases[phrase]
+        if entry.nil?
+          phrases[phrase] = { terms: phrase_terms, documents: { doc_id => true }, score: score }
+        elsif entry[:documents][doc_id].nil?
+          # The same document can reach one phrase through more than one slot
+          # combination; it must still contribute that phrase only once.
+          entry[:documents][doc_id] = true
+          entry[:score] += score
+        end
+      end
+    end
+
+    results = phrases.map do |phrase, data|
+      document_ids = data[:documents].keys.map { |doc_id| @document_ids[doc_id] }.sort
+      {
+        suggestion: phrase,
+        terms: data[:terms],
+        documents: document_ids,
+        score: data[:score].fdiv(document_ids.length)
+      }
+    end
+
+    sort_by_score(results)
+  end
+
+  # Tokenizes and processes a query string exactly as {#execute_query} does.
+  def search_query_terms(query_string, options)
+    options[:tokenize].call(query_string)
+                       .flat_map { |term| options[:process_term].call(term) }
+                       .select { |term| truthy?(term) }
+  end
+
+  # Cartesian product of the per-slot term arrays, keeping slot order.
+  def phrase_combinations(term_slots)
+    term_slots.reduce([[]]) do |combinations, terms|
+      combinations.flat_map { |combo| terms.map { |term| combo + [term] } }
+    end
   end
 
   def assign_unique_term(target, term)
