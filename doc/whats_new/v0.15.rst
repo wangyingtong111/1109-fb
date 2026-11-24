@@ -14,6 +14,18 @@ Bug fixes
 Enhancements
 ............
 
+- :class:`~imblearn.over_sampling.RandomOverSampler` now accepts a
+  ``sample_weight`` parameter in
+  :meth:`~imblearn.over_sampling.RandomOverSampler.fit_resample`. The weight
+  of each source sample is split equally between all its copies so that the
+  total weight associated with every source sample is preserved. The
+  resampled weights are returned as a third output and are aligned with the
+  rows of the resampled dataset. Samplers creating synthetic samples without
+  a one-to-one correspondence with the source data raise a
+  :class:`NotImplementedError` instead of guessing weights. The
+  :class:`~imblearn.pipeline.Pipeline` forwards the resampled weights to the
+  final estimator during ``fit``, leaving the prediction chain unchanged.
+
 Compatibility
 .............
 

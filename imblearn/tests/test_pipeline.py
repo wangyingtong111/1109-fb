@@ -38,6 +38,7 @@ from sklearn_compat.utils._tags import Tags
 
 from imblearn.base import BaseSampler
 from imblearn.datasets import make_imbalance
+from imblearn.over_sampling import RandomOverSampler
 from imblearn.pipeline import Pipeline, make_pipeline
 from imblearn.under_sampling import EditedNearestNeighbours as ENN
 from imblearn.under_sampling import RandomUnderSampler
@@ -1516,3 +1517,228 @@ def test_metadata_routing_with_sampler():
         pipeline.fit(X, y, cost_matrix=cost_matrix)
 
         assert_allclose(pipeline[0].cost_matrix_, cost_matrix)
+
+
+# =============================================================================
+# Sample weight propagation through samplers
+# =============================================================================
+
+
+class _SampleWeightClassifier(BaseEstimator, ClassifierMixin):
+    """Classifier recording the sample weights it was fitted with."""
+
+    def fit(self, X, y, sample_weight=None):
+        self.classes_ = np.unique(y)
+        self.sample_weight_ = (
+            None if sample_weight is None else np.asarray(sample_weight).copy()
+        )
+        self.n_samples_in_ = np.asarray(X).shape[0]
+        return self
+
+    def predict(self, X):
+        return np.zeros(np.asarray(X).shape[0], dtype=int)
+
+
+def _weight_propagation_data():
+    X = np.arange(8).reshape(4, 2).astype(float)
+    y = np.array([0, 0, 0, 1])
+    sample_weight = np.array([1.0, 2.0, 3.0, 6.0])
+    expected_weight = np.array([1.0, 2.0, 3.0, 2.0, 2.0, 2.0])
+    return X, y, sample_weight, expected_weight
+
+
+def test_pipeline_sample_weight_legacy_routing():
+    """Weights routed with the `step__sample_weight` syntax are redistributed
+    by the sampler and forwarded to the final estimator."""
+    X, y, sample_weight, expected_weight = _weight_propagation_data()
+
+    pipeline = Pipeline(
+        [
+            ("ros", RandomOverSampler(random_state=42)),
+            ("clf", _SampleWeightClassifier()),
+        ]
+    )
+    pipeline.fit(X, y, ros__sample_weight=sample_weight)
+
+    clf = pipeline.named_steps["clf"]
+    assert clf.n_samples_in_ == 6
+    assert_allclose(clf.sample_weight_, expected_weight)
+    # the prediction chain is unchanged and still operates on the 4 rows
+    assert pipeline.predict(X).shape == (4,)
+
+
+def test_pipeline_sample_weight_metadata_routing():
+    """The same propagation works when metadata routing is enabled."""
+    X, y, sample_weight, expected_weight = _weight_propagation_data()
+
+    with config_context(enable_metadata_routing=True):
+        ros = RandomOverSampler(random_state=42).set_fit_resample_request(
+            sample_weight=True
+        )
+        clf = _SampleWeightClassifier().set_fit_request(sample_weight=True)
+        pipeline = Pipeline([("ros", ros), ("clf", clf)])
+        pipeline.fit(X, y, sample_weight=sample_weight)
+
+        assert_allclose(pipeline.named_steps["clf"].sample_weight_, expected_weight)
+        assert pipeline.predict(X).shape == (4,)
+
+
+def test_pipeline_sample_weight_aligned_with_resampled_rows():
+    """The forwarded weights must be aligned row-by-row with resampled X."""
+    X, y, sample_weight, _ = _weight_propagation_data()
+
+    pipeline = Pipeline(
+        [
+            ("ros", RandomOverSampler(random_state=42)),
+            ("clf", _SampleWeightClassifier()),
+        ]
+    )
+    pipeline.fit(X, y, ros__sample_weight=sample_weight)
+
+    ros = pipeline.named_steps["ros"]
+    assert len(pipeline.named_steps["clf"].sample_weight_) == len(
+        ros.sample_indices_
+    )
+    # rebuilding the source weights from the resampled rows gives back the
+    # original contribution of every source sample
+    resampled_weight = pipeline.named_steps["clf"].sample_weight_
+    for source_idx in range(X.shape[0]):
+        mask = ros.sample_indices_ == source_idx
+        assert_allclose(
+            resampled_weight[mask].sum(), sample_weight[source_idx]
+        )
+
+
+def test_pipeline_sample_weight_with_transformer():
+    """Transformers do not interfere with the propagated weights."""
+    X, y, sample_weight, expected_weight = _weight_propagation_data()
+
+    pipeline = Pipeline(
+        [
+            ("scaler", StandardScaler()),
+            ("ros", RandomOverSampler(random_state=42)),
+            ("clf", _SampleWeightClassifier()),
+        ]
+    )
+    pipeline.fit(X, y, ros__sample_weight=sample_weight)
+
+    assert_allclose(
+        pipeline.named_steps["clf"].sample_weight_, expected_weight
+    )
+
+
+def test_pipeline_sample_weight_chained_samplers():
+    """Weights flow through several duplication-based samplers while the
+    total weight is conserved."""
+    X, y, sample_weight, _ = _weight_propagation_data()
+
+    pipeline = Pipeline(
+        [
+            ("ros1", RandomOverSampler(random_state=42)),
+            ("ros2", RandomOverSampler(random_state=0)),
+            ("clf", _SampleWeightClassifier()),
+        ]
+    )
+    pipeline.fit(X, y, ros1__sample_weight=sample_weight)
+
+    resampled_weight = pipeline.named_steps["clf"].sample_weight_
+    assert_allclose(resampled_weight.sum(), sample_weight.sum())
+
+
+def test_pipeline_sample_weight_unsupported_sampler():
+    """Synthetic samplers without row correspondence raise a clear error
+    instead of receiving guessed weights."""
+    from imblearn.over_sampling import SMOTE
+
+    X, y, sample_weight, _ = _weight_propagation_data()
+
+    pipeline = Pipeline(
+        [
+            ("smote", SMOTE(random_state=42)),
+            ("clf", _SampleWeightClassifier()),
+        ]
+    )
+    with pytest.raises(NotImplementedError, match="does not support"):
+        pipeline.fit(X, y, smote__sample_weight=sample_weight)
+
+
+def test_pipeline_sample_weight_unsupported_after_supported_sampler():
+    """An unsupported sampler placed after a supporting one also rejects the
+    weights carried by the pipeline."""
+    from imblearn.over_sampling import SMOTE
+
+    X, y, sample_weight, _ = _weight_propagation_data()
+
+    pipeline = Pipeline(
+        [
+            ("ros", RandomOverSampler(random_state=42)),
+            ("smote", SMOTE(random_state=42)),
+            ("clf", _SampleWeightClassifier()),
+        ]
+    )
+    with pytest.raises(NotImplementedError, match="does not support"):
+        pipeline.fit(X, y, ros__sample_weight=sample_weight)
+
+
+def test_pipeline_no_sample_weight_unchanged():
+    """Without sample weights the fitting behaviour is fully backward
+    compatible and the estimator does not receive any weight."""
+    X, y, _, _ = _weight_propagation_data()
+
+    pipeline = Pipeline(
+        [
+            ("ros", RandomOverSampler(random_state=42)),
+            ("clf", _SampleWeightClassifier()),
+        ]
+    )
+    pipeline.fit(X, y)
+
+    assert pipeline.named_steps["clf"].sample_weight_ is None
+
+
+def test_pipeline_fit_resample_forwards_sample_weight():
+    """`Pipeline.fit_resample` returns the resampled weights when the final
+    step is a sampler supporting the propagation."""
+    X, y, sample_weight, expected_weight = _weight_propagation_data()
+
+    pipeline = Pipeline([("ros", RandomOverSampler(random_state=42))])
+    X_res, y_res, sample_weight_res = pipeline.fit_resample(
+        X, y, ros__sample_weight=sample_weight
+    )
+
+    assert X_res.shape[0] == 6
+    assert_allclose(sample_weight_res, expected_weight)
+    assert_allclose(sample_weight_res.sum(), sample_weight.sum())
+
+
+def test_pipeline_sample_weight_metadata_routing_opt_out():
+    """An estimator explicitly opting out does not receive the weights."""
+    X, y, sample_weight, _ = _weight_propagation_data()
+
+    with config_context(enable_metadata_routing=True):
+        ros = RandomOverSampler(random_state=42).set_fit_resample_request(
+            sample_weight=True
+        )
+        clf = _SampleWeightClassifier().set_fit_request(sample_weight=False)
+        pipeline = Pipeline([("ros", ros), ("clf", clf)])
+        pipeline.fit(X, y, sample_weight=sample_weight)
+
+        assert pipeline.named_steps["clf"].sample_weight_ is None
+
+
+def test_pipeline_sample_weight_estimator_without_weight_support():
+    """A final estimator whose fit does not accept sample_weight is fitted
+    without receiving the propagated weights instead of raising."""
+    X, y, sample_weight, _ = _weight_propagation_data()
+
+    pipeline = Pipeline(
+        [
+            ("ros", RandomOverSampler(random_state=42)),
+            ("pca", PCA(n_components=1)),
+        ]
+    )
+    X_transformed = pipeline.fit_transform(X, y, ros__sample_weight=sample_weight)
+
+    assert X_transformed.shape == (6, 1)
+    # the prediction chain stays usable and operates on the original rows
+    assert pipeline.transform(X).shape == (4, 1)

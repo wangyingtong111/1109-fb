@@ -309,3 +309,118 @@ def test_random_over_sampler_full_nat():
     assert y_res.shape == (4,)
 
     assert X_res["col_timedelta"].dtype.kind == "m"  # timedelta
+
+
+def test_ros_fit_resample_sample_weight_redistribution():
+    """The weight of a source sample is split equally between its copies.
+
+    The total weight associated with every source sample is preserved and
+    the resampled weights are aligned with the resampled rows.
+    """
+    X = np.arange(8).reshape(4, 2).astype(float)
+    y = np.array([0, 0, 0, 1])
+    sample_weight = np.array([1.0, 2.0, 3.0, 6.0])
+
+    ros = RandomOverSampler(random_state=42)
+    X_res, y_res, sample_weight_res = ros.fit_resample(
+        X, y, sample_weight=sample_weight
+    )
+
+    assert_array_equal(ros.sample_indices_, np.array([0, 1, 2, 3, 3, 3]))
+    assert X_res.shape[0] == sample_weight_res.shape[0]
+    assert_allclose(sample_weight_res, [1.0, 2.0, 3.0, 2.0, 2.0, 2.0])
+
+    # the total weight per source sample is preserved
+    for source_idx in range(X.shape[0]):
+        mask = ros.sample_indices_ == source_idx
+        assert_allclose(
+            sample_weight_res[mask].sum(), sample_weight[source_idx]
+        )
+    assert_allclose(sample_weight_res.sum(), sample_weight.sum())
+
+
+def test_ros_fit_resample_sample_weight_none_returns_two_outputs():
+    """Without sample_weight the historical two-output contract is kept."""
+    X = np.arange(8).reshape(4, 2).astype(float)
+    y = np.array([0, 0, 0, 1])
+
+    output = RandomOverSampler(random_state=42).fit_resample(X, y)
+    assert len(output) == 2
+
+
+def test_ros_fit_resample_sample_weight_conservation():
+    """Check weight conservation on a larger randomized dataset."""
+    X, y = make_classification(
+        n_samples=50,
+        n_classes=2,
+        weights=[0.7, 0.3],
+        n_informative=3,
+        n_redundant=1,
+        random_state=0,
+    )
+    sample_weight = np.random.RandomState(42).rand(X.shape[0]) + 0.1
+
+    ros = RandomOverSampler(random_state=0)
+    _, _, sample_weight_res = ros.fit_resample(
+        X, y, sample_weight=sample_weight
+    )
+
+    assert_allclose(sample_weight_res.sum(), sample_weight.sum())
+    for source_idx in range(X.shape[0]):
+        mask = ros.sample_indices_ == source_idx
+        assert_allclose(
+            sample_weight_res[mask].sum(), sample_weight[source_idx]
+        )
+
+
+def test_ros_fit_resample_sample_weight_sparse():
+    """Weights are also propagated when X is a sparse matrix."""
+    from scipy import sparse
+
+    X = sparse.csr_matrix(np.arange(8).reshape(4, 2).astype(float))
+    y = np.array([0, 0, 0, 1])
+    sample_weight = np.array([1.0, 2.0, 3.0, 6.0])
+
+    X_res, _, sample_weight_res = RandomOverSampler(
+        random_state=42
+    ).fit_resample(X, y, sample_weight=sample_weight)
+
+    assert sparse.issparse(X_res)
+    assert_allclose(sample_weight_res, [1.0, 2.0, 3.0, 2.0, 2.0, 2.0])
+
+
+@pytest.mark.parametrize(
+    "bad_weight, err_message",
+    [
+        (np.ones((4, 1)), "1-dimensional"),
+        (np.ones(3), "inconsistent numbers of samples"),
+    ],
+)
+def test_ros_fit_resample_sample_weight_validation(bad_weight, err_message):
+    """Invalid sample weights raise a clear ValueError."""
+    X = np.arange(8).reshape(4, 2).astype(float)
+    y = np.array([0, 0, 0, 1])
+
+    with pytest.raises(ValueError, match=err_message):
+        RandomOverSampler().fit_resample(X, y, sample_weight=bad_weight)
+
+
+def test_ros_fit_resample_sample_weight_shrinkage_error():
+    """A smoothed bootstrap creates synthetic samples and cannot propagate
+    the source weights."""
+    X = np.arange(8).reshape(4, 2).astype(float)
+    y = np.array([0, 0, 0, 1])
+    sample_weight = np.ones(4)
+
+    with pytest.raises(NotImplementedError, match="shrinkage"):
+        RandomOverSampler(shrinkage=0.5).fit_resample(
+            X, y, sample_weight=sample_weight
+        )
+
+
+def test_ros_sample_weight_tag():
+    """RandomOverSampler advertises sample weight support through its tag."""
+    from imblearn.utils._tags import get_tags
+
+    tags = get_tags(RandomOverSampler())
+    assert tags.sampler_tags.sample_weight is True

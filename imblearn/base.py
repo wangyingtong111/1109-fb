@@ -72,7 +72,7 @@ class SamplerMixin(metaclass=ABCMeta):
         return self
 
     @_fit_context(prefer_skip_nested_validation=True)
-    def fit_resample(self, X, y, **params):
+    def fit_resample(self, X, y, sample_weight=None, **params):
         """Resample the dataset.
 
         Parameters
@@ -83,6 +83,14 @@ class SamplerMixin(metaclass=ABCMeta):
 
         y : array-like of shape (n_samples,)
             Corresponding label for each sample in X.
+
+        sample_weight : array-like of shape (n_samples,), default=None
+            Corresponding weight for each sample in X. The propagation of
+            these weights through the resampling is only supported by
+            samplers tagged with ``sampler_tags.sample_weight=True``. For
+            the other samplers, passing a value different from ``None``
+            raises an error because the synthetic samples they create
+            cannot be traced back to a unique source sample.
 
         **params : dict
             Extra parameters to use by the sampler.
@@ -95,6 +103,11 @@ class SamplerMixin(metaclass=ABCMeta):
 
         y_resampled : array-like of shape (n_samples_new,)
             The corresponding label of `X_resampled`.
+
+        sample_weight_resampled : ndarray of shape (n_samples_new,)
+            The corresponding weight of `X_resampled`. Only returned when
+            `sample_weight` is not None and the sampler supports weight
+            propagation.
         """
         check_classification_targets(y)
         arrays_transformer = ArraysTransformer(X, y)
@@ -104,7 +117,21 @@ class SamplerMixin(metaclass=ABCMeta):
             self.sampling_strategy, y, self._sampling_type
         )
 
-        output = self._fit_resample(X, y, **params)
+        if sample_weight is not None and not _sampler_supports_sample_weight(self):
+            raise NotImplementedError(
+                f"{self.__class__.__name__} does not support the propagation of "
+                "`sample_weight` through `fit_resample`. Only samplers that keep a "
+                "one-to-one correspondence between the resampled rows and the "
+                "original samples (tagged with `sampler_tags.sample_weight=True`) "
+                "can redistribute the weights."
+            )
+
+        if sample_weight is None:
+            output = self._fit_resample(X, y, **params)
+        else:
+            output = self._fit_resample(
+                X, y, sample_weight=sample_weight, **params
+            )
 
         y_ = (
             label_binarize(output[1], classes=np.unique(y)) if binarize_y else output[1]
@@ -180,7 +207,7 @@ class BaseSampler(SamplerMixin, OneToOneFeatureMixin, BaseEstimator):
         """
         return super().fit(X, y, **params)
 
-    def fit_resample(self, X, y, **params):
+    def fit_resample(self, X, y, sample_weight=None, **params):
         """Resample the dataset.
 
         Parameters
@@ -192,6 +219,10 @@ class BaseSampler(SamplerMixin, OneToOneFeatureMixin, BaseEstimator):
         y : array-like of shape (n_samples,)
             Corresponding label for each sample in X.
 
+        sample_weight : array-like of shape (n_samples,), default=None
+            Corresponding weight for each sample in X. Only supported by
+            samplers tagged with ``sampler_tags.sample_weight=True``.
+
         Returns
         -------
         X_resampled : {array-like, dataframe, sparse matrix} of shape \
@@ -200,8 +231,12 @@ class BaseSampler(SamplerMixin, OneToOneFeatureMixin, BaseEstimator):
 
         y_resampled : array-like of shape (n_samples_new,)
             The corresponding label of `X_resampled`.
+
+        sample_weight_resampled : ndarray of shape (n_samples_new,)
+            The corresponding weight of `X_resampled`. Only returned when
+            `sample_weight` is not None.
         """
-        return super().fit_resample(X, y, **params)
+        return super().fit_resample(X, y, sample_weight=sample_weight, **params)
 
     def _more_tags(self):
         return {"X_types": ["2darray", "sparse", "dataframe"]}
@@ -250,6 +285,15 @@ def is_sampler(estimator):
     if hasattr(tags, "sampler_tags") and tags.sampler_tags is not None:
         return True
     return False
+
+
+def _sampler_supports_sample_weight(estimator):
+    """Return True if the sampler can propagate ``sample_weight``."""
+    tags = get_tags(estimator)
+    sampler_tags = getattr(tags, "sampler_tags", None)
+    return sampler_tags is not None and getattr(
+        sampler_tags, "sample_weight", False
+    )
 
 
 class FunctionSampler(BaseSampler):
@@ -388,7 +432,7 @@ class FunctionSampler(BaseSampler):
 
         return self
 
-    def fit_resample(self, X, y):
+    def fit_resample(self, X, y, sample_weight=None):
         """Resample the dataset.
 
         Parameters
@@ -399,6 +443,11 @@ class FunctionSampler(BaseSampler):
         y : array-like of shape (n_samples,)
             Corresponding label for each sample in X.
 
+        sample_weight : array-like of shape (n_samples,), default=None
+            Corresponding weight for each sample in X. `FunctionSampler`
+            does not support weight propagation, therefore passing a value
+            different from ``None`` raises a `NotImplementedError`.
+
         Returns
         -------
         X_resampled : {array-like, sparse matrix} of shape \
@@ -408,6 +457,11 @@ class FunctionSampler(BaseSampler):
         y_resampled : array-like of shape (n_samples_new,)
             The corresponding label of `X_resampled`.
         """
+        if sample_weight is not None:
+            raise NotImplementedError(
+                "FunctionSampler does not support the propagation of "
+                "`sample_weight` through `fit_resample`."
+            )
         self._validate_params()
         arrays_transformer = ArraysTransformer(X, y)
 

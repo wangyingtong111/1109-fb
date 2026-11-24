@@ -87,9 +87,18 @@ class SamplerTags:
     sample_indices : bool, default=False
         Whether the sampler returns the indices of the samples that were
         selected.
+
+    sample_weight : bool, default=False
+        Whether the sampler supports propagating ``sample_weight`` through
+        ``fit_resample``. When set to ``True``, every row of the resampled
+        dataset can be traced back to a row of the original dataset, allowing
+        the weights of the source samples to be redistributed on the
+        resampled rows. Samplers creating synthetic samples for which no such
+        correspondence exists must leave this tag to ``False``.
     """
 
     sample_indices: bool = False
+    sample_weight: bool = False
 
 
 @dataclass(**_dataclass_args())
@@ -238,6 +247,7 @@ def _to_new_tags(old_tags, estimator=None):
     if estimator_type == "sampler":
         sampler_tags = SamplerTags(
             sample_indices=old_tags.get("sample_indices", False),
+            sample_weight=old_tags.get("sample_weight", False),
         )
     else:
         sampler_tags = None

@@ -105,3 +105,39 @@ def test_function_resampler_fit():
     sampler = FunctionSampler(func=func, validate=False)
     sampler.fit(X, y)
     sampler.fit_resample(X, y)
+
+
+def test_sampler_sample_weight_tag_default():
+    """Samplers without row correspondence do not advertise weight support."""
+    from imblearn.over_sampling import SMOTE
+    from imblearn.utils._tags import get_tags
+
+    assert get_tags(RandomUnderSampler()).sampler_tags.sample_weight is False
+    assert get_tags(SMOTE()).sampler_tags.sample_weight is False
+    assert get_tags(FunctionSampler()).sampler_tags.sample_weight is False
+
+
+def test_sampler_fit_resample_rejects_sample_weight_when_unsupported():
+    """A clear error is raised instead of guessing weights for synthetic
+    samples."""
+    from imblearn.over_sampling import SMOTE
+
+    X = np.arange(8).reshape(4, 2).astype(float)
+    y = np.array([0, 0, 0, 1])
+    sample_weight = np.ones(4)
+
+    with pytest.raises(NotImplementedError, match="does not support"):
+        SMOTE().fit_resample(X, y, sample_weight=sample_weight)
+
+    with pytest.raises(NotImplementedError, match="FunctionSampler"):
+        FunctionSampler().fit_resample(X, y, sample_weight=sample_weight)
+
+
+def test_function_sampler_fit_resample_without_weight_unchanged():
+    """FunctionSampler keeps its historical behavior without weights."""
+    X = np.arange(8).reshape(4, 2).astype(float)
+    y = np.array([0, 0, 0, 1])
+
+    X_res, y_res = FunctionSampler().fit_resample(X, y)
+    assert_array_equal(X_res, X)
+    assert_array_equal(y_res, y)
