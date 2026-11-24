@@ -268,3 +268,152 @@ def test_is_exhausted() -> None:
     assert not sampler.is_exhausted(study)
     study.optimize(lambda trial: trial.suggest_categorical("a", [0, 50]))
     assert sampler.is_exhausted(study)
+
+def test_step_grid_sequence_interface() -> None:
+    # Duplicated step numbers are deduplicated, keeping the first occurrences' order.
+    step_grid = samplers.StepGrid([3, 1, 3, 2])
+    assert list(step_grid) == [3, 1, 2]
+    assert len(step_grid) == 3
+    assert step_grid[0] == 3
+    assert 1 in step_grid
+    assert step_grid == samplers.StepGrid([3, 1, 2])
+    assert step_grid != samplers.StepGrid([1, 2, 3])
+    assert repr(step_grid) == "StepGrid(steps=[3, 1, 2])"
+
+    # NumPy integers are accepted as step numbers as well.
+    assert list(samplers.StepGrid(np.arange(0, 3))) == [0, 1, 2]
+
+
+def test_step_grid_deduplicates_equivalent_step_numbers() -> None:
+    def objective(trial: Trial) -> float:
+        return trial.suggest_float("x", 0.0, 1.0, step=0.1)
+
+    # `0.1 + 0.2` computed from increments and `0.3` read from a configuration file are
+    # different floats, but on the ladder defined by `step=0.1` both are unambiguously
+    # represented by step number 3.
+    assert 0.1 + 0.2 != 0.3
+    step_from_increment = round((0.1 + 0.2) / 0.1)
+    step_from_config = round(0.3 / 0.1)
+
+    search_space = {"x": samplers.StepGrid([step_from_increment, step_from_config, 4])}
+    sampler = samplers.GridSampler(search_space)
+    study = optuna.create_study(sampler=sampler)
+    study.optimize(objective)
+
+    # Only the two distinct points, step numbers 3 and 4, are scheduled.
+    assert len(study.trials) == 2
+    suggested_values = sorted(t.params["x"] for t in study.trials)
+    assert suggested_values == [0.3, 0.4]
+    # The canonical value is suggested, not a float artifact such as `0.1 + 0.2`.
+    assert 0.1 + 0.2 not in suggested_values
+
+
+def test_step_grid_with_int_distribution() -> None:
+    def objective(trial: Trial) -> float:
+        return trial.suggest_int("x", 0, 10, step=2)
+
+    search_space = {"x": samplers.StepGrid([0, 3, 5, 5])}
+    study = optuna.create_study(sampler=samplers.GridSampler(search_space))
+    study.optimize(objective)
+
+    assert sorted(t.params["x"] for t in study.trials) == [0, 6, 10]
+
+
+def test_step_grid_mixed_with_plain_values() -> None:
+    def objective(trial: Trial) -> float:
+        x = trial.suggest_float("x", 0.0, 1.0, step=0.1)
+        y = trial.suggest_categorical("y", ["a", "b"])
+        return x if y == "a" else -x
+
+    search_space = {"x": samplers.StepGrid([1, 2]), "y": ["a", "b"]}
+    study = optuna.create_study(sampler=samplers.GridSampler(search_space))
+    study.optimize(objective)
+
+    assert len(study.trials) == 4
+    assert sorted(t.params["x"] for t in study.trials) == [0.1, 0.1, 0.2, 0.2]
+
+
+def test_step_grid_resume_optimization() -> None:
+    def objective(trial: Trial) -> float:
+        return trial.suggest_float("x", 0.0, 1.0, step=0.1)
+
+    search_space = {"x": samplers.StepGrid([3, 3, 4])}
+    with StorageSupplier("sqlite") as storage:
+        sampler = samplers.GridSampler(search_space, seed=0)
+        study = optuna.create_study(sampler=sampler, storage=storage, study_name="step-grid")
+        study.optimize(objective, n_trials=1)
+
+        assert len(study.trials) == 1
+        assert not sampler.is_exhausted(study)
+        # The unfinished step is still visible as an unvisited grid.
+        assert len(sampler._get_unvisited_grid_ids(study)) == 1
+
+        # Resume the study on the same storage with a new sampler instance.
+        new_sampler = samplers.GridSampler(search_space, seed=0)
+        resumed_study = optuna.create_study(
+            sampler=new_sampler, storage=storage, study_name="step-grid", load_if_exists=True
+        )
+        resumed_study.optimize(objective)
+
+        # Each step's completion is still visible after the resume.
+        assert len(resumed_study.trials) == 2
+        assert new_sampler.is_exhausted(resumed_study)
+        assert new_sampler._get_unvisited_grid_ids(resumed_study) == []
+        assert sorted(t.params["x"] for t in resumed_study.trials) == [0.3, 0.4]
+        for t in resumed_study.trials:
+            assert new_sampler._same_search_space(t.system_attrs["search_space"])
+
+
+@pytest.mark.parametrize("steps", [[0.3], [2.5], [0.1 + 0.2], ["3"], [True], [None]])
+def test_step_grid_rejects_non_integer_step_numbers(steps: list) -> None:
+    # Values that do not fall exactly on the distribution's steps are rejected by an
+    # explicit rule: step numbers must be integers.
+    with pytest.raises(ValueError):
+        samplers.StepGrid(steps)
+
+
+@pytest.mark.parametrize("steps", [[-1], [11]])
+def test_step_grid_rejects_out_of_range_step_numbers(steps: list) -> None:
+    def objective(trial: Trial) -> float:
+        return trial.suggest_float("x", 0.0, 1.0, step=0.1)
+
+    study = optuna.create_study(sampler=samplers.GridSampler({"x": samplers.StepGrid(steps)}))
+    with pytest.raises(ValueError):
+        study.optimize(objective, n_trials=1)
+
+
+def test_step_grid_requires_discretized_distribution() -> None:
+    # A continuous float distribution has no ladder of steps.
+    study = optuna.create_study(sampler=samplers.GridSampler({"x": samplers.StepGrid([0, 1])}))
+    with pytest.raises(ValueError):
+        study.optimize(lambda trial: trial.suggest_float("x", 0.0, 1.0), n_trials=1)
+
+    # Neither does a categorical distribution.
+    study = optuna.create_study(sampler=samplers.GridSampler({"x": samplers.StepGrid([0, 1])}))
+    with pytest.raises(ValueError):
+        study.optimize(lambda trial: 0.0 if trial.suggest_categorical("x", ["a", "b"]) else 1.0)
+
+    # Log-scaled distributions are not ladders with equal steps.
+    study = optuna.create_study(sampler=samplers.GridSampler({"x": samplers.StepGrid([0, 1])}))
+    with pytest.raises(ValueError):
+        study.optimize(lambda trial: trial.suggest_int("x", 1, 100, log=True), n_trials=1)
+
+
+def test_plain_float_and_non_uniform_grids_are_unchanged() -> None:
+    def objective(trial: Trial) -> float:
+        return trial.suggest_float("x", 0.0, 1.0, step=0.1)
+
+    # Plain float grids keep the existing behavior: values are used as-is and are neither
+    # snapped to steps nor deduplicated, so `0.1 + 0.2` and `0.3` remain two distinct
+    # grid points.
+    search_space: dict[str, list[GridValueType]] = {"x": [0.1 + 0.2, 0.3]}
+    study = optuna.create_study(sampler=samplers.GridSampler(search_space))
+    study.optimize(objective)
+    assert len(study.trials) == 2
+
+    # Non-uniform grids keep working as before; off-ladder values are only warned about.
+    search_space = {"x": [0.0, 0.25, 0.5, 1.0]}
+    study = optuna.create_study(sampler=samplers.GridSampler(search_space))
+    with pytest.warns(UserWarning):
+        study.optimize(objective)
+    assert sorted(t.params["x"] for t in study.trials) == [0.0, 0.25, 0.5, 1.0]
