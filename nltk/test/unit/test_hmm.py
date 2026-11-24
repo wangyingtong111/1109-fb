@@ -100,5 +100,136 @@ def test_tag_repeated_unseen_word():
     assert tagger._symbols.count("blorp") == 1
 
 
+def _bounded_training_data():
+    # the training alphabet is deliberately restricted to the symbols a, b
+    return [
+        [("a", "A"), ("b", "B")],
+        [("b", "B"), ("a", "A")],
+        [("a", "A"), ("a", "A"), ("b", "B")],
+    ]
+
+
+def _lidstone_estimator():
+    from nltk.probability import LidstoneProbDist
+
+    return lambda fd, bins: LidstoneProbDist(fd, 0.1, bins)
+
+
+def test_unknown_cache_size_validation():
+    trainer = hmm.HiddenMarkovModelTrainer()
+    tagger = trainer.train_supervised(
+        _bounded_training_data(), estimator=_lidstone_estimator()
+    )
+    for bad in (0, -1, 1.5, True, "2"):
+        with pytest.raises(ValueError):
+            hmm.HiddenMarkovModelTagger(
+                tagger._symbols,
+                tagger._states,
+                tagger._transitions,
+                tagger._outputs,
+                tagger._priors,
+                unknown_cache_size=bad,
+            )
+
+
+def test_unknown_cache_keeps_symbol_table_fixed_and_bounds_columns():
+    tagger = hmm.HiddenMarkovModelTagger.train(
+        _bounded_training_data(),
+        estimator=_lidstone_estimator(),
+        unknown_cache_size=2,
+    )
+    assert tagger._symbols == ["a", "b"]
+
+    sentence = [f"u{i}" for i in range(1, 21)]
+    tagger.best_path(sentence)
+
+    # the training symbol table must never absorb prediction-time words
+    assert tagger._symbols == ["a", "b"]
+    # at most two unseen words stay resident in the cache
+    assert len(tagger._unknown_symbol_order) <= 2
+    assert len(tagger._unknown_symbol_map) <= 2
+    # the emission matrix keeps exactly two reusable unknown-word columns
+    assert tagger._cache[1].shape[1] == len(tagger._symbols) + 2
+
+
+def test_unknown_cache_path_matches_uncached_reference():
+    bounded = hmm.HiddenMarkovModelTagger.train(
+        _bounded_training_data(),
+        estimator=_lidstone_estimator(),
+        unknown_cache_size=2,
+    )
+    # an unbounded tagger exercises the pre-existing cached Viterbi path,
+    # while best_path_simple never uses the cache at all
+    unbounded = hmm.HiddenMarkovModelTagger.train(
+        _bounded_training_data(), estimator=_lidstone_estimator()
+    )
+
+    sentence = [f"u{i}" for i in range(1, 21)]
+    expected = unbounded.best_path(sentence)
+    assert bounded.best_path(sentence) == expected
+    assert bounded.best_path(sentence) == bounded.best_path_simple(sentence)
+
+
+def test_unknown_cache_repeated_word_shares_column_and_survives_eviction():
+    tagger = hmm.HiddenMarkovModelTagger.train(
+        _bounded_training_data(),
+        estimator=_lidstone_estimator(),
+        unknown_cache_size=2,
+    )
+    sentence = ["u1", "u1", "u2", "u1", "u3", "u1"]
+    expected = tagger.best_path_simple(sentence)
+
+    assert tagger.best_path(sentence) == expected
+    # every occurrence of u1 resolves to the same resident column
+    u1_columns = {tagger._cached_column("u1") for _ in sentence}
+    assert len(u1_columns) == 1
+    assert len(tagger._unknown_symbol_order) <= 2
+
+
+def test_unknown_cache_preserves_estimator_scores():
+    import numpy as np
+
+    tagger = hmm.HiddenMarkovModelTagger.train(
+        _bounded_training_data(),
+        estimator=_lidstone_estimator(),
+        unknown_cache_size=2,
+    )
+    # fill the cache, then force an eviction and refill a recycled column
+    tagger.best_path(["u1", "u2", "u3"])
+    column = tagger._cache_unknown_symbol("u4")
+
+    output_matrix = tagger._cache[1]
+    for i, state in enumerate(tagger._states):
+        live_score = tagger._output_logprob(state, "u4")
+        cached_score = output_matrix[i, column]
+        assert np.isclose(live_score, cached_score)
+
+
+def test_unknown_cache_reset_rebuilds_consistently():
+    tagger = hmm.HiddenMarkovModelTagger.train(
+        _bounded_training_data(),
+        estimator=_lidstone_estimator(),
+        unknown_cache_size=2,
+    )
+    sentence = ["u1", "u1", "u2", "u1", "u3", "u1"]
+    first_path = tagger.best_path(sentence)
+
+    tagger.reset_cache()
+    assert tagger._cache is None
+    assert tagger._unknown_symbol_map == {}
+    assert tagger._symbols == ["a", "b"]
+
+    assert tagger.best_path(sentence) == first_path
+    assert tagger._symbols == ["a", "b"]
+
+
+def test_default_cache_still_grows_symbol_table():
+    tagger = hmm.HiddenMarkovModelTagger.train(
+        _bounded_training_data(), estimator=_lidstone_estimator()
+    )
+    tagger.best_path(["u1", "u2", "u3"])
+    assert "u1" in tagger._symbols and "u3" in tagger._symbols
+
+
 def setup_module(module):
     pytest.importorskip("numpy")

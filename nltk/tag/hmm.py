@@ -70,6 +70,7 @@ which includes extensive demonstration code.
 """
 
 import itertools
+from collections import deque
 
 try:
     import numpy as np
@@ -135,10 +136,25 @@ class HiddenMarkovModelTagger(TaggerI):
     :param transform: an optional function for transforming training
         instances, defaults to the identity function.
     :type transform: callable
+    :param unknown_cache_size: optional cap on the number of unseen symbols
+        that are kept resident in the prediction cache at once. When set,
+        unseen symbols are never added to the training symbol table; their
+        emission scores are instead kept in a bounded, first-in-first-out
+        cache whose resident columns never exceed this number. When ``None``
+        (the default), unseen symbols are appended to the symbol table and
+        the cache may grow without bound.
+    :type unknown_cache_size: int or None
     """
 
     def __init__(
-        self, symbols, states, transitions, outputs, priors, transform=_identity
+        self,
+        symbols,
+        states,
+        transitions,
+        outputs,
+        priors,
+        transform=_identity,
+        unknown_cache_size=None,
     ):
         self._symbols = unique_list(symbols)
         self._states = unique_list(states)
@@ -147,6 +163,21 @@ class HiddenMarkovModelTagger(TaggerI):
         self._priors = priors
         self._cache = None
         self._transform = transform
+        if unknown_cache_size is not None and (
+            isinstance(unknown_cache_size, bool)
+            or not isinstance(unknown_cache_size, int)
+            or unknown_cache_size < 1
+        ):
+            raise ValueError(
+                "unknown_cache_size must be a positive integer or None, "
+                f"got {unknown_cache_size!r}"
+            )
+        self._unknown_cache_size = unknown_cache_size
+        # bounded cache state, populated by _create_cache():
+        # mapping of resident unseen symbols to their extra O column and
+        # the FIFO queue which decides which symbol is evicted next.
+        self._unknown_symbol_map = {}
+        self._unknown_symbol_order = deque()
 
     @classmethod
     def _train(
@@ -156,6 +187,7 @@ class HiddenMarkovModelTagger(TaggerI):
         unlabeled_sequence=None,
         transform=_identity,
         estimator=None,
+        unknown_cache_size=None,
         **kwargs,
     ):
         if estimator is None:
@@ -176,6 +208,7 @@ class HiddenMarkovModelTagger(TaggerI):
             hmm._outputs,
             hmm._priors,
             transform=transform,
+            unknown_cache_size=unknown_cache_size,
         )
 
         if test_sequence:
@@ -222,6 +255,10 @@ class HiddenMarkovModelTagger(TaggerI):
         :type verbose: bool
         :param max_iterations: number of Baum-Welch iterations to perform
         :type max_iterations: int
+        :param unknown_cache_size: optional cap on the number of unseen
+            symbols kept resident in the prediction cache; see
+            ``HiddenMarkovModelTagger`` for details.
+        :type unknown_cache_size: int or None
         """
         return cls._train(labeled_sequence, test_sequence, unlabeled_sequence, **kwargs)
 
@@ -324,9 +361,13 @@ class HiddenMarkovModelTagger(TaggerI):
         if not self._cache:
             N = len(self._states)
             M = len(self._symbols)
+            # in bounded mode, reserve a fixed number of extra columns that
+            # are recycled among unseen symbols instead of growing the
+            # training symbol table (and the O matrix) without bound.
+            extra = self._unknown_cache_size or 0
             P = np.zeros(N, np.float32)
             X = np.zeros((N, N), np.float32)
-            O = np.zeros((N, M), np.float32)
+            O = np.zeros((N, M + extra), np.float32)
             for i in range(N):
                 si = self._states[i]
                 P[i] = self._priors.logprob(si)
@@ -337,13 +378,69 @@ class HiddenMarkovModelTagger(TaggerI):
             S = {}
             for k in range(M):
                 S[self._symbols[k]] = k
+            if extra:
+                self._unknown_symbol_map = {}
+                self._unknown_symbol_order = deque()
             self._cache = (P, O, X, S)
+
+    def _cache_unknown_symbol(self, symbol):
+        """
+        Ensure an unseen symbol has a resident output column in a bounded
+        cache. The extra columns are recycled first-in-first-out so that no
+        more than ``unknown_cache_size`` unseen symbols stay resident; the
+        recycled column is refilled through the estimator-backed output
+        distribution so that each unseen word keeps the score the estimator
+        assigns to it.
+
+        :return: the column index of the symbol in the output matrix
+        :rtype: int
+        """
+        O = self._cache[1]
+        cap = self._unknown_cache_size
+        if symbol in self._unknown_symbol_map:
+            return self._unknown_symbol_map[symbol]
+        M = len(self._symbols)
+        if len(self._unknown_symbol_order) >= cap:
+            evicted = self._unknown_symbol_order.popleft()
+            column = self._unknown_symbol_map.pop(evicted)
+        else:
+            column = M + len(self._unknown_symbol_order)
+        for i, state in enumerate(self._states):
+            O[i, column] = self._output_logprob(state, symbol)
+        self._unknown_symbol_map[symbol] = column
+        self._unknown_symbol_order.append(symbol)
+        return column
+
+    def _update_unknown_cache(self, symbols):
+        # Pre-cache the unseen symbols of the whole sentence. Scanning the
+        # sentence up front makes repeated occurrences of the same unseen
+        # word share a single column, and any symbol evicted mid-sentence is
+        # simply re-cached on demand in _cached_column().
+        for symbol in symbols:
+            if symbol not in self._cache[3] and symbol not in self._symbols:
+                self._cache_unknown_symbol(symbol)
+
+    def _cached_column(self, symbol):
+        # Look up the output matrix column for a symbol, lazily caching an
+        # unseen symbol when a bounded cache is in use.
+        S = self._cache[3]
+        column = S.get(symbol)
+        if column is None:
+            column = self._unknown_symbol_map.get(symbol)
+            if column is None:
+                column = self._cache_unknown_symbol(symbol)
+        return column
 
     def _update_cache(self, symbols):
         # add new symbols to the symbol table and repopulate the output
         # probabilities and symbol table mapping
         if symbols:
             self._create_cache()
+            if self._unknown_cache_size is not None:
+                # bounded mode: keep the training symbol table fixed and
+                # recycle a small set of columns for unseen symbols
+                self._update_unknown_cache(symbols)
+                return
             P, O, X, S = self._cache
             for symbol in symbols:
                 # S maps every cached symbol, so only new ones scan the list
@@ -369,7 +466,15 @@ class HiddenMarkovModelTagger(TaggerI):
                 self._cache = (P, O, X, S)
 
     def reset_cache(self):
+        """
+        Drop the cached probability matrices. In bounded mode this also
+        evicts every resident unseen symbol, so the next prediction rebuilds
+        the unknown-word cache from scratch while leaving the training symbol
+        table untouched.
+        """
         self._cache = None
+        self._unknown_symbol_map = {}
+        self._unknown_symbol_order.clear()
 
     def best_path(self, unlabeled_sequence):
         """
@@ -390,18 +495,20 @@ class HiddenMarkovModelTagger(TaggerI):
         N = len(self._states)
         self._create_cache()
         self._update_cache(unlabeled_sequence)
-        P, O, X, S = self._cache
+        P, O, X, _ = self._cache
 
         V = np.zeros((T, N), np.float32)
         B = -np.ones((T, N), int)
 
-        V[0] = P + O[:, S[unlabeled_sequence[0]]]
+        V[0] = P + O[:, self._cached_column(unlabeled_sequence[0])]
         states = np.arange(N)
         for t in range(1, T):
             # vs[i, j] is the score of reaching state j at t from state i
             vs = V[t - 1, :, np.newaxis] + X
             best = np.argmax(vs, axis=0)
-            V[t] = vs[best, states] + O[:, S[unlabeled_sequence[t]]]
+            V[t] = vs[best, states] + O[
+                :, self._cached_column(unlabeled_sequence[t])
+            ]
             B[t] = best
 
         current = np.argmax(V[T - 1, :])
