@@ -43,6 +43,57 @@ hypothesis = ["hello duck", "i like python"]
 error = wer(reference, hypothesis)
 ```
 
+## Weighted edit costs
+
+By default substitutions, deletions and insertions each have a unit cost, which
+gives the classical Levenshtein alignment and WER. Some ASR evaluations regard
+substitutions as more severe than missed (deletions) or extra (insertions)
+words. `jiwer.process_words` therefore accepts explicit per-word costs
+(`substitution_cost`, `deletion_cost`, `insertion_cost`). The alignment is
+then selected to minimize the total weighted cost, which is reported on the
+`cost` attribute together with the corresponding edit counts.
+
+```python
+import jiwer
+
+# a substitution costs 3, while a deletion and an insertion each cost 1
+out = jiwer.process_words(
+    "red",
+    "blue",
+    substitution_cost=3,
+    deletion_cost=1,
+    insertion_cost=1,
+)
+
+print(out.cost)            # 2
+print(out.deletions)       # 1
+print(out.insertions)      # 1
+print(out.substitutions)   # 0
+
+# the convenience function returns the total cost directly
+print(jiwer.weighted_wer(
+    "red",
+    "blue",
+    substitution_cost=3,
+    deletion_cost=1,
+    insertion_cost=1,
+))  # 2
+```
+
+With the default unit costs the same pair is instead aligned as a single
+substitution, and the classical WER interpretation is always preserved:
+
+```python
+out = jiwer.process_words("red", "blue")
+
+print(out.substitutions)   # 1
+print(out.wer)             # 1.0
+print(out.cost)            # 1
+```
+
+Note that `cost` is an absolute edit cost, whereas `wer` remains the original
+unit-weight error rate computed from the edit counts of the selected alignment.
+
 ## Character error rate
 
 We also provide the character error rate:

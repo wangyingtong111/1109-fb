@@ -1,5 +1,5 @@
 from .alignment import collect_error_counts, visualize_alignment, visualize_error_counts
-from .measures import cer, mer, wer, wil, wip
+from .measures import cer, mer, weighted_wer, wer, wil, wip
 from .process import (
     AlignmentChunk,
     CharacterOutput,
@@ -45,6 +45,7 @@ __all__ = [
     cer,
     mer,
     wer,
+    weighted_wer,
     wil,
     wip,
     AlignmentChunk,

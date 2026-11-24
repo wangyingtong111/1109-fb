@@ -153,6 +153,21 @@ def visualize_alignment(
             final_str += f"\nwil={output.wil * 100:.2f}%"
             final_str += f"\nwip={output.wip * 100:.2f}%"
             final_str += f"\nwer={output.wer * 100:.2f}%\n"
+
+            # only report the weighted cost when explicit, non-unit costs were
+            # used to select the alignment
+            if (
+                output.substitution_cost != 1
+                or output.deletion_cost != 1
+                or output.insertion_cost != 1
+            ):
+                final_str += (
+                    "\ncost="
+                    f"{output.cost} "
+                    f"(substitution_cost={output.substitution_cost}, "
+                    f"deletion_cost={output.deletion_cost}, "
+                    f"insertion_cost={output.insertion_cost})\n"
+                )
     else:
         # remove last newline
         final_str = final_str[:-1]

@@ -54,6 +54,7 @@ __all__ = [
     "wer",
     "wil",
     "wip",
+    "weighted_wer",
 ]
 
 ########################################################################################
@@ -65,26 +66,97 @@ def wer(
     hypothesis: Union[str, List[str]] = None,
     reference_transform: Union[tr.Compose, tr.AbstractTransform] = wer_default,
     hypothesis_transform: Union[tr.Compose, tr.AbstractTransform] = wer_default,
+    substitution_cost: int = 1,
+    deletion_cost: int = 1,
+    insertion_cost: int = 1,
 ) -> float:
     """
     Calculate the word error rate (WER) between one or more reference and
     hypothesis sentences.
+
+    With the default unit costs this is the classical WER. Explicit per-operation
+    costs can be supplied to select the alignment on the minimum weighted edit
+    cost; the returned WER is still computed with the original (unit-weight)
+    formula from the edit counts of the selected alignment. To obtain the
+    weighted total itself, use
+    [jiwer.weighted_wer][measures.weighted_wer].
 
     Args:
         reference: The reference sentence(s)
         hypothesis: The hypothesis sentence(s)
         reference_transform: The transformation(s) to apply to the reference string(s)
         hypothesis_transform: The transformation(s) to apply to the hypothesis string(s)
+        substitution_cost: The cost of substituting a reference word
+        deletion_cost: The cost of deleting a reference word
+        insertion_cost: The cost of inserting a hypothesis word
 
     Returns:
         (float): The word error rate of the given reference and
                  hypothesis sentence(s).
     """
     output = process_words(
-        reference, hypothesis, reference_transform, hypothesis_transform
+        reference,
+        hypothesis,
+        reference_transform,
+        hypothesis_transform,
+        substitution_cost=substitution_cost,
+        deletion_cost=deletion_cost,
+        insertion_cost=insertion_cost,
     )
 
     return output.wer
+
+
+def weighted_wer(
+    reference: Union[str, List[str]] = None,
+    hypothesis: Union[str, List[str]] = None,
+    reference_transform: Union[tr.Compose, tr.AbstractTransform] = wer_default,
+    hypothesis_transform: Union[tr.Compose, tr.AbstractTransform] = wer_default,
+    substitution_cost: int = 1,
+    deletion_cost: int = 1,
+    insertion_cost: int = 1,
+) -> int:
+    """
+    Calculate the total weighted edit cost between one or more reference and
+    hypothesis sentences under explicit per-operation costs.
+
+    The alignment is chosen to minimize the total cost, which is computed as
+
+    ``substitutions * substitution_cost``
+    ``+ deletions * deletion_cost``
+    ``+ insertions * insertion_cost``.
+
+    For example, with a substitution cost of 3 and deletion and insertion costs
+    of 1, a single mismatched word is cheaper to explain as one deletion plus
+    one insertion (total cost 2) than as one substitution (cost 3).
+
+    Note that this returns an absolute edit cost, not a rate. The classical WER
+    remains available through [jiwer.wer][measures.wer].
+
+    Args:
+        reference: The reference sentence(s)
+        hypothesis: The hypothesis sentence(s)
+        reference_transform: The transformation(s) to apply to the reference string(s)
+        hypothesis_transform: The transformation(s) to apply to the hypothesis string(s)
+        substitution_cost: The cost of substituting a reference word. Must be positive.
+        deletion_cost: The cost of deleting a reference word. Must be positive.
+        insertion_cost: The cost of inserting a hypothesis word. Must be positive.
+
+    Returns:
+        (int): The total weighted edit cost between the reference and
+               hypothesis sentence(s).
+    """
+    output = process_words(
+        reference,
+        hypothesis,
+        reference_transform,
+        hypothesis_transform,
+        substitution_cost=substitution_cost,
+        deletion_cost=deletion_cost,
+        insertion_cost=insertion_cost,
+    )
+
+    return output.cost
 
 
 def mer(
