@@ -1,3 +1,12 @@
+# Unreleased
+## rumale-evaluation_measure
+
+- Allow ROCAUC#score to evaluate a one-dimensional ground truth label vector against a predicted
+  score matrix whose columns are identified by explicit column labels. The new labels, average and
+  skip_undefined options report per-class ROC AUC through score_each_class, and can skip or reject
+  classes that have no positive or negative examples in a validation fold. The existing binary
+  score path, the one-hot ground truth path, and the tied threshold rule are unchanged.
+
 # [[2.2.0](https://github.com/yoshoku/rumale/compare/v2.1.0...v2.2.0)]
 ## all
 
