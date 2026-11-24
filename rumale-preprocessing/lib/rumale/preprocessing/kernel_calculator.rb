@@ -28,20 +28,34 @@ module Rumale
       # @return [Numo::DFloat] (shape: n_components, n_features)
       attr_reader :components
 
+      # Returns the column means of the kernel matrix on the training data.
+      # These values are used for centering the kernel matrix with the training data as a reference.
+      # @return [Numo::DFloat] (shape: n_components)
+      attr_reader :col_means
+
+      # Returns the mean of all elements of the kernel matrix on the training data.
+      # @return [Float]
+      attr_reader :total_mean
+
       # Create a new transformer that transforms feature vectors into a kernel matrix.
       #
       # @param kernel [String] The type of kernel function ('rbf', 'linear', 'poly', and 'sigmoid').
       # @param gamma [Float] The gamma parameter in rbf/poly/sigmoid kernel function.
       # @param degree [Integer] The degree parameter in polynomial kernel function.
       # @param coef [Float] The coefficient in poly/sigmoid kernel function.
-      def initialize(kernel: 'rbf', gamma: 1, degree: 3, coef: 1)
+      # @param center [Boolean] The flag indicating whether to center the kernel matrix
+      #   with the kernel matrix on the training data as a reference.
+      def initialize(kernel: 'rbf', gamma: 1, degree: 3, coef: 1, center: false)
         super()
         @params = {
           kernel: kernel,
           gamma: gamma,
           degree: degree,
-          coef: coef
+          coef: coef,
+          center: center
         }
+        @col_means = nil
+        @total_mean = nil
       end
 
       # Fit the model with given training data.
@@ -53,6 +67,7 @@ module Rumale
         x = ::Rumale::Validation.check_convert_sample_array(x)
 
         @components = x.dup
+        calc_kernel_mat_means if @params[:center]
         self
       end
 
@@ -74,10 +89,20 @@ module Rumale
       def transform(x)
         x = ::Rumale::Validation.check_convert_sample_array(x)
 
-        kernel_mat(x, @components)
+        kernel_mat = kernel_mat(x, @components)
+        return kernel_mat unless @params[:center]
+
+        row_means = kernel_mat.mean(1).expand_dims(1)
+        kernel_mat - @col_means - row_means + @total_mean
       end
 
       private
+
+      def calc_kernel_mat_means
+        kernel_mat = kernel_mat(@components, @components)
+        @col_means = kernel_mat.mean(0)
+        @total_mean = @col_means.mean
+      end
 
       def kernel_mat(x, y)
         case @params[:kernel]

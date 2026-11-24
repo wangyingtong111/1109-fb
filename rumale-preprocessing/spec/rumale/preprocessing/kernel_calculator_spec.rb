@@ -62,4 +62,50 @@ RSpec.describe Rumale::Preprocessing::KernelCalculator do
       end
     end
   end
+
+  describe 'kernel centering' do
+    let(:calculator) { described_class.new(kernel: 'linear', center: true) }
+    let(:x_train) { Numo::DFloat[[1], [3]] }
+    let(:x_single) { Numo::DFloat[[4]] }
+    let(:x_batch) { Numo::DFloat[[4], [1]] }
+
+    it 'centers kernel matrix with the training data as a reference', :aggregate_failures do
+      calculator.fit(x_train)
+      expect(calculator.transform(x_single)).to eq(Numo::DFloat[[-2, 2]])
+      expect(calculator.transform(x_batch)[0, true]).to eq(Numo::DFloat[-2, 2])
+    end
+
+    it 'centers kernel matrix on the training data', :aggregate_failures do
+      kernel_mat = calculator.fit_transform(x_train)
+      expect(kernel_mat).to eq(Numo::DFloat[[1, -1], [-1, 1]])
+      expect(kernel_mat.mean(0)).to eq(Numo::DFloat[0, 0])
+      expect(kernel_mat.mean(1)).to eq(Numo::DFloat[0, 0])
+    end
+
+    it 'stores column means of the kernel matrix on the training data', :aggregate_failures do
+      calculator.fit(x_train)
+      expect(calculator.col_means).to eq(Numo::DFloat[2, 6])
+      expect(calculator.total_mean).to eq(4)
+    end
+
+    it 'restores column means with the dumped model', :aggregate_failures do
+      calculator.fit(x_train)
+      copied = Marshal.load(Marshal.dump(calculator))
+      expect(copied.col_means).to eq(Numo::DFloat[2, 6])
+      expect(copied.total_mean).to eq(4)
+      expect(copied.transform(x_single)).to eq(Numo::DFloat[[-2, 2]])
+    end
+
+    context 'when centering is not enabled' do
+      let(:calculator) { described_class.new(kernel: 'linear') }
+
+      it 'returns the kernel matrix without centering', :aggregate_failures do
+        calculator.fit(x_train)
+        expect(calculator.col_means).to be_nil
+        expect(calculator.total_mean).to be_nil
+        expect(calculator.transform(x_single)).to eq(Numo::DFloat[[4, 12]])
+        expect(calculator.fit_transform(x_train)).to eq(Numo::DFloat[[1, 3], [3, 9]])
+      end
+    end
+  end
 end
