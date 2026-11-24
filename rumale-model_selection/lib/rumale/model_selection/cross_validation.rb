@@ -18,6 +18,14 @@ module Rumale
     #   report = cv.perform(samples, labels)
     #   mean_test_score = report[:test_score].inject(:+) / kf.n_splits
     #
+    # CrossValidation evaluates each split with an unfitted estimator that has the same
+    # configuration as the given estimator, so that the given estimator and the estimators
+    # of other splits never share the state accumulated during training.
+    # If the estimator carries state before training or holds objects that cannot be
+    # marshaled (e.g. Proc), define the #rebuild_estimator method that returns a new
+    # unfitted estimator with the same configuration. Otherwise, the estimator is
+    # deep-copied with Marshal.
+    #
     class CrossValidation
       # Return the classifier of which performance is evaluated.
       # @return [Classifier]
@@ -65,6 +73,8 @@ module Rumale
         report[:train_score] = [] if @return_train_score
         # Evaluate the estimator on each split.
         @splitter.split(x, y).each do |train_ids, test_ids|
+          # Build an unfitted estimator with the same configuration for the split.
+          estimator = clone_estimator
           # Split dataset into training and testing dataset.
           feature_ids = !kernel_machine? || train_ids
           train_x = x[train_ids, feature_ids]
@@ -73,27 +83,35 @@ module Rumale
           test_y = y.shape[1].nil? ? y[test_ids] : y[test_ids, true]
           # Fit the estimator.
           start_time = Time.now.to_i
-          @estimator.fit(train_x, train_y)
+          estimator.fit(train_x, train_y)
           # Calculate scores and prepare the report.
           report[:fit_time].push(Time.now.to_i - start_time)
           if @evaluator.nil?
-            report[:test_score].push(@estimator.score(test_x, test_y))
-            report[:train_score].push(@estimator.score(train_x, train_y)) if @return_train_score
+            report[:test_score].push(estimator.score(test_x, test_y))
+            report[:train_score].push(estimator.score(train_x, train_y)) if @return_train_score
           elsif log_loss?
-            report[:test_score].push(@evaluator.score(test_y, @estimator.predict_proba(test_x)))
+            report[:test_score].push(@evaluator.score(test_y, estimator.predict_proba(test_x)))
             if @return_train_score
               report[:train_score].push(@evaluator.score(train_y,
-                                                         @estimator.predict_proba(train_x)))
+                                                         estimator.predict_proba(train_x)))
             end
           else
-            report[:test_score].push(@evaluator.score(test_y, @estimator.predict(test_x)))
-            report[:train_score].push(@evaluator.score(train_y, @estimator.predict(train_x))) if @return_train_score
+            report[:test_score].push(@evaluator.score(test_y, estimator.predict(test_x)))
+            report[:train_score].push(@evaluator.score(train_y, estimator.predict(train_x))) if @return_train_score
           end
         end
         report
       end
 
       private
+
+      def clone_estimator
+        if @estimator.respond_to?(:rebuild_estimator)
+          @estimator.rebuild_estimator
+        else
+          Marshal.load(Marshal.dump(@estimator))
+        end
+      end
 
       def kernel_machine?
         @estimator.class.name.include?('Rumale::KernelMachine')
