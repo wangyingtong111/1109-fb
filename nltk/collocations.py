@@ -31,6 +31,7 @@ measures are provided in bigram_measures and trigram_measures.
 #   and unigram counts (raw_freq, pmi, student_t)
 
 import itertools as _itertools
+from collections import deque as _deque
 
 # these two unused imports are referenced in collocations.doctest
 from nltk.metrics import (
@@ -155,12 +156,27 @@ class BigramCollocationFinder(AbstractCollocationFinder):
 
     default_ws = 2
 
-    def __init__(self, word_fd, bigram_fd, window_size=2):
+    def __init__(self, word_fd, bigram_fd, window_size=2, n_opportunities=None):
         """Construct a BigramCollocationFinder, given FreqDists for
         appearances of words and (possibly non-contiguous) bigrams.
+
+        :param word_fd: frequency of each word as the head (first member) of
+            a window.
+        :param bigram_fd: frequency of each ordered bigram observed within a
+            window.
+        :param window_size: the number of tokens spanned by each window; the
+            head of the window is paired with every later token in it.
+        :param n_opportunities: the total number of ordered position pairs
+            (bigram opportunities) counted while building the finder.  This
+            is the common denominator ``n_all`` used when scoring.  When not
+            given, it defaults to the number of word outcomes in ``word_fd``,
+            which is the behaviour of :meth:`from_words`.
         """
         AbstractCollocationFinder.__init__(self, word_fd, bigram_fd)
         self.window_size = window_size
+        if n_opportunities is None:
+            n_opportunities = self.N
+        self.n_opportunities = n_opportunities
 
     @classmethod
     def from_words(cls, words, window_size=2):
@@ -184,12 +200,132 @@ class BigramCollocationFinder(AbstractCollocationFinder):
                     bfd[(w1, w2)] += 1
         return cls(wfd, bfd, window_size=window_size)
 
+    @staticmethod
+    def _count_windowed_document(chunks, window_size, word_fd, bigram_fd):
+        """Accumulate the bigram statistics of a single document.
+
+        The document may be handed over as several consecutive ``chunks``
+        (each a sequence of tokens).  Windows are allowed to span the gap
+        between chunks of the same document, so splitting a document into
+        chunks does not change the result, but windows never cross from one
+        document to another because this helper always starts with an empty
+        trailing-token buffer.
+
+        A window of size ``window_size`` pairs each token with every token
+        that follows it within ``window_size - 1`` positions.  A document
+        shorter than the window therefore only contributes the ordered
+        position pairs that actually exist.
+
+        :return: the number of ordered position pairs (bigram opportunities)
+            counted for this document.
+        :rtype: int
+        """
+        n_opportunities = 0
+        # Tokens seen earlier in this document that may still be paired with
+        # an upcoming token; the oldest entry is on the left.
+        preceding = _deque(maxlen=window_size - 1)
+        for chunk in chunks:
+            for token in chunk:
+                for head in preceding:
+                    word_fd[head] += 1
+                    bigram_fd[(head, token)] += 1
+                    n_opportunities += 1
+                preceding.append(token)
+        return n_opportunities
+
+    @classmethod
+    def from_windowed_documents(cls, documents, window_size=3):
+        """Construct a finder from documents, counting by sliding window.
+
+        Unlike :meth:`from_documents` -- which joins its documents into one
+        padded token stream -- this method keeps the documents separate:
+        co-occurrence windows never cross a document boundary, while windows
+        are allowed to span the boundary between consecutive chunks of the
+        same document.
+
+        Each document is given as an iterable of chunks, where every chunk is
+        a sequence of tokens.  A document supplied as a single token list is
+        therefore written as ``[tokens]``.  A caller that streams a long
+        document piece by piece may instead provide several chunks, e.g.
+        ``[[a, b], [c, d]]``, and the window reaching from one chunk into the
+        next is preserved.
+
+        Co-occurrence counts and the total number of bigram opportunities are
+        first accumulated over every document, and only then used for
+        scoring.  Short documents only contribute the ordered position pairs
+        that actually fit inside them; the opportunity count reflects this
+        rather than assuming a full window at every position.
+
+        :param documents: an iterable of documents, each an iterable of
+            token sequences (chunks).
+        :param window_size: the number of token positions spanned by a
+            window; must be at least 2.
+        """
+        if window_size < 2:
+            raise ValueError("Specify window_size at least 2")
+
+        word_fd = FreqDist()
+        bigram_fd = FreqDist()
+        n_opportunities = 0
+        for document in documents:
+            n_opportunities += cls._count_windowed_document(
+                document, window_size, word_fd, bigram_fd
+            )
+        return cls(
+            word_fd,
+            bigram_fd,
+            window_size=window_size,
+            n_opportunities=n_opportunities,
+        )
+
+    @classmethod
+    def merge(cls, *finders):
+        """Merge finders whose statistics were collected independently.
+
+        This allows a corpus to be processed in separate batches -- for
+        example one batch per document -- and combined afterwards.  Merging
+        produces exactly the same finder as feeding every document to a
+        single :meth:`from_windowed_documents` call, because the
+        co-occurrence counts, word counts and bigram opportunity totals are
+        simply summed.
+
+        All finders must use the same ``window_size``.  Candidates removed
+        from a finder by a filter before merging are absent from the merged
+        bigram distribution, but the opportunity total is unaffected, so the
+        common scoring denominator stays the same.
+
+        :param finders: one or more :class:`BigramCollocationFinder`
+            instances built with the same window size.
+        """
+        if not finders:
+            raise ValueError("merge requires at least one finder")
+        window_size = finders[0].window_size
+        for finder in finders:
+            if not isinstance(finder, cls):
+                raise TypeError("merge only combines BigramCollocationFinders")
+            if finder.window_size != window_size:
+                raise ValueError("merge requires a common window_size")
+
+        word_fd = FreqDist()
+        bigram_fd = FreqDist()
+        n_opportunities = 0
+        for finder in finders:
+            word_fd.update(finder.word_fd)
+            bigram_fd.update(finder.ngram_fd)
+            n_opportunities += finder.n_opportunities
+        return cls(
+            word_fd,
+            bigram_fd,
+            window_size=window_size,
+            n_opportunities=n_opportunities,
+        )
+
     def score_ngram(self, score_fn, w1, w2):
         """Returns the score for a given bigram using the given scoring
         function.  Following Church and Hanks (1990), counts are scaled by
         a factor of 1/(window_size - 1).
         """
-        n_all = self.N
+        n_all = self.n_opportunities
         n_ii = self.ngram_fd[(w1, w2)] / (self.window_size - 1.0)
         if not n_ii:
             return
