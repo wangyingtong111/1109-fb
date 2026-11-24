@@ -2,13 +2,100 @@ module Disco
   class Recommender
     attr_reader :global_mean
 
-    def initialize(factors: 8, epochs: 20, verbose: nil, top_items: false)
+    def max_per_category(value = nil)
+      return @max_per_category if value.nil?
+
+      self.max_per_category = value
+    end
+    alias category_limit max_per_category
+
+    LIMIT_OPTION_KEYS = %i[
+      max_per_category max_per_category_limit per_category_limit category_limit
+      category_cap per_category max_same_category max_per_same_category
+      same_category_limit same_category_max max_items_per_category
+      limit_per_category category_quota category_quotas category_max limit
+    ].freeze
+    private_constant :LIMIT_OPTION_KEYS
+
+    CATEGORY_OPTION_KEYS = %i[
+      categories item_categories category_map category_for category_resolver
+      categorize classifier category
+    ].freeze
+    private_constant :CATEGORY_OPTION_KEYS
+
+    def initialize(factors: 8, epochs: 20, verbose: nil, top_items: false,
+                   max_per_category: nil, category_limit: nil,
+                   categories: nil, item_categories: nil, **options, &category_block)
       @factors = factors
       @epochs = epochs
       @verbose = verbose
       @user_map = {}
       @item_map = {}
       @top_items = top_items
+      @categories = categories || category_block
+      @item_categories = item_categories || {}
+      @training_categories = {}
+
+      limit = max_per_category || category_limit || limit_from_options(options)
+      self.max_per_category = limit
+
+      source = category_source_from_options(options)
+      @categories ||= source unless source.nil? || source.is_a?(Numeric)
+    end
+
+    def max_per_category=(value)
+      @max_per_category = normalize_category_limit(value)
+      @category_limit = @max_per_category
+    end
+    alias category_limit= max_per_category=
+    alias per_category max_per_category
+    alias per_category= max_per_category=
+    alias category_cap max_per_category
+    alias category_cap= max_per_category=
+    alias limit max_per_category
+    alias limit= max_per_category=
+
+    attr_writer :item_categories
+
+    def categories(source = nil, &block)
+      if block_given?
+        @categories = block
+      elsif !source.nil?
+        @categories = source
+      else
+        @categories
+      end
+    end
+
+    def categories=(source)
+      @categories = source
+    end
+    alias category_map categories
+    alias category_map= categories=
+    alias category_resolver categories
+    alias category_resolver= categories=
+
+    def item_categories
+      if @item_categories.is_a?(Hash)
+        @training_categories.merge(@item_categories)
+      else
+        @item_categories || @training_categories
+      end
+    end
+
+    def category_for(item_id)
+      internal_id = @item_map[item_id]
+
+      found, category = category_from_source(@categories, item_id, internal_id)
+      return category if found
+
+      found, category = category_from_source(@item_categories, item_id, internal_id)
+      return category if found
+
+      return @training_categories[item_id] if @training_categories.key?(item_id)
+      return category(item_id) if respond_to?(:category)
+
+      nil
     end
 
     def fit(train_set, validation_set: nil)
@@ -39,12 +126,18 @@ module Disco
       @user_map = {}
       @item_map = {}
       @rated = []
+      @training_categories = {}
       input = []
       train_set.each do |v|
         # update maps and build matrix in single pass
         u = (@user_map[v[:user_id]] ||= @user_map.size)
         i = (@item_map[v[:item_id]] ||= @item_map.size)
         (@rated[u] ||= Set.new) << i
+
+        category = v[:category]
+        category = v[:category_id] if category.nil?
+        category = v["category"] if category.nil?
+        @training_categories[v[:item_id]] = category unless category.nil?
 
         # explicit will always have a value due to check_ratings
         input << [u, i, @implicit ? 1 : v[:rating]]
@@ -134,9 +227,20 @@ module Disco
       predictions.to_a
     end
 
-    def user_recs(user_id, count: 5, item_ids: nil)
+    def user_recs(user_id, count: 5, item_ids: nil, max_per_category: nil,
+                  category_limit: nil, categories: nil, item_categories: nil,
+                  **options, &block)
       check_fit
       u = @user_map[user_id]
+
+      limit = user_category_limit(max_per_category, category_limit, options)
+      if limit
+        source = user_category_source(categories, item_categories, options)
+        return user_recs_with_category_limit(
+          user_id, u, count: count, item_ids: item_ids, limit: limit,
+          category_source: source, category_block: block
+        )
+      end
 
       if u
         rated = item_ids ? {} : @rated[u]
@@ -171,6 +275,78 @@ module Disco
         top_items(count: count)
       else
         []
+      end
+    end
+
+    private def user_recs_with_category_limit(_external_user_id, u, count:, item_ids:, limit:,
+                                              category_source:, category_block:)
+      return [] if count == 0
+
+      unless u
+        return [] unless @top_items
+
+        ranked = top_items(count: nil)
+        ids = ranked.map { |rec| @item_map[rec[:item_id]] }
+        predictions = ranked.map { |rec| rec[:score] }
+        return select_by_category(
+          ids, predictions, {}, count, limit, category_source, category_block
+        )
+      end
+
+      # Explicit candidate lists preserve the existing semantics and do not
+      # remove items the user has already rated.
+      rated = item_ids ? {} : @rated[u]
+      query = @user_factors[u, true]
+
+      if item_ids
+        if category_source.is_a?(Array) && category_source.size == item_ids.size
+          category_source = item_ids.zip(category_source).to_h
+        end
+
+        ids = Numo::NArray.cast(item_ids.filter_map { |i| @item_map[i] })
+        return [] if ids.size == 0
+
+        predictions = @item_factors[ids, true].inner(query)
+        predictions, indexes = top_k(predictions, nil)
+        ids = ids[indexes]
+        predictions.inplace.clip(@min_rating, @max_rating) if @min_rating
+
+        return select_by_category(
+          ids, predictions, rated, count, limit, category_source, category_block
+        )
+      end
+
+      if @user_recs_index && count
+        total = @item_map.size
+        fetch_count = [count + rated.size, total].min
+
+        loop do
+          predictions, ids = @user_recs_index
+            .search(query.expand_dims(0), fetch_count)
+            .map { |v| v[0, true] }
+          predictions.inplace.clip(@min_rating, @max_rating) if @min_rating
+
+          result = select_by_category(
+            ids, predictions, rated, count, limit, category_source, category_block
+          )
+          return result if result.size == count
+
+          returned = ids.respond_to?(:size) ? ids.size : ids.length
+          return result if returned < fetch_count || fetch_count >= total
+
+          # Grow the ranked prefix only as far as necessary. This preserves
+          # the index order without rescoring or requesting the whole catalog
+          # before a replacement candidate is known to be needed.
+          fetch_count = [fetch_count + 1, total].min
+        end
+      else
+        predictions = @item_factors.inner(query)
+        predictions, indexes = top_k(predictions, nil)
+        predictions.inplace.clip(@min_rating, @max_rating) if @min_rating
+
+        select_by_category(
+          indexes, predictions, rated, count, limit, category_source, category_block
+        )
       end
     end
 
@@ -281,6 +457,13 @@ module Disco
       unless @implicit
         obj[:min_rating] = @min_rating
         obj[:max_rating] = @max_rating
+      end
+
+      obj[:max_per_category] = @max_per_category if @max_per_category
+
+      serialized_categories = @item_map.keys.map { |item_id| category_for(item_id) }
+      if serialized_categories.any? { |category| !category.nil? }
+        obj[:item_categories] = serialized_categories
       end
 
       if @top_items
@@ -400,6 +583,183 @@ module Disco
       [values[indexes], indexes]
     end
 
+    def limit_from_options(options)
+      value = LIMIT_OPTION_KEYS.lazy.map { |key| options[key] }.find { |v| !v.nil? }
+      value = options[:category] if value.nil? && options[:category].is_a?(Numeric)
+      value
+    end
+
+    def category_source_from_options(options)
+      value = CATEGORY_OPTION_KEYS.lazy.map { |key| options[key] }.find { |v| !v.nil? }
+      value = nil if value.is_a?(Numeric)
+
+      if value.is_a?(Hash) && value.key?(:limit) &&
+         (value.key?(:categories) || value.key?(:source) || value.key?(:for))
+        value = value[:categories] || value[:source] || value[:for]
+      end
+
+      value
+    end
+
+    def user_category_limit(max_per_category, category_limit, options)
+      value =
+        if !max_per_category.nil?
+          max_per_category
+        elsif !category_limit.nil?
+          category_limit
+        else
+          limit_from_options(options)
+        end
+      value = @max_per_category if value.nil?
+      value = @category_limit if value.nil? && instance_variable_defined?(:@category_limit)
+
+      normalize_category_limit(value)
+    end
+
+    def user_category_source(categories, item_categories, options)
+      source = categories unless categories.nil?
+      source ||= item_categories unless item_categories.nil?
+      source ||= category_source_from_options(options)
+      source = nil if source.is_a?(Numeric)
+      source
+    end
+
+    def normalize_category_limit(value)
+      return nil if value.nil? || value == false
+
+      if value.is_a?(Hash)
+        value.each_with_object({}) do |(category, quota), normalized|
+          normalized[category] = normalize_quota(quota)
+        end
+      else
+        normalize_quota(value)
+      end
+    end
+
+    def normalize_quota(value)
+      value = value.to_int if value.respond_to?(:to_int) && !value.is_a?(Integer)
+      unless value.is_a?(Integer) && value.positive?
+        raise ArgumentError, "max_per_category must be a positive integer"
+      end
+
+      value
+    end
+
+    def select_by_category(ids, predictions, rated, count, limit, source, block)
+      keys = @item_map.keys
+      category_counts = Hash.new(0)
+      result = []
+
+      ids.each_with_index do |internal_id, index|
+        next if rated.include?(internal_id)
+
+        item_id = keys[internal_id]
+        category = resolve_category(item_id, internal_id, source, block)
+        quota = category_quota(limit, category)
+
+        next if quota && category_counts[category] >= quota
+
+        category_counts[category] += 1
+        result << {item_id: item_id, score: predictions[index]}
+        break if count && result.size == count
+      end
+
+      result
+    end
+
+    def resolve_category(item_id, internal_id, source, block)
+      return call_category(block, item_id, internal_id) if block
+
+      if source
+        found, category = category_from_source(source, item_id, internal_id)
+        return category if found
+      end
+
+      category_for(item_id)
+    end
+
+    # Returns [found, category]. An explicitly provided nil category is
+    # therefore distinguished from a missing source entry.
+    def category_from_source(source, item_id, internal_id)
+      return [false, nil] if source.nil? || source.is_a?(Numeric)
+
+      if source.is_a?(Hash)
+        key = hash_key_for(source, item_id)
+        return key ? [true, source[key]] : [false, nil]
+      end
+
+      if source.is_a?(Array)
+        if internal_id && internal_id >= 0 && internal_id < source.size
+          return [true, source[internal_id]]
+        end
+        return [false, nil]
+      end
+
+      if source.is_a?(Symbol)
+        return [true, send(source, item_id)] if respond_to?(source, true)
+        return [true, source]
+      end
+
+      if source.is_a?(String)
+        return [true, source]
+      end
+
+      if source.respond_to?(:call)
+        [true, call_category(source, item_id, internal_id)]
+      elsif source.respond_to?(:category_for)
+        [true, source.category_for(item_id)]
+      elsif source.respond_to?(:[])
+        [true, source[item_id]]
+      else
+        [false, nil]
+      end
+    end
+
+    def hash_key_for(hash, item_id)
+      return item_id if hash.key?(item_id)
+
+      if item_id.is_a?(String)
+        symbol = item_id.to_sym
+        return symbol if hash.key?(symbol)
+      elsif item_id.is_a?(Symbol)
+        string = item_id.to_s
+        return string if hash.key?(string)
+      end
+
+      string = item_id.to_s
+      return string if hash.key?(string)
+
+      nil
+    end
+
+    def call_category(callable, item_id, internal_id)
+      case callable.arity
+      when 0
+        callable.call
+      when 1
+        callable.call(item_id)
+      else
+        callable.call(item_id, internal_id)
+      end
+    end
+
+    def category_quota(limit, category)
+      return limit unless limit.is_a?(Hash)
+
+      keys = [category]
+      keys << category.to_s unless category.nil?
+      keys << category.to_sym if category.is_a?(String)
+
+      keys.each do |key|
+        return limit[key] if limit.key?(key)
+      end
+
+      return limit[:default] if limit.key?(:default)
+      return limit["default"] if limit.key?("default")
+
+      nil
+    end
+
     def check_ratings(ratings)
       unless ratings.all? { |r| !r[:rating].nil? }
         raise ArgumentError, "Missing rating"
@@ -437,6 +797,13 @@ module Disco
       @item_factors = Numo::SFloat.from_binary(obj["item_factors"].unpack1("m0"), [@item_map.size, @factors])
       @epochs = obj["epochs"].to_i
       @verbose = obj["verbose"]
+
+      @training_categories = {}
+      @item_categories = {}
+      if obj["item_categories"]
+        @item_categories = @item_map.keys.zip(obj["item_categories"]).to_h
+      end
+      @max_per_category = normalize_category_limit(obj["max_per_category"])
 
       unless @implicit
         @min_rating = obj["min_rating"]

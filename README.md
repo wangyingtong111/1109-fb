@@ -64,6 +64,22 @@ Use the `count` option to specify the number of recommendations (default is 5)
 recommender.user_recs(user_id, count: 3)
 ```
 
+Limit how many recommendations may share a category
+
+```ruby
+categories = {"A" => "tea", "B" => "tea", "C" => "rice"}
+recommender.user_recs(user_id, count: 2, max_per_category: 1, categories: categories)
+# => A (tea), C (rice)
+```
+
+`category_limit:` is an alias, and categories can also be passed as a callable or block:
+
+```ruby
+recommender.user_recs(user_id, max_per_category: 1) { |item_id| category_for(item_id) }
+```
+
+Candidates are considered in their original score order after excluding seen items. Skipped categories do not consume result slots, so later candidates can backfill the list. Items without a category share one missing-category bucket. If category quotas or the catalog are exhausted, a shorter list is returned. Indexed recommendations expand the retrieved prefix only as needed and never fall back to full-catalog scoring for a capped indexed request.
+
 Get predicted ratings for specific users and items
 
 ```ruby

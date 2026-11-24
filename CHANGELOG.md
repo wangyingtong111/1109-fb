@@ -1,3 +1,7 @@
+## 1.0.1 (unreleased)
+
+- Added optional `max_per_category` / `category_limit` recommendations with backfill across full rankings and bounded index prefix expansion
+
 ## 1.0.0 (2026-04-17)
 
 - Switched to `numo-narray-alt`
