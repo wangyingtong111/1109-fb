@@ -34,6 +34,10 @@ if TYPE_CHECKING:
 _logger = logging.get_logger(__name__)
 _suggest_deprecated_msg = "Use suggest_float{args} instead."
 
+#: System attribute key that maps each reported global step to its (optional) phase.
+#: It is only present when a phase is given to :func:`Trial.report`.
+PHASE_ATTR_KEY = "intermediate_value_phases"
+
 
 class Trial(BaseTrial):
     """A trial is a process of evaluating an objective function.
@@ -409,7 +413,7 @@ class Trial(BaseTrial):
 
         return self._suggest(name, CategoricalDistribution(choices=choices))
 
-    def report(self, value: float, step: int) -> None:
+    def report(self, value: float, step: int, *, phase: int | None = None) -> None:
         """Report an objective function value for a given step.
 
         The reported values are used by the pruners to determine whether this trial should be
@@ -475,6 +479,14 @@ class Trial(BaseTrial):
                 :class:`~optuna.pruners.MedianPruner` simply checks if ``step`` is less than
                 ``n_warmup_steps`` as the warmup mechanism.
                 ``step`` must be a non-negative integer.
+            phase:
+                Optional non-negative integer identifying the training phase the reported
+                value belongs to (e.g. ``0`` for main-model training and ``1`` for
+                fine-tuning on a different dataset). When omitted, the report is handled
+                with the phase-agnostic legacy rules. Phase-aware pruners such as
+                :class:`~optuna.pruners.PercentilePruner` with ``phase_isolation=True``
+                compare reports only within the same phase and count steps from zero at
+                the beginning of each phase.
         """
 
         if len(self.study.directions) > 1:
@@ -500,6 +512,18 @@ class Trial(BaseTrial):
         if step < 0:
             raise ValueError(f"`{step=}` must be non-negative.")
 
+        if phase is not None:
+            try:
+                phase = int(phase)
+            except (TypeError, ValueError):
+                message = (
+                    f"The `phase` argument is of type '{type(phase)}' "
+                    "but supposed to be an int."
+                )
+                raise TypeError(message) from None
+            if phase < 0:
+                raise ValueError(f"`{phase=}` must be non-negative.")
+
         if step in self._cached_frozen_trial.intermediate_values:
             # Do nothing if already reported.
             optuna_warn(
@@ -509,6 +533,13 @@ class Trial(BaseTrial):
 
         self.storage.set_trial_intermediate_value(self._trial_id, step, value)
         self._cached_frozen_trial.intermediate_values[step] = value
+
+        if phase is not None:
+            phase_mapping = dict(
+                self.storage.get_trial_system_attrs(self._trial_id).get(PHASE_ATTR_KEY, {})
+            )
+            phase_mapping[step] = phase
+            self.storage.set_trial_system_attr(self._trial_id, PHASE_ATTR_KEY, phase_mapping)
 
     def should_prune(self) -> bool:
         """Suggest whether the trial should be pruned or not.

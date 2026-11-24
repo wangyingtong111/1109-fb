@@ -231,3 +231,124 @@ def test_get_percentile_intermediate_result_over_trials() -> None:
             all_trials, direction, 2, 75, 2
         )
     )
+
+
+def _create_phase_isolated_study(
+    direction: Literal["minimize", "maximize"] = "minimize",
+    n_min_trials: int = 1,
+) -> Study:
+    pruner = optuna.pruners.PercentilePruner(
+        25.0,
+        n_startup_trials=0,
+        n_warmup_steps=0,
+        interval_steps=1,
+        n_min_trials=n_min_trials,
+        phase_isolation=True,
+    )
+    return optuna.study.create_study(direction=direction, pruner=pruner)
+
+
+def test_percentile_pruner_phase_isolation_protects_only_within_phase() -> None:
+    # Main phase (phase=0) of the reference trial has a different number of steps (3)
+    # than that of the current trial (1), and its fine-tune phase (phase=1) reports 5
+    # at phase-local step 0.
+    study = _create_phase_isolated_study()
+    reference = study.ask()
+    reference.report(2, 0, phase=0)
+    reference.report(1, 1, phase=0)
+    reference.report(1, 2, phase=0)
+    reference.report(5, 3, phase=1)
+    study.tell(reference, 5)
+
+    current = study.ask()
+    current.report(1, 0, phase=0)  # Best result of the main phase.
+    current.report(8, 1, phase=1)  # Fine-tune phase-local step 0.
+
+    # The main-phase result (1) must not protect the trial in the fine-tune phase.
+    assert current.should_prune()
+
+
+def test_percentile_pruner_without_phase_isolation_keeps_legacy_rule() -> None:
+    pruner = optuna.pruners.PercentilePruner(25.0, 0, 0, n_min_trials=1)
+    study = optuna.study.create_study(direction="minimize", pruner=pruner)
+
+    reference = study.ask()
+    reference.report(5, 0)
+    study.tell(reference, 5)
+
+    current = study.ask()
+    current.report(1, 0)  # Good historical result protects the trial.
+    current.report(8, 1)
+    assert not current.should_prune()
+
+
+def test_percentile_pruner_phase_isolation_ignored_without_phases() -> None:
+    # Even with phase isolation enabled, unphased reports follow the legacy rule.
+    study = _create_phase_isolated_study()
+    reference = study.ask()
+    reference.report(5, 0)
+    study.tell(reference, 5)
+
+    current = study.ask()
+    current.report(1, 0)
+    current.report(8, 1)
+    assert not current.should_prune()
+
+
+def test_percentile_pruner_phase_isolation_compares_local_steps() -> None:
+    # Trials may have main phases of different lengths; local steps inside the
+    # fine-tune phase are still compared.
+    study = _create_phase_isolated_study()
+
+    first = study.ask()
+    first.report(3, 0, phase=0)
+    first.report(5, 1, phase=1)  # phase-1 local step 0
+    study.tell(first, 5)
+
+    second = study.ask()
+    second.report(3, 0, phase=0)
+    second.report(2, 1, phase=0)
+    second.report(4, 2, phase=1)  # phase-1 local step 0 (global step 2)
+    study.tell(second, 4)
+
+    current = study.ask()
+    current.report(9, 0, phase=0)
+    current.report(8, 1, phase=1)  # phase-1 local step 0
+    assert current.should_prune()
+
+
+def test_percentile_pruner_phase_isolation_respects_n_min_trials() -> None:
+    study = _create_phase_isolated_study(n_min_trials=2)
+    current = study.ask()
+    current.report(1, 0, phase=0)
+    current.report(8, 1, phase=1)
+    # No completed trial reports in phase 1, so the minimum sample count is unmet.
+    assert not current.should_prune()
+
+
+def test_percentile_pruner_phase_isolation_within_phase_protection() -> None:
+    study = _create_phase_isolated_study()
+    reference = study.ask()
+    reference.report(9, 0, phase=0)
+    study.tell(reference, 9)
+
+    current = study.ask()
+    current.report(1, 0, phase=0)  # Best within the same phase still protects.
+    assert not current.should_prune()
+
+
+def test_get_local_step_and_phase_mapping() -> None:
+    study = _create_phase_isolated_study()
+    trial = study.ask()
+    trial.report(3, 0, phase=0)
+    trial.report(2, 1, phase=0)
+    trial.report(5, 2, phase=1)
+    trial.report(4, 3, phase=1)
+    frozen = study._storage.get_trial(trial._trial_id)
+
+    assert _percentile._get_phase_mapping(frozen) == {0: 0, 1: 0, 2: 1, 3: 1}
+    assert _percentile._get_local_step(frozen, 0) == 0
+    assert _percentile._get_local_step(frozen, 1) == 1
+    assert _percentile._get_local_step(frozen, 2) == 0
+    assert _percentile._get_local_step(frozen, 3) == 1
+

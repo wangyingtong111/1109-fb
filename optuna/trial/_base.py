@@ -88,7 +88,7 @@ class BaseTrial(abc.ABC):
         raise NotImplementedError
 
     @abc.abstractmethod
-    def report(self, value: float, step: int) -> None:
+    def report(self, value: float, step: int, *, phase: int | None = None) -> None:
         raise NotImplementedError
 
     @abc.abstractmethod

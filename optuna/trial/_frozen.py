@@ -259,7 +259,7 @@ class FrozenTrial(BaseTrial):
     ) -> CategoricalChoiceType:
         return self._suggest(name, CategoricalDistribution(choices=choices))
 
-    def report(self, value: float, step: int) -> None:
+    def report(self, value: float, step: int, *, phase: int | None = None) -> None:
         """Interface of report function.
 
         Since :class:`~optuna.trial.FrozenTrial` is not pruned,
@@ -276,6 +276,10 @@ class FrozenTrial(BaseTrial):
                 assume that ``step`` starts at zero. For example,
                 :class:`~optuna.pruners.MedianPruner` simply checks if ``step`` is less than
                 ``n_warmup_steps`` as the warmup mechanism.
+            phase:
+                Optional non-negative integer identifying the training phase the reported
+                value belongs to. Ignored because :class:`~optuna.trial.FrozenTrial` is not
+                pruned.
         """
 
         pass

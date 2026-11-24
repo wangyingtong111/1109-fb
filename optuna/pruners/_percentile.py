@@ -9,6 +9,7 @@ import numpy as np
 from optuna.pruners import BasePruner
 from optuna.study._study_direction import StudyDirection
 from optuna.trial._state import TrialState
+from optuna.trial._trial import PHASE_ATTR_KEY
 
 
 if TYPE_CHECKING:
@@ -16,11 +17,54 @@ if TYPE_CHECKING:
 
     import optuna
 
+#: System attribute key that maps each reported global step to its (optional) phase.
+#: It is only present when a phase is given to :func:`optuna.trial.Trial.report`.
+_PHASE_ATTR_KEY = PHASE_ATTR_KEY
+
+
+def _get_phase_mapping(trial: "optuna.trial.FrozenTrial") -> dict[int, int]:
+    """Return the ``global step -> phase`` mapping recorded for the trial.
+
+    Trials whose reports never specify a phase have no such attribute and are handled
+    by the legacy, phase-agnostic rules.
+    """
+    phases = trial.system_attrs.get(_PHASE_ATTR_KEY)
+    if phases is None:
+        return {}
+    # System attribute keys are serialized as strings in some storage backends.
+    return {int(step): phase for step, phase in phases.items()}
+
+
+def _get_local_step(trial: "optuna.trial.FrozenTrial", step: int) -> int:
+    """Return the step local to the phase that ``step`` belongs to.
+
+    Steps of different trials inside the same phase are counted from zero, so trials
+    whose main (previous) phase has a different number of steps remain comparable.
+    """
+    phases = _get_phase_mapping(trial)
+    if step not in phases:
+        return step
+    phase = phases[step]
+    return sum(1 for s, p in phases.items() if p == phase and s <= step) - 1
+
 
 def _get_best_intermediate_result_over_steps(
-    trial: "optuna.trial.FrozenTrial", direction: StudyDirection
+    trial: "optuna.trial.FrozenTrial",
+    direction: StudyDirection,
+    phase: int | None = None,
 ) -> float:
-    values = np.asarray(list(trial.intermediate_values.values()), dtype=float)
+    if phase is not None:
+        phases = _get_phase_mapping(trial)
+        values = np.asarray(
+            [
+                value
+                for step, value in trial.intermediate_values.items()
+                if phases.get(step) == phase
+            ],
+            dtype=float,
+        )
+    else:
+        values = np.asarray(list(trial.intermediate_values.values()), dtype=float)
     if values.size > 0 and np.isnan(values).all():
         # `np.nanmin`/`np.nanmax` would return NaN for an all-NaN input anyway, but they also
         # emit an "All-NaN slice encountered" RuntimeWarning while doing so.
@@ -36,14 +80,32 @@ def _get_percentile_intermediate_result_over_trials(
     step: int,
     percentile: float,
     n_min_trials: int,
+    phase: int | None = None,
 ) -> float:
     if len(completed_trials) == 0:
         raise ValueError("No trials have been completed.")
 
-    intermediate_values = np.array(
-        [t.intermediate_values[step] for t in completed_trials if step in t.intermediate_values],
-        dtype=float,
-    )
+    if phase is not None:
+        values_at_local_step: list[float] = []
+        for trial in completed_trials:
+            phases = _get_phase_mapping(trial)
+            for global_step, step_phase in phases.items():
+                if (
+                    step_phase == phase
+                    and _get_local_step(trial, global_step) == step
+                    and global_step in trial.intermediate_values
+                ):
+                    values_at_local_step.append(trial.intermediate_values[global_step])
+        intermediate_values = np.asarray(values_at_local_step, dtype=float)
+    else:
+        intermediate_values = np.array(
+            [
+                t.intermediate_values[step]
+                for t in completed_trials
+                if step in t.intermediate_values
+            ],
+            dtype=float,
+        )
     if len(intermediate_values) < n_min_trials or np.isnan(intermediate_values).all():
         return math.nan
 
@@ -141,6 +203,14 @@ class PercentilePruner(BasePruner):
             If the number of reported intermediate values from all trials at the current step
             is less than ``n_min_trials``, the trial will not be pruned. This can be used to ensure
             that a minimum number of trials are run to completion without being pruned.
+        phase_isolation:
+            If :obj:`True`, reports carrying a phase (see the ``phase`` argument of
+            :func:`optuna.trial.Trial.report`) are judged only against reports of the same
+            phase at the same phase-local step. A good result achieved in an earlier phase
+            (e.g. a low loss of the main model before fine-tuning) therefore no longer
+            protects the trial once a later phase starts. Steps are counted from zero within
+            each phase, so trials whose earlier phases have different lengths are still
+            comparable. Reports without a phase keep using the phase-agnostic legacy rules.
     """
 
     def __init__(
@@ -151,6 +221,7 @@ class PercentilePruner(BasePruner):
         interval_steps: int = 1,
         *,
         n_min_trials: int = 1,
+        phase_isolation: bool = False,
     ) -> None:
         if not 0.0 <= percentile <= 100:
             raise ValueError(
@@ -178,6 +249,7 @@ class PercentilePruner(BasePruner):
         self._n_warmup_steps = n_warmup_steps
         self._interval_steps = interval_steps
         self._n_min_trials = n_min_trials
+        self._phase_isolation = phase_isolation
 
     def prune(self, study: "optuna.study.Study", trial: "optuna.trial.FrozenTrial") -> bool:
         completed_trials = study.get_trials(deepcopy=False, states=(TrialState.COMPLETE,))
@@ -193,22 +265,43 @@ class PercentilePruner(BasePruner):
         if step is None:
             return False
 
+        phase: int | None = None
+        if self._phase_isolation:
+            phase = _get_phase_mapping(trial).get(step)
+            if phase is not None:
+                # Compare against other trials within the phase, where steps restart at zero.
+                step = _get_local_step(trial, trial.last_step)
+
         n_warmup_steps = self._n_warmup_steps
         if step < n_warmup_steps:
             return False
 
+        if phase is None:
+            interval_steps_keys = trial.intermediate_values.keys()
+        else:
+            phases = _get_phase_mapping(trial)
+            interval_steps_keys = {
+                _get_local_step(trial, s) for s, p in phases.items() if p == phase
+            }
         if not _is_first_in_interval_step(
-            step, trial.intermediate_values.keys(), n_warmup_steps, self._interval_steps
+            step, interval_steps_keys, n_warmup_steps, self._interval_steps
         ):
             return False
 
         direction = study.direction
-        best_intermediate_result = _get_best_intermediate_result_over_steps(trial, direction)
+        best_intermediate_result = _get_best_intermediate_result_over_steps(
+            trial, direction, phase
+        )
         if math.isnan(best_intermediate_result):
             return True
 
         p = _get_percentile_intermediate_result_over_trials(
-            completed_trials, direction, step, self._percentile, self._n_min_trials
+            completed_trials,
+            direction,
+            step,
+            self._percentile,
+            self._n_min_trials,
+            phase,
         )
         if math.isnan(p):
             return False

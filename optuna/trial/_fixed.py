@@ -126,7 +126,7 @@ class FixedTrial(BaseTrial):
     ) -> CategoricalChoiceType:
         return self._suggest(name, CategoricalDistribution(choices=choices))
 
-    def report(self, value: float, step: int) -> None:
+    def report(self, value: float, step: int, *, phase: int | None = None) -> None:
         pass
 
     def should_prune(self) -> bool:

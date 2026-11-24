@@ -652,6 +652,33 @@ def test_report_warning() -> None:
         trial.report(1, 1)
 
 
+def test_report_phase() -> None:
+    from optuna.trial._trial import PHASE_ATTR_KEY
+
+    study = create_study()
+    trial = study.ask()
+
+    # Reports without a phase leave no phase mapping behind.
+    trial.report(1.0, 0)
+    trial.report(2.0, 1)
+    assert PHASE_ATTR_KEY not in trial.storage.get_trial_system_attrs(trial._trial_id)
+
+    # Phased reports are persisted alongside the intermediate values.
+    trial.report(3.0, 2, phase=0)
+    trial.report(4.0, 3, phase=1)
+    mapping = trial.storage.get_trial_system_attrs(trial._trial_id)[PHASE_ATTR_KEY]
+    assert mapping == {2: 0, 3: 1} or mapping == {"2": 0, "3": 1}
+
+    # Values that can be cast to int are accepted as phases.
+    trial.report(5.0, 4, phase=1.0)
+
+    # Invalid phases are rejected.
+    with pytest.raises(TypeError):
+        trial.report(1.0, 5, phase="foo")  # type: ignore
+    with pytest.raises(ValueError):
+        trial.report(1.0, 6, phase=-1)
+
+
 def test_suggest_with_multi_objectives() -> None:
     study = create_study(directions=["maximize", "maximize"])
 
