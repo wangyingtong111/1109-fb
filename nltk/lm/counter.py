@@ -110,9 +110,23 @@ class NgramCounter:
         self._counts[1] = self.unigrams = FreqDist()
         #: Number of distinct ngrams stored, tracked for the ``MAX_NGRAMS`` guard.
         self._distinct = 0
+        #: Monotonic revision used by caches that must observe removals/rebuilds.
+        self._revision = 0
 
         if ngram_text:
             self.update(ngram_text)
+
+    def clear(self):
+        """Remove all counted ngrams while preserving this counter object.
+
+        Incremental vocabulary training replays retained raw ngrams after a
+        rare word is promoted.  Clearing in place keeps references held by
+        smoothing objects valid.
+        """
+        self._counts = defaultdict(ConditionalFreqDist)
+        self._counts[1] = self.unigrams = FreqDist()
+        self._distinct = 0
+        self._revision += 1
 
     def update(self, ngram_text):
         """Updates ngram counts from `ngram_text`.

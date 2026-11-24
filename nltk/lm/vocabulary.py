@@ -8,9 +8,26 @@
 
 import sys
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from functools import singledispatch
 from itertools import chain
+
+
+class PositionIndex(dict):
+    """Mapping from a word to its recorded positions.
+
+    The index supports both mapping and call syntax so callers can use either
+    ``index[word]`` or ``index(word)``.  A missing word is initialised to an
+    empty list for the mapping access form.
+    """
+
+    def __missing__(self, word):
+        positions = []
+        self[word] = positions
+        return positions
+
+    def __call__(self, word):
+        return self[word]
 
 
 @singledispatch
@@ -124,7 +141,14 @@ class Vocabulary:
     3
     """
 
-    def __init__(self, counts=None, unk_cutoff=1, unk_label="<UNK>"):
+    def __init__(
+        self,
+        counts=None,
+        unk_cutoff=1,
+        unk_label="<UNK>",
+        track_occurrences=False,
+        incremental=False,
+    ):
         """Create a new Vocabulary.
 
         :param counts: Optional iterable or `collections.Counter` instance to
@@ -133,6 +157,10 @@ class Vocabulary:
         :param int unk_cutoff: Words that occur less frequently than this value
                                are not considered part of the vocabulary.
         :param unk_label: Label for marking words not part of vocabulary.
+        :param bool track_occurrences: Record the integer positions of tokens
+                               supplied through iterable updates. This is used
+                               by incremental training to recover rare words.
+        :param bool incremental: Alias for ``track_occurrences``.
 
         """
         self.unk_label = unk_label
@@ -141,6 +169,15 @@ class Vocabulary:
         self._cutoff = unk_cutoff
 
         self.counts = Counter()
+        self.incremental = incremental
+        self.track_occurrences = track_occurrences or incremental
+        #: Flat token-stream positions from iterable vocabulary updates.
+        self.token_positions = PositionIndex()
+        self.positions = self.token_positions
+        self.occurrences = self.token_positions
+        #: Structural ngram locations supplied by :class:`LanguageModel`.
+        self.locations = PositionIndex()
+        self._next_token_position = 0
         self.update(counts if counts is not None else "")
 
     @property
@@ -152,14 +189,101 @@ class Vocabulary:
         """
         return self._cutoff
 
-    def update(self, *counter_args, **counter_kwargs):
+    def update(
+        self,
+        *counter_args,
+        track_occurrences=None,
+        incremental=None,
+        track_positions=None,
+        remember_positions=None,
+        **counter_kwargs,
+    ):
         """Update vocabulary counts.
 
-        Wraps `collections.Counter.update` method.
-
+        Wraps `collections.Counter.update` method. When occurrence tracking is
+        enabled and the first argument is a token iterable, its positions are
+        recorded before the counts are updated.
         """
+        record = (
+            self.track_occurrences
+            or bool(track_occurrences)
+            or bool(incremental)
+            or bool(track_positions)
+            or bool(remember_positions)
+        )
+        if incremental:
+            self.incremental = True
+        if track_occurrences or incremental:
+            self.track_occurrences = True
+
+        tokens = None
+        if (
+            record
+            and counter_args
+            and isinstance(counter_args[0], Iterable)
+            and not isinstance(counter_args[0], Mapping)
+        ):
+            # Materialise generators once so both position recording and the
+            # counter see the same tokens.
+            tokens = list(counter_args[0])
+            counter_args = (tokens, *counter_args[1:])
+
         self.counts.update(*counter_args, **counter_kwargs)
+
+        if tokens is not None:
+            start = self._next_token_position
+            for offset, word in enumerate(tokens):
+                self.token_positions[word].append(start + offset)
+            self._next_token_position += len(tokens)
+
         self._len = sum(1 for _ in self)
+
+    def record_location(self, word, location):
+        """Record a structural location where ``word`` occurs."""
+        self.locations[word].append(location)
+
+    def occurrence_positions(self, word):
+        """Return flat token-stream positions recorded for ``word``."""
+        return list(self.token_positions.get(word, ()))
+
+    def positions_for(self, word):
+        """Alias for :meth:`occurrence_positions`."""
+        return self.occurrence_positions(word)
+
+    def get_positions(self, word):
+        """Alias for :meth:`occurrence_positions`."""
+        return self.occurrence_positions(word)
+
+    def position(self, word):
+        """Alias for :meth:`occurrence_positions`."""
+        return self.occurrence_positions(word)
+
+    def recover_positions(self, word):
+        """Recover recorded flat positions for a rare or promoted word."""
+        return self.occurrence_positions(word)
+
+    restore_positions = recover_positions
+
+    def structural_positions(self, word):
+        """Return ngram/batch locations recorded for ``word``."""
+        return list(self.locations.get(word, ()))
+
+    def low_frequency_words(self):
+        """Return seen words that are currently masked as unknown."""
+        return [word for word in self.counts if word not in self]
+
+    def low_frequency_positions(self):
+        """Map each currently rare word to its flat token positions."""
+        return {
+            word: self.occurrence_positions(word)
+            for word in self.low_frequency_words()
+        }
+
+    # Concise aliases for callers using the terminology from incremental
+    # training/debugging.
+    low_freq_positions = low_frequency_positions
+    unknown_positions = low_frequency_positions
+    oov_positions = low_frequency_positions
 
     def lookup(self, words):
         """Look up one or more words in the vocabulary.
@@ -215,4 +339,32 @@ class Vocabulary:
     def __str__(self):
         return "<{} with cutoff={} unk_label='{}' and {} items>".format(
             self.__class__.__name__, self.cutoff, self.unk_label, len(self)
+        )
+
+    def __getstate__(self):
+        return self.__dict__.copy()
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        # Instances pickled before position tracking was added lack these
+        # attributes.
+        self.__dict__.setdefault("track_occurrences", False)
+        self.__dict__.setdefault("incremental", False)
+        positions = self.__dict__.setdefault("token_positions", PositionIndex())
+        self.__dict__.setdefault("positions", positions)
+        self.__dict__.setdefault("occurrences", positions)
+        self.__dict__.setdefault("locations", PositionIndex())
+        self.__dict__.setdefault("_next_token_position", 0)
+
+
+class IncrementalVocabulary(Vocabulary):
+    """A :class:`Vocabulary` that remembers token positions by default."""
+
+    def __init__(self, counts=None, unk_cutoff=1, unk_label="<UNK>"):
+        super().__init__(
+            counts,
+            unk_cutoff=unk_cutoff,
+            unk_label=unk_label,
+            track_occurrences=True,
+            incremental=True,
         )

@@ -220,10 +220,11 @@ from nltk.lm.models import (
     StupidBackoff,
     WittenBellInterpolated,
 )
-from nltk.lm.vocabulary import Vocabulary
+from nltk.lm.vocabulary import IncrementalVocabulary, Vocabulary
 
 __all__ = [
     "Vocabulary",
+    "IncrementalVocabulary",
     "NgramCounter",
     "MLE",
     "Lidstone",

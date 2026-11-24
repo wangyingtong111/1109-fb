@@ -134,7 +134,11 @@ class KneserNey(Smoothing):
         # setdefault: a model pickled before this cache existed has no attribute.
         cache = self.__dict__.setdefault("_continuation_cache", {})
         # NgramCounter.update() bumps _distinct whenever it stores a new ngram.
-        version = getattr(self.counts, "_distinct", None)
+        # _revision additionally changes when counts are cleared/rebuilt.
+        version = (
+            getattr(self.counts, "_revision", 0),
+            getattr(self.counts, "_distinct", None),
+        )
         if order not in cache or cache[order][0] != version:
             word_counts = Counter(
                 (prefix_ngram[1:], word)
