@@ -23,6 +23,14 @@ Bug fixes
   of failing with an opaque ``zero-size array`` NumPy error.
   :issue:`1035` by :user:`Imran Ahamed <immu4989>`.
 
+- Fix a bug in :class:`~imblearn.over_sampling.ADASYN` where the number of
+  synthetic samples allocated to each minority sample was rounded independently,
+  leading to generating more or fewer samples than requested (and even raising an
+  error when every quota rounded down to zero). The quotas are now allocated with
+  a largest-remainder method so that they sum exactly to the requested number of
+  samples, with deterministic index-based tie breaking for samples of equal
+  difficulty.
+
 - Compatibility
 
 Version 0.14.1

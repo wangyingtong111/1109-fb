@@ -3,6 +3,8 @@
 #          Christos Aridas
 # License: MIT
 
+from collections import Counter
+
 import numpy as np
 from sklearn.neighbors import NearestNeighbors
 from sklearn.utils._testing import assert_allclose, assert_array_equal
@@ -119,3 +121,80 @@ def test_ada_fit_resample_nn_obj():
     )
     assert_allclose(X_resampled, X_gt, rtol=R_TOL)
     assert_array_equal(y_resampled, y_gt)
+
+
+def test_ada_generates_exact_number_of_samples():
+    """Check that the per-sample quotas sum to the requested sample count.
+
+    Independent rounding of each quota used to either drop samples (all
+    quotas rounded down to zero) or create extra samples. The allocation
+    must rely on a largest-remainder scheme so that the target of the
+    sampling strategy is treated as the true number of samples to
+    generate.
+    """
+    # Three minority samples at 0, 10 and 20 with a single majority
+    # neighbour each (0.1, 10.1 and 20.1) and two additional majority
+    # samples far away. With ``n_neighbors=1`` every minority sample has
+    # the same difficulty (ratio of 1 / 3).
+    X = np.array(
+        [[0.0], [10.0], [20.0], [0.1], [10.1], [20.1], [100.0], [101.0]]
+    )
+    y = np.array([1, 1, 1, 0, 0, 0, 0, 0])
+
+    majority_X = X[y == 0]
+    for n_new_samples in (1, 2):
+        ada = ADASYN(
+            sampling_strategy={1: 3 + n_new_samples},
+            n_neighbors=1,
+            random_state=RND_SEED,
+        )
+        X_resampled, y_resampled = ada.fit_resample(X, y)
+
+        # exactly the requested number of minority samples is created
+        assert Counter(y_resampled.tolist()) == {
+            0: 5,
+            1: 3 + n_new_samples,
+        }
+        assert len(X_resampled) == len(X) + n_new_samples
+        # the five original majority samples are left untouched
+        assert_array_equal(
+            np.sort(X_resampled[y_resampled == 0].ravel()),
+            np.sort(majority_X.ravel()),
+        )
+        # the original minority samples are kept as well
+        minority_values = X_resampled[y_resampled == 1].ravel()
+        for minority_sample in X[y == 1].ravel():
+            assert minority_sample in minority_values
+        # with k=1 the single neighbour of a minority sample is another
+        # minority sample, so every synthetic sample lies between two of
+        # the original minority samples
+        X_new = X_resampled[len(X):]
+        assert np.all(X_new >= 0.0)
+        assert np.all(X_new <= 20.0)
+
+
+def test_ada_allocation_sums_to_target_and_is_reproducible():
+    """Largest-remainder allocation keeps the exact total on any dataset."""
+    rng = np.random.RandomState(42)
+    X = rng.normal(size=(40, 2))
+    y = np.array([0] * 30 + [1] * 10)
+
+    for n_new_samples in range(1, 12):
+        ada = ADASYN(
+            sampling_strategy={1: 10 + n_new_samples},
+            n_neighbors=3,
+            random_state=RND_SEED,
+        )
+        X_resampled, y_resampled = ada.fit_resample(X, y)
+        assert np.sum(y_resampled == 1) == 10 + n_new_samples
+        assert len(X_resampled) == 40 + n_new_samples
+
+        # a fixed random state makes the interpolation reproducible
+        ada_bis = ADASYN(
+            sampling_strategy={1: 10 + n_new_samples},
+            n_neighbors=3,
+            random_state=RND_SEED,
+        )
+        X_bis, y_bis = ada_bis.fit_resample(X, y)
+        assert_allclose(X_resampled, X_bis)
+        assert_array_equal(y_resampled, y_bis)

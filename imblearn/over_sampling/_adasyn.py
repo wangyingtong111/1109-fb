@@ -109,7 +109,7 @@ class ADASYN(BaseOverSampler):
     >>> ada = ADASYN(random_state=42)
     >>> X_res, y_res = ada.fit_resample(X, y)
     >>> print('Resampled dataset shape %s' % Counter(y_res))
-    Resampled dataset shape Counter({{0: 904, 1: 900}})
+    Resampled dataset shape Counter({{0: 900, 1: 900}})
     """
 
     _parameter_constraints: dict = {
@@ -166,13 +166,20 @@ class ADASYN(BaseOverSampler):
                     " Use SMOTE instead."
                 )
             ratio_nn /= np.sum(ratio_nn)
-            n_samples_generate = np.rint(ratio_nn * n_samples).astype(int)
-            # rounding may cause new amount for n_samples
-            n_samples = np.sum(n_samples_generate)
-            if not n_samples:
-                raise ValueError(
-                    "No samples will be generated with the provided ratio settings."
-                )
+            # Allocate the number of samples to generate per minority sample
+            # with the largest-remainder method. Rounding each quota on its
+            # own (e.g. with ``np.rint``) would either generate more samples
+            # than requested or drop some of them. The integer quotas below
+            # therefore sum exactly to ``n_samples`` while preserving the
+            # contribution of the hardest (highest ratio) samples. Ties on
+            # the fractional part are broken by the (stable) sample index so
+            # that equal-difficulty cases lead to reproducible results.
+            quotas = ratio_nn * n_samples
+            n_samples_generate = np.floor(quotas).astype(int)
+            n_remaining = n_samples - n_samples_generate.sum()
+            fractional_parts = quotas - n_samples_generate
+            allocation_order = np.argsort(-fractional_parts, kind="stable")
+            n_samples_generate[allocation_order[:n_remaining]] += 1
 
             # the nearest neighbors need to be fitted only on the current class
             # to find the class NN to generate new samples
