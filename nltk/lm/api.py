@@ -36,6 +36,10 @@ class Smoothing(metaclass=ABCMeta):
         self.vocab = vocabulary
         self.counts = counter
 
+    def subtract(self, ngram_text=None, **kwargs):
+        """Subtract ngrams through the underlying strict NgramCounter API."""
+        return self.counts.subtract(ngram_text, **kwargs)
+
     @abstractmethod
     def unigram_score(self, word):
         raise NotImplementedError()
@@ -115,6 +119,25 @@ class LanguageModel(metaclass=ABCMeta):
                 )
             self.vocab.update(vocabulary_text)
         self.counts.update(self.vocab.lookup(sent) for sent in text)
+
+    def subtract(self, text):
+        """Subtract ngrams in ``text`` from the fitted counts.
+
+        Unlike :meth:`fit`, this never updates the vocabulary: the existing,
+        frozen vocabulary is only used to normalize tokens.  ``text`` uses
+        the same ngram-sequence format as :meth:`fit`.  Requests that would
+        make an ngram count negative raise ``ValueError`` before any count is
+        changed.
+        """
+        self.counts.subtract(self.vocab.lookup(sent) for sent in text)
+
+    #: Conventional aliases for callers using fit/unfit or explicit wording.
+    unfit = subtract
+    deduct = subtract
+    remove = subtract
+    remove_text = subtract
+    subtract_ngrams = subtract
+    subtract_text = subtract
 
     def score(self, word, context=None):
         """Masks out of vocab (OOV) words and computes their model score.

@@ -15,6 +15,7 @@ from collections import Counter
 from operator import methodcaller
 
 from nltk.lm.api import Smoothing
+from nltk.lm.counter import _ChangeTrackingFreqDist
 from nltk.probability import ConditionalFreqDist
 
 
@@ -82,9 +83,11 @@ class KneserNey(Smoothing):
 
     This is an extension of smoothing with a discount.
 
-    Continuation counts are cached between scores and rebuilt when fit()
-    or NgramCounter.update() stores a new ngram, so change the counts
-    through those methods rather than by editing counts directly.
+    Continuation counts are cached between scores and rebuilt when the
+    positive ngram topology changes.  `fit()`, `NgramCounter.update()`, and
+    `NgramCounter.subtract()` maintain the version automatically; decrementing
+    a count through the nested mapping also invalidates the cache when an
+    ngram type reaches zero.
 
     Resources:
     - https://pages.ucsd.edu/~rlevy/lign256/winter2008/kneser_ney_mini_example.pdf
@@ -101,6 +104,12 @@ class KneserNey(Smoothing):
 
     def unigram_score(self, word):
         word_continuation_count, total_count = self._continuation_counts(word)
+        if total_count == 0:
+            # No continuation types remain (for example after subtracting all
+            # trained ngrams). A frozen non-empty vocabulary falls back to the
+            # uniform distribution rather than dividing by zero.
+            vocabulary_size = len(self.vocab)
+            return 1.0 / vocabulary_size if vocabulary_size else 0.0
         return word_continuation_count / total_count
 
     def alpha_gamma(self, word, context):
@@ -110,11 +119,15 @@ class KneserNey(Smoothing):
             if len(context) + 1 == self._order
             else self._continuation_counts(word, context)
         )
+        if total_count == 0:
+            # There is no observed continuation mass to normalize; defer all
+            # probability to the next lower-order backoff distribution.
+            return 0.0, 1.0
         alpha = max(word_continuation_count - self.discount, 0.0) / total_count
         gamma = self.discount * _count_values_gt_zero(prefix_counts) / total_count
         return alpha, gamma
 
-    def _continuation_counts(self, word, context=tuple()):
+    def _continuation_counts(self, word, context=()):
         """Count continuations that end with context and word.
 
         Continuations track unique ngram "types", regardless of how many
@@ -124,6 +137,10 @@ class KneserNey(Smoothing):
         word_counts, totals = self._continuation_index(len(context) + 2)
         return word_counts[context, word], totals[context]
 
+    def continuation_counts(self, word, context=()):
+        """Public alias for :meth:`_continuation_counts`."""
+        return self._continuation_counts(word, context)
+
     def _continuation_index(self, order):
         """Continuation counts of every (context, word) and every context.
 
@@ -131,10 +148,15 @@ class KneserNey(Smoothing):
         cost as much as the whole model, so the counts are gathered in one
         pass and kept until the counter stores a new ngram.
         """
-        # setdefault: a model pickled before this cache existed has no attribute.
+        # The version combines the counter's monotonic topology generation with
+        # the process-wide revision emitted by the change-tracking frequency
+        # distributions.  The latter also catches direct count edits.
         cache = self.__dict__.setdefault("_continuation_cache", {})
-        # NgramCounter.update() bumps _distinct whenever it stores a new ngram.
-        version = getattr(self.counts, "_distinct", None)
+        version = (
+            getattr(self.counts, "_version", None),
+            getattr(self.counts, "_distinct", None),
+            _ChangeTrackingFreqDist._topology_revision,
+        )
         if order not in cache or cache[order][0] != version:
             word_counts = Counter(
                 (prefix_ngram[1:], word)
@@ -147,3 +169,7 @@ class KneserNey(Smoothing):
                 totals[context] += count
             cache[order] = (version, word_counts, totals)
         return cache[order][1:]
+
+    def invalidate_continuation_cache(self):
+        """Drop cached continuation distributions so the next query rebuilds."""
+        self.__dict__.setdefault("_continuation_cache", {}).clear()
