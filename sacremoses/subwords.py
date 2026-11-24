@@ -5,6 +5,7 @@ from __future__ import print_function
 import copy
 from collections import Counter, defaultdict
 from functools import reduce
+from heapq import nlargest
 
 from sacremoses.util import pairwise
 
@@ -171,14 +172,69 @@ class SubwordTokenizer(object):
                 # We move one char down the new *word*
                 i += 1
 
+    def _pair_rank(self, pair):
+        """Sort key for a pair: (frequency, pair).
+
+        The pair itself breaks ties, so the merge order is fully determined by
+        the corpus and never depends on dict insertion order or hash seed.
+        This is the tie-break used by upstream subword-nmt:
+        ``max(stats, key=lambda x: (stats[x], x))``.
+        """
+        return self.stats.get(pair, 0), pair
+
+    def _best_pair(self):
+        """The pair with the highest live frequency, ties broken by the pair."""
+        if not self.stats:
+            return None
+        return max(self.stats, key=self._pair_rank)
+
     def learn(self, num_symbols, min_freq=2, jump=1, is_dict=None):
-        # threshold is inspired by Zipfian assumption, but should only affect speed
-        threshold = max(self.stats.values()) / 10
-        for i in range(num_symbols):
-            most_freq_tokens = self.stats.most_common(jump)
-            for token, count in most_freq_tokens:
-                changes = self.replace_pair(token)
-                self.update_pair_statistics(token, changes)
-                self.stats[token] = 0
-                if self.stats[token] < min_freq:
-                    return
+        """Learn up to ``num_symbols`` merges, stopping early only once no pair
+        still reaches ``min_freq``.
+
+        A pair that has just been merged has its own count zeroed, which must
+        not be mistaken for "the corpus is exhausted": the merges it created
+        are frequently the most frequent pairs left.  So the loop keeps going
+        until a *freshly selected* candidate is below ``min_freq``.
+
+        ``jump`` is a prefetch hint: several candidates are picked in one pass,
+        but those counts go stale the moment anything is merged, so the batch
+        only decides *which* pairs to look at.  Before a candidate is applied
+        its count is re-read and it is confirmed to still be the live best;
+        otherwise the batch is dropped and the selection is redone from the
+        live statistics.  ``jump`` therefore never changes the result: every
+        value produces exactly the same merges, in the same order, as
+        ``jump=1``.
+        """
+        num_symbols = max(0, int(num_symbols))
+        jump = max(1, int(jump))
+        merged = 0
+        while merged < num_symbols:
+            # Snapshot a batch of candidates, best first.
+            batch = nlargest(jump, self.stats, key=self._pair_rank)
+            if not batch:
+                break
+            progressed = False
+            for position, pair in enumerate(batch):
+                if merged >= num_symbols:
+                    break
+                # Re-read the live count: an earlier merge in this batch may
+                # have consumed this pair or dropped it below the threshold.
+                # The snapshotted count is never trusted for the decision.
+                live = self.stats.get(pair, 0)
+                if live <= 0 or live < min_freq:
+                    continue
+                # `batch[0]` is the live best by construction; any later
+                # position must still be the live best or the ranking has
+                # moved and the batch is stale.
+                if position and self._best_pair() != pair:
+                    break
+                changes = self.replace_pair(pair)
+                self.update_pair_statistics(pair, changes)
+                self.stats[pair] = 0
+                merged += 1
+                progressed = True
+            if not progressed:
+                # Nothing in the batch was applicable: every remaining pair is
+                # already merged or below min_freq.
+                break
