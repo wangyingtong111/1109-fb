@@ -103,6 +103,47 @@ callable returning a per-*query-term* multiplier (default `1`). `:bm25` tunes th
 BM25+ parameters `k`, `b`, and `d` (defaults `{ k: 1.2, b: 0.7, d: 0.5 }`).
 Defaults can be set once via the constructor's `:search_options`.
 
+## Score explanations
+
+Pass `explain: true` (or call `ms.explain(query, options)`) to attach an
+`:explain` object to every **returned** hit. It records what the actual search
+path computed — one contribution per field and matching route — plus the
+coverage multiplier, so the result's `:score` can be recomputed. Explanations
+are only exposed on hits returned after `:filter`, and a search without
+`explain:` returns exactly the usual result shape (no extra keys or tracing).
+
+Each contribution has the originating `:query_term` (the query node), the
+actual indexed `:term` that scored (different from `:query_term` for prefix and
+fuzzy matches), the `:field`, the `:route` (`"exact"`, `"prefix"`, `"fuzzy"`,
+or `"wildcard"`), the route decay `:weight`, the `:term_boost`/`:field_boost`/
+`:document_boost` multipliers, the `:bm25_score` raw score, and the final
+weighted `:score` that was added.
+
+```ruby
+ms = MiniFTS.new(fields: %w[title text])
+ms.add("id" => 1, "title" => "oak", "text" => "oaks maple")
+
+q = { combine_with: "AND", queries: [{ queries: ["oak"], prefix: true }, "maple"] }
+hit = ms.search(q, explain: true).first
+hit[:score]                                   # => 2.027155068671851
+
+ex = hit[:explain]
+ex[:coverage]                                 # => 2  (two query terms covered)
+ex[:contributions].map { |c| [c[:query_term], c[:term], c[:field], c[:route]] }
+# => [["oak", "oak",  "title", "exact"],
+#     ["oak", "oaks", "text",  "prefix"],
+#     ["maple", "maple", "text", "exact"]]
+
+raw = ex[:contributions].inject(0.0) { |sum, c| sum + c[:score] }
+raw * ex[:coverage]                           # => 2.027155068671851 == hit[:score]
+```
+
+The two `oak` rows are the two sources: the title's exact `oak` and the body's
+`oaks` reached through the prefix route. `:query_nodes` groups the same
+contributions by originating query node. Aliases are provided for convenience —
+`:explanation` mirrors `:explain`, and `:coverage_multiplier` mirrors
+`:coverage`.
+
 ## Auto-suggestions
 
 ```ruby

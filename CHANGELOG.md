@@ -1,3 +1,12 @@
+## Unreleased
+
+- Optional score explanations: pass `explain: true` to `search` (or use the new
+  `explain` method) to attach `:explain` to returned hits. Each explanation
+  lists one contribution per query node, field, and matching route (exact,
+  prefix, or fuzzy), plus the coverage multiplier, so `score` recomputes from
+  the contributions. Searches without the option keep the original result
+  shape and do no tracing.
+
 ## [1.0.1] - 2026-07-18
 
 - Require MFA for gem pushes (`rubygems_mfa_required` gemspec metadata). No

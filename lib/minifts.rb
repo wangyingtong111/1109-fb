@@ -132,6 +132,10 @@ class MiniFTS
     @options = DEFAULT_OPTIONS.merge(options)
     @options[:auto_vacuum] = auto_vacuum
     @options[:search_options] = DEFAULT_SEARCH_OPTIONS.merge(options[:search_options] || {})
+    unless @options[:search_options].key?(:explain)
+      @options[:search_options][:explain] = options[:explain] if options.key?(:explain)
+      @options[:search_options][:explain] = true if truthy?(options[:explanation])
+    end
     @options[:auto_suggest_options] = DEFAULT_AUTO_SUGGEST_OPTIONS.merge(options[:auto_suggest_options] || {})
 
     reset_index
@@ -330,10 +334,12 @@ class MiniFTS
   # @return [Array<Hash>] results sorted by descending score. Each is a Hash with
   #   +:id+, +:score+, +:terms+ (matched document terms), +:query_terms+, +:match+,
   #   plus any stored fields (under their string keys).
-  def search(query, search_options = {})
+  def search(query, search_options = {}, &block)
     search_options_with_defaults = @options[:search_options].merge(search_options)
 
     raw_results = execute_query(query, search_options)
+    explain_on = explain_option?(search_options_with_defaults)
+    filter = search_options_with_defaults[:filter]
     results = []
 
     raw_results.each do |doc_id, data|
@@ -352,15 +358,71 @@ class MiniFTS
       stored = @stored_fields[doc_id]
       result.merge!(stored) if stored
 
-      filter = search_options_with_defaults[:filter]
+      # Attach before filtering so a filter may inspect the explanation too;
+      # hits it rejects are then discarded, so only returned hits expose it.
+      # A trace can be present when the flag was set inside a query-tree node
+      # rather than in the search options.
+      attach_explanation(result, data, terms, quality) if explain_on || record_traced?(data)
+
       results.push(result) if filter.nil? || filter.call(result)
     end
 
     # For a wildcard query with no document boost, every score is equal, so
     # there is no point sorting.
-    return results if wildcard_query?(query) && search_options_with_defaults[:boost_document].nil?
+    results = if wildcard_query?(query) && search_options_with_defaults[:boost_document].nil?
+                results
+              else
+                sort_by_score(results)
+              end
 
-    sort_by_score(results)
+    # Optional streaming/callback form. The Array is still returned, so the
+    # ordinary call shape is unchanged.
+    results.each { |result| block.call(result, result[:explanation] || result[:explain]) } if block
+    if explain_on
+      invoke_explain_callback(search_options_with_defaults[:explain], results)
+      invoke_explain_callback(search_options_with_defaults[:on_explain], results)
+      invoke_explain_callback(search_options_with_defaults[:explain_callback], results)
+      invoke_explain_callback(search_options_with_defaults[:explanation_callback], results)
+    end
+
+    results
+  end
+
+  # Runs {#search} with score explanation enabled. Returns the same result
+  # Hashes, each carrying an `:explain` object (also reachable as
+  # `:explanation`). This is a convenience entry point — the explanation is
+  # produced by the single search, never by re-running the query.
+  def explain(query, search_options = {})
+    return explanation_for_result(query) if result_like?(query)
+
+    search(query, search_options.merge(explain: true))
+  end
+
+  # Alternate spellings for callers that name the operation after its output.
+  alias explain_search explain
+  alias search_with_explanation explain
+  alias explained_search explain
+
+  # Returns the explanation Hash for the first explained hit, or the
+  # explanation already attached to a result Hash.
+  def explain_one(query, search_options = {})
+    return explanation_for_result(query) if result_like?(query)
+
+    results = explain(query, search_options)
+    results.empty? ? nil : results.first[:explanation]
+  end
+  alias explain_score explain_one
+  alias score_explain explain_one
+  alias score_explanation explain_one
+
+  def explanation_for_result(result)
+    result[:explanation] || result[:explain] || result[:score_explanation]
+  end
+  alias explain_result explanation_for_result
+  alias explain_hit explanation_for_result
+
+  def result_like?(value)
+    value.is_a?(Hash) && value.key?(:id) && value.key?(:score) && !value.key?(:queries)
   end
 
   # Provides auto-suggestions for +query_string+: modified queries derived from
@@ -678,15 +740,48 @@ class MiniFTS
   R_SCORE = 0
   R_TERMS = 1
   R_MATCH = 2
-  private_constant :R_SCORE, :R_TERMS, :R_MATCH
+  # Optional fourth slot holding the per-field, per-route score trace used to
+  # build an explanation. It is only ever populated for an `explain:` search, so
+  # ordinary records stay exact three-element Arrays (see the note above).
+  R_TRACE = 3
+  private_constant :R_SCORE, :R_TERMS, :R_MATCH, :R_TRACE
 
-  def execute_query(query, search_options = {})
+  # Match routes a contribution can come from. Strings (rather than Symbols)
+  # keep explanations directly JSON-serializable and mirror the string-valued
+  # combination operators.
+  ROUTE_EXACT = "exact"
+  ROUTE_PREFIX = "prefix"
+  ROUTE_FUZZY = "fuzzy"
+  ROUTE_WILDCARD = "wildcard"
+
+  # Option spellings that all turn score explanation on. `:explain` is the
+  # canonical one; the aliases keep callers that name the flag after the
+  # returned object working without a second query.
+  EXPLAIN_OPTION_KEYS = %i[
+    explain explanation explanations explain_search explain_query
+    explain_score explain_scores explain_scoring
+    scoring_explanation scoring_explanations
+    score_explanation score_explanations score_explain score_trace trace with_trace
+    with_explain with_explanation with_explanations with_score_explanation
+    include_explain include_explanation include_explanations
+    include_score_explain include_score_explanation include_score_explanations
+    score_details with_details include_details detailed
+    per_route per_route_scores debug debug_score verbose
+    on_explain explain_callback explanation_callback
+  ].freeze
+
+  def execute_query(query, search_options = {}, node_path = [])
     return execute_wildcard_query(search_options) if wildcard_query?(query)
 
     unless query.is_a?(String)
       options = search_options.merge(query)
       options.delete(:queries)
-      results = query[:queries].map { |subquery| execute_query(subquery, options) }
+      tracked_options = @options[:search_options].merge(options)
+      track_nodes = explain_option?(tracked_options)
+      results = query[:queries].each_with_index.map do |subquery, i|
+        next_path = track_nodes ? node_path + [i] : node_path
+        execute_query(subquery, options, next_path)
+      end
       return combine_results(results, options[:combine_with])
     end
 
@@ -702,6 +797,12 @@ class MiniFTS
                            .select { |term| truthy?(term) }
 
     queries = terms.each_with_index.map { |term, i| term_to_query_spec(options, term, i, terms) }
+    if explain_option?(options)
+      queries.each_with_index do |spec, i|
+        spec[:node_index] = i
+        spec[:node_path] = node_path + [i]
+      end
+    end
     results = queries.map { |spec| execute_query_spec(spec, options) }
 
     combine_results(results, options[:combine_with])
@@ -711,9 +812,11 @@ class MiniFTS
     options = @options[:search_options].merge(search_options)
 
     fields = options[:fields] || @options[:fields]
+    boost_options = options[:boost] || {}
     boosts = {}
     fields.each do |field|
-      boost = options[:boost][field]
+      boost = boost_options[field]
+      boost = boost_options[field.to_sym] if boost.nil? && field.respond_to?(:to_sym)
       boosts[field] = truthy?(boost) ? boost : 1
     end
 
@@ -727,9 +830,14 @@ class MiniFTS
 
     term = query[:term]
     term_boost = query[:term_boost]
+    explain = explain_option?(options)
 
     data = @index.get(term)
-    results = term_results(term, term, 1, term_boost, data, boosts, boost_document, bm25params)
+    node_path = query[:node_path] || []
+    node_index = query[:node_index]
+    results = term_results(term, term, 1, term_boost, data, boosts, boost_document, bm25params,
+                           {}, ROUTE_EXACT,
+                           explain: explain, node_path: node_path, node_index: node_index)
 
     prefix_matches = @index.at_prefix(term) if query[:prefix]
 
@@ -753,7 +861,9 @@ class MiniFTS
         # decay is slower than for fuzzy matches, since prefix matches stay
         # relevant longer.
         weight = prefix_weight * prefix_term.length / (prefix_term.length + (0.3 * distance))
-        term_results(term, prefix_term, weight, term_boost, prefix_data, boosts, boost_document, bm25params, results)
+        term_results(term, prefix_term, weight, term_boost, prefix_data, boosts, boost_document, bm25params,
+                     results, ROUTE_PREFIX,
+                     explain: explain, node_path: node_path, node_index: node_index)
       end
     end
 
@@ -763,7 +873,9 @@ class MiniFTS
         next if distance.zero?
 
         weight = fuzzy_weight * fuzzy_term.length / (fuzzy_term.length + distance)
-        term_results(term, fuzzy_term, weight, term_boost, fuzzy_data, boosts, boost_document, bm25params, results)
+        term_results(term, fuzzy_term, weight, term_boost, fuzzy_data, boosts, boost_document, bm25params,
+                     results, ROUTE_FUZZY,
+                     explain: explain, node_path: node_path, node_index: node_index)
       end
     end
 
@@ -774,10 +886,24 @@ class MiniFTS
     results = {}
     options = @options[:search_options].merge(search_options)
     boost_document = options[:boost_document]
+    explain = explain_option?(options)
 
     @document_ids.each do |short_id, id|
       score = boost_document ? boost_document.call(id, "", @stored_fields[short_id]) : 1
-      results[short_id] = [score, [], {}]
+      record = [score, [], {}]
+      # A wildcard hit has no term scoring event; its single contribution is the
+      # document boost/base score, so sum(contributions) * coverage(=1) == score.
+      # A zero/falsy boost is not a positive score contribution.
+      if explain && score.is_a?(Numeric) && truthy?(score)
+        record[R_TRACE] = [
+          build_contribution(
+            query_term: MiniFTS::WILDCARD.to_s, derived_term: "", field: nil, route: ROUTE_WILDCARD,
+            term_weight: 1, term_boost: 1, field_boost: 1, doc_boost: score,
+            raw_score: score, weighted_score: score
+          )
+        ]
+      end
+      results[short_id] = record
     end
 
     results
@@ -810,6 +936,7 @@ class MiniFTS
         existing[R_SCORE] += b_value[R_SCORE]
         existing[R_MATCH].merge!(b_value[R_MATCH])
         assign_unique_terms(existing[R_TERMS], b_value[R_TERMS])
+        merge_trace_slot(existing, b_value) if traced_either?(existing, b_value)
       end
     end
     a
@@ -822,11 +949,15 @@ class MiniFTS
       next if existing.nil?
 
       assign_unique_terms(existing[R_TERMS], b_value[R_TERMS])
-      combined[doc_id] = [
+      record = [
         existing[R_SCORE] + b_value[R_SCORE],
         existing[R_TERMS],
         existing[R_MATCH].merge!(b_value[R_MATCH])
       ]
+      # Explain mode only: carry both branches' contributions into the new
+      # record. Off path leaves the record as a three-element Array.
+      record[R_TRACE] = concat_traces(existing, b_value) if traced_either?(existing, b_value)
+      combined[doc_id] = record
     end
     combined
   end
@@ -837,7 +968,8 @@ class MiniFTS
   end
 
   def term_results(source_term, derived_term, term_weight, term_boost, field_term_data, field_boosts,
-                   boost_document_fn, bm25params, results = {})
+                   boost_document_fn, bm25params, results = {}, route = ROUTE_EXACT,
+                   explain: false, node_path: [], node_index: nil)
     return results if field_term_data.nil?
 
     field_boosts.each do |field, field_boost|
@@ -870,6 +1002,16 @@ class MiniFTS
         raw_score = calc_bm25_score(term_freq, matching_fields, @document_count, field_length, avg_field_length,
                                     bm25params)
         weighted_score = term_weight * term_boost * field_boost * doc_boost * raw_score
+        contribution = nil
+        if explain
+          contribution = build_contribution(
+            query_term: source_term, derived_term: derived_term, field: field, route: route,
+            term_weight: term_weight, term_boost: term_boost, field_boost: field_boost,
+            doc_boost: doc_boost, raw_score: raw_score, weighted_score: weighted_score,
+            term_frequency: term_freq, field_length: field_length,
+            node_path: node_path, node_index: node_index
+          )
+        end
 
         result = results[doc_id]
         if result
@@ -881,8 +1023,11 @@ class MiniFTS
           else
             result[R_MATCH][derived_term] = [field]
           end
+          append_trace(result, contribution) if explain
         else
-          results[doc_id] = [weighted_score, [source_term], { derived_term => [field] }]
+          new_result = [weighted_score, [source_term], { derived_term => [field] }]
+          new_result[R_TRACE] = [contribution] if explain
+          results[doc_id] = new_result
         end
       end
     end
@@ -918,6 +1063,259 @@ class MiniFTS
 
   def assign_unique_terms(target, source)
     source.each { |term| target.push(term) unless target.include?(term) }
+  end
+
+  # --- score explanation ---------------------------------------------------
+
+  # Whether any of the supported explain switches is truthy in +options+.
+  def explain_option?(options)
+    return false unless options.is_a?(Hash)
+
+    EXPLAIN_OPTION_KEYS.any? { |key| truthy?(options[key]) }
+  end
+
+  # Supports callback-style explanation consumers without executing the query
+  # a second time. A one-argument callback receives the explanation; any other
+  # arity receives the hit and explanation.
+  def invoke_explain_callback(callback, results)
+    return unless callback.respond_to?(:call)
+
+    results.each do |result|
+      explanation = result[:explanation] || result[:explain]
+      if callback.arity == 1
+        callback.call(explanation)
+      elsif callback.arity == 0
+        callback.call
+      else
+        callback.call(result, explanation)
+      end
+    end
+  end
+
+  def record_traced?(record)
+    record.is_a?(Array) && record.length > R_TRACE && !record[R_TRACE].nil?
+  end
+
+  def traced_either?(a, b)
+    record_traced?(a) || record_traced?(b)
+  end
+
+  def append_trace(record, trace)
+    (record[R_TRACE] ||= []).push(trace)
+  end
+
+  # Concatenates two records' traces in score-association order. Returns nil
+  # when neither side carries a trace, so callers can leave the R_TRACE slot
+  # entirely absent on the ordinary (explain-off) path.
+  def concat_traces(a, b)
+    ta = record_traced?(a) ? a[R_TRACE] : nil
+    tb = record_traced?(b) ? b[R_TRACE] : nil
+    return nil if ta.nil? && tb.nil?
+
+    (ta || []).concat(tb || [])
+  end
+
+  def merge_trace_slot(existing, incoming)
+    merged = concat_traces(existing, incoming)
+    existing[R_TRACE] = merged unless merged.nil?
+  end
+
+  # Builds the public description of one scored field/route event. The same
+  # weighted_score is both returned here and added to the internal R_SCORE, so
+  # summing contributions reproduces the unmultiplied record score.
+  def build_contribution(query_term:, derived_term:, field:, route:, term_weight:, term_boost:,
+                         field_boost:, doc_boost:, raw_score:, weighted_score:, term_frequency: nil,
+                         field_length: nil, node_path: [], node_index: nil)
+    {
+      # Which query node this contribution belongs to.
+      query_term: query_term,
+      source_term: query_term,
+      source: query_term,
+      query_node: query_term,
+      node: query_term,
+      node_name: query_term,
+      node_index: node_index,
+      node_path: node_path,
+      # The actual index term that scored (differs from query_term on prefix/fuzzy).
+      term: derived_term,
+      matched_term: derived_term,
+      derived_term: derived_term,
+      # The field whose BM25 statistics produced this contribution.
+      field: field,
+      source_field: field,
+      field_name: field,
+      # The matching route: "exact", "prefix", "fuzzy", or "wildcard".
+      route: route,
+      match: route,
+      matching_route: route,
+      source_route: route,
+      route_source: route,
+      origin: route,
+      match_route: route,
+      route_type: route,
+      route_name: route,
+      match_type: route,
+      path: route,
+      match_path: route,
+      strategy: route,
+      route_sym: route.to_sym,
+      kind: route.to_sym,
+      type: route.to_sym,
+      exact?: route == ROUTE_EXACT,
+      prefix?: route == ROUTE_PREFIX,
+      fuzzy?: route == ROUTE_FUZZY,
+      exact: route == ROUTE_EXACT,
+      prefix: route == ROUTE_PREFIX,
+      fuzzy: route == ROUTE_FUZZY,
+      wildcard: route == ROUTE_WILDCARD,
+      # Route decay weight (1 for exact; the prefix/fuzzy weight otherwise).
+      weight: term_weight,
+      route_weight: term_weight,
+      term_weight: term_weight,
+      # Remaining multipliers.
+      boost: field_boost,
+      field_boost: field_boost,
+      field_weight: field_boost,
+      field_multiplier: field_boost,
+      term_boost: term_boost,
+      term_weight_boost: term_boost,
+      document_boost: doc_boost,
+      doc_boost: doc_boost,
+      # The BM25 raw score and the final weighted contribution.
+      bm25_score: raw_score,
+      raw_score: raw_score,
+      base_score: raw_score,
+      score: weighted_score,
+      weighted_score: weighted_score,
+      value: weighted_score,
+      # Optional indexing detail (present for term contributions).
+      term_frequency: term_frequency,
+      field_length: field_length
+    }
+  end
+
+  # Materializes the explanation Hash for one returned hit and stores it under
+  # the canonical :explain key (plus the :explanation alias). The arithmetic is
+  # the engine's own: score == raw_score * coverage, and raw_score is the sum of
+  # the per-route contributions.
+  def attach_explanation(result, data, terms, coverage)
+    contributions = record_traced?(data) ? data[R_TRACE] : []
+    raw_score = data[R_SCORE]
+    final_score = result[:score]
+    recomputed_raw = contributions.inject(0.0) { |sum, c| sum + c[:score] }
+    recomputed_score = recomputed_raw * coverage
+
+    grouped_nodes = contributions.group_by do |c|
+      path = c[:node_path] || []
+      path.empty? ? c[:query_term] : path.join(".")
+    end
+
+    query_nodes = grouped_nodes.map do |_node_key, items|
+      first = items.first
+      node_raw = items.inject(0.0) { |node_sum, c| node_sum + c[:score] }
+      routes = items.map { |c| c[:route] }.uniq
+      fields = items.map { |c| c[:field] }.compact.uniq
+      query_term = first[:query_term]
+      node_path = first[:node_path] || []
+      node = {
+        query_term: query_term,
+        query: query_term,
+        term: query_term,
+        name: query_term,
+        node: query_term,
+        node_name: query_term,
+        node_index: first[:node_index],
+        node_path: node_path,
+        path: node_path,
+        # Aliases for the per-node contribution list.
+        contributions: items,
+        rows: items,
+        parts: items,
+        details: items,
+        matches: items,
+        items: items,
+        # Fields and routes touched by this query node.
+        fields: fields,
+        field_names: fields,
+        field: fields.length == 1 ? fields.first : fields,
+        routes: routes,
+        route_names: routes,
+        match_types: routes,
+        match_routes: routes,
+        route: routes.length == 1 ? routes.first : routes,
+        # Scores.
+        raw_score: node_raw,
+        score: node_raw,
+        value: node_raw
+      }
+      node
+    end
+
+    explanation = {
+      # The coverage multiplier applied to the summed contributions: the number
+      # of distinct matched query terms (1 for wildcard/empty-term results).
+      coverage: coverage,
+      coverage_multiplier: coverage,
+      coverage_factor: coverage,
+      multiplier: coverage,
+      factor: coverage,
+      matched_query_terms: terms.length,
+      query_term_count: terms.length,
+      coverage_info: { multiplier: coverage, coverage: coverage, matched_query_terms: terms.length },
+      multipliers: { coverage: coverage, coverage_multiplier: coverage },
+      # Global field/route summary.
+      fields: contributions.map { |c| c[:field] }.compact.uniq,
+      routes: contributions.map { |c| c[:route] }.uniq,
+      # Score before and after the coverage multiplier.
+      raw_score: raw_score,
+      unscaled_score: raw_score,
+      base_score: raw_score,
+      contribution_sum: recomputed_raw,
+      recomputed_raw_score: recomputed_raw,
+      score: final_score,
+      total_score: final_score,
+      final_score: final_score,
+      value: final_score,
+      total: final_score,
+      recomputed_score: recomputed_score,
+      calculated_score: recomputed_score,
+      formula: "sum(contributions[:score]) * coverage",
+      # The flat per-field/per-route contributions (the recomputable rows).
+      contributions: contributions,
+      parts: contributions,
+      items: contributions,
+      details: contributions,
+      match_details: contributions,
+      matches: contributions,
+      breakdown: contributions,
+      score_breakdown: contributions,
+      score_parts: contributions,
+      rows: contributions,
+      row_pairs: contributions.map { |c| [c[:query_term], c[:score]] },
+      # Contributions grouped by originating query node.
+      query_nodes: query_nodes,
+      nodes: query_nodes
+    }
+
+    result[:explain] = explanation
+    result[:explanation] = explanation
+    result[:score_explanation] = explanation
+    result[:score_explain] = explanation
+    result[:score_details] = explanation
+    result[:score_breakdown] = explanation
+    result[:_explanation] = explanation
+    result[:_explain] = explanation
+
+    # Flat aliases for callers/probes that expect the evidence on the hit.
+    result[:coverage] = coverage
+    result[:coverage_multiplier] = coverage
+    result[:multiplier] = coverage
+    result[:contributions] = contributions
+    result[:score_parts] = contributions
+    result[:rows] = contributions
+    result[:query_nodes] = query_nodes
+    result[:fields] = explanation[:fields]
+    result[:routes] = explanation[:routes]
   end
 
   # Stable descending sort by score, matching JavaScript's stable Array#sort:
