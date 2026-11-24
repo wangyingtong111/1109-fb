@@ -104,6 +104,22 @@ The `optimal` version uses the Hungarian algorithm to compute the mapping that m
 
 In practice, the `greedy` version is much faster than the `optimal` one, especially for files with a large number of speakers -- though it may slightly over-estimate the value of the diarization error rate.
 
+Fixed speaker identities
+************************
+
+When some speaker identities are already known (for instance because a recording was manually reviewed), the optimal mapping can be constrained. Pass `fixed_mapping` as a `{hypothesis_label: reference_label}` dictionary to lock those hypothesis speakers to their reference speaker; other hypothesis speakers are still matched automatically, but only against the reference speakers that are not already taken.
+
+.. code-block:: python
+
+    metric = DiarizationErrorRate(fixed_mapping={"X": "A"})
+    metric(reference, hypothesis)
+
+The constraint applies to the whole evaluation: the fixed edges are used when computing the mapping, so the error breakdown (confusion, missed detection, false alarm) and the final score all keep honoring them. A fixed hypothesis speaker stays locked to its reference speaker even when it does not overlap that speaker at all, and even when the reference speaker is not part of the evaluated region -- in which case its speech keeps counting as an identity error rather than silently taking over another speaker. Use `fixed_mapping={}` when calling the metric to release the constraint for one particular file.
+
+Duplicate fixed edges (the same hypothesis label declared twice) and mutually exclusive fixed edges (two hypothesis labels locked to the same reference label) raise a `ValueError` as soon as the constraint is validated, i.e. before any scoring takes place.
+
+Without `fixed_mapping`, the diarization error rate is the usual unconstrained optimal (or greedy) one.
+
 Purity and coverage
 *******************
 

@@ -25,18 +25,50 @@
 
 """Metrics for diarization"""
 
+from collections.abc import Iterable
+
 import numpy as np
 from pyannote.core import Annotation, Timeline
+from pyannote.core.utils.generators import int_generator, string_generator
 from pyannote.core.utils.types import Label
 
 from .base import BaseMetric
 from .identification import IdentificationErrorRate
-from .matcher import GreedyMapper, HungarianMapper
+from .matcher import GreedyMapper, HungarianMapper, check_fixed_mapping
 from .types import Details, MetricComponents
 from .utils import UEMSupportMixin
 
 # TODO: can't we put these as class attributes?
 DER_NAME = "diarization error rate"
+
+
+def _label_renaming(
+    annotation: Annotation,
+    generator_factory,
+    extra_labels: Iterable[Label] = (),
+) -> dict[Label, Label]:
+    """Label renaming that `Annotation.rename_labels` would apply.
+
+    Labels are renamed in the same order as
+    `annotation.rename_labels(generator=...)` (i.e. sorted by `str`), so that
+    normalized labels are identical to the historical behavior whenever
+    `extra_labels` is empty.
+
+    `extra_labels` are renamed as well even when they do not occur in
+    `annotation`. This lets a fixed identity survive when its pinned label is
+    not evaluated in the current region (e.g. cropped away by `uem`): the
+    pinned label still receives its own normalized name, which no reference
+    track uses, so the corresponding hypothesis speech is scored accordingly
+    instead of silently stealing another speaker's identity.
+
+    The mapping is returned (instead of the renamed annotation) so that
+    callers can also translate externally-provided labels such as fixed
+    identities into the normalized label space.
+    """
+
+    labels = sorted(set(annotation.labels()) | set(extra_labels), key=str)
+    generator = generator_factory()
+    return {label: next(generator) for label in labels}
 
 
 class DiarizationSpeakerCountAccuracy(UEMSupportMixin, BaseMetric):
@@ -147,6 +179,29 @@ class DiarizationErrorRate(IdentificationErrorRate):
     skip_overlap : bool, optional
         Set to True to not evaluate overlap regions.
         Defaults to False (i.e. keep overlap regions).
+    fixed_mapping : dict or iterable of pairs, optional
+        Optional one-to-one constraint on the label mapping, given as
+        ``{hypothesis_label: reference_label}`` (or as an iterable of such
+        pairs). Fixed edges are applied first and the remaining hypothesis
+        labels are still assigned by the optimal mapping, restricted to the
+        reference labels that are not already taken. As a consequence, the
+        error breakdown and the score keep honoring the fixed identities for
+        the whole evaluation.
+
+        The constraint is expressed on the hypothesis labels as they appear in
+        the hypothesis annotation passed to the metric, before the internal
+        normalization to integer labels. When unset, the metric is the usual
+        unconstrained optimal diarization error rate.
+
+        Duplicate edges (same hypothesis label twice) and mutually exclusive
+        edges (two hypothesis labels fixed to the same reference label) raise
+        a `ValueError` before any error measurement is computed. A fixed
+        hypothesis label is kept even when it does not overlap the fixed
+        reference label in the evaluated region, and even when that reference
+        label is not evaluated at all: it still consumes that reference label,
+        so the remaining hypothesis labels are matched against a smaller set
+        of reference labels and the corresponding duration keeps counting as
+        an identity error.
 
     Examples
     --------
@@ -155,6 +210,11 @@ class DiarizationErrorRate(IdentificationErrorRate):
         >>> metric = DiarizationErrorRate()
         >>> reference = Annotation(...)           # doctest: +SKIP
         >>> hypothesis = Annotation(...)          # doctest: +SKIP
+        >>> value = metric(reference, hypothesis) # doctest: +SKIP
+
+    * Same, with a manually confirmed identity `X` being speaker `A`
+
+        >>> metric = DiarizationErrorRate(fixed_mapping={"X": "A"})
         >>> value = metric(reference, hypothesis) # doctest: +SKIP
 
     * Compute global diarization error rate and confidence interval
@@ -185,15 +245,23 @@ class DiarizationErrorRate(IdentificationErrorRate):
     def metric_name(cls) -> str:
         return DER_NAME
 
-    def __init__(self, collar: float = 0.0, skip_overlap: bool = False, **kwargs):
+    def __init__(
+        self,
+        collar: float = 0.0,
+        skip_overlap: bool = False,
+        fixed_mapping=None,
+        **kwargs,
+    ):
         super().__init__(collar=collar, skip_overlap=skip_overlap, **kwargs)
-        self.mapper_ = HungarianMapper()
+        self.fixed_mapping_ = check_fixed_mapping(fixed_mapping)
+        self.mapper_ = HungarianMapper(self.fixed_mapping_)
 
     def optimal_mapping(
         self,
         reference: Annotation,
         hypothesis: Annotation,
         uem: Timeline | None = None,
+        fixed_mapping=None,
     ) -> dict[Label, Label]:
         """Optimal label mapping
 
@@ -204,6 +272,12 @@ class DiarizationErrorRate(IdentificationErrorRate):
             Reference and hypothesis diarization
         uem : Timeline
             Evaluation map
+        fixed_mapping : dict or iterable of pairs, optional
+            Override the fixed mapping set at instantiation time for this call.
+            Label pairs use the hypothesis-to-reference direction, on the
+            labels of the given annotations. Pass an empty mapping to compute
+            the unconstrained optimal mapping. Defaults to the mapping given at
+            instantiation time.
 
         Returns
         -------
@@ -217,16 +291,28 @@ class DiarizationErrorRate(IdentificationErrorRate):
         if uem:
             reference, hypothesis = self.uemify(reference, hypothesis, uem=uem)
 
-        # call hungarian mapper
-        return self.mapper_(hypothesis, reference)
+        # call hungarian mapper ('None' keeps the mapping set at instantiation
+        # time, while an empty mapping disables every fixed edge)
+        if fixed_mapping is None:
+            return self.mapper_(hypothesis, reference)
+        return self.mapper_(hypothesis, reference, fixed_mapping=fixed_mapping)
 
     def compute_components(
         self,
         reference: Annotation,
         hypothesis: Annotation,
         uem: Timeline | None = None,
+        fixed_mapping=None,
         **kwargs,
     ) -> Details:
+        # normalize the fixed mapping before anything else, so that duplicate
+        # or mutually exclusive fixed edges are diagnosed before any error is
+        # measured
+        if fixed_mapping is None:
+            fixed_mapping = self.fixed_mapping_
+        else:
+            fixed_mapping = check_fixed_mapping(fixed_mapping)
+
         # crop reference and hypothesis to evaluated regions (uem)
         # remove collars around reference segment boundaries
         # remove overlap regions (if requested)
@@ -242,13 +328,33 @@ class DiarizationErrorRate(IdentificationErrorRate):
         # might have an impact on the search for the optimal mapping.
 
         # make sure reference only contains string labels ('A', 'B', ...)
-        reference = reference.rename_labels(generator="string")
+        # and hypothesis only contains integer labels (1, 2, ...)
+        # NOTE that fixed identities pinned to a reference label which is not
+        # evaluated in this region are renamed too: the lock then keeps the
+        # pinned name out of every evaluated reference label, so that the
+        # hypothesis speech is still scored as an identity error instead of
+        # silently taking over an evaluated speaker.
+        reference_renaming = _label_renaming(
+            reference, string_generator, extra_labels=fixed_mapping.values()
+        )
+        hypothesis_renaming = _label_renaming(
+            hypothesis, int_generator, extra_labels=fixed_mapping.keys()
+        )
+        reference = reference.rename_labels(mapping=reference_renaming)
+        hypothesis = hypothesis.rename_labels(mapping=hypothesis_renaming)
 
-        # make sure hypothesis only contains integer labels (1, 2, ...)
-        hypothesis = hypothesis.rename_labels(generator="int")
+        # fixed identities are declared on the caller's labels: translate them
+        # so that they stay in force for both the mapping and the error
+        # breakdown.
+        fixed_mapping = {
+            hypothesis_renaming[hlabel]: reference_renaming[rlabel]
+            for hlabel, rlabel in fixed_mapping.items()
+        }
 
-        # optimal (int --> str) mapping
-        mapping = self.optimal_mapping(reference, hypothesis)
+        # optimal (int --> str) mapping, constrained by the fixed edges
+        mapping = self.optimal_mapping(
+            reference, hypothesis, fixed_mapping=fixed_mapping
+        )
 
         # compute identification error rate based on mapped hypothesis
         # NOTE that collar is set to 0.0 because 'uemify' has already
@@ -275,6 +381,11 @@ class GreedyDiarizationErrorRate(IdentificationErrorRate):
     skip_overlap : bool, optional
         Set to True to not evaluate overlap regions.
         Defaults to False (i.e. keep overlap regions).
+    fixed_mapping : dict or iterable of pairs, optional
+        Optional one-to-one constraint on the label mapping. See
+        :class:`DiarizationErrorRate` for details. Fixed edges are applied
+        before the greedy search, which keeps re-optimizing the remaining
+        assignment on the reference labels that are not already taken.
 
     Examples
     --------
@@ -283,6 +394,11 @@ class GreedyDiarizationErrorRate(IdentificationErrorRate):
         >>> metric = GreedyDiarizationErrorRate()
         >>> reference = Annotation(...)           # doctest: +SKIP
         >>> hypothesis = Annotation(...)          # doctest: +SKIP
+        >>> value = metric(reference, hypothesis) # doctest: +SKIP
+
+    * Same, with a manually confirmed identity `X` being speaker `A`
+
+        >>> metric = GreedyDiarizationErrorRate(fixed_mapping={"X": "A"})
         >>> value = metric(reference, hypothesis) # doctest: +SKIP
 
     * Compute global greedy diarization error rate and confidence interval
@@ -312,15 +428,23 @@ class GreedyDiarizationErrorRate(IdentificationErrorRate):
     def metric_name(cls):
         return DER_NAME
 
-    def __init__(self, collar: float = 0.0, skip_overlap: bool = False, **kwargs):
+    def __init__(
+        self,
+        collar: float = 0.0,
+        skip_overlap: bool = False,
+        fixed_mapping=None,
+        **kwargs,
+    ):
         super().__init__(collar=collar, skip_overlap=skip_overlap, **kwargs)
-        self.mapper_ = GreedyMapper()
+        self.fixed_mapping_ = check_fixed_mapping(fixed_mapping)
+        self.mapper_ = GreedyMapper(self.fixed_mapping_)
 
     def greedy_mapping(
         self,
         reference: Annotation,
         hypothesis: Annotation,
         uem: Timeline | None = None,
+        fixed_mapping=None,
     ) -> dict[Label, Label]:
         """Greedy label mapping
 
@@ -331,6 +455,10 @@ class GreedyDiarizationErrorRate(IdentificationErrorRate):
             Reference and hypothesis diarization
         uem : Timeline
             Evaluation map
+        fixed_mapping : dict or iterable of pairs, optional
+            Override the fixed mapping set at instantiation time for this call.
+            Pass an empty mapping to compute the unconstrained greedy mapping.
+            Defaults to the mapping given at instantiation time.
 
         Returns
         -------
@@ -339,15 +467,29 @@ class GreedyDiarizationErrorRate(IdentificationErrorRate):
         """
         if uem:
             reference, hypothesis = self.uemify(reference, hypothesis, uem=uem)
-        return self.mapper_(hypothesis, reference)
+
+        # ('None' keeps the mapping set at instantiation time, while an empty
+        # mapping disables every fixed edge)
+        if fixed_mapping is None:
+            return self.mapper_(hypothesis, reference)
+        return self.mapper_(hypothesis, reference, fixed_mapping=fixed_mapping)
 
     def compute_components(
         self,
         reference: Annotation,
         hypothesis: Annotation,
         uem: Timeline | None = None,
+        fixed_mapping=None,
         **kwargs,
     ) -> Details:
+        # normalize the fixed mapping before anything else, so that duplicate
+        # or mutually exclusive fixed edges are diagnosed before any error is
+        # measured
+        if fixed_mapping is None:
+            fixed_mapping = self.fixed_mapping_
+        else:
+            fixed_mapping = check_fixed_mapping(fixed_mapping)
+
         # crop reference and hypothesis to evaluated regions (uem)
         # remove collars around reference segment boundaries
         # remove overlap regions (if requested)
@@ -363,13 +505,32 @@ class GreedyDiarizationErrorRate(IdentificationErrorRate):
         # might have an impact on the search for the greedy mapping.
 
         # make sure reference only contains string labels ('A', 'B', ...)
-        reference = reference.rename_labels(generator="string")
+        # and hypothesis only contains integer labels (1, 2, ...)
+        # NOTE that fixed identities pinned to a reference label which is not
+        # evaluated in this region are renamed too: the lock then keeps the
+        # pinned name out of every evaluated reference label, so that the
+        # hypothesis speech is still scored as an identity error instead of
+        # silently taking over an evaluated speaker.
+        reference_renaming = _label_renaming(
+            reference, string_generator, extra_labels=fixed_mapping.values()
+        )
+        hypothesis_renaming = _label_renaming(
+            hypothesis, int_generator, extra_labels=fixed_mapping.keys()
+        )
+        reference = reference.rename_labels(mapping=reference_renaming)
+        hypothesis = hypothesis.rename_labels(mapping=hypothesis_renaming)
 
-        # make sure hypothesis only contains integer labels (1, 2, ...)
-        hypothesis = hypothesis.rename_labels(generator="int")
+        # translate the declared fixed identities into the normalized label
+        # space, so that the lock keeps applying to the greedy assignment
+        fixed_mapping = {
+            hypothesis_renaming[hlabel]: reference_renaming[rlabel]
+            for hlabel, rlabel in fixed_mapping.items()
+        }
 
-        # greedy (int --> str) mapping
-        mapping = self.greedy_mapping(reference, hypothesis)
+        # greedy (int --> str) mapping, constrained by the fixed edges
+        mapping = self.greedy_mapping(
+            reference, hypothesis, fixed_mapping=fixed_mapping
+        )
 
         # compute identification error rate based on mapped hypothesis
         # NOTE that collar is set to 0.0 because 'uemify' has already
@@ -447,7 +608,19 @@ class JaccardErrorRate(DiarizationErrorRate):
     500%, JER will never exceed 100% and may be far lower if the reference
     speakers are handled correctly."
 
-
+    Parameters
+    ----------
+    collar : float, optional
+        Duration (in seconds) of collars removed from evaluation around
+        boundaries of reference segments.
+    skip_overlap : bool, optional
+        Set to True to not evaluate overlap regions.
+        Defaults to False (i.e. keep overlap regions).
+    fixed_mapping : dict or iterable of pairs, optional
+        Optional one-to-one constraint on the label mapping, expressed as
+        ``{hypothesis_label: reference_label}`` like in
+        :class:`DiarizationErrorRate`. Fixed identities are honored when
+        selecting the pairing that minimizes the per-speaker Jaccard error.
 
     """
 
@@ -462,17 +635,67 @@ class JaccardErrorRate(DiarizationErrorRate):
             JER_SPEAKER_ERROR,
         ]
 
-    def __init__(self, collar=0.0, skip_overlap=False, **kwargs):
-        super().__init__(collar=collar, skip_overlap=skip_overlap, **kwargs)
+    def __init__(
+        self,
+        collar: float = 0.0,
+        skip_overlap: bool = False,
+        fixed_mapping=None,
+        **kwargs,
+    ):
+        super().__init__(
+            collar=collar,
+            skip_overlap=skip_overlap,
+            fixed_mapping=fixed_mapping,
+            **kwargs,
+        )
+        # JER optimizes its own objective on the (reference, hypothesis) label
+        # order: the mapper set by 'DiarizationErrorRate' would apply the fixed
+        # edges in the opposite direction, so it is replaced here. Fixed edges
+        # are handed to each mapping call in the right direction instead.
         self.mapper_ = HungarianMapper()
+
+    def optimal_mapping(
+        self,
+        reference: Annotation,
+        hypothesis: Annotation,
+        uem: Timeline | None = None,
+        fixed_mapping=None,
+    ) -> dict[Label, Label]:
+        """Optimal label mapping, minimizing the per-speaker Jaccard error.
+
+        JER is computed on the opposite label order than DER, so the fixed
+        identities are inverted here. Parameters are those of
+        :meth:`DiarizationErrorRate.optimal_mapping`, with ``fixed_mapping``
+        still expressed as ``{hypothesis_label: reference_label}``.
+        """
+        if fixed_mapping is None:
+            # the constraint stored at instantiation time is expressed
+            # hypothesis-to-reference; this method is called with the opposite
+            # label order, so hand it over inverted
+            fixed_mapping = {
+                reference_label: hypothesis_label
+                for hypothesis_label, reference_label in self.fixed_mapping_.items()
+            }
+        return super().optimal_mapping(
+            reference, hypothesis, uem=uem, fixed_mapping=fixed_mapping
+        )
 
     def compute_components(
         self,
         reference: Annotation,
         hypothesis: Annotation,
         uem: Timeline | None = None,
+        fixed_mapping=None,
         **kwargs,
     ) -> Details:
+        # normalize the fixed mapping before anything else, so that duplicate
+        # or mutually exclusive fixed edges are diagnosed before any error is
+        # measured
+        if fixed_mapping is None:
+            fixed_mapping = self.fixed_mapping_
+        else:
+            fixed_mapping = check_fixed_mapping(fixed_mapping)
+
         # crop reference and hypothesis to evaluated regions (uem)
         # remove collars around reference segment boundaries
         # remove overlap regions (if requested)
@@ -488,13 +711,32 @@ class JaccardErrorRate(DiarizationErrorRate):
         # might have an impact on the search for the optimal mapping.
 
         # make sure reference only contains string labels ('A', 'B', ...)
-        reference = reference.rename_labels(generator="string")
+        # and hypothesis only contains integer labels (1, 2, ...)
+        # NOTE that fixed identities are renamed even when their pinned label
+        # is not evaluated in this region, so that the lock is preserved.
+        reference_renaming = _label_renaming(
+            reference, string_generator, extra_labels=fixed_mapping.values()
+        )
+        hypothesis_renaming = _label_renaming(
+            hypothesis, int_generator, extra_labels=fixed_mapping.keys()
+        )
+        reference = reference.rename_labels(mapping=reference_renaming)
+        hypothesis = hypothesis.rename_labels(mapping=hypothesis_renaming)
 
-        # make sure hypothesis only contains integer labels (1, 2, ...)
-        hypothesis = hypothesis.rename_labels(generator="int")
+        # JER calls 'optimal_mapping(hypothesis, reference)', so the mapper
+        # receives the reference labels first: invert the fixed edges, which
+        # are expressed hypothesis-to-reference, into that direction. This
+        # explicit mapping overrides the (already inverted) one that
+        # 'JaccardErrorRate.optimal_mapping' would otherwise derive itself.
+        fixed_mapping = {
+            reference_renaming[rlabel]: hypothesis_renaming[hlabel]
+            for hlabel, rlabel in fixed_mapping.items()
+        }
 
-        # optimal (str --> int) mapping
-        mapping = self.optimal_mapping(hypothesis, reference)
+        # optimal (str --> int) mapping, constrained by the fixed edges
+        mapping = self.optimal_mapping(
+            hypothesis, reference, fixed_mapping=fixed_mapping
+        )
 
         detail = self.init_components()
 

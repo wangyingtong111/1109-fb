@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- feat: add an optional `fixed_mapping` constraint to the diarization error
+  rates (`DiarizationErrorRate`, `GreedyDiarizationErrorRate`,
+  `JaccardErrorRate`) and to `HungarianMapper` / `GreedyMapper`, to lock
+  manually confirmed speaker identities while the remaining speakers are still
+  matched automatically
+- feat: diagnose duplicate and mutually exclusive fixed identities before any
+  scoring takes place
+
 ## Version 4.2.0 (2026-10-16)
 
 - BREAKING: require Python 3.11 or newer; Python 3.10 is no longer supported
