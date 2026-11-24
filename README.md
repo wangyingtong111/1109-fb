@@ -242,6 +242,16 @@ recommender.top_items
 
 This uses [Wilson score](https://www.evanmiller.org/how-not-to-sort-by-average-rating.html) for explicit feedback and item frequency for implicit feedback.
 
+For explicit feedback, pass the rating scale with `rating_range` so the Wilson score is normalized against the full scale rather than the ratings observed in the training data.
+
+```ruby
+recommender = Disco::Recommender.new(top_items: true)
+recommender.fit(data, rating_range: 1..5)
+recommender.top_items
+```
+
+Without `rating_range`, the observed minimum and maximum ratings are used, so an item’s score can change when other items reach new ratings. With it, the score stays on a fixed scale - an item rated `3, 3, 4, 4` gets the same lower bound whether or not other items have `1` or `5` ratings. The range only affects popularity scores; predicted ratings continue to clip to the observed minimum and maximum. An invalid range raises an `ArgumentError` when fitting.
+
 ## Data
 
 Data can be an array of hashes

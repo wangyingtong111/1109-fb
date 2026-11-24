@@ -1,3 +1,8 @@
+## Unreleased
+
+- Added `rating_range` option to `fit` for scaling `top_items` Wilson scores with explicit feedback against a fixed rating scale
+- Raise `ArgumentError` for invalid rating ranges when fitting
+
 ## 1.0.0 (2026-04-17)
 
 - Switched to `numo-narray-alt`

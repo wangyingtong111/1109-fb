@@ -11,11 +11,12 @@ module Disco
       @top_items = top_items
     end
 
-    def fit(train_set, validation_set: nil)
+    def fit(train_set, validation_set: nil, rating_range: nil)
       train_set = to_dataset(train_set)
       validation_set = to_dataset(validation_set) if validation_set
 
       check_training_set(train_set)
+      check_rating_range(rating_range)
 
       # TODO option to set in initializer to avoid pass
       # could also just check first few values
@@ -55,11 +56,18 @@ module Disco
       raise ArgumentError, "Missing item_id" if @item_map.key?(nil)
 
       # TODO improve performance
-      unless @implicit
-        @min_rating, @max_rating = train_set.minmax_by { |o| o[:rating] }.map { |o| o[:rating] }
-      else
+      if @implicit
+        # factor prediction bounds are not used for implicit feedback
         @min_rating = nil
         @max_rating = nil
+        @rating_range = nil
+      else
+        # factor predictions keep clipping to the observed ratings
+        @min_rating, @max_rating = train_set.minmax_by { |o| o[:rating] }.map { |o| o[:rating] }
+
+        # popularity scores use the explicit rating scale when given,
+        # otherwise fall back to the observed ratings for backward compatibility
+        @rating_range = rating_range ? [rating_range.first, rating_range.last] : nil
       end
 
       if @top_items
@@ -192,15 +200,22 @@ module Disco
       if @implicit
         scores = Numo::UInt64.cast(@item_count)
       else
-        min_rating = @min_rating
+        if @rating_range
+          # use the fixed, explicit rating scale
+          min_rating, max_rating = @rating_range
+        else
+          # fall back to the observed ratings
+          min_rating = @min_rating
+          max_rating = @max_rating
 
-        # TODO remove temp fix
-        min_rating -= 1 if @min_rating == @max_rating
+          # TODO remove temp fix
+          min_rating -= 1 if @min_rating == @max_rating
+        end
 
         # wilson score with continuity correction
         # https://en.wikipedia.org/wiki/Binomial_proportion_confidence_interval#Wilson_score_interval_with_continuity_correction
         z = 1.96 # 95% confidence
-        range = @max_rating - min_rating
+        range = max_rating - min_rating
         n = Numo::DFloat.cast(@item_count)
         phat = (Numo::DFloat.cast(@item_sum) - (min_rating * n)) / range / n
         phat = (phat - (1 / (2 * n))).clip(0, nil) # continuity correction
@@ -281,6 +296,7 @@ module Disco
       unless @implicit
         obj[:min_rating] = @min_rating
         obj[:max_rating] = @max_rating
+        obj[:rating_range] = @rating_range if @rating_range
       end
 
       if @top_items
@@ -409,6 +425,31 @@ module Disco
       end
     end
 
+    def check_rating_range(rating_range)
+      return if rating_range.nil?
+
+      bounds =
+        if rating_range.is_a?(Array)
+          rating_range if rating_range.size == 2
+        elsif rating_range.is_a?(Range)
+          # endless and beginless ranges have no finite endpoints
+          begin
+            [rating_range.first, rating_range.last]
+          rescue RangeError
+            nil
+          end
+        elsif rating_range.respond_to?(:first) && rating_range.respond_to?(:last)
+          [rating_range.first, rating_range.last]
+        end
+
+      unless bounds && bounds.all? { |r| r.is_a?(Numeric) }
+        raise ArgumentError, "Rating range must have numeric endpoints"
+      end
+      unless bounds.first < bounds.last
+        raise ArgumentError, "Rating range minimum must be less than maximum"
+      end
+    end
+
     def check_training_set(train_set)
       raise ArgumentError, "No training data" if train_set.empty?
     end
@@ -438,9 +479,13 @@ module Disco
       @epochs = obj["epochs"].to_i
       @verbose = obj["verbose"]
 
-      unless @implicit
+      if @implicit
+        @rating_range = nil
+      else
         @min_rating = obj["min_rating"]
         @max_rating = obj["max_rating"]
+        # snapshots without an explicit range keep the previous behavior
+        @rating_range = obj["rating_range"]
       end
 
       @top_items = obj.key?("item_count")

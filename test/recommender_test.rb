@@ -152,6 +152,146 @@ class RecommenderTest < Minitest::Test
     assert_equal ["B", "A"], recommender.top_items.map { |r| r[:item_id] }
   end
 
+  def test_top_items_rating_range
+    data = [
+      {user_id: 1, item_id: "A", rating: 3},
+      {user_id: 2, item_id: "A", rating: 3},
+      {user_id: 3, item_id: "A", rating: 4},
+      {user_id: 4, item_id: "A", rating: 4}
+    ]
+    recommender = Disco::Recommender.new(factors: 20, top_items: true)
+    recommender.fit(data, rating_range: 1..5)
+
+    # Wilson lower bound scaled to the explicit 1..5 scale
+    assert_in_delta 1.600142835280686, recommender.top_items.first[:score]
+  end
+
+  def test_top_items_rating_range_unaffected_by_other_items
+    item_a = [
+      {user_id: 1, item_id: "A", rating: 3},
+      {user_id: 2, item_id: "A", rating: 3},
+      {user_id: 3, item_id: "A", rating: 4},
+      {user_id: 4, item_id: "A", rating: 4}
+    ]
+
+    recommender = Disco::Recommender.new(factors: 20, top_items: true)
+    recommender.fit(item_a, rating_range: 1..5)
+    expected = recommender.top_items.find { |r| r[:item_id] == "A" }[:score]
+
+    # other items reaching the ends of the scale do not change the bound
+    data = item_a + [
+      {user_id: 5, item_id: "B", rating: 1},
+      {user_id: 6, item_id: "B", rating: 5}
+    ]
+    recommender = Disco::Recommender.new(factors: 20, top_items: true)
+    recommender.fit(data, rating_range: 1..5)
+    actual = recommender.top_items.find { |r| r[:item_id] == "A" }[:score]
+    assert_in_delta expected, actual
+  end
+
+  def test_top_items_without_rating_range_uses_observed_ratings
+    item_a = [
+      {user_id: 1, item_id: "A", rating: 3},
+      {user_id: 2, item_id: "A", rating: 3},
+      {user_id: 3, item_id: "A", rating: 4},
+      {user_id: 4, item_id: "A", rating: 4}
+    ]
+
+    recommender = Disco::Recommender.new(factors: 20, top_items: true)
+    recommender.fit(item_a)
+    assert_in_delta 3.091897047476151, recommender.top_items.first[:score]
+
+    # without an explicit range, other items change the observed bounds
+    data = item_a + [
+      {user_id: 5, item_id: "B", rating: 1},
+      {user_id: 6, item_id: "B", rating: 5}
+    ]
+    recommender = Disco::Recommender.new(factors: 20, top_items: true)
+    recommender.fit(data)
+    assert_in_delta 1.600142835280686, recommender.top_items.find { |r| r[:item_id] == "A" }[:score]
+  end
+
+  def test_top_items_rating_range_array
+    data = [
+      {user_id: 1, item_id: "A", rating: 3},
+      {user_id: 2, item_id: "A", rating: 3},
+      {user_id: 3, item_id: "A", rating: 4},
+      {user_id: 4, item_id: "A", rating: 4}
+    ]
+    recommender = Disco::Recommender.new(factors: 20, top_items: true)
+    recommender.fit(data, rating_range: [1, 5])
+    assert_in_delta 1.600142835280686, recommender.top_items.first[:score]
+  end
+
+  def test_top_items_rating_range_json
+    data = [
+      {user_id: 1, item_id: "A", rating: 3},
+      {user_id: 2, item_id: "A", rating: 3},
+      {user_id: 3, item_id: "A", rating: 4},
+      {user_id: 4, item_id: "A", rating: 4},
+      {user_id: 5, item_id: "B", rating: 1},
+      {user_id: 6, item_id: "B", rating: 5}
+    ]
+    recommender = Disco::Recommender.new(factors: 20, top_items: true)
+    recommender.fit(data, rating_range: 1..5)
+    top_items = recommender.top_items
+
+    loaded = Disco::Recommender.load_json(recommender.to_json)
+    assert_equal top_items, loaded.top_items
+  end
+
+  def test_top_items_old_snapshot_without_rating_range
+    data = [
+      {user_id: 1, item_id: "A", rating: 3},
+      {user_id: 2, item_id: "A", rating: 3},
+      {user_id: 3, item_id: "A", rating: 4},
+      {user_id: 4, item_id: "A", rating: 4}
+    ]
+    recommender = Disco::Recommender.new(factors: 20, top_items: true)
+    recommender.fit(data)
+    top_items = recommender.top_items
+
+    json = JSON.parse(recommender.to_json)
+    refute json.key?("rating_range")
+    loaded = Disco::Recommender.load_json(JSON.generate(json))
+    assert_equal top_items, loaded.top_items
+  end
+
+  def test_predict_clips_to_observed_ratings_with_rating_range
+    data = [
+      {user_id: 1, item_id: "A", rating: 3},
+      {user_id: 2, item_id: "A", rating: 3},
+      {user_id: 3, item_id: "A", rating: 4},
+      {user_id: 4, item_id: "A", rating: 4}
+    ]
+    recommender = Disco::Recommender.new(factors: 20)
+    recommender.fit(data, rating_range: 1..5)
+
+    predictions = recommender.predict([
+      {user_id: 1, item_id: "A"},
+      {user_id: 99, item_id: 99}
+    ])
+    assert predictions.all? { |score| score >= 3.0 && score <= 4.0 }
+  end
+
+  def test_invalid_rating_range
+    data = [{user_id: 1, item_id: "A", rating: 3}]
+
+    [5..1, 3..3, [1], [1, 5, 9], [1, "5"], [nil, 5], "1..5", 1.., ..5].each do |rating_range|
+      recommender = Disco::Recommender.new
+      error = assert_raises(ArgumentError, "expected #{rating_range.inspect} to be invalid") do
+        recommender.fit(data, rating_range: rating_range)
+      end
+      assert_match "Rating range", error.message
+    end
+  end
+
+  def test_rating_range_implicit
+    recommender = Disco::Recommender.new(top_items: true)
+    recommender.fit([{user_id: 1, item_id: "A"}], rating_range: 1..5)
+    assert_equal [{item_id: "A", score: 1}], recommender.top_items
+  end
+
   def test_ids
     data = [
       {user_id: 1, item_id: "A"},
