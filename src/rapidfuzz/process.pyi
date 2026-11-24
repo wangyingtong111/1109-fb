@@ -221,6 +221,9 @@ def extract(
     score_cutoff: float | None = None,
     score_hint: float | None = None,
     scorer_kwargs: dict[str, Any] | None = None,
+    entities: Any = None,
+    entity_key: Any = None,
+    k: int | None = None,
 ) -> list[tuple[_StringType2, float, _KeyType]]: ...
 @overload
 def extract(
@@ -233,6 +236,9 @@ def extract(
     score_cutoff: float | None = None,
     score_hint: float | None = None,
     scorer_kwargs: dict[str, Any] | None = None,
+    entities: Any = None,
+    entity_key: Any = None,
+    k: int | None = None,
 ) -> list[tuple[_StringType2, float, int]]: ...
 @overload
 def extract(
@@ -245,6 +251,9 @@ def extract(
     score_cutoff: float | None = None,
     score_hint: float | None = None,
     scorer_kwargs: dict[str, Any] | None = None,
+    entities: Any = None,
+    entity_key: Any = None,
+    k: int | None = None,
 ) -> list[tuple[_UnprocessedType2, float, _KeyType]]: ...
 @overload
 def extract(
@@ -257,6 +266,9 @@ def extract(
     score_cutoff: float | None = None,
     score_hint: float | None = None,
     scorer_kwargs: dict[str, Any] | None = None,
+    entities: Any = None,
+    entity_key: Any = None,
+    k: int | None = None,
 ) -> list[tuple[_UnprocessedType2, float, int]]: ...
 @overload
 def extract(
@@ -269,6 +281,9 @@ def extract(
     score_cutoff: _ResultType | None = None,
     score_hint: _ResultType | None = None,
     scorer_kwargs: dict[str, Any] | None = None,
+    entities: Any = None,
+    entity_key: Any = None,
+    k: int | None = None,
 ) -> list[tuple[_StringType2, _ResultType, _KeyType]]: ...
 @overload
 def extract(
@@ -281,6 +296,9 @@ def extract(
     score_cutoff: _ResultType | None = None,
     score_hint: _ResultType | None = None,
     scorer_kwargs: dict[str, Any] | None = None,
+    entities: Any = None,
+    entity_key: Any = None,
+    k: int | None = None,
 ) -> list[tuple[_StringType2, _ResultType, int]]: ...
 @overload
 def extract(
@@ -293,6 +311,9 @@ def extract(
     score_cutoff: _ResultType | None = None,
     score_hint: _ResultType | None = None,
     scorer_kwargs: dict[str, Any] | None = None,
+    entities: Any = None,
+    entity_key: Any = None,
+    k: int | None = None,
 ) -> list[tuple[_UnprocessedType2, _ResultType, _KeyType]]: ...
 @overload
 def extract(
@@ -305,6 +326,9 @@ def extract(
     score_cutoff: _ResultType | None = None,
     score_hint: _ResultType | None = None,
     scorer_kwargs: dict[str, Any] | None = None,
+    entities: Any = None,
+    entity_key: Any = None,
+    k: int | None = None,
 ) -> list[tuple[_UnprocessedType2, _ResultType, int]]: ...
 
 # mypy wants defaults to be valid for every possible parameterization of a generic function

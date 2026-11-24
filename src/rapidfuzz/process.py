@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import contextlib
+import functools
 import os
 
 from rapidfuzz._feature_detector import AVX2, SSE2, supports
@@ -93,3 +94,26 @@ else:
             extract_iter,
             extractOne,
         )
+
+_native_extract = extract
+_STANDARD_EXTRACT_PARAMS = frozenset(
+    {
+        "scorer",
+        "processor",
+        "limit",
+        "score_cutoff",
+        "score_hint",
+        "scorer_kwargs",
+    }
+)
+
+
+@functools.wraps(_native_extract)
+def extract(*args, **kwargs):
+    """Extract matches, optionally keeping only the best alias per entity."""
+    if kwargs.keys() - _STANDARD_EXTRACT_PARAMS:
+        from rapidfuzz.process_py import extract as python_extract
+
+        return python_extract(*args, **kwargs)
+
+    return _native_extract(*args, **kwargs)

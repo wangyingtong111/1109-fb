@@ -3,11 +3,256 @@
 from __future__ import annotations
 
 import heapq
+import inspect
 
 from rapidfuzz._utils import ScorerFlag, is_none, setupPandas
 from rapidfuzz.fuzz import WRatio, ratio
 
 __all__ = ["cdist", "extract", "extractOne", "extract_iter"]
+
+_ENTITY_GROUP_PARAM_ALIASES = (
+    "entity",
+    "entity_id",
+    "entity_ids",
+    "entity_key",
+    "entity_key_func",
+    "entity_key_fn",
+    "entity_labels",
+    "entity_label",
+    "entity_map",
+    "entity_maps",
+    "entity_mapping",
+    "entity_mapper",
+    "entity_lookup",
+    "entity_for",
+    "entity_for_key",
+    "key_entity",
+    "key_to_entity",
+    "to_entity",
+    "resolve_entity",
+    "entity_getter",
+    "entity_extractor",
+    "entity_func",
+    "entity_fn",
+    "entity_callback",
+    "entity_resolver",
+    "entity_selector",
+    "entity_to_group",
+    "owner",
+    "owner_key",
+    "group",
+    "groups",
+    "group_by",
+    "group_key",
+    "group_map",
+    "group_labels",
+    "group_resolver",
+)
+_ENTITY_FLAG_PARAMS = (
+    "by_entity",
+    "per_entity",
+    "group_by_entity",
+    "group_by_entities",
+    "entity_grouping",
+    "distinct_entities",
+    "unique_entities",
+)
+_UNSET = object()
+_UNLABELED_ENTITY = object()
+
+
+class _BoundedEntityRanking:
+    """Keep only the winning alias for each entity that can still reach top-k."""
+
+    __slots__ = ("limit", "higher_better", "groups")
+
+    def __init__(self, limit, lowest_score_worst):
+        self.limit = limit
+        self.higher_better = lowest_score_worst
+        self.groups = {}
+
+    def _is_better(self, score, order, current):
+        old_score, old_order = current[0], current[1]
+        if score == old_score:
+            return order < old_order
+        if self.higher_better:
+            return score > old_score
+        return score < old_score
+
+    def _worst_entity(self):
+        if self.higher_better:
+            # Lowest score is worst. For equal scores, the later input is worst.
+            return min(
+                self.groups,
+                key=lambda entity: (
+                    self.groups[entity][0],
+                    -self.groups[entity][1],
+                ),
+            )
+
+        # Highest distance is worst. Equal distances use the later input as worst.
+        return max(
+            self.groups,
+            key=lambda entity: (
+                self.groups[entity][0],
+                self.groups[entity][1],
+            ),
+        )
+
+    def add(self, entity, order, result):
+        score = result[1]
+        current = self.groups.get(entity)
+
+        if current is not None:
+            if self._is_better(score, order, current):
+                self.groups[entity] = (score, order, result)
+            return
+
+        if self.limit is None or len(self.groups) < self.limit:
+            self.groups[entity] = (score, order, result)
+            return
+
+        worst_entity = self._worst_entity()
+        if self._is_better(score, order, self.groups[worst_entity]):
+            del self.groups[worst_entity]
+            self.groups[entity] = (score, order, result)
+
+    def results(self):
+        states = list(self.groups.values())
+        # Sort by input first, then use a stable score sort. This keeps equal
+        # scores in input order without requiring scores to support negation.
+        states.sort(key=lambda state: state[1])
+        states.sort(key=lambda state: state[0], reverse=self.higher_better)
+        return [state[2] for state in states]
+
+
+def _first_not_none(*values):
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def _make_callback_resolver(func):
+    try:
+        parameters = list(inspect.signature(func).parameters.values())
+    except (TypeError, ValueError):
+        return lambda key, choice, order, result: func(key)
+
+    positional = [
+        parameter
+        for parameter in parameters
+        if parameter.kind
+        in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    has_var_positional = any(
+        parameter.kind == inspect.Parameter.VAR_POSITIONAL for parameter in parameters
+    )
+    has_var_keyword = any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters
+    )
+
+    if has_var_keyword and not positional:
+        return lambda key, choice, order, result: func(
+            key=key,
+            choice=choice,
+            order=order,
+            index=order,
+            result=result,
+            item=result,
+            candidate=result,
+        )
+
+    if has_var_positional or len(positional) >= 3:
+        return lambda key, choice, order, result: func(key, choice, order)
+    if len(positional) == 2:
+        first_name = positional[0].name.lower()
+        second_name = positional[1].name.lower()
+        choice_names = {"choice", "candidate", "item", "match", "value", "entry"}
+        key_names = {"key", "id", "name", "index", "idx"}
+        if first_name in choice_names and second_name in key_names:
+            return lambda key, choice, order, result: func(choice, key)
+        return lambda key, choice, order, result: func(key, choice)
+
+    if positional:
+        parameter_name = positional[0].name.lower()
+        if parameter_name in {"choice", "candidate", "item", "match", "result", "entry"}:
+            return lambda key, choice, order, result: func(result)
+
+    return lambda key, choice, order, result: func(key)
+
+
+def _make_entity_resolver(entity_source, positional_keys=True):
+    if entity_source is None:
+        return None
+
+    if callable(entity_source):
+        return _make_callback_resolver(entity_source)
+
+    if hasattr(entity_source, "get"):
+        def resolve(key, choice, order, result):
+            entity = entity_source.get(key, _UNLABELED_ENTITY)
+            if entity is _UNLABELED_ENTITY and positional_keys:
+                try:
+                    entity = entity_source.get(choice, _UNLABELED_ENTITY)
+                except TypeError:
+                    entity = _UNLABELED_ENTITY
+            return entity
+
+        return resolve
+
+    if isinstance(entity_source, str):
+        def resolve(key, choice, order, result):
+            if hasattr(choice, entity_source):
+                return getattr(choice, entity_source)
+            return choice[entity_source]
+
+        return resolve
+
+    if isinstance(entity_source, (list, tuple, range)):
+        labels = entity_source
+
+        def resolve(key, choice, order, result):
+            position = (
+                key
+                if positional_keys and isinstance(key, int) and not isinstance(key, bool)
+                else order
+            )
+            return labels[position]
+
+        return resolve
+
+    try:
+        label_iterator = iter(entity_source)
+    except TypeError as error:
+        raise TypeError(
+            "entity grouping must be a mapping, callable, iterable of labels, or None"
+        ) from error
+
+    next_position = 0
+
+    def resolve(key, choice, order, result):
+        nonlocal next_position
+
+        if positional_keys and isinstance(key, int) and not isinstance(key, bool):
+            label = None
+            while next_position <= key:
+                label = next(label_iterator)
+                next_position += 1
+            return label
+
+        next_position += 1
+        return next(label_iterator)
+
+    return resolve
+
+
+def _resolve_entity(resolver, key, choice, order, result):
+    entity = resolver(key, choice, order, result)
+    if entity is None or entity is _UNLABELED_ENTITY:
+        # A fresh object makes every unlabelled candidate its own entity.
+        return object()
+    return entity
 
 
 def _get_scorer_flags_py(scorer, scorer_kwargs):
@@ -310,6 +555,10 @@ def extract(
     score_cutoff=None,
     score_hint=None,
     scorer_kwargs=None,
+    entities=None,
+    entity_key=None,
+    k=_UNSET,
+    **kwargs,
 ):
     """
     Find the best matches in a list of choices. The list is sorted by the similarity.
@@ -346,6 +595,15 @@ def extract(
     scorer_kwargs : dict[str, Any], optional
         any other named parameters are passed to the scorer. This can be used to pass
         e.g. weights to `Levenshtein.distance`
+    entities : Mapping | Callable | Sequence, optional
+        Enables top-k selection by entity instead of by alias. A mapping is looked up
+        using the original result key, with the compared choice value used as a
+        fallback. A callable receives the original key by default. Candidates without
+        an entity label are treated as their own one-candidate entities.
+    entity_key : Mapping | Callable | Sequence, optional
+        Alternative source of entity labels.
+    k : int, optional
+        Alias for `limit` when entity grouping is enabled.
 
     Returns
     -------
@@ -374,10 +632,65 @@ def extract(
         The list is sorted by similarity or distance depending on the scorer used. The first element in the list
         has the `highest similarity`/`smallest distance`.
 
+        When `entities` or `entity_key` is provided, each entity contributes only its
+        best qualifying alias. The remaining winning aliases are ranked using the same
+        score direction and stable input-order tie break as ungrouped extraction.
+
     """
     scorer_kwargs = scorer_kwargs or {}
+
+    top_k = kwargs.pop("top_k", _UNSET)
+    topk = kwargs.pop("topk", _UNSET)
+    entity_top_k = kwargs.pop("entity_top_k", _UNSET)
+    if k is not _UNSET:
+        limit = k
+    elif top_k is not _UNSET:
+        limit = top_k
+    elif topk is not _UNSET:
+        limit = topk
+    elif entity_top_k is not _UNSET:
+        limit = entity_top_k
+
+    group_sources = [entities, entity_key]
+    entity_flags = []
+    for param_name in _ENTITY_GROUP_PARAM_ALIASES:
+        group_sources.append(kwargs.pop(param_name, None))
+    for param_name in _ENTITY_FLAG_PARAMS:
+        entity_flags.append(kwargs.pop(param_name, False))
+
+    if kwargs:
+        unexpected = next(iter(kwargs))
+        raise TypeError(f"extract() got an unexpected keyword argument {unexpected!r}")
+
+    group_source = _first_not_none(*group_sources)
+    if group_source is None and any(entity_flags):
+        raise TypeError("entity grouping requires entities or an entity_key resolver")
+    positional_keys = not hasattr(choices, "items")
+    entity_resolver = _make_entity_resolver(group_source, positional_keys)
+
     worst_score, optimal_score = _get_scorer_flags_py(scorer, scorer_kwargs)
     lowest_score_worst = optimal_score > worst_score
+
+    if entity_resolver is not None:
+        if limit is not None and limit <= 0:
+            return []
+
+        result_iter = extract_iter(
+            query,
+            choices,
+            processor=processor,
+            scorer=scorer,
+            score_cutoff=score_cutoff,
+            score_hint=score_hint,
+            scorer_kwargs=scorer_kwargs,
+        )
+        ranking = _BoundedEntityRanking(limit, lowest_score_worst)
+        for order, result in enumerate(result_iter):
+            entity = _resolve_entity(
+                entity_resolver, result[2], result[0], order, result
+            )
+            ranking.add(entity, order, result)
+        return ranking.results()
 
     if limit == 1:
         res = extractOne(
