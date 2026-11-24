@@ -13,6 +13,18 @@ class MethodAveragePrecision(Enum):
     ELEVEN_POINT_INTERPOLATION = 2
 
 
+class TubeMatchingMethod(Enum):
+    """
+    Class representing the strategy used to associate predicted tubes
+    with ground-truth tubes when computing the tube AP.
+    """
+    # Greedily build the pairs with the highest IoU first (legacy behaviour).
+    MAX_IOU = 1
+    # Process predictions in decreasing confidence order (ties broken by the
+    # input order), so the association order matches the PR-curve order.
+    CONFIDENCE = 2
+
+
 class CoordinatesType(Enum):
     """
     Class representing if the coordinates are relative to the

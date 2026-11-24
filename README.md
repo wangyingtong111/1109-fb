@@ -316,8 +316,38 @@ See [example annotation](https://github.com/rafaelpadilla/review_object_detectio
 ```python
 from src.evaluators.tube_evaluator import TubeEvaluator
 
+# By default, the legacy maximum-overlap-first association is used.
 tube_evaluator = TubeEvaluator(annot_filepath, preds_filepath)
 res, mAP = tube_evaluator.evaluate(thr=0.5)
+```
+
+Two strategies are available through `src.utils.enumerators.TubeMatchingMethod`:
+
+- `TubeMatchingMethod.MAX_IOU` (default): builds the pred/GT pairs with the highest STT-IOU first,
+  regardless of confidence (legacy behaviour).
+- `TubeMatchingMethod.CONFIDENCE`: processes predictions in decreasing confidence order - the same
+  order used to build the PR curve - so the association order and the PR order are guaranteed to
+  agree. Each prediction is used exactly once. A prediction is a TP when its best still-available
+  ground truth reaches the IOU threshold; otherwise it is a FP (`duplicate FP` when it overlaps an
+  already matched ground truth above the threshold). Predictions sharing the same confidence keep
+  their input order, so the result is reproducible.
+
+```python
+from src.evaluators.tube_evaluator import TubeEvaluator
+from src.utils.enumerators import TubeMatchingMethod
+
+# choose the strategy in the constructor ...
+tube_evaluator = TubeEvaluator(annot_filepath, preds_filepath,
+                               matching_method=TubeMatchingMethod.CONFIDENCE)
+res, mAP = tube_evaluator.evaluate(thr=0.5)
+
+# ... or override it per evaluation call
+res, mAP = tube_evaluator.evaluate(thr=0.5,
+                                   matching_method=TubeMatchingMethod.MAX_IOU)
+
+# inspect the actual pred<->gt pairings of the last evaluation:
+# one entry per prediction with keys pred_id, gt_id, iou, status, confidence, video_id
+pairings = tube_evaluator.get_pairings()
 ```
 
 ## Contributing
