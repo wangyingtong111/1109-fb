@@ -1,3 +1,9 @@
+## 0.8.0 (unreleased)
+
+- Added multiclass log loss: `Eps::Metrics.log_loss` now accepts label-to-probability Hashes from `predict_probability`
+- Added `Eps::Metrics.log_loss_accumulator` and `log_loss_segments` for accumulating and merging log loss across segments
+- Added log loss and accuracy to `Eps.metrics` when passed probability Hashes
+
 ## 0.7.0 (2026-04-14)
 
 - Dropped support for Daru

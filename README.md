@@ -396,6 +396,12 @@ model.predict_probability(data)
 
 Naive Bayes is known to produce poor probability estimates, so stick with LightGBM if you need this.
 
+`Eps.metrics` also accepts these probability Hashes, reporting log loss alongside accuracy
+
+```ruby
+Eps.metrics(actual, model.predict_probability(data))
+```
+
 ## Validation Options
 
 Pass your own validation set with:
@@ -473,6 +479,61 @@ Eps.metrics(actual, predicted, weight: weight)
 ```
 
 Reweighing is one method to [mitigate bias](https://fairlearn.org/) in training data
+
+## Log Loss
+
+`Eps::Metrics.log_loss` accepts the two-class shape, where each prediction is the probability of the positive class (a true label of `1` selects it, any other label selects its complement)
+
+```ruby
+Eps::Metrics.log_loss([0, 1, 0], [0.1, 0.9, 0.4])
+```
+
+It also accepts the label-to-probability Hashes that `predict_probability` returns for multiclass models. The value stored under each row’s true label is used, so the Hash key order does not matter
+
+```ruby
+Eps::Metrics.log_loss(
+  ["a", "c"],
+  [{"a" => 0.2, "b" => 0.3, "c" => 0.5}, {"b" => 0.4, "c" => 0.5, "a" => 0.1}],
+  weight: [1, 3]
+)
+# => (-log(0.2) - 3 * log(0.5)) / 4
+```
+
+Edge cases have a defined contract:
+
+- a true label missing from its row’s Hash raises `ArgumentError`
+- a probability outside `0..1`, or `NaN`/`Infinity`, raises `ArgumentError`
+- a legal probability of `0` is treated as `eps` (default `1e-15`), so the loss stays finite
+- a zero weight contributes neither loss nor denominator weight
+
+### Segments
+
+When predictions and weights only arrive in pieces from a one-shot enumerator, accumulate them and normalize once at the end
+
+```ruby
+accumulator = Eps::Metrics.log_loss_accumulator
+predictions.each_slice(100) do |chunk|
+  accumulator.add(labels.shift(100), chunk, weight: weights.shift(100))
+end
+accumulator.value
+```
+
+The raw loss and effective weight are summed across segments and divided once, so this matches evaluating the whole batch. The per-segment metrics are never averaged, and a segment whose rows all carry zero weight does not shift the result.
+
+Segments can also be merged directly
+
+```ruby
+Eps::Metrics::LogLossAccumulator.combine([first, second, third]).value
+```
+
+A segment is validated before it is added, so a segment with an illegal value raises and leaves the accumulator untouched; retry it with corrected content without the earlier rows being counted twice.
+
+You can also pass an enumerator of segments straight to `log_loss`
+
+```ruby
+Eps::Metrics.log_loss(segments)
+Eps::Metrics.log_loss_segments(segments)
+```
 
 ## History
 
