@@ -57,4 +57,25 @@ RSpec.describe Rumale::NaiveBayes::GaussianNB do
     expect(probs.shape[1]).to eq(n_classes)
     expect(predicted_by_probs).to eq(y)
   end
+
+  context 'with constant features' do
+    let(:x_const) { Numo::DFloat[[0, 7], [0, 7], [10, 7], [10, 7]] }
+    let(:y_const) { Numo::Int32[0, 0, 1, 1] }
+    let(:estimator_const) { described_class.new.fit(x_const, y_const) }
+    let(:probs_const) { estimator_const.predict_proba(x_const) }
+
+    it 'classifies samples with constant features.', :aggregate_failures do
+      expect(estimator_const.predict(x_const)).to eq(y_const)
+      expect(probs_const).to be_a(Numo::DFloat)
+      expect(probs_const.to_a.flatten).to all(be_finite)
+      expect(probs_const.sum(axis: 1).to_a).to all(be_within(1e-8).of(1.0))
+    end
+
+    it 'keeps class ranking when the feature constant across all classes is dropped.', :aggregate_failures do
+      x_dropped = x_const[true, 0].expand_dims(1).dup
+      probs_dropped = described_class.new.fit(x_dropped, y_const).predict_proba(x_dropped)
+      expect(probs_dropped.to_a.map { |row| row.each_with_index.max[1] })
+        .to eq(probs_const.to_a.map { |row| row.each_with_index.max[1] })
+    end
+  end
 end

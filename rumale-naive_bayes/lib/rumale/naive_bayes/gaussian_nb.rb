@@ -30,9 +30,13 @@ module Rumale
       attr_reader :variances
 
       # Create a new classifier with Gaussian Naive Bayes.
-      def initialize
-        super
+      #
+      # @param var_smoothing [Float] The portion of the largest variance of all features
+      #   to be added to variances for calculation stability.
+      def initialize(var_smoothing: 1.0e-9)
+        super()
         @params = {}
+        @params[:var_smoothing] = var_smoothing
       end
 
       # Fit the model with given training data.
@@ -51,6 +55,9 @@ module Rumale
         @class_priors = Numo::DFloat[*@classes.to_a.map { |l| y.eq(l).count / n_samples.to_f }]
         @means = Numo::DFloat[*@classes.to_a.map { |l| x[y.eq(l).where, true].mean(0) }]
         @variances = Numo::DFloat[*@classes.to_a.map { |l| x[y.eq(l).where, true].var(0) }]
+        epsilon = @params[:var_smoothing] * x.var(0).max
+        epsilon = Float::EPSILON unless epsilon.positive?
+        @variances += epsilon
         self
       end
 

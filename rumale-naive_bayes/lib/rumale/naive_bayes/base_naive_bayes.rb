@@ -36,6 +36,7 @@ module Rumale
 
         n_samples, = x.shape
         log_likelihoods = decision_function(x)
+        log_likelihoods -= log_likelihoods.max(axis: 1).reshape(n_samples, 1)
         log_likelihoods - Numo::NMath.log(Numo::NMath.exp(log_likelihoods).sum(axis: 1)).reshape(n_samples, 1)
       end
 
