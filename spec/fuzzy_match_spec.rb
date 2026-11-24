@@ -306,6 +306,63 @@ describe FuzzyMatch do
       d.last_result.score.should == 0.6
       d.last_result.winner.should == 'NISSAN'
     end
+
+    it %{not let a nested find hijack the outer find's last result} do
+      matcher = nil
+      inner_results = []
+      identity = lambda do |needle_original, straw_original|
+        if needle_original == 'green tea'
+          matcher.find 'red apple', :gather_last_result => true
+          # the nested find must see its OWN last result
+          inner_results << matcher.last_result
+        end
+        nil
+      end
+      matcher = FuzzyMatch.new ['green tea', 'green tee', 'red apple'], :identities => [identity]
+      matcher.find('green tea', :gather_last_result => true).should == 'green tea'
+      inner_results.each do |inner_result|
+        inner_result.needle.original.should == 'red apple'
+        inner_result.winner.should == 'red apple'
+      end
+      # once the outer find is done, last_result describes the OUTER find again
+      matcher.last_result.needle.original.should == 'green tea'
+      matcher.last_result.winner.should == 'green tea'
+    end
+
+    it %{not cross state between layers when the nested find matches nothing} do
+      matcher = nil
+      identity = lambda do |needle_original, straw_original|
+        matcher.find 'zzz nothing like this', :gather_last_result => true if needle_original == 'green tea'
+        nil
+      end
+      matcher = FuzzyMatch.new ['green tea'], :identities => [identity]
+      matcher.find 'green tea', :gather_last_result => true
+      matcher.last_result.needle.original.should == 'green tea'
+      matcher.last_result.winner.should == 'green tea'
+    end
+
+    it %{not cross state between layers when the nested find raises} do
+      matcher = nil
+      identity = lambda do |needle_original, straw_original|
+        if needle_original == 'green tea'
+          matcher.find 'red apple', :gather_last_result => true
+          raise 'boom'
+        end
+        nil
+      end
+      matcher = FuzzyMatch.new ['green tea', 'red apple'], :identities => [identity]
+      lambda do
+        matcher.find 'green tea', :gather_last_result => true
+      end.should raise_error(::RuntimeError, /boom/)
+      matcher.last_result.needle.original.should == 'green tea'
+    end
+
+    it %{not gather metadata on nested finds that don't ask for it} do
+      d = FuzzyMatch.new %w{ NISSAN HONDA }
+      d.find 'MISSAM', :gather_last_result => true
+      d.find 'HONDA'
+      d.last_result.winner.should == 'NISSAN'
+    end
   end
   
   describe 'quirks' do

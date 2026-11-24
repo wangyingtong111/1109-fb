@@ -113,27 +113,55 @@ class FuzzyMatch
   
   def find(needle, options = {})
     options = default_options.merge options
-    
+
+    if options[:gather_last_result]
+      result = Result.new
+      @last_result = result
+      begin
+        find_with_options needle, options, result
+      ensure
+        # A nested find/explain (for example one triggered by an identity
+        # Proc while this find was running) may have overwritten
+        # @last_result with its own Result. Once this find is done,
+        # #last_result must describe THIS find again.
+        @last_result = result
+      end
+    else
+      find_with_options needle, options, nil
+    end
+  end
+
+  # Explain is like mysql's EXPLAIN command. You give it a needle and it tells you about how it was located (successfully or not) in the haystack.
+  #
+  #     d = FuzzyMatch.new ['737', '747', '757' ]
+  #     d.explain 'boeing 737-100'
+  def explain(needle, options = {})
+    find needle, options.merge(:gather_last_result => true)
+    last_result.explain
+  end
+
+  private
+
+  def find_with_options(needle, options, result)
     threshold = options[:threshold]
-    gather_last_result = options[:gather_last_result]
+    gather_last_result = !result.nil?
     is_find_all_with_score = options[:find_all_with_score]
     is_find_with_score = options[:find_with_score]
     is_find_best = options[:find_best]
     is_find_all = options[:find_all] || is_find_all_with_score || is_find_best
     must_match_grouping = options[:must_match_grouping]
     must_match_at_least_one_word = options[:must_match_at_least_one_word]
-    
+
     if gather_last_result
-      @last_result = Result.new
-      last_result.read = read
-      last_result.haystack = haystack
-      last_result.options = options
+      result.read = read
+      result.haystack = haystack
+      result.options = options
     end
-    
+
     if gather_last_result
-      last_result.identities = identities
-      last_result.groupings = groupings
-      last_result.stop_words = stop_words
+      result.identities = identities
+      result.groupings = groupings
+      result.stop_words = stop_words
     end
     
     needle = case needle
@@ -144,23 +172,23 @@ class FuzzyMatch
     end
     
     if gather_last_result
-      last_result.needle = needle
+      result.needle = needle
     end
 
     if groupings.any?
       first_grouping = groupings.detect { |grouping| grouping.xmatch? needle }
       if gather_last_result
         if first_grouping
-          last_result.timeline << "Grouping: #{first_grouping.inspect}"
+          result.timeline << "Grouping: #{first_grouping.inspect}"
         else
-          last_result.timeline << "No grouping."
+          result.timeline << "No grouping."
         end
       end
     end
 
     if must_match_grouping and not first_grouping
       if gather_last_result
-        last_result.timeline << <<-EOS
+        result.timeline << <<-EOS
 The needle didn't match any of the #{groupings.length} groupings, which was a requirement.
 \t#{groupings.map(&:inspect).join("\n\t")}
 EOS
@@ -185,7 +213,7 @@ EOS
         (needle.words & straw.words).any?
       end
       if gather_last_result
-        last_result.timeline << <<-EOS
+        result.timeline << <<-EOS
 Since :must_match_at_least_one_word => true, the competition was reduced to records sharing at least one word with the needle.
 \tNeedle words: #{needle.words.map(&:inspect).join(', ')}
 \tPassed (first 3): #{passed_word_requirement[0,3].map(&:inspect).join(', ')}
@@ -202,7 +230,7 @@ EOS
       end
       # binding.pry      
       if gather_last_result
-        last_result.timeline << <<-EOS
+        result.timeline << <<-EOS
 Since there were groupings, the competition was reduced to #{joint.length} records in the same group as the needle.
 \t#{joint.map(&:inspect).join("\n\t")}
 EOS
@@ -214,7 +242,7 @@ EOS
     if joint.none?
       if must_match_grouping
         if gather_last_result
-          last_result.timeline << <<-EOS
+          result.timeline << <<-EOS
 Since :must_match_at_least_one_word => true and none of the competition was in the same group as the needle, the search stopped.
 EOS
         end
@@ -236,7 +264,7 @@ EOS
         end
       end
       if gather_last_result
-        last_result.timeline << <<-EOS
+        result.timeline << <<-EOS
 Since there were identities, the competition was reduced to records that might be identical to the needle (in other words, are not certainly different)
 \tIdentities (first 10 of #{identities.length}): #{identities[0,9].map(&:inspect).join(', ')}
 \tPassed (first 10 of #{possibly_identical.length}): #{possibly_identical[0,9].map(&:inspect).join(', ')}
@@ -250,7 +278,7 @@ EOS
     similarities = possibly_identical.map { |straw| needle.similarity straw }.sort.reverse
         
     if gather_last_result
-      last_result.timeline << <<-EOS
+      result.timeline << <<-EOS
 The competition was sorted in order of similarity to the needle.
 \t#{similarities[0,9].map { |s| "#{s.record2.similarity(needle).inspect}" }.join("\n\t")}
 EOS
@@ -300,9 +328,9 @@ EOS
     if best_similarity and best_similarity.satisfy?(needle, threshold)
       winner = best_similarity.record2.original
       if gather_last_result
-        last_result.winner = winner
-        last_result.score = best_similarity.best_score.dices_coefficient_similar
-        last_result.timeline << <<-EOS
+        result.winner = winner
+        result.score = best_similarity.best_score.dices_coefficient_similar
+        result.timeline << <<-EOS
 A winner was determined because the Dice's Coefficient similarity (#{'%0.5f' % best_similarity.best_score.dices_coefficient_similar}) is greater than zero or because it shared a word with the needle.
 EOS
       end
@@ -316,20 +344,11 @@ EOS
       best_similarity_record = if best_similarity and best_similarity.record2
         best_similarity.record2.original
       end
-      last_result.timeline << <<-EOS
+      result.timeline << <<-EOS
 No winner assigned because the score of the best similarity (#{best_similarity_record.inspect}) was zero and it didn't match any words with the needle (#{needle.inspect}).
 EOS
     end
 
     nil # ugly
-  end
-  
-  # Explain is like mysql's EXPLAIN command. You give it a needle and it tells you about how it was located (successfully or not) in the haystack.
-  #
-  #     d = FuzzyMatch.new ['737', '747', '757' ]
-  #     d.explain 'boeing 737-100'
-  def explain(needle, options = {})
-    find needle, options.merge(:gather_last_result => true)
-    last_result.explain
   end
 end
