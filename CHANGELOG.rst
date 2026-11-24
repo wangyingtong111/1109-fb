@@ -2,6 +2,15 @@ Changelog
 ---------
 [Unreleased]
 ^^^^^^^^^^^^
+Added
+~~~~~
+* add support for custom ``weights`` to ``Levenshtein.editops`` and
+  ``Levenshtein.opcodes`` in the pure Python implementation. The returned edit
+  script is reconstructed from the weighted Wagner-Fischer alignment, so its
+  total cost equals ``Levenshtein.distance`` for the same weights, including
+  unequal insertion/deletion weights and zero weights. The default
+  ``(1, 1, 1)`` edit script is unchanged.
+
 Fixed
 ~~~~~
 * keep the ``score_cutoff`` of normalized scorers in double precision: a score equal to the

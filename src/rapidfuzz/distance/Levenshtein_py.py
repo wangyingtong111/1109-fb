@@ -41,6 +41,67 @@ def _uniform_generic(s1, s2, weights):
     return cache[-1]
 
 
+def _weighted_matrix(s1, s2, weights):
+    """
+    calculate the weighted Wagner-Fischer edit distance together with the
+    predecessor of each cell, so an optimal edit script can be reconstructed
+    by backtracking through the alignment.
+
+    The predecessor is encoded as one of the three operations used to reach
+    the cell:
+
+    * "delete":  reached from the cell to the left      (cost ``delete``)
+    * "insert":  reached from the cell above            (cost ``insert``)
+    * "replace": reached from the diagonal cell         (cost ``replace``
+      when the characters differ and 0 otherwise)
+
+    Ties are resolved in the order ``insert`` -> ``delete`` -> ``replace``.
+    This matches the ordering produced by the bit-parallel implementation of
+    the uniform Levenshtein distance, so both implementations produce the
+    same edit script whenever their costs coincide.
+    """
+    insert, delete, replace = weights
+    len1 = len(s1)
+    len2 = len(s2)
+
+    # only the previous and the current row of the cost matrix are required
+    previous = [col * delete for col in range(len1 + 1)]
+    # predecessor operation used to reach each cell
+    predecessors = [[None] * (len1 + 1) for _ in range(len2 + 1)]
+
+    for col in range(1, len1 + 1):
+        predecessors[0][col] = "delete"
+
+    for row in range(1, len2 + 1):
+        current = [row * insert]
+        predecessors[row][0] = "insert"
+        pred = predecessors[row]
+        ch2 = s2[row - 1]
+        for col in range(1, len1 + 1):
+            # insertion: s1[:col] -> s2[:row-1] and insert s2[row-1]
+            cost_insert = previous[col] + insert
+            # deletion: s1[:col-1] -> s2[:row] and drop s1[col-1]
+            cost_delete = current[col - 1] + delete
+            # match (cost 0) or substitution (cost ``replace``)
+            cost_replace = previous[col - 1] + (0 if s1[col - 1] == ch2 else replace)
+
+            best = cost_insert
+            tag = "insert"
+            if cost_delete < best:
+                best = cost_delete
+                tag = "delete"
+            if cost_replace < best:
+                best = cost_replace
+                tag = "replace"
+
+            current.append(best)
+            pred[col] = tag
+
+        previous = current
+
+    return previous[len1], predecessors
+
+
 def _uniform_distance(s1, s2):
     if not s1:
         return len(s2)
@@ -416,6 +477,7 @@ def editops(
     s1,
     s2,
     *,
+    weights=(1, 1, 1),
     processor=None,
     score_hint=None,
 ):
@@ -428,6 +490,12 @@ def editops(
         First string to compare.
     s2 : Sequence[Hashable]
         Second string to compare.
+    weights : tuple[int, int, int] or None, optional
+        The weights for the three operations in the form
+        (insertion, deletion, substitution). Default is (1, 1, 1),
+        which gives all three operations a weight of 1.
+        The total cost of the returned edit script is guaranteed to equal
+        :func:`Levenshtein.distance` calculated with the same weights.
     processor : callable, optional
         Optional callable that is used to preprocess the strings before
         comparing them. Default is None, which deactivates this behaviour.
@@ -442,13 +510,19 @@ def editops(
 
     Notes
     -----
-    The alignment is calculated using an algorithm of Heikki Hyyrö, which is
-    described [8]_. It has a time complexity and memory usage of ``O([N/64] * M)``.
+    With the default weights the alignment is calculated using an algorithm
+    of Heikki Hyyrö, which is described [8]_. It has a time complexity and
+    memory usage of ``O([N/64] * M)``.
+    For all other weights the weighted Wagner-Fischer algorithm [9]_ is used,
+    which has a time complexity and memory usage of ``O(N * M)``.
 
     References
     ----------
     .. [8] Hyyrö, Heikki. "A Note on Bit-Parallel Alignment Computation."
            Stringology (2004).
+    .. [9] Wagner, Robert A. and Fischer, Michael J.
+           "The String-to-String Correction Problem."
+           Journal of the ACM 21.1 (1974): 168-173.
 
     Examples
     --------
@@ -458,6 +532,23 @@ def editops(
      delete s1[1] s2[0]
     replace s1[3] s2[2]
      insert s1[6] s2[5]
+
+    Custom weights are taken into account when selecting the edit script.
+    With a substitution weight of 4 the substitution of ``a`` by ``u`` is
+    more expensive than deleting ``a`` and inserting ``u``, so the latter
+    script with a total cost of 2 is selected:
+
+    >>> Levenshtein.editops("cat", "cut", weights=(1, 1, 4)).as_list()
+    [('delete', 1, 1), ('insert', 2, 1)]
+    >>> Levenshtein.distance("cat", "cut", weights=(1, 1, 4))
+    2
+
+    The inverse script turns ``cut`` back into ``cat``. With the swapped
+    insertion and deletion weights its cost equals the distance of the
+    reversed direction:
+
+    >>> Levenshtein.editops("cat", "cut", weights=(1, 1, 4)).inverse().as_list()
+    [('insert', 1, 1), ('delete', 1, 2)]
     """
     _ = score_hint
     if processor is not None:
@@ -465,14 +556,30 @@ def editops(
         s2 = processor(s2)
 
     s1, s2 = conv_sequences(s1, s2)
+
+    if weights is None:
+        weights = (1, 1, 1)
+
     prefix_len, suffix_len = common_affix(s1, s2)
     s1 = s1[prefix_len : len(s1) - suffix_len]
     s2 = s2[prefix_len : len(s2) - suffix_len]
-    dist, VP, VN = _matrix(s1, s2)
 
     editops = Editops([], 0, 0)
     editops._src_len = len(s1) + prefix_len + suffix_len
     editops._dest_len = len(s2) + prefix_len + suffix_len
+
+    if weights == (1, 1, 1):
+        return _uniform_editops(s1, s2, prefix_len, editops)
+
+    return _weighted_editops(s1, s2, weights, prefix_len, editops)
+
+
+def _uniform_editops(s1, s2, prefix_len, editops):
+    """
+    reconstruct the edit script of the uniform Levenshtein distance using
+    the bit-parallel alignment computation of Heikki Hyyrö
+    """
+    dist, VP, VN = _matrix(s1, s2)
 
     if dist == 0:
         return editops
@@ -515,10 +622,65 @@ def editops(
     return editops
 
 
+def _weighted_editops(s1, s2, weights, prefix_len, editops):
+    """
+    reconstruct an edit script of minimum cost for the weighted
+    Levenshtein distance by backtracking through the weighted edit matrix
+
+    All insertions, deletions and substitutions of differing characters are
+    recorded, even when the weight of the operation is zero. This is required,
+    because :meth:`Editops.apply` has to be able to actually perform the edit.
+    A zero weight simply means the recorded operation contributes nothing to
+    the total cost, so the script still costs exactly the weighted
+    Levenshtein distance. Diagonal steps aligning identical characters are
+    matches and are never recorded.
+    """
+    insert, delete, replace = weights
+    _dist, predecessors = _weighted_matrix(s1, s2, weights)
+
+    editop_list = []
+    col = len(s1)
+    row = len(s2)
+    while row != 0 or col != 0:
+        if row == 0:
+            tag = "delete"
+        elif col == 0:
+            tag = "insert"
+        else:
+            tag = predecessors[row][col]
+
+        if tag == "delete":
+            col -= 1
+            editop_list.append(Editop("delete", col + prefix_len, row + prefix_len))
+        elif tag == "insert":
+            row -= 1
+            editop_list.append(Editop("insert", col + prefix_len, row + prefix_len))
+        else:
+            col -= 1
+            row -= 1
+            # matches (identical characters) are not recorded, while
+            # substitutions are recorded even if their weight is zero
+            if s1[col] != s2[row]:
+                editop_list.append(
+                    Editop("replace", col + prefix_len, row + prefix_len)
+                )
+
+    if not editop_list:
+        # the strings are equal
+        return editops
+
+    # the operations were collected from the end of the alignment to the
+    # beginning, so they have to be reversed afterwards
+    editop_list.reverse()
+    editops._editops = editop_list
+    return editops
+
+
 def opcodes(
     s1,
     s2,
     *,
+    weights=(1, 1, 1),
     processor=None,
     score_hint=None,
 ):
@@ -531,6 +693,12 @@ def opcodes(
         First string to compare.
     s2 : Sequence[Hashable]
         Second string to compare.
+    weights : tuple[int, int, int] or None, optional
+        The weights for the three operations in the form
+        (insertion, deletion, substitution). Default is (1, 1, 1),
+        which gives all three operations a weight of 1.
+        See :func:`editops` for details on how the weights affect the
+        selected alignment.
     processor : callable, optional
         Optional callable that is used to preprocess the strings before
         comparing them. Default is None, which deactivates this behaviour.
@@ -545,8 +713,11 @@ def opcodes(
 
     Notes
     -----
-    The alignment is calculated using an algorithm of Heikki Hyyrö, which is
-    described [9]_. It has a time complexity and memory usage of ``O([N/64] * M)``.
+    With the default weights the alignment is calculated using an algorithm
+    of Heikki Hyyrö, which is described [9]_. It has a time complexity and
+    memory usage of ``O([N/64] * M)``.
+    For all other weights the weighted Wagner-Fischer algorithm is used,
+    which has a time complexity and memory usage of ``O(N * M)``.
 
     References
     ----------
@@ -568,4 +739,6 @@ def opcodes(
       equal a[4:6] (cd) b[3:5] (cd)
      insert a[6:6] () b[5:6] (f)
     """
-    return editops(s1, s2, processor=processor, score_hint=score_hint).as_opcodes()
+    return editops(
+        s1, s2, weights=weights, processor=processor, score_hint=score_hint
+    ).as_opcodes()

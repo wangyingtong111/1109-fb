@@ -102,6 +102,7 @@ def editops(
     s1: Sequence[Hashable],
     s2: Sequence[Hashable],
     *,
+    weights: tuple[int, int, int] | None = (1, 1, 1),
     processor: None = None,
     score_hint: int | None = None,
 ) -> Editops: ...
@@ -110,6 +111,7 @@ def editops(
     s1: _UnprocessedType1,
     s2: _UnprocessedType2,
     *,
+    weights: tuple[int, int, int] | None = (1, 1, 1),
     processor: Callable[[_UnprocessedType1 | _UnprocessedType2], Sequence[Hashable]],
     score_hint: int | None = None,
 ) -> Editops: ...
@@ -118,6 +120,7 @@ def opcodes(
     s1: Sequence[Hashable],
     s2: Sequence[Hashable],
     *,
+    weights: tuple[int, int, int] | None = (1, 1, 1),
     processor: None = None,
     score_hint: int | None = None,
 ) -> Opcodes: ...
@@ -126,6 +129,7 @@ def opcodes(
     s1: _UnprocessedType1,
     s2: _UnprocessedType2,
     *,
+    weights: tuple[int, int, int] | None = (1, 1, 1),
     processor: Callable[[_UnprocessedType1 | _UnprocessedType2], Sequence[Hashable]],
     score_hint: int | None = None,
 ) -> Opcodes: ...
