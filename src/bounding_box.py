@@ -3,7 +3,7 @@ from math import isclose
 from src.utils.general_utils import (convert_to_absolute_values,
                                      convert_to_relative_values)
 
-from .utils.enumerators import BBFormat, BBType, CoordinatesType
+from .utils.enumerators import BBFormat, BBGeometry, BBType, CoordinatesType
 
 
 class BoundingBox:
@@ -16,7 +16,8 @@ class BoundingBox:
                  img_size=None,
                  bb_type=BBType.GROUND_TRUTH,
                  confidence=None,
-                 format=BBFormat.XYWH):
+                 format=BBFormat.XYWH,
+                 geometry=BBGeometry.CONTINUOUS):
         """ Constructor.
 
         Parameters
@@ -49,6 +50,11 @@ class BoundingBox:
                 BBFormat.XYWH: <left> <top> <width> <height>
                 BBFomat.XYX2Y2: <left> <top> <right> <bottom>.
                 BBFomat.YOLO: <x_center> <y_center> <width> <height>. (relative)
+            geometry : Enum (optional)
+                Enum (BBGeometry.CONTINUOUS or BBGeometry.PIXEL_CLOSED) identifying the geometric
+                convention of the coordinates. It is stored per box and is only read by evaluation
+                entry points that explicitly opt in to the shared geometry convention; it never
+                changes the stored coordinates. Default: BBGeometry.CONTINUOUS.
         """
 
         self._image_name = image_name
@@ -56,6 +62,7 @@ class BoundingBox:
         self._confidence = confidence
         self._class_id = class_id
         self._format = format
+        self.set_geometry(geometry)
         if bb_type == BBType.DETECTED and confidence is None:
             raise IOError(
                 'For bb_type=\'Detected\', it is necessary to inform the confidence value.')
@@ -254,6 +261,37 @@ class BoundingBox:
         """
         return self._type_coordinates
 
+    def set_geometry(self, geometry):
+        """ Set the geometric convention of the bounding box.
+
+        Parameters
+        ----------
+        geometry : BBGeometry
+            BBGeometry.CONTINUOUS for continuous half-open intervals or
+            BBGeometry.PIXEL_CLOSED for inclusive integer pixel spans. The stored coordinates
+            are never modified; the convention only affects evaluators that explicitly opt in
+            to the shared geometry convention.
+        """
+        if geometry is None:
+            # boxes created without an explicit convention behave as continuous boxes
+            geometry = BBGeometry.CONTINUOUS
+        if not isinstance(geometry, BBGeometry):
+            raise IOError(
+                "Parameter 'geometry' must be a member of the BBGeometry enumerator "
+                "(BBGeometry.CONTINUOUS or BBGeometry.PIXEL_CLOSED).")
+        self._geometry = geometry
+
+    def get_geometry(self):
+        """ Get the geometric convention of the bounding box.
+
+        Returns
+        -------
+        Enum
+            BBGeometry.CONTINUOUS for continuous half-open intervals or
+            BBGeometry.PIXEL_CLOSED for inclusive integer pixel spans.
+        """
+        return self._geometry
+
     def get_bb_type(self):
         """ Get type of the bounding box that represents if it is a ground-truth or detected box.
 
@@ -339,7 +377,13 @@ class BoundingBox:
         return new_bounding_box
 
     @staticmethod
-    def iou(boxA, boxB):
+    def iou(boxA, boxB, use_shared_geometry=False):
+        # Opt-in shared geometry convention: every box is interpreted as a continuous
+        # half-open region based on its own per-box geometry marker. The input boxes are
+        # never modified, and legacy callers keep the historical inclusive-pixel behaviour.
+        if use_shared_geometry:
+            from src.utils.shared_geometry import shared_iou
+            return shared_iou(boxA, boxB)
         coords_A = boxA.get_absolute_bounding_box(format=BBFormat.XYX2Y2)
         coords_B = boxB.get_absolute_bounding_box(format=BBFormat.XYX2Y2)
         # if boxes do not intersect

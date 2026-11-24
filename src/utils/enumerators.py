@@ -43,6 +43,29 @@ class BBFormat(Enum):
     YOLO = 4
 
 
+class BBGeometry(Enum):
+    """
+    Class representing the geometric convention of a bounding box.
+
+    This convention describes how the four stored XYXY coordinates should be
+    interpreted geometrically. It is only used by evaluation entry points that
+    explicitly opt in to the shared geometry convention; the legacy evaluators
+    keep their historical behaviour untouched.
+
+    CONTINUOUS
+        Continuous, half-open intervals [x1, x2) x [y1, y2). Coordinates may
+        be floating point. Two boxes that only touch at an edge do not share
+        any area, so their intersection (and IoU) is 0.
+    PIXEL_CLOSED
+        Inclusive pixel spans, e.g. [3, 0, 3, 0] denotes the single pixel at
+        column 3, row 0. The coordinates are integer and both extremes are
+        included. Such boxes are interpreted as the continuous half-open box
+        [x1, x2 + 1) x [y1, y2 + 1) inside the shared geometry convention.
+    """
+    CONTINUOUS = 1
+    PIXEL_CLOSED = 2
+
+
 class FileFormat(Enum):
     ABSOLUTE_TEXT = 1
     PASCAL = 2

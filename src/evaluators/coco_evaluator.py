@@ -23,9 +23,10 @@ from collections import defaultdict
 
 import numpy as np
 from src.bounding_box import BBFormat
+from src.utils.shared_geometry import (get_continuous_area, shared_iou)
 
 
-def get_coco_summary(groundtruth_bbs, detected_bbs):
+def get_coco_summary(groundtruth_bbs, detected_bbs, use_shared_geometry=False):
     """Calculate the 12 standard metrics used in COCOEval,
         AP, AP50, AP75,
         AR1, AR10, AR100,
@@ -42,6 +43,12 @@ def get_coco_summary(groundtruth_bbs, detected_bbs):
                 A list containing objects of type BoundingBox representing the ground-truth bounding boxes.
             detected_bbs : list
                 A list containing objects of type BoundingBox representing the detected bounding boxes.
+            use_shared_geometry : bool
+                If True, IoU and the area-range filtering use the shared geometry convention, which
+                reads each box's per-box geometry marker (BBGeometry.CONTINUOUS or
+                BBGeometry.PIXEL_CLOSED) and interprets every box as a continuous half-open region.
+                Edge-only contact then yields IoU 0 and the input boxes are never modified.
+                If False (default), the historical COCO open-ended calculation is used unchanged.
     Returns:
             A dictionary with one entry for each metric.
     """
@@ -50,7 +57,10 @@ def get_coco_summary(groundtruth_bbs, detected_bbs):
     _bbs = _group_detections(detected_bbs, groundtruth_bbs)
 
     # pairwise ious
-    _ious = {k: _compute_ious(**v) for k, v in _bbs.items()}
+    _ious = {
+        k: _compute_ious(**v, use_shared_geometry=use_shared_geometry)
+        for k, v in _bbs.items()
+    }
 
     def _evaluate(iou_threshold, max_dets, area_range):
         # accumulate evaluations on a per-class basis
@@ -63,6 +73,7 @@ def get_coco_summary(groundtruth_bbs, detected_bbs):
                 iou_threshold,
                 max_dets,
                 area_range,
+                use_shared_geometry=use_shared_geometry,
             )
             acc = _evals[class_id]
             acc["scores"].append(ev["scores"])
@@ -174,6 +185,7 @@ def get_coco_metrics(
         iou_threshold=0.5,
         area_range=(0, np.inf),
         max_dets=100,
+        use_shared_geometry=False,
 ):
     """ Calculate the Average Precision and Recall metrics as in COCO's official implementation
         given an IOU threshold, area range and maximum number of detections.
@@ -189,6 +201,12 @@ def get_coco_metrics(
                 Lower and upper bounds on annotation areas that should be considered.
             max_dets : int
                 Upper bound on the number of detections to be considered for each class in an image.
+            use_shared_geometry : bool
+                If True, IoU and the area-range filtering use the shared geometry convention, which
+                reads each box's per-box geometry marker (BBGeometry.CONTINUOUS or
+                BBGeometry.PIXEL_CLOSED) and interprets every box as a continuous half-open region.
+                Edge-only contact then yields IoU 0 and the input boxes are never modified.
+                If False (default), the historical COCO open-ended calculation is used unchanged.
 
     Returns:
             A list of dictionaries. One dictionary for each class.
@@ -211,7 +229,10 @@ def get_coco_metrics(
     _bbs = _group_detections(detected_bbs, groundtruth_bbs)
 
     # pairwise ious
-    _ious = {k: _compute_ious(**v) for k, v in _bbs.items()}
+    _ious = {
+        k: _compute_ious(**v, use_shared_geometry=use_shared_geometry)
+        for k, v in _bbs.items()
+    }
 
     # accumulate evaluations on a per-class basis
     _evals = defaultdict(lambda: {"scores": [], "matched": [], "NP": []})
@@ -224,6 +245,7 @@ def get_coco_metrics(
             iou_threshold,
             max_dets,
             area_range,
+            use_shared_geometry=use_shared_geometry,
         )
         acc = _evals[class_id]
         acc["scores"].append(ev["scores"])
@@ -262,13 +284,23 @@ def _group_detections(dt, gt):
     return bb_info
 
 
-def _get_area(a):
-    """ COCO does not consider the outer edge as included in the bbox """
+def _get_area(a, use_shared_geometry=False):
+    """ Area of a bounding box.
+
+    By default COCO does not consider the outer edge as included in the bbox.
+    When the shared geometry convention is enabled, the per-box geometry marker
+    is honoured (pixel-closed boxes span x2 - x1 + 1 units) and the box is not
+    modified.
+    """
+    if use_shared_geometry:
+        return get_continuous_area(a)
     x, y, x2, y2 = a.get_absolute_bounding_box(format=BBFormat.XYX2Y2)
     return (x2 - x) * (y2 - y)
 
 
-def _jaccard(a, b):
+def _jaccard(a, b, use_shared_geometry=False):
+    if use_shared_geometry:
+        return shared_iou(a, b)
     xa, ya, x2a, y2a = a.get_absolute_bounding_box(format=BBFormat.XYX2Y2)
     xb, yb, x2b, y2b = b.get_absolute_bounding_box(format=BBFormat.XYX2Y2)
 
@@ -287,17 +319,23 @@ def _jaccard(a, b):
     return Ai / (Aa + Ab - Ai)
 
 
-def _compute_ious(dt, gt):
+def _compute_ious(dt, gt, use_shared_geometry=False):
     """ compute pairwise ious """
 
     ious = np.zeros((len(dt), len(gt)))
     for g_idx, g in enumerate(gt):
         for d_idx, d in enumerate(dt):
-            ious[d_idx, g_idx] = _jaccard(d, g)
+            ious[d_idx, g_idx] = _jaccard(d, g, use_shared_geometry=use_shared_geometry)
     return ious
 
 
-def _evaluate_image(dt, gt, ious, iou_threshold, max_dets=None, area_range=None):
+def _evaluate_image(dt,
+                    gt,
+                    ious,
+                    iou_threshold,
+                    max_dets=None,
+                    area_range=None,
+                    use_shared_geometry=False):
     """ use COCO's method to associate detections to ground truths """
     # sort dts by increasing confidence
     dt_sort = np.argsort([-d.get_confidence() for d in dt], kind="stable")
@@ -310,7 +348,8 @@ def _evaluate_image(dt, gt, ious, iou_threshold, max_dets=None, area_range=None)
     def _is_ignore(bb):
         if area_range is None:
             return False
-        return not (area_range[0] <= _get_area(bb) <= area_range[1])
+        return not (area_range[0] <= _get_area(
+            bb, use_shared_geometry=use_shared_geometry) <= area_range[1])
 
     gt_ignore = [_is_ignore(g) for g in gt]
 

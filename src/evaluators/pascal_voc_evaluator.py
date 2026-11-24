@@ -83,7 +83,8 @@ def get_pascalvoc_metrics(gt_boxes,
                           det_boxes,
                           iou_threshold=0.5,
                           method=MethodAveragePrecision.EVERY_POINT_INTERPOLATION,
-                          generate_table=False):
+                          generate_table=False,
+                          use_shared_geometry=False):
     """Get the metrics used by the VOC Pascal 2012 challenge.
     Args:
         boundingboxes: Object of the class BoundingBoxes representing ground truth and detected
@@ -100,7 +101,13 @@ def get_pascalvoc_metrics(gt_boxes,
         dict['interpolated recall']: interpolated recall values;
         dict['total positives']: total number of ground truth positives;
         dict['total TP']: total number of True Positive detections;
-        dict['total FP']: total number of False Positive detections;"""
+        dict['total FP']: total number of False Positive detections;
+        use_shared_geometry: if True, IoU is computed with the shared geometry convention, which
+        reads each box's per-box geometry marker (BBGeometry.CONTINUOUS or BBGeometry.PIXEL_CLOSED)
+        and interprets every box as a continuous half-open region. In that case edge-only contact
+        yields IoU 0 and the input boxes are never modified. If False (default), the historical
+        inclusive-pixel VOC calculation is used unchanged.
+    """
     ret = {}
     # Get classes of all bounding boxes separating them by classes
     gt_classes_only = []
@@ -157,7 +164,7 @@ def get_pascalvoc_metrics(gt_boxes,
             for j, g in enumerate(gt):
                 # print('Ground truth gt => %s' %
                 #       str(g.get_absolute_bounding_box(format=BBFormat.XYX2Y2)))
-                iou = BoundingBox.iou(det, g)
+                iou = BoundingBox.iou(det, g, use_shared_geometry=use_shared_geometry)
                 if iou > iouMax:
                     iouMax = iou
                     id_match_gt = j
