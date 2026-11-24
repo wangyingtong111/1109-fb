@@ -95,13 +95,49 @@ ms.search(
 
 Supported search options: `:fields`, `:filter`, `:boost`, `:boost_term`,
 `:weights`, `:boost_document`, `:prefix`, `:fuzzy`, `:max_fuzzy`,
-`:combine_with`, `:tokenize`, `:process_term`, `:bm25`.
+`:combine_with`, `:tokenize`, `:process_term`, `:bm25`, `:field_statistics`.
 
 `:weights` scales non-exact matches — defaults `{ fuzzy: 0.45, prefix: 0.375 }`,
 so a fuzzy or prefix hit counts for less than an exact one. `:boost_term` takes a
 callable returning a per-*query-term* multiplier (default `1`). `:bm25` tunes the
 BM25+ parameters `k`, `b`, and `d` (defaults `{ k: 1.2, b: 0.7, d: 0.5 }`).
 Defaults can be set once via the constructor's `:search_options`.
+
+### Field-length populations
+
+The upstream-compatible default keeps its existing field-length running averages
+and scores. Pass `field_statistics: :present_fields` (or the alias
+`field_length_population: :present_fields`) when missing fields should be excluded
+from the average denominator while an explicitly present empty string remains a
+sample of length `0`:
+
+```ruby
+ms = MiniFTS.new(fields: ["summary"], field_statistics: :present_fields)
+ms.add_all([
+  { "id" => 1, "summary" => "oak pine" }, # length 2
+  { "id" => 2 },                           # missing: excluded
+  { "id" => 3, "summary" => "" }           # explicit empty: length 0
+])
+
+ms.average_field_length("summary") # => 1.0  ((2 + 0) / 2)
+ms.field_document_count("summary") # => 2
+ms.discard(3)
+ms.average_field_length("summary") # => 2.0
+```
+
+The selected population is used by BM25+ scoring. The original statistics remain
+available and can be selected for one query with
+`ms.search("oak", field_statistics: :legacy)`. Term frequencies and the default
+legacy scores are unchanged. Present-field statistics persist in `to_json` /
+`as_plain_object` under `fieldCount` and `population*FieldLength` keys, alongside
+the established `averageFieldLength` view for the selected population.
+
+A loaded legacy index that still contains `fieldLength` can rebuild this
+population with `enable_field_statistics!(:present_fields)` (or automatically when
+loaded with that option). Use `field_statistics_reconstructable?` /
+`field_statistics_available?` first. If the serialized index has no old
+`fieldLength` counts, those predicates are `false` and enabling the population
+raises `MiniFTS::Error`; such an index must be reindexed.
 
 ## Auto-suggestions
 

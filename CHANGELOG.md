@@ -1,3 +1,7 @@
+## Unreleased
+
+- Add optional present-field field-length statistics (`field_statistics: :present_fields`). This population excludes missing/nil fields from averages but keeps explicitly present empty strings as zero-length samples, persists its per-field counts, and can rebuild from legacy `fieldLength` data when available. The upstream statistics, term frequencies, serialization, and default BM25+ scores remain unchanged.
+
 ## [1.0.1] - 2026-07-18
 
 - Require MFA for gem pushes (`rubygems_mfa_required` gemspec metadata). No

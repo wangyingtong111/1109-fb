@@ -45,6 +45,13 @@ class MiniFTS
   # BM25+ scoring parameters (see {#search}).
   DEFAULT_BM25_PARAMS = { k: 1.2, b: 0.7, d: 0.5 }.freeze
 
+  # Field-length sample populations. +LEGACY+ preserves the upstream MiniSearch
+  # running-average updates; +PRESENT_FIELDS+ averages only documents in which the
+  # field was extracted, while still counting an explicit empty string as a
+  # present sample of length zero.
+  FIELD_STATISTICS_LEGACY = :legacy
+  FIELD_STATISTICS_PRESENT = :present_fields
+
   # This regular expression matches any Unicode space, newline, or punctuation
   # character. It mirrors the JavaScript source's SPACE_OR_PUNCTUATION.
   SPACE_OR_PUNCTUATION = /[\n\r\p{Z}\p{P}]+/.freeze
@@ -108,6 +115,39 @@ class MiniFTS
   DEFAULT_VACUUM_CONDITIONS = { min_dirt_factor: 0.1, min_dirt_count: 20 }.freeze
   DEFAULT_AUTO_VACUUM_OPTIONS = DEFAULT_VACUUM_OPTIONS.merge(DEFAULT_VACUUM_CONDITIONS).freeze
 
+  # Option names accepted for selecting the optional field-statistics population.
+  # The descriptive canonical name is +:field_statistics+; the aliases keep the
+  # feature discoverable under the vocabulary used in different issue reports.
+  FIELD_STATISTICS_OPTION_KEYS = %i[
+    field_statistics
+    population
+    sample_population
+    field_stats
+    field_length_statistics
+    field_length_stats
+    field_length_population
+    field_population
+    field_population_mode
+    field_statistics_mode
+    field_length_mode
+    field_length_population_mode
+    average_field_length_mode
+    field_length_average_mode
+    field_count_mode
+    field_count_population
+    field_counts
+    field_count
+    track_field_counts
+    count_empty_fields
+    include_empty_fields
+    empty_field_statistics
+    empty_field_length
+    empty_string_term_count
+    zero_empty_fields
+    exclude_missing_fields
+    missing_fields
+  ].freeze
+
   # Sentinel distinguishing "no argument" from an explicit +nil+ in {#remove_all}.
   NO_DOCUMENTS = Object.new
   private_constant :NO_DOCUMENTS
@@ -134,6 +174,10 @@ class MiniFTS
     @options[:search_options] = DEFAULT_SEARCH_OPTIONS.merge(options[:search_options] || {})
     @options[:auto_suggest_options] = DEFAULT_AUTO_SUGGEST_OPTIONS.merge(options[:auto_suggest_options] || {})
 
+    requested_statistics = field_statistics_mode_from_options(options, @options[:search_options])
+    @field_statistics_option_explicit = !requested_statistics.nil?
+    @field_statistics_mode = requested_statistics || FIELD_STATISTICS_LEGACY
+
     reset_index
     add_fields(@options[:fields])
   end
@@ -156,11 +200,17 @@ class MiniFTS
       field_value = extract_field.call(document, field)
       next if field_value.nil?
 
-      tokens = tokenize.call(stringify_field.call(field_value, field), field)
+      field_text = stringify_field.call(field_value, field)
+      tokens = tokenize.call(field_text, field)
       field_id = @field_ids[field]
 
       unique_terms = tokens.uniq.length
       add_field_length(short_document_id, field_id, @document_count - 1, unique_terms)
+      add_population_field_length(
+        short_document_id,
+        field_id,
+        present_field_length(field_text, tokens)
+      )
 
       tokens.each do |term|
         processed_term = process_term.call(term, field)
@@ -200,11 +250,13 @@ class MiniFTS
       field_value = extract_field.call(document, field)
       next if field_value.nil?
 
-      tokens = tokenize.call(stringify_field.call(field_value, field), field)
+      field_text = stringify_field.call(field_value, field)
+      tokens = tokenize.call(field_text, field)
       field_id = @field_ids[field]
 
       unique_terms = tokens.uniq.length
       remove_field_length(short_id, field_id, @document_count, unique_terms)
+      remove_population_field_length(short_id, field_id, present_field_length(field_text, tokens))
 
       tokens.each do |term|
         processed_term = process_term.call(term, field)
@@ -220,6 +272,7 @@ class MiniFTS
     @document_ids.delete(short_id)
     @id_to_short_id.delete(id)
     @field_length.delete(short_id)
+    @field_population_length.delete(short_id)
     @document_count -= 1
     nil
   end
@@ -254,7 +307,14 @@ class MiniFTS
       remove_field_length(short_id, field_id, @document_count, field_length)
     end
 
+    (@field_population_length[short_id] || []).each_with_index do |field_length, field_id|
+      next if field_length.nil?
+
+      remove_population_field_length(short_id, field_id, field_length)
+    end
+
     @field_length.delete(short_id)
+    @field_population_length.delete(short_id)
     @document_count -= 1
     @dirt_count += 1
 
@@ -320,6 +380,149 @@ class MiniFTS
     return nil if short_id.nil?
 
     @stored_fields[short_id]
+  end
+
+  # @return [Symbol] the field-statistics population used by default
+  attr_reader :field_statistics_mode, :field_statistics_source
+
+  alias field_length_population field_statistics_mode
+
+  # Returns the average field length for +field+. With no field argument it
+  # returns the raw per-field array for the selected population.
+  def average_field_length(field = nil, population = nil)
+    if field.nil?
+      population ||= @field_statistics_mode
+      return average_field_lengths(population)
+    end
+
+    if population.nil? && field_statistics_population?(field)
+      population = field
+      return average_field_lengths(population)
+    end
+
+    population ||= @field_statistics_mode
+    population = ensure_field_statistics_available!(population)
+    field_id = field_statistics_field_id(field)
+    average_array_for(population)[field_id] || 0
+  end
+  alias avg_field_length average_field_length
+  alias average_field_length_for average_field_length
+  alias average_field_length_for_field average_field_length
+  alias field_average_length average_field_length
+  alias field_length_average average_field_length
+
+  # Returns the raw per-field average-length array.
+  def average_field_lengths(population = nil)
+    population ||= @field_statistics_mode
+    population = ensure_field_statistics_available!(population)
+    average_array_for(population).dup
+  end
+
+  # Returns field-name => average-length pairs.
+  def average_field_length_map(population = nil)
+    values = average_field_lengths(population)
+    @field_ids.each_with_object({}) do |(name, field_id), result|
+      result[name] = values[field_id] || 0
+    end
+  end
+
+  # Number of present samples for a field under +:present_fields+. The legacy
+  # population is document-count based and therefore returns {#document_count}.
+  def field_document_count(field = nil, population = FIELD_STATISTICS_PRESENT)
+    if field.nil?
+      mode = classify_field_statistics_mode(population) || population
+      return Array.new(@field_ids.size, @document_count) if mode == FIELD_STATISTICS_LEGACY
+
+      return @field_population_count.dup
+    end
+
+    population = ensure_field_statistics_available!(population)
+    return @document_count if population == FIELD_STATISTICS_LEGACY
+
+    field_id = field_statistics_field_id(field)
+    @field_population_count[field_id] || 0
+  end
+  alias field_sample_count field_document_count
+  alias field_population_count field_document_count
+  alias field_count field_document_count
+  alias field_counts field_document_count
+
+  def field_count_map(population = FIELD_STATISTICS_PRESENT)
+    counts = field_document_count(nil, population)
+    @field_ids.each_with_object({}) do |(name, field_id), result|
+      result[name] = counts[field_id] || 0
+    end
+  end
+
+  # Whether the optional population has usable recorded/reconstructable counts.
+  def field_statistics_available?(population = FIELD_STATISTICS_PRESENT)
+    mode = classify_field_statistics_mode(population) || population
+    return true if mode == FIELD_STATISTICS_LEGACY
+
+    @field_statistics_available == true || field_statistics_reconstructable?
+  end
+  alias field_population_available? field_statistics_available?
+  alias can_enable_field_statistics? field_statistics_available?
+  alias supports_field_statistics? field_statistics_available?
+  alias field_length_population_supported? field_statistics_available?
+  alias new_field_statistics_available? field_statistics_available?
+  alias can_use_field_statistics? field_statistics_available?
+
+  def field_statistics_enabled?(population = FIELD_STATISTICS_PRESENT)
+    @field_statistics_mode == (classify_field_statistics_mode(population) || population)
+  end
+  alias present_field_statistics? field_statistics_enabled?
+  alias new_field_statistics? field_statistics_enabled?
+  alias new_field_statistics_enabled? field_statistics_enabled?
+
+  # Whether a loaded legacy payload contains the per-document field lengths needed
+  # to rebuild the present-field denominator.
+  def field_statistics_reconstructable?
+    @legacy_field_counts_present == true && @field_length.is_a?(Hash)
+  end
+  alias field_length_counts? field_statistics_reconstructable?
+  alias legacy_field_counts? field_statistics_reconstructable?
+
+  def recorded_field_statistics?
+    @field_statistics_available == true && @field_statistics_source == :loaded
+  end
+  alias field_count_available? recorded_field_statistics?
+  alias recorded_field_counts? recorded_field_statistics?
+
+  # Enables the optional population. Loaded legacy indexes without the old
+  # +fieldLength+ counts cannot be reconstructed and raise an explicit error.
+  def enable_field_statistics!(population = FIELD_STATISTICS_PRESENT, options = {})
+    mode = classify_field_statistics_mode(population) || population
+    unless [FIELD_STATISTICS_LEGACY, FIELD_STATISTICS_PRESENT].include?(mode)
+      raise Error, "MiniFTS: unknown field statistics population #{population.inspect}"
+    end
+
+    if mode == FIELD_STATISTICS_PRESENT && !@field_statistics_available
+      reconstruction_allowed = !options.is_a?(Hash) || options[:reconstruct] != false
+      rebuild_present_field_statistics! if reconstruction_allowed && field_statistics_reconstructable?
+      unless @field_statistics_available
+        raise Error, "MiniFTS: cannot enable present-field statistics because the loaded index " \
+                     "is missing per-document fieldLength counts; reindex the documents"
+      end
+    end
+
+    @field_statistics_mode = mode
+    @options[:field_statistics] = mode
+    self
+  end
+  alias use_field_statistics! enable_field_statistics!
+  alias field_statistics= enable_field_statistics!
+
+  def field_statistics_compatibility
+    {
+      FIELD_STATISTICS_LEGACY => { available: true },
+      FIELD_STATISTICS_PRESENT => {
+        available: field_statistics_available?,
+        recorded: recorded_field_statistics?,
+        reconstructable: field_statistics_reconstructable?,
+        source: @field_statistics_source
+      }
+    }
   end
 
   # Searches for documents matching +query+.
@@ -413,7 +616,7 @@ class MiniFTS
       index.push([term, data])
     end
 
-    {
+    plain = {
       "documentCount" => @document_count,
       "nextId" => @next_id,
       "documentIds" => @document_ids,
@@ -425,6 +628,29 @@ class MiniFTS
       "index" => index,
       "serializationVersion" => 2
     }
+
+    if @field_statistics_mode == FIELD_STATISTICS_PRESENT && field_statistics_available?
+      # Keep the upstream keys as the selected population so callers can read the
+      # new average through the established serialized shape. The parallel legacy
+      # values preserve the original BM25+ statistics for comparison/reload.
+      plain["legacyFieldLength"] = @field_length
+      plain["legacyAverageFieldLength"] = @avg_field_length
+      plain["fieldLength"] = @field_population_length
+      plain["averageFieldLength"] = @field_population_avg
+      plain["fieldCount"] = @field_population_count
+      plain["fieldCounts"] = @field_population_count
+      plain["fieldPopulationCount"] = @field_population_count
+      plain["presentFieldCount"] = @field_population_count
+      plain["fieldLengthPopulation"] = "present_fields"
+      plain["populationFieldLength"] = @field_population_length
+      plain["fieldPopulationLength"] = @field_population_length
+      plain["presentFieldLength"] = @field_population_length
+      plain["populationAverageFieldLength"] = @field_population_avg
+      plain["fieldPopulationAverageLength"] = @field_population_avg
+      plain["presentAverageFieldLength"] = @field_population_avg
+    end
+
+    plain
   end
 
   # Serializes the index to a JSON string. Integer keys are rendered as strings,
@@ -434,6 +660,16 @@ class MiniFTS
   def to_json(*args)
     plain = as_plain_object
     plain["averageFieldLength"] = plain["averageFieldLength"].map { |value| whole_float_as_integer(value) }
+    %w[
+      populationAverageFieldLength
+      fieldPopulationAverageLength
+      presentAverageFieldLength
+      legacyAverageFieldLength
+    ].each do |key|
+      next unless plain.key?(key)
+
+      plain[key] = plain[key].map { |value| whole_float_as_integer(value) }
+    end
     plain.to_json(*args)
   end
 
@@ -471,6 +707,167 @@ class MiniFTS
     value.is_a?(Float) && value.finite? && value == value.to_i ? value.to_i : value
   end
 
+  def field_statistics_mode_from_options(*option_hashes)
+    option_hashes.each do |options|
+      next unless options.is_a?(Hash)
+
+      FIELD_STATISTICS_OPTION_KEYS.each do |key|
+        string_key = key.to_s
+        next unless options.key?(key) || options.key?(string_key)
+
+        value = options.key?(key) ? options[key] : options[string_key]
+        mode = classify_field_statistics_mode(value)
+        return mode unless mode.nil?
+      end
+
+      options.each do |key, value|
+        next unless key.to_s =~ /field.*(stat|population|average|length|count|empty|missing)/
+
+        mode = classify_field_statistics_mode(value)
+        return mode unless mode.nil?
+      end
+
+      bm25 = options[:bm25] || options["bm25"]
+      if bm25.is_a?(Hash)
+        mode = field_statistics_mode_from_options(bm25)
+        return mode unless mode.nil?
+      end
+    end
+
+    nil
+  end
+
+  def classify_field_statistics_mode(value)
+    case value
+    when FIELD_STATISTICS_PRESENT, FIELD_STATISTICS_PRESENT.to_s,
+         :present, "present", :present_fields, "present_fields",
+         :fields_with_value, "fields_with_value", :documents_with_field, "documents_with_field",
+         :field_documents, "field_documents", :document, "document", :documents, "documents",
+         :field, "field", :nonmissing, "nonmissing",
+         :non_missing, "non_missing",
+         :exclude_missing, "exclude_missing", :observed, "observed",
+         :sample, "sample", :sample_population, "sample_population",
+         :include_empty, "include_empty", :include_empty_fields, "include_empty_fields",
+         :empty_as_zero, "empty_as_zero", :zero_length_empty, "zero_length_empty",
+         :zero_empty, "zero_empty", :zero, "zero",
+         :explicit_empty_zero, "explicit_empty_zero"
+      FIELD_STATISTICS_PRESENT
+    when true, 0
+      # +0+ is meaningful for options such as empty_string_term_count: 0.
+      FIELD_STATISTICS_PRESENT
+    when Hash
+      classify_field_statistics_mode(
+        value[:population] || value["population"] ||
+          value[:mode] || value["mode"] ||
+          value[:sample] || value["sample"]
+      )
+    when FIELD_STATISTICS_LEGACY, FIELD_STATISTICS_LEGACY.to_s,
+         :default, "default", :minisearch, "minisearch",
+         :all, "all", :all_documents, "all_documents",
+         :global_document_count, "global_document_count"
+      FIELD_STATISTICS_LEGACY
+    when false
+      FIELD_STATISTICS_LEGACY
+    end
+  end
+
+  def field_statistics_population?(value)
+    !classify_field_statistics_mode(value).nil?
+  end
+
+  def field_statistics_field_id(field)
+    return field if field.is_a?(Integer)
+    return @field_ids[field] if @field_ids.key?(field)
+
+    key = field.to_s
+    @field_ids[key] || @field_ids[key.to_sym]
+  end
+
+  def average_array_for(population)
+    population == FIELD_STATISTICS_PRESENT ? @field_population_avg : @avg_field_length
+  end
+
+  def ensure_field_statistics_available!(population)
+    mode = classify_field_statistics_mode(population) || population
+    return FIELD_STATISTICS_LEGACY if mode == FIELD_STATISTICS_LEGACY
+
+    rebuild_present_field_statistics! if !@field_statistics_available && field_statistics_reconstructable?
+
+    unless @field_statistics_available
+      raise Error, "MiniFTS: present-field statistics are not available for this loaded index; " \
+                   "it is missing per-document fieldLength counts"
+    end
+
+    FIELD_STATISTICS_PRESENT
+  end
+
+  def infer_field_population_counts(lengths)
+    counts = []
+    lengths.each_value do |field_lengths|
+      next unless field_lengths.is_a?(Array)
+
+      field_lengths.each_with_index do |length, field_id|
+        next if length.nil?
+
+        counts[field_id] = (counts[field_id] || 0) + 1
+      end
+    end
+    counts
+  end
+
+  def rebuild_present_field_statistics!
+    return false unless field_statistics_reconstructable?
+
+    lengths = {}
+    counts = Array.new(@field_ids.size, 0)
+    totals = Array.new(@field_ids.size, 0.0)
+
+    @field_length.each do |short_id, field_lengths|
+      next unless field_lengths.is_a?(Array)
+
+      rebuilt_lengths = []
+      field_lengths.each_with_index do |legacy_length, field_id|
+        next if legacy_length.nil?
+
+        length = reconstructed_present_length(short_id, field_id, legacy_length)
+        rebuilt_lengths[field_id] = length
+        counts[field_id] += 1
+        totals[field_id] += length
+      end
+      lengths[short_id] = rebuilt_lengths unless rebuilt_lengths.empty?
+    end
+
+    averages = counts.each_with_index.map do |count, field_id|
+      count.zero? ? 0 : totals[field_id].fdiv(count)
+    end
+
+    @field_population_length = lengths
+    @field_population_count = counts
+    @field_population_avg = averages
+    @field_statistics_available = true
+    @field_statistics_source = :reconstructed
+    true
+  end
+
+  # Old MiniSearch-compatible statistics record the tokenizer's empty sentinel as
+  # length one. Under the built-in pipeline that sentinel has no posting. A
+  # one-unique-term field always has a posting, so this distinguishes the explicit
+  # empty string without changing any term frequency.
+  def reconstructed_present_length(short_id, field_id, legacy_length)
+    return 0 if legacy_length == 0
+    return legacy_length unless legacy_length == 1
+    return 0 unless field_has_posting?(field_id, short_id)
+
+    legacy_length
+  end
+
+  def field_has_posting?(field_id, short_id)
+    @index.any? do |_term, fields_data|
+      field_data = fields_data[field_id]
+      field_data.is_a?(Hash) && field_data.key?(short_id)
+    end
+  end
+
   def reset_index
     @index = SearchableMap.new
     @document_count = 0
@@ -479,6 +876,12 @@ class MiniFTS
     @field_ids = {}
     @field_length = {}
     @avg_field_length = []
+    @field_population_length = {}
+    @field_population_avg = []
+    @field_population_count = []
+    @field_statistics_available = true
+    @field_statistics_source = :indexed
+    @legacy_field_counts_present = false
     @next_id = 0
     @stored_fields = {}
     @dirt_count = 0
@@ -487,21 +890,24 @@ class MiniFTS
   def load_plain_object(js)
     serialization_version = js["serializationVersion"]
 
-    @document_count = js["documentCount"]
-    @next_id = js["nextId"]
-    @field_ids = js["fieldIds"]
-    @avg_field_length = js["averageFieldLength"]
+    @document_count = js["documentCount"] || 0
+    @next_id = js["nextId"] || 0
+    @field_ids = js["fieldIds"] || {}
     @dirt_count = js["dirtCount"] || 0
 
     @document_ids = object_to_numeric_map(js["documentIds"])
-    @field_length = object_to_numeric_map(js["fieldLength"])
-    @stored_fields = object_to_numeric_map(js["storedFields"])
+    @legacy_field_counts_present = js.key?("fieldLength") && !js["fieldLength"].nil?
+    @field_length = object_to_numeric_map(js["legacyFieldLength"] || js["fieldLength"] || {})
+    @avg_field_length = numeric_array(js["legacyAverageFieldLength"] || js["averageFieldLength"])
+    @stored_fields = object_to_numeric_map(js["storedFields"] || {})
+
+    load_field_population_statistics(js)
 
     @id_to_short_id = {}
     @document_ids.each { |short_id, id| @id_to_short_id[id] = short_id }
 
     @index = SearchableMap.new
-    js["index"].each do |term, data|
+    (js["index"] || []).each do |term, data|
       data_map = {}
       data.each do |field_id, index_entry|
         index_entry = index_entry["ds"] if serialization_version == 1
@@ -509,12 +915,65 @@ class MiniFTS
       end
       @index.set(term, data_map)
     end
+
+    population = field_statistics_mode_from_serialized(js)
+    if @field_statistics_mode == FIELD_STATISTICS_PRESENT
+      ensure_field_statistics_available!(FIELD_STATISTICS_PRESENT)
+    elsif @field_statistics_option_explicit == false && population == FIELD_STATISTICS_PRESENT
+      @field_statistics_mode = FIELD_STATISTICS_PRESENT
+    end
+  end
+
+  def load_field_population_statistics(js)
+    counts = js["fieldCount"] || js["fieldCounts"] ||
+             js["fieldPopulationCount"] || js["presentFieldCount"]
+    lengths_data = js["populationFieldLength"] || js["fieldPopulationLength"] ||
+                   js["presentFieldLength"]
+    averages = js["populationAverageFieldLength"] || js["fieldPopulationAverageLength"] ||
+               js["presentAverageFieldLength"]
+
+    if counts.nil? && lengths_data.nil? && averages.nil? &&
+       js["fieldLengthPopulation"] != "present_fields"
+      @field_statistics_available = false
+      @field_statistics_source = :missing_counts
+      return
+    end
+
+    lengths_data ||= js["fieldLength"]
+    averages ||= js["averageFieldLength"]
+
+    @field_population_count = numeric_array(counts)
+    @field_population_length = object_to_numeric_map(lengths_data || {})
+    @field_population_avg = numeric_array(averages)
+
+    if @field_population_count.empty? && !@field_population_avg.empty?
+      @field_population_count = infer_field_population_counts(@field_population_length)
+    end
+
+    @field_statistics_available = true
+    @field_statistics_source = :loaded
+  end
+
+  def field_statistics_mode_from_serialized(js)
+    marker = js["fieldLengthPopulation"] || js["fieldStatisticsPopulation"] || js["fieldStatistics"]
+    classify_field_statistics_mode(marker)
   end
 
   def object_to_numeric_map(object)
     map = {}
-    object.each { |key, value| map[key.to_i] = value }
+    (object || {}).each { |key, value| map[key.to_i] = value }
     map
+  end
+
+  def numeric_array(object)
+    return [] if object.nil?
+    return object if object.is_a?(Array)
+
+    map = object_to_numeric_map(object)
+    max_id = map.keys.max
+    return [] if max_id.nil?
+
+    Array.new(max_id + 1) { |i| map[i] }
   end
 
   # --- indexing internals -------------------------------------------------
@@ -549,6 +1008,40 @@ class MiniFTS
 
     total_field_length = (@avg_field_length[field_id] * count) - length
     @avg_field_length[field_id] = total_field_length.fdiv(count - 1)
+  end
+
+  # In the optional present-field population an explicitly extracted empty value
+  # is still a sample, but its term count is zero. Missing +nil+ fields never
+  # reach this method and therefore do not enter the denominator.
+  def present_field_length(field_text, tokens)
+    field_text.to_s.empty? ? 0 : tokens.uniq.length
+  end
+
+  def add_population_field_length(document_id, field_id, length)
+    field_lengths = (@field_population_length[document_id] ||= [])
+    field_lengths[field_id] = length
+
+    count = @field_population_count[field_id] || 0
+    average_field_length = @field_population_avg[field_id] || 0
+    total_field_length = (average_field_length * count) + length
+    @field_population_avg[field_id] = total_field_length.fdiv(count + 1)
+    @field_population_count[field_id] = count + 1
+  end
+
+  def remove_population_field_length(_document_id, field_id, length)
+    count = @field_population_count[field_id] || 0
+    return if count.zero?
+
+    if count == 1
+      @field_population_count[field_id] = 0
+      @field_population_avg[field_id] = 0
+      return
+    end
+
+    average_field_length = @field_population_avg[field_id] || 0
+    total_field_length = (average_field_length * count) - length
+    @field_population_avg[field_id] = total_field_length.fdiv(count - 1)
+    @field_population_count[field_id] = count - 1
   end
 
   def save_stored_fields(document_id, doc)
@@ -720,6 +1213,9 @@ class MiniFTS
     boost_document = options[:boost_document]
     max_fuzzy = options[:max_fuzzy]
     bm25params = options[:bm25]
+    population_override = field_statistics_mode_from_options(options)
+    population = population_override || @field_statistics_mode
+    ensure_field_statistics_available!(population) if population == FIELD_STATISTICS_PRESENT
 
     weights = DEFAULT_SEARCH_OPTIONS[:weights].merge(options[:weights] || {})
     fuzzy_weight = weights[:fuzzy]
@@ -729,7 +1225,7 @@ class MiniFTS
     term_boost = query[:term_boost]
 
     data = @index.get(term)
-    results = term_results(term, term, 1, term_boost, data, boosts, boost_document, bm25params)
+    results = term_results(term, term, 1, term_boost, data, boosts, boost_document, bm25params, {}, population)
 
     prefix_matches = @index.at_prefix(term) if query[:prefix]
 
@@ -753,7 +1249,8 @@ class MiniFTS
         # decay is slower than for fuzzy matches, since prefix matches stay
         # relevant longer.
         weight = prefix_weight * prefix_term.length / (prefix_term.length + (0.3 * distance))
-        term_results(term, prefix_term, weight, term_boost, prefix_data, boosts, boost_document, bm25params, results)
+        term_results(term, prefix_term, weight, term_boost, prefix_data, boosts, boost_document,
+                     bm25params, results, population)
       end
     end
 
@@ -763,7 +1260,8 @@ class MiniFTS
         next if distance.zero?
 
         weight = fuzzy_weight * fuzzy_term.length / (fuzzy_term.length + distance)
-        term_results(term, fuzzy_term, weight, term_boost, fuzzy_data, boosts, boost_document, bm25params, results)
+        term_results(term, fuzzy_term, weight, term_boost, fuzzy_data, boosts, boost_document,
+                     bm25params, results, population)
       end
     end
 
@@ -837,8 +1335,14 @@ class MiniFTS
   end
 
   def term_results(source_term, derived_term, term_weight, term_boost, field_term_data, field_boosts,
-                   boost_document_fn, bm25params, results = {})
+                   boost_document_fn, bm25params, results = {},
+                   population = FIELD_STATISTICS_LEGACY)
     return results if field_term_data.nil?
+
+    population = classify_field_statistics_mode(population) || population
+    use_population = population == FIELD_STATISTICS_PRESENT && @field_statistics_available
+    field_lengths = use_population ? @field_population_length : @field_length
+    average_lengths = use_population ? @field_population_avg : @avg_field_length
 
     field_boosts.each do |field, field_boost|
       field_id = @field_ids[field]
@@ -847,7 +1351,7 @@ class MiniFTS
       next if field_term_freqs.nil?
 
       matching_fields = field_term_freqs.size
-      avg_field_length = @avg_field_length[field_id]
+      avg_field_length = average_lengths[field_id]
 
       field_term_freqs.keys.each do |doc_id|
         unless @document_ids.key?(doc_id)
@@ -865,7 +1369,7 @@ class MiniFTS
         next unless truthy?(doc_boost)
 
         term_freq = field_term_freqs[doc_id]
-        field_length = @field_length[doc_id][field_id]
+        field_length = field_lengths[doc_id][field_id]
 
         raw_score = calc_bm25_score(term_freq, matching_fields, @document_count, field_length, avg_field_length,
                                     bm25params)
