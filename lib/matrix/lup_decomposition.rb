@@ -9,9 +9,14 @@ class Matrix
   # If m < n, then L is m-by-m and U is m-by-n.
   #
   # The LUP decomposition with pivoting always exists, even if the matrix is
-  # singular, so the constructor will never fail.  The primary use of the
-  # LU decomposition is in the solution of square systems of simultaneous
-  # linear equations.  This will fail if singular? returns true.
+  # singular, so the constructor will never fail. Use #full_rank? to check
+  # whether a rectangular matrix has its maximum possible rank; #singular?
+  # is its rank-deficiency complement.
+  #
+  # The primary use of the LU decomposition is in the solution of square
+  # systems of simultaneous linear equations. #solve raises
+  # Matrix::ErrDimensionMismatch for a rectangular factor and
+  # Matrix::ErrNotRegular for a singular square factor.
   #
 
   class LUPDecomposition
@@ -62,24 +67,54 @@ class Matrix
 
     attr_reader :pivots
 
-    # Returns +true+ if +U+, and hence +A+, is singular.
+    # Returns the exact rank of the decomposed matrix.
+
+    attr_reader :rank
+
+    # Returns +true+ if the decomposed matrix has full row rank.
+
+    def full_row_rank?
+      rank == @row_count
+    end
+
+    # Returns +true+ if the decomposed matrix has full column rank.
+
+    def full_column_rank?
+      rank == @column_count
+    end
+
+    # Returns +true+ if the decomposed matrix has its maximum possible rank,
+    # i.e. <tt>rank == min(row_count, column_count)</tt>.
+    #
+    # An empty row or column axis has rank 0, which is also its maximum
+    # possible rank, so such a matrix is full rank. The more specific
+    # #full_row_rank? and #full_column_rank? predicates distinguish which
+    # axis is saturated.
+
+    def full_rank?
+      rank == [@row_count, @column_count].min
+    end
+
+    # Returns +true+ if the decomposed matrix is square.
+
+    def square?
+      @row_count == @column_count
+    end
+
+    # Returns +true+ if the decomposed matrix is rank deficient.
+    #
+    # For square matrices this is the usual singular-matrix test. For
+    # rectangular matrices it is the corresponding rank-deficiency test.
 
     def singular?
-      @column_count.times do |j|
-        if (@lu[j][j] == 0)
-          return true
-        end
-      end
-      false
+      !full_rank?
     end
 
     # Returns the determinant of +A+, calculated efficiently
     # from the factorization.
 
     def det
-      if (@row_count != @column_count)
-        raise Matrix::ErrDimensionMismatch
-      end
+      raise Matrix::ErrDimensionMismatch unless square?
       d = @pivot_sign
       @column_count.times do |j|
         d *= @lu[j][j]
@@ -89,10 +124,19 @@ class Matrix
     alias_method :determinant, :det
 
     # Returns +m+ so that <tt>A*m = b</tt>,
-    # or equivalently so that <tt>L*U*m = P*b</tt>
-    # +b+ can be a Matrix or a Vector
+    # or equivalently so that <tt>L*U*m = P*b</tt>.
+    # +b+ can be a Matrix, Vector, or Array.
+    #
+    # This unique-solution contract is only available for square factors.
+    # Rectangular factors raise Matrix::ErrDimensionMismatch rather than
+    # returning an underdetermined or overdetermined pseudo-solution. A 0x0
+    # factor is square and solves an empty right-hand side.
 
     def solve b
+      unless square?
+        raise Matrix::ErrDimensionMismatch,
+              "LUPDecomposition#solve only supports square matrices"
+      end
       if (singular?)
         raise Matrix::ErrNotRegular, "Matrix is singular."
       end
@@ -157,6 +201,7 @@ class Matrix
       @lu = a.to_a
       @row_count = a.row_count
       @column_count = a.column_count
+      @rank = a.rank
       @pivots = Array.new(@row_count)
       @row_count.times do |i|
          @pivots[i] = i

@@ -1452,6 +1452,32 @@ class Matrix
   end
 
   #
+  # Returns +true+ if this matrix has full row rank.
+  #
+  def full_row_rank?
+    rank == row_count
+  end
+
+  #
+  # Returns +true+ if this matrix has full column rank.
+  #
+  def full_column_rank?
+    rank == column_count
+  end
+
+  #
+  # Returns +true+ if the matrix has its maximum possible rank, i.e.
+  # <tt>rank == [row_count, column_count].min</tt>.
+  #
+  # Empty matrices are full rank because their rank and their minimum
+  # dimension are both zero. Use #full_row_rank? or #full_column_rank?
+  # for the axis-specific contract.
+  #
+  def full_rank?
+    rank == [row_count, column_count].min
+  end
+
+  #
   # deprecated; use Matrix#rank
   #
   def rank_e

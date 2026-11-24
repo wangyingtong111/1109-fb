@@ -502,6 +502,74 @@ class TestMatrix < Test::Unit::TestCase
     assert_equal(m.lup.solve([2, 5]), Vector[1, Rational(1,2)])
   end
 
+  def test_lup_rectangular_full_rank
+    full_row_rank = [
+      Matrix[[1, 0, 0], [0, 1, 0]],
+      Matrix[[0, 1, 0], [0, 0, 1]]
+    ]
+    deficient = [
+      Matrix[[0, 1, 0], [0, 1, 0]],
+      Matrix[[1, 0, 0], [1, 0, 0]]
+    ]
+
+    full_row_rank.each do |m|
+      lup = m.lup
+      assert_equal(2, lup.rank)
+      assert(lup.full_rank?)
+      assert(lup.full_row_rank?)
+      assert(!lup.full_column_rank?)
+      assert(m.full_rank?)
+      assert(m.full_row_rank?)
+      assert(!lup.singular?)
+      assert(lup.l * lup.u == lup.p * m)
+      assert_raise(Matrix::ErrDimensionMismatch) { lup.solve([0, 0]) }
+    end
+
+    deficient.each do |m|
+      lup = m.lup
+      assert_equal(1, lup.rank)
+      assert(!lup.full_rank?)
+      assert(!m.full_rank?)
+      assert(lup.singular?)
+      assert(lup.l * lup.u == lup.p * m)
+    end
+  end
+
+  def test_lup_empty_axes
+    zero_by_zero = Matrix.empty(0, 0).lup
+    assert_equal(0, zero_by_zero.rank)
+    assert(zero_by_zero.full_rank?)
+    assert(zero_by_zero.full_row_rank?)
+    assert(zero_by_zero.full_column_rank?)
+    assert(!zero_by_zero.singular?)
+
+    zero_rows = Matrix.empty(0, 3).lup
+    assert_equal(0, zero_rows.rank)
+    assert(zero_rows.full_rank?)
+    assert(zero_rows.full_row_rank?)
+    assert(!zero_rows.full_column_rank?)
+    assert(!zero_rows.singular?)
+    assert(zero_rows.l * zero_rows.u == zero_rows.p * Matrix.empty(0, 3))
+
+    zero_columns = Matrix.empty(2, 0).lup
+    assert_equal(0, zero_columns.rank)
+    assert(zero_columns.full_rank?)
+    assert(!zero_columns.full_row_rank?)
+    assert(zero_columns.full_column_rank?)
+    assert(!zero_columns.singular?)
+    assert(zero_columns.l * zero_columns.u == zero_columns.p * Matrix.empty(2, 0))
+
+    assert_equal(Vector[], zero_by_zero.solve([]))
+    assert_equal(Matrix.empty(0, 2), zero_by_zero.solve(Matrix.empty(0, 2)))
+
+    assert_raise(Matrix::ErrDimensionMismatch) do
+      Matrix.empty(0, 3).lup.solve([])
+    end
+    assert_raise(Matrix::ErrDimensionMismatch) do
+      Matrix.empty(2, 0).lup.solve([0, 0])
+    end
+  end
+
   def test_real
     assert_equal(Matrix[[1, 0, 0], [1, 2, 3]], @c1.real)
   end
