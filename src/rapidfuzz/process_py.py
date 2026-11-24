@@ -47,6 +47,9 @@ def extract_iter(
     processor : Callable, optional
         Optional callable that is used to preprocess the strings before
         comparing them. Default is None, which deactivates this behaviour.
+        When a processor returns ``None`` for a choice, that choice is
+        explicitly rejected and is not yielded. Returning an empty string is
+        not a rejection and remains a valid zero-distance candidate.
     score_cutoff : Any, optional
         Optional argument for a score threshold. When an edit distance is used this represents the maximum
         edit distance and matches with a `distance > score_cutoff` are ignored. When a
@@ -98,24 +101,28 @@ def extract_iter(
     if score_cutoff is None:
         score_cutoff = worst_score
 
-    # preprocess the query
+    # preprocess the query. A ``None`` result is an explicit rejection rather
+    # than an empty string and therefore has no comparable score.
     if processor is not None:
         query = processor(query)
+        if query is None:
+            return
 
     choices_iter = choices.items() if hasattr(choices, "items") else enumerate(choices)
     for key, choice in choices_iter:
         if is_none(choice):
             continue
 
-        if processor is None:
-            score = scorer(query, choice, score_cutoff=score_cutoff, **scorer_kwargs)
-        else:
-            score = scorer(
-                query,
-                processor(choice),
-                score_cutoff=score_cutoff,
-                **scorer_kwargs,
-            )
+        processed_choice = processor(choice) if processor is not None else choice
+        if processed_choice is None:
+            continue
+
+        score = scorer(
+            query,
+            processed_choice,
+            score_cutoff=score_cutoff,
+            **scorer_kwargs,
+        )
 
         if lowest_score_worst:
             if score >= score_cutoff:
@@ -155,6 +162,10 @@ def extractOne(
     processor : Callable, optional
         Optional callable that is used to preprocess the strings before
         comparing them. Default is None, which deactivates this behaviour.
+        A ``None`` result from the processor marks that item as rejected.
+        Extraction omits such items while matrix results keep their position
+        and record the cell as incomparable. An empty string is still a
+        comparable value.
     score_cutoff : Any, optional
         Optional argument for a score threshold. When an edit distance is used this represents the maximum
         edit distance and matches with a `distance > score_cutoff` are ignored. When a
@@ -264,9 +275,12 @@ def extractOne(
     if score_cutoff is None:
         score_cutoff = worst_score
 
-    # preprocess the query
+    # preprocess the query. A ``None`` result is an explicit rejection rather
+    # than an empty string and therefore cannot produce a match.
     if processor is not None:
         query = processor(query)
+        if query is None:
+            return None
 
     result = None
 
@@ -275,15 +289,16 @@ def extractOne(
         if is_none(choice):
             continue
 
-        if processor is None:
-            score = scorer(query, choice, score_cutoff=score_cutoff, **scorer_kwargs)
-        else:
-            score = scorer(
-                query,
-                processor(choice),
-                score_cutoff=score_cutoff,
-                **scorer_kwargs,
-            )
+        processed_choice = processor(choice) if processor is not None else choice
+        if processed_choice is None:
+            continue
+
+        score = scorer(
+            query,
+            processed_choice,
+            score_cutoff=score_cutoff,
+            **scorer_kwargs,
+        )
 
         if lowest_score_worst:
             if score >= score_cutoff and (result is None or score > result[1]):
@@ -331,6 +346,10 @@ def extract(
     processor : Callable, optional
         Optional callable that is used to preprocess the strings before
         comparing them. Default is None, which deactivates this behaviour.
+        A ``None`` result from the processor marks that item as rejected.
+        Extraction omits such items while matrix results keep their position
+        and record the cell as incomparable. An empty string is still a
+        comparable value.
     limit : int, optional
         maximum amount of results to return. None can be passed to disable this behavior.
         Default is 5.
@@ -443,6 +462,45 @@ def _is_symmetric(scorer, scorer_kwargs):
     return False
 
 
+def _preprocess_matrix_values(values, processor):
+    """Preprocess matrix inputs and record processor-generated rejections."""
+    processed_values = []
+    rejected = []
+
+    for value in values:
+        original_is_none = is_none(value)
+        if processor is None or original_is_none:
+            processed_value = value
+        else:
+            processed_value = processor(value)
+
+        processed_values.append(processed_value)
+        rejected.append(processor is not None and not original_is_none and processed_value is None)
+
+    return processed_values, rejected
+
+
+def _mark_incomparable_cells(np, results, invalid, *, explicit_dtype):
+    if not np.any(invalid):
+        return results
+
+    # NumPy's integer dtypes have no NaN sentinel. When the dtype was inferred,
+    # promote it so callers can test the position with ``np.isnan``. Explicit
+    # integer dtypes are preserved and marked with a mask instead.
+    if not explicit_dtype and np.issubdtype(results.dtype, np.integer):
+        results = results.astype(np.float64)
+
+    if results.dtype.kind == "f":
+        results[invalid] = np.nan
+        return results
+
+    if results.dtype.hasobject:
+        results[invalid] = None
+        return results
+
+    return np.ma.array(results, mask=invalid, shrink=False)
+
+
 def cdist(
     queries,
     choices,
@@ -474,6 +532,10 @@ def cdist(
     processor : Callable, optional
         Optional callable that is used to preprocess the strings before
         comparing them. Default is None, which deactivates this behaviour.
+        A ``None`` result from the processor marks that item as rejected.
+        Extraction omits such items while matrix results keep their position
+        and record the cell as incomparable. An empty string is still a
+        comparable value.
     score_cutoff : Any, optional
         Optional argument for a score threshold to be passed to the scorer.
         Default is None, which deactivates this behaviour.
@@ -510,7 +572,10 @@ def cdist(
     -------
     ndarray
         Returns a matrix of dtype with the distance/similarity between each pair
-        of the two collections of inputs.
+        of the two collections of inputs. Processor-rejected rows or columns keep
+        their original position and are marked as incomparable: NaN for
+        floating-point arrays, None for object arrays, and a mask for integer
+        arrays.
     """
     import numpy as np
 
@@ -518,18 +583,30 @@ def cdist(
     scorer_kwargs = scorer_kwargs or {}
     if processor is False:
         processor = None
-    dtype = _dtype_to_type_num(dtype, scorer, scorer_kwargs)
-    results = np.zeros((len(queries), len(choices)), dtype=dtype)
 
     setupPandas()
 
-    if processor is None:
-        proc_choices = list(choices)
-    else:
-        proc_choices = [x if is_none(x) else processor(x) for x in choices]
+    explicit_dtype = dtype is not None
+    dtype = _dtype_to_type_num(dtype, scorer, scorer_kwargs)
+    len_queries = len(queries)
+    len_choices = len(choices)
 
-    if queries is choices and _is_symmetric(scorer, scorer_kwargs):
+    proc_choices, choice_rejected = _preprocess_matrix_values(choices, processor)
+    symmetric = queries is choices and _is_symmetric(scorer, scorer_kwargs)
+    results = np.zeros((len_queries, len_choices), dtype=dtype)
+
+    invalid = np.zeros(results.shape, dtype=bool)
+    for i, rejected in enumerate(choice_rejected):
+        if rejected:
+            invalid[:, i] = True
+            if symmetric:
+                invalid[i, :] = True
+
+    if symmetric:
         for i, proc_query in enumerate(proc_choices):
+            if choice_rejected[i]:
+                continue
+
             score = scorer(proc_query, proc_query, score_cutoff=score_cutoff, **scorer_kwargs) * score_multiplier
 
             if np.issubdtype(dtype, np.integer):
@@ -537,6 +614,9 @@ def cdist(
 
             results[i, i] = score
             for j in range(i + 1, len(proc_choices)):
+                if choice_rejected[j]:
+                    continue
+
                 score = (
                     scorer(
                         proc_query,
@@ -554,11 +634,21 @@ def cdist(
     else:
         for i, query in enumerate(queries):
             proc_query = processor(query) if (processor is not None and not is_none(query)) else query
-            for j, choice in enumerate(proc_choices):
+            query_rejected = (
+                processor is not None and not is_none(query) and proc_query is None
+            )
+            if query_rejected:
+                invalid[i, :] = True
+                continue
+
+            for j, proc_choice in enumerate(proc_choices):
+                if choice_rejected[j]:
+                    continue
+
                 score = (
                     scorer(
                         proc_query,
-                        choice,
+                        proc_choice,
                         score_cutoff=score_cutoff,
                         **scorer_kwargs,
                     )
@@ -570,7 +660,7 @@ def cdist(
 
                 results[i, j] = score
 
-    return results
+    return _mark_incomparable_cells(np, results, invalid, explicit_dtype=explicit_dtype)
 
 
 def cpdist(
@@ -604,6 +694,10 @@ def cpdist(
     processor : Callable, optional
         Optional callable that is used to preprocess the strings before
         comparing them. Default is None, which deactivates this behaviour.
+        A ``None`` result from the processor marks that item as rejected.
+        Extraction omits such items while matrix results keep their position
+        and record the cell as incomparable. An empty string is still a
+        comparable value.
     score_cutoff : Any, optional
         Optional argument for a score threshold to be passed to the scorer.
         Default is None, which deactivates this behaviour.
@@ -655,14 +749,24 @@ def cpdist(
     scorer_kwargs = scorer_kwargs or {}
     if processor is False:
         processor = None
-    dtype = _dtype_to_type_num(dtype, scorer, scorer_kwargs)
-    results = np.zeros((len_queries,), dtype=dtype)
 
     setupPandas()
+
+    explicit_dtype = dtype is not None
+    dtype = _dtype_to_type_num(dtype, scorer, scorer_kwargs)
+    results = np.zeros((len_queries,), dtype=dtype)
+    invalid = np.zeros((len_queries,), dtype=bool)
 
     for i, (query, choice) in enumerate(zip(queries, choices)):
         proc_query = processor(query) if (processor is not None and not is_none(query)) else query
         proc_choice = processor(choice) if (processor is not None and not is_none(choice)) else choice
+        query_rejected = processor is not None and not is_none(query) and proc_query is None
+        choice_rejected = processor is not None and not is_none(choice) and proc_choice is None
+
+        if query_rejected or choice_rejected:
+            invalid[i] = True
+            continue
+
         score = scorer(
             proc_query,
             proc_choice,
@@ -680,4 +784,4 @@ def cpdist(
         # Store the score in the results matrix
         results[i] = score
 
-    return results
+    return _mark_incomparable_cells(np, results, invalid, explicit_dtype=explicit_dtype)
