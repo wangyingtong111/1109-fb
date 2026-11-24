@@ -1,12 +1,18 @@
 module Eps
   module Evaluators
     class LinearRegression
-      attr_reader :features
+      attr_reader :features, :interaction_terms
 
-      def initialize(coefficients:, features:, text_features:)
+      def initialize(coefficients:, features:, text_features:, interaction_terms: [])
         @coefficients = coefficients.to_h { |k, v| [k.is_a?(Array) ? [k[0].to_s, k[1]] : k.to_s, v] }
         @features = features
         @text_features = text_features || {}
+        @interaction_terms = interaction_terms.map do |term|
+          {
+            fields: term[:fields].map(&:to_s),
+            coefficient: term[:coefficient].to_f
+          }
+        end
       end
 
       def predict(x, probabilities: false)
@@ -43,6 +49,19 @@ module Eps
             x.columns[k].each_with_index do |xv, i|
               scores[i] += coef * xv
             end
+          end
+        end
+
+        # PMML PredictorTerm: coefficient * product of the referenced fields
+        @interaction_terms.each do |term|
+          fields = term[:fields]
+          fields.each do |k|
+            raise "Missing data in #{k}" if !x.columns[k] || x.columns[k].any?(&:nil?)
+          end
+
+          x.size.times do |i|
+            product = fields.reduce(1.0) { |p, k| p * x.columns[k][i] }
+            scores[i] += term[:coefficient] * product
           end
         end
 

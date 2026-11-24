@@ -79,7 +79,23 @@ module Eps
           features[name] = "categorical"
         end
 
-        Evaluators::LinearRegression.new(coefficients: coefficients, features: features, text_features: text_features)
+        interaction_terms = []
+        node.css("PredictorTerm").each do |n|
+          fields = n.css("FieldRef").map do |fr|
+            name = fr.attribute("field").value
+            # fields only referenced by an interaction term still need to be
+            # declared so the model field checks apply to them
+            features[name] ||= "numeric"
+            name
+          end
+
+          interaction_terms << {
+            fields: fields,
+            coefficient: n.attribute("coefficient").value.to_f
+          }
+        end
+
+        Evaluators::LinearRegression.new(coefficients: coefficients, features: features, text_features: text_features, interaction_terms: interaction_terms)
       end
 
       def naive_bayes

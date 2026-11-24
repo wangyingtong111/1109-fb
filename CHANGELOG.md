@@ -1,3 +1,8 @@
+## 0.7.1 (unreleased)
+
+- Added support for `PredictorTerm` interaction terms when loading PMML linear regression models
+- Added re-export of `PredictorTerm` interaction terms
+
 ## 0.7.0 (2026-04-14)
 
 - Dropped support for Daru

@@ -151,8 +151,9 @@ module Eps
       end
 
       def linear_regression
-        predictors = model.instance_variable_get(:@coefficients).dup
+        predictors = coefficients.dup
         intercept = predictors.delete("_intercept") || 0.0
+        interaction_terms = evaluator.interaction_terms
 
         data_fields = {}
         features.each do |k, type|
@@ -181,6 +182,13 @@ module Eps
                   end
                 else
                   xml.NumericPredictor(name: k, coefficient: v)
+                end
+              end
+              interaction_terms.each do |term|
+                xml.PredictorTerm(coefficient: term[:coefficient]) do
+                  term[:fields].each do |field|
+                    xml.FieldRef(field: field)
+                  end
                 end
               end
             end
@@ -376,12 +384,20 @@ module Eps
 
       # TODO create instance methods on model for all of these features
 
+      def evaluator
+        @evaluator ||= model.instance_variable_get(:@evaluator)
+      end
+
+      def coefficients
+        model.instance_variable_get(:@coefficients) || evaluator.instance_variable_get(:@coefficients)
+      end
+
       def features
-        model.instance_variable_get(:@features)
+        model.instance_variable_get(:@features) || evaluator.features
       end
 
       def text_features
-        model.instance_variable_get(:@text_features)
+        model.instance_variable_get(:@text_features) || evaluator.instance_variable_get(:@text_features) || {}
       end
 
       def text_encoders

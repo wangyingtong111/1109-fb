@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<PMML xmlns="http://www.dmg.org/PMML-4_4" version="4.4">
+	<Header>
+		<Application name="Partner" version="1.0"/>
+	</Header>
+	<DataDictionary>
+		<DataField name="y" optype="continuous" dataType="double"/>
+		<DataField name="x" optype="continuous" dataType="double"/>
+		<DataField name="z" optype="continuous" dataType="double"/>
+	</DataDictionary>
+	<RegressionModel functionName="regression">
+		<MiningSchema>
+			<MiningField name="y" usageType="target"/>
+			<MiningField name="x"/>
+			<MiningField name="z"/>
+		</MiningSchema>
+		<RegressionTable intercept="1.0">
+			<NumericPredictor name="x" coefficient="2.0"/>
+			<PredictorTerm coefficient="3.0">
+				<FieldRef field="x"/>
+				<FieldRef field="z"/>
+			</PredictorTerm>
+		</RegressionTable>
+	</RegressionModel>
+</PMML>

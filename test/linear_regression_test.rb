@@ -60,6 +60,53 @@ class LinearRegressionTest < Minitest::Test
     assert_elements_in_delta expected, predictions
   end
 
+  def test_predictor_term_pmml
+    # intercept 1, x coefficient 2, x*z interaction coefficient 3
+    model = Eps::Model.load_pmml(File.read("test/support/python/linear_regression_interaction.pmml"))
+
+    # 1 + 2*2 + 3*(2*4) = 29
+    assert_in_delta 29, model.predict(x: 2, z: 4)
+    assert_elements_in_delta [29], model.predict([{x: 2, z: 4}])
+
+    evaluator = model.instance_variable_get(:@estimator).instance_variable_get(:@evaluator)
+    assert_equal [{fields: ["x", "z"], coefficient: 3.0}], evaluator.interaction_terms
+  end
+
+  def test_predictor_term_pmml_fields_checked
+    model = Eps::Model.load_pmml(File.read("test/support/python/linear_regression_interaction.pmml"))
+
+    # interaction inputs go through the same field checks as regular features
+    error = assert_raises(ArgumentError) { model.predict(x: 2) }
+    assert_equal "Missing column: z", error.message
+
+    error = assert_raises(ArgumentError) { model.predict(x: 2, z: "four") }
+    assert_equal "Bad type for column z: Expected numeric but got categorical", error.message
+
+    error = assert_raises(ArgumentError) { model.predict(x: "two", z: 4) }
+    assert_equal "Bad type for column x: Expected numeric but got categorical", error.message
+
+    error = assert_raises(RuntimeError) { model.predict([{x: 2, z: 4}, {x: 3, z: nil}]) }
+    assert_equal "Missing data in z", error.message
+  end
+
+  def test_predictor_term_pmml_round_trip
+    model = Eps::Model.load_pmml(File.read("test/support/python/linear_regression_interaction.pmml"))
+
+    # re-export and reload: still 29
+    reloaded = Eps::Model.load_pmml(model.to_pmml)
+    assert_in_delta 29, reloaded.predict(x: 2, z: 4)
+
+    # force a fresh generation (bypass cached pmml) and check the term survives
+    estimator = model.instance_variable_get(:@estimator)
+    estimator.instance_variable_set(:@pmml, nil)
+    pmml = estimator.to_pmml
+    assert_includes pmml, "PredictorTerm"
+    assert_valid_pmml(pmml)
+
+    reloaded = Eps::Model.load_pmml(pmml)
+    assert_in_delta 29, reloaded.predict(x: 2, z: 4)
+  end
+
   def test_mpg_text
     data = mpg_data(extra_fields: [:model])
     model = Eps::LinearRegression.new(data, target: :hwy, split: false, text_features: {model: {max_features: 5}})
