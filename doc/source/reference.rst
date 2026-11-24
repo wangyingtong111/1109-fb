@@ -145,6 +145,16 @@ absolute difference between these counts, in speakers. Both count distinct
 labels within the optional evaluation map (``uem``), and ``abs(metric)``
 averages scores equally across files. Empty annotations contain zero speakers.
 
+:class:`~pyannote.metrics.diarization.DiarizationConcurrentSpeakerCountAccuracy`
+adds the missing time-resolved view: it counts distinct active labels at every
+instant and weights agreement by duration. Duplicate tracks carrying the same
+label count as one speaker. Its detailed components include the total correct
+duration, total evaluated duration, and pair keys such as ``"2->1"`` for the
+duration with two reference speakers and one hypothesis speaker. Set
+``include_silence=True`` to include ``(0, 0)`` intervals; the default excludes
+common silence so long pauses do not inflate accuracy. The original file-level
+metrics and their scalar components remain unchanged.
+
 .. automodule:: pyannote.metrics.diarization
    :members:
 
