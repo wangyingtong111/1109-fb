@@ -346,3 +346,50 @@ class TestDetokenizer(unittest.TestCase):
             ".",
         ]
         assert detokenizer.detokenize(tokenizer.tokenize(text)) == text
+
+    def test_mixed_script_chunked_detokenization(self):
+        detokenizer = MosesDetokenizer(lang="mixed")
+        tokens = ["北", "京", "、", "green", "tea", "5", "kg", "。"]
+        chunks = [["北", "京"], ["、", "green", "tea", "5"], [], ["kg", "。"]]
+        expected = "北京、 green tea 5 kg。"
+
+        assert detokenizer.detokenize(tokens) == expected
+        assert detokenizer.detokenize(chunks) == expected
+
+        # Mixed Han/Latin input also uses the boundary-aware rules when the
+        # historical en/zh constructors are used.
+        for lang in ("en", "zh"):
+            assert MosesDetokenizer(lang=lang).detokenize(tokens) == expected
+
+        streamed = detokenizer.detokenize_stream(chunks)
+        assert str(streamed) == expected
+        assert "".join(streamed) == expected
+
+        detokenizer.reset_stream()
+        fragments = [detokenizer.feed(chunk) for chunk in chunks]
+        assert "".join(fragments) == expected
+        assert fragments == ["北京", "、 green tea 5", "", " kg。"]
+
+    def test_mixed_script_every_boundary_matches_whole(self):
+        sequences = [
+            ["北", "京", "、", "green", "tea", "5", "kg", "。"],
+            ["It", "'s", "Alice", "'s", "idea"],
+            ["It", "’", "s", "Alice", "’", "s"],
+            ["‘", "Unicode", "’"],
+            ["“", "Hello", ",", "”", "she", "said"],
+        ]
+        assert MosesDetokenizer(lang="mixed").detokenize(["It", "’", "s"]) == "It’s"
+        for tokens in sequences:
+            expected = MosesDetokenizer(lang="mixed").detokenize(tokens)
+            for cut in range(len(tokens) + 1):
+                chunks = [tokens[:cut], [], tokens[cut:]]
+                detokenizer = MosesDetokenizer(lang="mixed")
+                assert "".join(detokenizer.feed(chunk) for chunk in chunks) == expected
+
+    def test_empty_chunk_keeps_pending_quote_attachment(self):
+        detokenizer = MosesDetokenizer(lang="mixed")
+        assert detokenizer.feed(["“"]) == "“"
+        assert detokenizer.feed([]) == ""
+        assert detokenizer.feed(["mixed", "”"]) == "mixed”"
+        assert detokenizer.feed([]) == ""
+        assert detokenizer.feed(["text"]) == " text"

@@ -2,6 +2,9 @@
 # -*- coding: utf-8 -*-
 
 import re
+import unicodedata
+from collections.abc import Iterable
+from itertools import chain
 
 from sacremoses.corpus import Perluniprops
 from sacremoses.corpus import NonbreakingPrefixes
@@ -611,6 +614,132 @@ class MosesTokenizer(object):
         return text if return_str else text.split()
 
 
+_MIXED_DETOKENIZER_LANGS = frozenset(
+    {
+        "mixed",
+        "mix",
+        "zh-mixed",
+        "mixed-zh",
+        "zh-en",
+        "en-zh",
+        "zh-latn",
+        "cjk-latin",
+        "latin-cjk",
+    }
+)
+
+_HAN_RANGES = (
+    (0x3400, 0x4DBF),
+    (0x4E00, 0x9FFF),
+    (0xF900, 0xFAFF),
+    (0x20000, 0x2A6DF),
+    (0x2A700, 0x2B73F),
+    (0x2B740, 0x2B81F),
+    (0x2B820, 0x2CEAF),
+    (0x2F800, 0x2FA1F),
+)
+
+_CJK_EXTRA_CONTEXT_CHARS = frozenset("“”‘’")
+_OPENING_QUOTE_CHARS = frozenset(
+    "“‘„‚「『〔〖〘〚〝❛❝❨❪❴｢"
+)
+_CLOSING_QUOTE_CHARS = frozenset(
+    "”’」』〕〗〙〛〞❜❞❩❫❵｣"
+)
+_QUOTE_CHARS = frozenset(
+    "'\"`“”‘’„‚‛❛❜❝❞＇＂"
+) | _OPENING_QUOTE_CHARS | _CLOSING_QUOTE_CHARS
+_APOSTROPHE_CHARS = frozenset("'’ʼ＇")
+_ENGLISH_CONTRACTION_SUFFIX = re.compile(r"^(?:s|t|m|d|re|ve|ll)$", re.IGNORECASE)
+
+
+def _is_han_character(character):
+    codepoint = ord(character)
+    return any(start <= codepoint <= end for start, end in _HAN_RANGES)
+
+
+def _is_cjk_context_character(character):
+    if not character:
+        return False
+    codepoint = ord(character)
+    if _is_han_character(character) or is_cjk(character):
+        return True
+    if 0x3000 <= codepoint <= 0x303F or 0xFF00 <= codepoint <= 0xFFEF:
+        return True
+    return character in _CJK_EXTRA_CONTEXT_CHARS
+
+
+def _is_cjk_punctuation_character(character):
+    codepoint = ord(character)
+    in_cjk_block = (
+        0x3000 <= codepoint <= 0x303F
+        or 0xFF00 <= codepoint <= 0xFFEF
+        or character in _CJK_EXTRA_CONTEXT_CHARS
+    )
+    return in_cjk_block and unicodedata.category(character).startswith("P")
+
+
+def _is_quote_token(token):
+    return bool(token) and all(
+        character in _QUOTE_CHARS
+        or unicodedata.category(character) in {"Pi", "Pf"}
+        for character in token
+    )
+
+
+def _is_chunk_iterable(value):
+    return isinstance(value, Iterable) and not isinstance(value, (str, bytes))
+
+
+def _intrinsic_quote_side(token):
+    for character in token:
+        category = unicodedata.category(character)
+        if character in _OPENING_QUOTE_CHARS or category == "Pi":
+            return "open"
+        if character in _CLOSING_QUOTE_CHARS or category == "Pf":
+            return "close"
+    return "ambiguous"
+
+
+class _MixedDetokenizationState(object):
+    """Boundary state that can still change how the next token is joined."""
+
+    __slots__ = ("previous_token", "bind_next", "quote_counts")
+
+    def __init__(self):
+        self.previous_token = None
+        self.bind_next = False
+        self.quote_counts = {}
+
+
+class _ChunkedDetokenizedText(str):
+    """String result that can additionally replay its per-chunk fragments."""
+
+    __slots__ = ("_parts", "_iterator_index")
+
+    def __new__(cls, parts):
+        text = "".join(parts)
+        obj = super(_ChunkedDetokenizedText, cls).__new__(cls, text)
+        obj._parts = list(parts)
+        obj._iterator_index = 0
+        return obj
+
+    @property
+    def parts(self):
+        return list(self._parts)
+
+    def __iter__(self):
+        self._iterator_index = 0
+        return self
+
+    def __next__(self):
+        if self._iterator_index >= len(self._parts):
+            raise StopIteration
+        part = self._parts[self._iterator_index]
+        self._iterator_index += 1
+        return part
+
+
 class MosesDetokenizer(object):
     """
     This is a Python port of the Moses Detokenizer from
@@ -745,14 +874,326 @@ class MosesDetokenizer(object):
 
     IS_OPEN_QUOTE = re.compile(r"""^[\'\"„“`]+$""")
 
-    def __init__(self, lang="en"):
+    def __init__(
+        self,
+        lang="en",
+        mixed=False,
+        mixed_mode=False,
+        mixed_script=False,
+        streaming=False,
+        stream=False,
+        incremental=False,
+        chunked=False,
+        stateful=False,
+        language=None,
+        mode=None,
+        config=None,
+    ):
         super(MosesDetokenizer, self).__init__()
+        if config is not None and mode is None:
+            mode = config
+        if language is not None:
+            lang = language
+        normalized_lang = str(lang).lower().replace("_", "-")
+        if mode is not None and str(mode).lower() in _MIXED_DETOKENIZER_LANGS:
+            mixed = True
+        if isinstance(mode, str) and mode.lower() in {
+            "stream",
+            "streaming",
+            "chunk",
+            "chunked",
+            "incremental",
+        }:
+            streaming = True
         self.lang = lang
+        self.mixed = bool(
+            mixed
+            or mixed_mode
+            or mixed_script
+            or normalized_lang in _MIXED_DETOKENIZER_LANGS
+            or "mixed" in normalized_lang
+        )
+        self.streaming = bool(
+            streaming or stream or incremental or chunked or stateful
+        )
+        self._stream_state = None
+
+    def reset_stream(self):
+        """Clear all incremental detokenization boundary state."""
+        self._stream_state = _MixedDetokenizationState()
+        return self
+
+    @property
+    def state(self):
+        if self._stream_state is None:
+            self.reset_stream()
+        return self._stream_state
+
+    @state.setter
+    def state(self, value):
+        self._stream_state = value
+
+    def finish(self):
+        """Flush an incremental stream.
+
+        The mixed token joiner needs no look-ahead buffer, so finishing only
+        clears boundary state and returns the empty final fragment.
+        """
+        self.reset_stream()
+        return ""
+
+    flush = finish
+
+    def _new_state(self):
+        return _MixedDetokenizationState()
 
     def unescape_xml(self, text):
         for regexp, substitution in self.MOSES_UNESCAPE_XML_REGEXES:
             text = regexp.sub(substitution, text)
         return text
+
+    def _prepare_mixed_token(self, token, unescape):
+        token = str(token)
+        if unescape:
+            token = self.unescape_xml(token)
+        if token == "@-@":
+            return "-"
+        return token
+
+    def _mixed_quote_role(self, token, state):
+        # Moses treats a lone apostrophe after an s-final word as a possessive.
+        if (
+            token == "'"
+            and state.previous_token is not None
+            and state.previous_token.endswith("s")
+        ):
+            return "possessive"
+
+        if any(character in "“”„" for character in token):
+            family = '"'
+        elif any(character in "‘’" for character in token):
+            family = "'"
+        else:
+            family = token
+
+        seen = state.quote_counts.get(family, 0)
+        intrinsic_side = _intrinsic_quote_side(token)
+        if seen % 2:
+            role = "close"
+        else:
+            role = intrinsic_side if intrinsic_side != "ambiguous" else "open"
+        state.quote_counts[family] = seen + 1
+        return role
+
+    def _cjk_punctuation_side(self, token):
+        if not token or not all(
+            _is_cjk_punctuation_character(character) for character in token
+        ):
+            return None
+        if any(
+            unicodedata.category(character) == "Ps" or character in "¿¡"
+            for character in token
+        ):
+            return "open"
+        return "close"
+
+    def _mixed_separator(self, token, state, left_binds, french_space_punct):
+        if state.previous_token is None:
+            return ""
+        if state.bind_next:
+            return ""
+        if french_space_punct:
+            return " "
+        if left_binds:
+            return ""
+
+        # The tokenizer can split a curly apostrophe from its suffix:
+        # It / ’ / s.  Rejoin the known English contraction suffix even when
+        # the suffix arrives in a later chunk.
+        if (
+            len(state.previous_token) == 1
+            and state.previous_token in _APOSTROPHE_CHARS
+            and _ENGLISH_CONTRACTION_SUFFIX.match(token)
+        ):
+            return ""
+
+        previous_character = state.previous_token[-1]
+        current_character = token[0]
+
+        if (
+            self.lang == "fi"
+            and state.previous_token.endswith(":")
+            and self.FINNISH_REGEX.search(token)
+        ):
+            return ""
+
+        # Han/Han and CJK punctuation boundaries are tight.  A Latin word on
+        # either side falls through to the normal single-space default.
+        if _is_cjk_context_character(previous_character) and _is_cjk_context_character(
+            current_character
+        ):
+            return ""
+        return " "
+
+    def _advance_mixed(self, raw_token, state, unescape=True):
+        token = self._prepare_mixed_token(raw_token, unescape)
+        if token == "":
+            return ""
+
+        french_space_punct = bool(
+            self.lang == "fr" and re.search(r"^[\?\!\:\;\\\%]$", token)
+        )
+        english_contraction = bool(
+            self.IS_ENGLISH_CONTRACTION.search(token)
+            or re.search(r"^[’ʼ][^\W\d_]", token, flags=re.UNICODE)
+        )
+        french_contraction = bool(
+            self.IS_FRENCH_CONRTACTION.search(token)
+            or re.search(r"[A-Za-zÀ-ÿ][’]$", token)
+        )
+
+        quote_role = None
+        if _is_quote_token(token):
+            quote_role = self._mixed_quote_role(token, state)
+
+        aggressive_hyphen = raw_token == "@-@"
+        cjk_side = self._cjk_punctuation_side(token)
+        ascii_punctuation = bool(self.IS_PUNCT.search(token))
+        currency_or_opener = bool(self.IS_CURRENCY_SYMBOL.search(token))
+
+        left_binds = (
+            aggressive_hyphen
+            or english_contraction
+            or quote_role in {"close", "possessive"}
+            or ascii_punctuation
+            or (cjk_side == "close" and quote_role != "open")
+        )
+        right_binds = (
+            quote_role == "open"
+            or currency_or_opener
+            or french_contraction
+            or cjk_side == "open"
+            or aggressive_hyphen
+        )
+
+        separator = self._mixed_separator(
+            token, state, left_binds, french_space_punct
+        )
+        state.previous_token = token
+        state.bind_next = right_binds
+        return separator + token
+
+    def _feed_mixed(self, tokens, state, unescape=True):
+        return "".join(
+            self._advance_mixed(token, state, unescape=unescape) for token in tokens
+        )
+
+    def feed(self, tokens=(), state=None, unescape=True, return_state=False):
+        """
+        Feed one token chunk and return its appendable detokenized fragment.
+
+        Concatenating the returned fragments gives the same result as calling
+        :meth:`detokenize` on the flattened token sequence.  An empty chunk is
+        a no-op and therefore cannot discard a quote or prefix attachment that
+        is waiting for the next chunk.
+        """
+        if state is None:
+            if self._stream_state is None:
+                self.reset_stream()
+            state = self._stream_state
+        if tokens is None:
+            tokens = ()
+        if isinstance(tokens, str):
+            tokens = [tokens]
+        fragment = self._feed_mixed(tokens, state, unescape=unescape)
+        if return_state:
+            return fragment, state
+        return fragment
+
+    #: Readable aliases for callers using queue/push vocabulary.
+    push = feed
+    append_chunk = feed
+    add_chunk = feed
+    detokenize_chunk = feed
+    process_chunk = feed
+    process = feed
+    write = feed
+
+    def add_token(self, token, **kwargs):
+        return self.feed([token], **kwargs)
+
+    def iter_detokenized_chunks(self, chunks, unescape=True):
+        """Yield one appendable text fragment for every token chunk."""
+        if (
+            isinstance(chunks, (list, tuple))
+            and chunks
+            and all(isinstance(chunk, str) for chunk in chunks)
+        ):
+            chunks = [chunks]
+        state = self._new_state()
+        for chunk in chunks:
+            yield self.feed(chunk, unescape=unescape, state=state)
+
+    def detokenize_stream(self, chunks, unescape=True):
+        """
+        Detokenize ordered chunks with shared boundary state.
+
+        The returned object compares equal to the complete string and can also
+        be iterated to recover the fragment associated with each input chunk.
+        """
+        parts = list(self.iter_detokenized_chunks(chunks, unescape=unescape))
+        return _ChunkedDetokenizedText(parts)
+
+    def _detokenize_mixed(self, tokens, return_str=True, unescape=True):
+        state = self._new_state()
+        detokenized_text = self._feed_mixed(tokens, state, unescape=unescape)
+        regexp, substitution = self.ONE_SPACE
+        detokenized_text = regexp.sub(substitution, detokenized_text).strip()
+        return detokenized_text if return_str else detokenized_text.split()
+
+    @staticmethod
+    def _looks_chunked(tokens):
+        return (
+            isinstance(tokens, (list, tuple))
+            and len(tokens) > 0
+            and all(_is_chunk_iterable(chunk) for chunk in tokens)
+        )
+
+    @staticmethod
+    def _looks_mixed_script(tokens):
+        """Detect Han/Latin content so ordinary en/zh calls can opt in safely."""
+        if not isinstance(tokens, (list, tuple)):
+            return False
+        has_han = False
+        has_latin = False
+        for token in tokens:
+            for character in str(token):
+                if _is_han_character(character):
+                    has_han = True
+                elif "a" <= character <= "z" or "A" <= character <= "Z":
+                    has_latin = True
+                if has_han and has_latin:
+                    return True
+        return False
+
+    @staticmethod
+    def _coerce_mixed_input(tokens):
+        """Detect nested chunks without consuming a generator unnecessarily."""
+        if isinstance(tokens, (str, bytes)):
+            return False, tokens
+        if isinstance(tokens, (list, tuple)):
+            if MosesDetokenizer._looks_chunked(tokens):
+                return True, tokens
+            return False, tokens
+
+        iterator = iter(tokens)
+        try:
+            first = next(iterator)
+        except StopIteration:
+            return False, ()
+        if _is_chunk_iterable(first):
+            return True, chain((first,), iterator)
+        return False, chain((first,), iterator)
 
     def tokenize(self, tokens, return_str=True, unescape=True):
         """
@@ -761,6 +1202,20 @@ class MosesDetokenizer(object):
         :type tokens: list(str)
         :return: str
         """
+        use_mixed_rules = self.mixed or self._looks_mixed_script(tokens)
+        if use_mixed_rules:
+            if self.streaming:
+                return self.feed(tokens, unescape=unescape)
+            chunked, mixed_tokens = self._coerce_mixed_input(tokens)
+            if chunked:
+                chunked_result = self.detokenize_stream(
+                    mixed_tokens, unescape=unescape
+                )
+                return chunked_result if return_str else chunked_result.split()
+            return self._detokenize_mixed(
+                mixed_tokens, return_str=return_str, unescape=unescape
+            )
+
         # Convert the list of tokens into a string and pad it with spaces.
         text = r" {} ".format(" ".join(tokens))
         # Converts input string into unicode.
@@ -907,9 +1362,136 @@ class MosesDetokenizer(object):
 
         return detokenized_text if return_str else detokenized_text.split()
 
-    def detokenize(self, tokens, return_str=True, unescape=True):
+    def detokenize(
+        self,
+        tokens,
+        return_str=True,
+        unescape=True,
+        stream=False,
+        chunked=False,
+        state=None,
+        return_state=False,
+    ):
         """Duck-typing the abstract *tokenize()*."""
-        return self.tokenize(tokens, return_str, unescape)
+        if state is not None:
+            return self.feed(
+                tokens,
+                state=state,
+                unescape=unescape,
+                return_state=return_state,
+            )
+        if self.streaming:
+            return self.feed(
+                tokens, unescape=unescape, return_state=return_state
+            )
+
+        is_chunked, normalized_tokens = self._coerce_mixed_input(tokens)
+        if is_chunked:
+            result = self.detokenize_stream(normalized_tokens, unescape=unescape)
+            return result if return_str else result.split()
+
+        if stream or chunked:
+            result = self.detokenize_stream(normalized_tokens, unescape=unescape)
+            return result if return_str else result.split()
+
+        if not self.mixed and self._looks_mixed_script(normalized_tokens):
+            return self._detokenize_mixed(
+                normalized_tokens, return_str=return_str, unescape=unescape
+            )
+
+        return self.tokenize(normalized_tokens, return_str, unescape)
+
+    def stream(self, chunks=None, unescape=True):
+        """
+        Return a chunk generator, or an accumulator when called without chunks.
+        """
+        if chunks is None:
+            return MosesDetokenizerStream(self, unescape=unescape)
+        return self.iter_detokenized_chunks(chunks, unescape=unescape)
+
+    #: Alternative names used by callers describing chunk I/O.
+    detokenize_chunks = detokenize_stream
+    chunked_detokenize = detokenize_stream
+    stream_detokenize = detokenize_stream
+    stream_chunks = iter_detokenized_chunks
+    detokenize_iter = iter_detokenized_chunks
+    iter_detokenize = iter_detokenized_chunks
+    create_stream = stream
+    open_stream = stream
 
 
-__all__ = ["MosesTokenizer", "MosesDetokenizer"]
+class MosesDetokenizerStream(object):
+    """Small accumulator for callers that want push-style chunk processing."""
+
+    def __init__(self, detokenizer=None, lang="mixed", unescape=True, **kwargs):
+        self.detokenizer = detokenizer or MosesDetokenizer(
+            lang=lang, streaming=True, **kwargs
+        )
+        self.unescape = unescape
+        self._parts = []
+
+    def feed(self, tokens=()):
+        part = self.detokenizer.feed(tokens, unescape=self.unescape)
+        self._parts.append(part)
+        return part
+
+    push = feed
+    append = feed
+    append_chunk = feed
+    detokenize_chunk = feed
+    write = feed
+
+    @property
+    def parts(self):
+        return list(self._parts)
+
+    @property
+    def text(self):
+        return "".join(self._parts)
+
+    #: Common aliases for the accumulated result.
+    output = text
+    result = text
+
+    def detokenize(self, tokens=None):
+        if tokens is not None:
+            self.feed(tokens)
+        return self.text
+
+    def finish(self):
+        return self.text
+
+    flush = finish
+
+    def getvalue(self):
+        return self.text
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return False
+
+    def reset(self):
+        self._parts = []
+        self.detokenizer.reset_stream()
+        return self
+
+    def __str__(self):
+        return self.text
+
+
+StreamingMosesDetokenizer = MosesDetokenizerStream
+IncrementalMosesDetokenizer = MosesDetokenizerStream
+MixedMosesDetokenizer = MosesDetokenizer
+MosesDetokenizer.Stream = MosesDetokenizerStream
+MosesDetokenizer.Incremental = MosesDetokenizerStream
+
+__all__ = [
+    "MosesTokenizer",
+    "MosesDetokenizer",
+    "MosesDetokenizerStream",
+    "StreamingMosesDetokenizer",
+    "IncrementalMosesDetokenizer",
+    "MixedMosesDetokenizer",
+]
