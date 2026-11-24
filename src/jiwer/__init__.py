@@ -1,9 +1,13 @@
 from .alignment import collect_error_counts, visualize_alignment, visualize_error_counts
-from .measures import cer, mer, wer, wil, wip
+from .measures import cer, expected_wer, mer, wer, wil, wip
 from .process import (
     AlignmentChunk,
+    CandidateOutput,
     CharacterOutput,
+    PosteriorOutput,
+    TranscriptGroup,
     WordOutput,
+    process_candidates,
     process_characters,
     process_words,
 )
@@ -43,13 +47,18 @@ __all__ = [
     visualize_error_counts,
     collect_error_counts,
     cer,
+    expected_wer,
     mer,
     wer,
     wil,
     wip,
     AlignmentChunk,
+    CandidateOutput,
     CharacterOutput,
+    PosteriorOutput,
+    TranscriptGroup,
     WordOutput,
+    process_candidates,
     process_characters,
     process_words,
     AbstractTransform,

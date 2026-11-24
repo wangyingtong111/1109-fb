@@ -21,9 +21,10 @@ The core algorithm(s) for processing a one or more reference and hypothesis sent
 so that measures can be computed and an alignment can be visualized.
 """
 
+import math
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, List, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import rapidfuzz
 
@@ -32,8 +33,12 @@ from jiwer.transformations import cer_default, wer_default
 
 __all__ = [
     "AlignmentChunk",
+    "CandidateOutput",
     "CharacterOutput",
+    "PosteriorOutput",
+    "TranscriptGroup",
     "WordOutput",
+    "process_candidates",
     "process_characters",
     "process_words",
 ]
@@ -267,6 +272,345 @@ def process_words(
         substitutions=num_substitutions,
         insertions=num_insertions,
         deletions=num_deletions,
+    )
+
+
+########################################################################################
+# Implementation of probability-weighted candidate (decoding path) aggregation
+
+
+@dataclass
+class CandidateOutput:
+    """
+    The result of aligning a single hypothesis candidate (decoding path) against the
+    reference, together with the weight that candidate received.
+
+    Attributes:
+        index: The position of the candidate in the input sequence.
+        hypothesis: The original hypothesis string of this candidate.
+        transcript: The hypothesis after the word-level transformation, as a tuple of
+                    tokens. Candidates with an equal tuple are considered the same
+                    transcript.
+        log_weight: The weight of the candidate in log-space, when it was supplied as a
+                    log weight (`None` otherwise).
+        probability: The normalized probability of this candidate, i.e. its weight
+                     divided by the sum of all candidate weights.
+        output: The regular [jiwer.WordOutput][process.WordOutput] of this candidate,
+                which holds its own alignment and error counts.
+    """
+
+    index: int
+    hypothesis: str
+    transcript: Tuple[str, ...]
+    log_weight: Optional[float]
+    probability: float
+    output: WordOutput
+
+    @property
+    def wer(self) -> float:
+        """The word error rate of this candidate on its own."""
+        return self.output.wer
+
+    @property
+    def error_contribution(self) -> float:
+        """
+        The contribution of this candidate to the expected (posterior) WER,
+        i.e. `probability * wer`.
+        """
+        return self.probability * self.output.wer
+
+    @property
+    def alignments(self) -> List[AlignmentChunk]:
+        """The alignment chunks between the reference and this candidate."""
+        return self.output.alignments[0]
+
+    @property
+    def hits(self) -> int:
+        return self.output.hits
+
+    @property
+    def substitutions(self) -> int:
+        return self.output.substitutions
+
+    @property
+    def deletions(self) -> int:
+        return self.output.deletions
+
+    @property
+    def insertions(self) -> int:
+        return self.output.insertions
+
+
+@dataclass
+class TranscriptGroup:
+    """
+    All candidates which, after the word-level transformation, yield the same
+    transcript. Their probabilities are merged, which is what decides the top-1
+    transcript.
+
+    Attributes:
+        transcript: The shared transcript as a tuple of tokens.
+        probability: The merged probability of all candidates in this group.
+        candidate_indices: The indices of the candidates in this group, in the order
+                           they were given.
+    """
+
+    transcript: Tuple[str, ...]
+    probability: float
+    candidate_indices: List[int]
+
+    @property
+    def text(self) -> str:
+        """The transcript as a single string, words separated by a space."""
+        return " ".join(self.transcript)
+
+    @property
+    def first_candidate_index(self) -> int:
+        """The index of the first candidate which produced this transcript."""
+        return self.candidate_indices[0]
+
+
+@dataclass
+class PosteriorOutput:
+    """
+    The output of [jiwer.process_candidates][process.process_candidates].
+
+    Attributes:
+        reference: The reference sentence.
+        candidates: One [jiwer.CandidateOutput][process.CandidateOutput] per input
+                    candidate, keeping the input order.
+        transcript_groups: The distinct transcripts after the word-level
+                           transformation, with their merged probabilities. Groups are
+                           ordered by the first appearance of their transcript.
+        top1: The transcript group with the highest merged probability. Ties are
+              resolved by the earliest candidate.
+        wer: The expected (probability-weighted) word error rate over all candidates.
+        log_weights: Whether the supplied weights were interpreted as log weights.
+    """
+
+    reference: str
+    candidates: List[CandidateOutput]
+    transcript_groups: List[TranscriptGroup]
+    top1: TranscriptGroup
+    wer: float
+    log_weights: bool
+
+    @property
+    def expected_wer(self) -> float:
+        """Alias for [wer][process.PosteriorOutput.wer]."""
+        return self.wer
+
+    @property
+    def top1_transcript(self) -> str:
+        """The top-1 transcript as a single string."""
+        return self.top1.text
+
+    @property
+    def top1_candidate(self) -> CandidateOutput:
+        """The first candidate which produced the top-1 transcript."""
+        return self.candidates[self.top1.first_candidate_index]
+
+    @property
+    def top1_output(self) -> WordOutput:
+        """
+        The regular [jiwer.WordOutput][process.WordOutput] of the first candidate
+        which produced the top-1 transcript, so its alignment can be inspected with
+        the existing alignment and report entry points.
+        """
+        return self.top1_candidate.output
+
+    def candidate_contributions(self) -> List[Tuple[int, float, float, float]]:
+        """
+        Retrieve, for every candidate in input order, a tuple of
+        `(index, probability, wer, error_contribution)`.
+        """
+        return [
+            (c.index, c.probability, c.wer, c.error_contribution)
+            for c in self.candidates
+        ]
+
+
+def process_candidates(
+    reference: Union[str, List[str]],
+    hypotheses: Sequence[str],
+    probabilities: Optional[Sequence[float]] = None,
+    reference_transform: Union[tr.Compose, tr.AbstractTransform] = wer_default,
+    hypothesis_transform: Union[tr.Compose, tr.AbstractTransform] = wer_default,
+    log_weights: bool = False,
+) -> PosteriorOutput:
+    """
+    Aggregate the word error rate over several hypothesis candidates (decoding paths)
+    of the same sentence, each carrying a probability.
+
+    Every candidate is aligned individually, so its probability, its alignment and its
+    own error counts remain available. The returned `wer` is the expected error rate,
+    i.e. the sum of `probability * candidate.wer` over the candidates. The top-1
+    transcript is chosen by merging the probabilities of all candidates which have the
+    same hypothesis *after* the word-level transformation; ties are resolved in favour
+    of the candidate which appeared first.
+
+    Weights can be given either as probabilities or as log weights. Log weights may be
+    shifted by an arbitrary common offset (for instance when they all have been
+    decreased by 1000): the computation is shifted by the maximum weight before
+    exponentiation, so no probability underflows because of that common offset.
+
+    Args:
+        reference: The reference sentence
+        hypotheses: The hypothesis sentence of each candidate
+        probabilities: The probability (or log weight) of each candidate. When omitted,
+                       all candidates are weighted equally.
+        reference_transform: The transformation(s) to apply to the reference string(s)
+        hypothesis_transform: The transformation(s) to apply to the hypothesis string(s)
+        log_weights: If true, `probabilities` is interpreted as log weights
+                     (e.g. log-probabilities), which need not be normalized.
+
+    Returns:
+        (PosteriorOutput): The per-candidate alignments, the merged transcript groups,
+                           the top-1 transcript, and the expected WER.
+
+    Raises:
+        ValueError: If no hypotheses are given
+        ValueError: If the number of weights does not match the number of hypotheses
+        ValueError: If a weight is negative or all weights are zero
+        ValueError: If log weights are not finite (and not `-inf`), or all are `-inf`
+
+    Example:
+        ```python
+        import jiwer
+
+        out = jiwer.process_candidates(
+            "red green",
+            ["red green", "red", "red blue green"],
+            [0.25, 0.5, 0.25],
+        )
+        print(out.wer)                  # 0.375
+        print(out.top1_transcript)      # red
+
+        # merged probabilities of equal transcripts decide the top-1
+        out = jiwer.process_candidates(
+            "red green",
+            ["red green", "red  green", "red"],
+            [0.3, 0.3, 0.4],
+            log_weights=False,
+        )
+        print(out.top1_transcript)      # red green
+        ```
+    """
+    if isinstance(reference, list):
+        if len(reference) != 1:
+            raise ValueError(
+                "process_candidates expects a single reference sentence, "
+                f"got {len(reference)} reference sentences."
+            )
+        reference = reference[0]
+    elif not isinstance(reference, str):
+        raise ValueError(
+            "process_candidates expects a single reference sentence, "
+            f"got {reference!r}."
+        )
+
+    if isinstance(hypotheses, str):
+        hypotheses = [hypotheses]
+    hypotheses = list(hypotheses)
+
+    if len(hypotheses) == 0:
+        raise ValueError("process_candidates requires at least one hypothesis.")
+
+    if probabilities is None:
+        weights = [1.0] * len(hypotheses)
+        logs: List[Optional[float]] = [None] * len(hypotheses)
+    else:
+        weights = [float(p) for p in probabilities]
+        if len(weights) != len(hypotheses):
+            raise ValueError(
+                "The number of weights "
+                f"({len(weights)}) must match the number of hypotheses "
+                f"({len(hypotheses)})."
+            )
+
+        for weight in weights:
+            if math.isnan(weight) or weight == math.inf:
+                raise ValueError(f"Weights must not be NaN or +inf, got {weight}.")
+            if not log_weights and weight < 0:
+                raise ValueError(f"Probabilities may not be negative, got {weight}.")
+
+        if log_weights:
+            logs = list(weights)
+            offset = max(logs)
+            if offset == -math.inf:
+                raise ValueError("Weights may not all be zero.")
+            # Shift by the maximum before exponentiating: a common offset on the
+            # log weights (e.g. all lowered by 1000) then cancels exactly, instead
+            # of underflowing towards zero.
+            weights = [
+                math.exp(w - offset) if w != -math.inf else 0.0 for w in logs
+            ]
+        else:
+            logs = [None] * len(hypotheses)
+
+    total = math.fsum(weights)
+    if total <= 0:
+        raise ValueError("Weights may not all be zero.")
+
+    normalized = [w / total for w in weights]
+
+    candidates: List[CandidateOutput] = []
+    for index, (hypothesis, probability, log_weight) in enumerate(
+        zip(hypotheses, normalized, logs)
+    ):
+        output = process_words(
+            reference,
+            hypothesis,
+            reference_transform,
+            hypothesis_transform,
+        )
+        candidates.append(
+            CandidateOutput(
+                index=index,
+                hypothesis=hypothesis,
+                transcript=tuple(output.hypotheses[0]),
+                log_weight=log_weight,
+                probability=probability,
+                output=output,
+            )
+        )
+
+    # Merge candidates which result in the same transcript after the word-level
+    # transformation. Groups are kept in order of first appearance, and a tie in the
+    # merged probability is won by the group which appeared first.
+    groups: Dict[Tuple[str, ...], TranscriptGroup] = {}
+    for candidate in candidates:
+        group = groups.get(candidate.transcript)
+        if group is None:
+            groups[candidate.transcript] = TranscriptGroup(
+                transcript=candidate.transcript,
+                probability=candidate.probability,
+                candidate_indices=[candidate.index],
+            )
+        else:
+            group.probability = math.fsum(
+                [group.probability, candidate.probability]
+            )
+            group.candidate_indices.append(candidate.index)
+
+    transcript_groups = list(groups.values())
+    top1 = transcript_groups[0]
+    for group in transcript_groups[1:]:
+        if group.probability > top1.probability:
+            top1 = group
+
+    expected_wer = math.fsum(
+        probability * candidate.wer
+        for probability, candidate in zip(normalized, candidates)
+    )
+
+    return PosteriorOutput(
+        reference=reference,
+        candidates=candidates,
+        transcript_groups=transcript_groups,
+        top1=top1,
+        wer=expected_wer,
+        log_weights=log_weights,
     )
 
 

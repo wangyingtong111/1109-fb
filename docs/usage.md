@@ -147,6 +147,85 @@ here = 1x
 a    = 1x
 ```
 
+## Candidate (decoding-path) probabilities
+
+An ASR model can emit the same utterance along several decoding paths. When each
+candidate comes with a probability, `jiwer.process_candidates` returns the expected
+(probability-weighted) WER, while keeping the probability, alignment and error
+contribution of every individual candidate:
+
+```python3
+import jiwer
+
+out = jiwer.process_candidates(
+    "red green",
+    ["red green", "red", "red blue green"],
+    [0.25, 0.5, 0.25],
+)
+
+print(out.wer)                     # 0.375
+print(out.top1_transcript)         # red
+
+for candidate in out.candidates:
+    print(
+        candidate.index,
+        candidate.hypothesis,
+        candidate.probability,     # 0.25 / 0.5 / 0.25
+        candidate.wer,             # 0.0 / 0.5 / 0.5
+        candidate.error_contribution,  # 0.0 / 0.25 / 0.125
+        candidate.alignments,
+    )
+
+# the per-candidate output can be fed to the existing report entry points
+print(jiwer.visualize_alignment(out.candidates[1].output))
+```
+
+`jiwer.expected_wer(...)` is a shortcut which only returns the expected WER.
+
+The top-1 transcript is selected by *merging* the probabilities of candidates whose
+hypothesis is identical after the word-level transformation, so two decoding paths
+that only differ in spacing share their evidence:
+
+```python3
+import math
+import jiwer
+
+out = jiwer.process_candidates(
+    "red green",
+    ["red green", "red  green", "red"],
+    [0.3, 0.3, 0.4],
+)
+
+print(out.top1_transcript)         # red green (0.6, merged from 0.3 + 0.3)
+print(out.wer)                     # 0.2
+print([g.probability for g in out.transcript_groups])  # [0.6, 0.4]
+```
+
+Weights may also be supplied as log weights. They need not be normalized and may be
+shifted by an arbitrary common offset (for example all lowered by 1000): the
+computation is shifted by the largest weight before exponentiation, so the result does
+not underflow.
+
+```python3
+import math
+import jiwer
+
+probabilities = [0.3, 0.3, 0.4]
+out = jiwer.process_candidates(
+    "red green",
+    ["red green", "red  green", "red"],
+    [math.log(p) - 1000 for p in probabilities],
+    log_weights=True,
+)
+
+print(out.top1_transcript)  # red green
+print(out.wer)              # 0.2
+```
+
+When two different transcripts end up with the same merged probability, the transcript
+of the earliest candidate wins. `jiwer.process_words`, `jiwer.process_characters` and
+the visualization helpers are unchanged and keep working as before.
+
 ## Transformations
 
 You can apply transformations to reference or hypothesis strings before the calculation of various metrics
