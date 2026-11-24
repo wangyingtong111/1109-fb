@@ -63,6 +63,7 @@ class Matrix
   include ExceptionForMatrix
   autoload :EigenvalueDecomposition, "matrix/eigenvalue_decomposition"
   autoload :LUPDecomposition, "matrix/lup_decomposition"
+  autoload :SolutionSpace, "matrix/solution_space"
 
   # instance creations
   private_class_method :new
@@ -1568,6 +1569,40 @@ class Matrix
     LUPDecomposition.new(self)
   end
   alias_method :lup_decomposition, :lup
+
+  #
+  # Returns the exact solution space of <tt>A*x = b</tt>, one right hand
+  # side column at a time; see +SolutionSpace+.
+  #
+  # Unlike <tt>lup.solve</tt>, the receiver need not be square nor of full
+  # rank, and every target column is solved independently.  The row
+  # operations that bring +A+ to reduced row echelon form are applied to all
+  # target columns at once, so the null space is shared by every solvable
+  # column, while a column whose reduced form has a non-zero entry below the
+  # rank is reported as unsolvable.
+  #
+  # +rhs+ may be +nil+ (null space and degrees of freedom only), a Vector or
+  # Array (one target column), or a Matrix with +row_count+ rows (one target
+  # column per matrix column).
+  #
+  #   a = Matrix[[1, 2, 3], [2, 4, 6]]
+  #   b = Matrix.columns([[1, 2], [1, 3]])
+  #   ss = a.solution_space(b)
+  #   ss.rank                          # => 1
+  #   ss.consistent?(0)                # => true
+  #   a * ss.particular(0)             # => Vector[(1/1), (2/1)]
+  #   ss.null_space.size               # => 2
+  #   ss.consistent?(1)                # => false
+  #   ss.particular(1)                 # => nil
+  #
+  # An empty receiver still fixes the number of degrees of freedom: an
+  # <tt>0 x n</tt> matrix has nullity +n+ and an <tt>m x 0</tt> matrix has
+  # nullity 0, with no target column when +rhs+ is +nil+.
+  #
+  def solution_space(rhs = nil)
+    SolutionSpace.new(self, rhs)
+  end
+  alias_method :exact_solution_space, :solution_space
 
   #--
   # COMPLEX ARITHMETIC -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=

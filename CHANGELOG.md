@@ -2,6 +2,14 @@
 
 List of new feature changes (excluding most bug fixes and optimizations)
 
+## Unreleased
+
+* Add `Matrix#solution_space` (and `Matrix::SolutionSpace`) for the exact
+  solution space of `A*x = b` with rectangular, rank deficient coefficient
+  matrices and several right hand side columns at once.  Each column is
+  reported solvable or not, a particular solution is returned for solvable
+  columns, and one null space basis is shared by all of them.
+
 ## v0.4.0
 
 * Add `Matrix#rotate_entries` [#19]

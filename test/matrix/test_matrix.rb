@@ -502,6 +502,219 @@ class TestMatrix < Test::Unit::TestCase
     assert_equal(m.lup.solve([2, 5]), Vector[1, Rational(1,2)])
   end
 
+  def test_solution_space_shared_rhs
+    a = Matrix[[1, 2, 3], [2, 4, 6]]
+    b = Matrix.columns([[1, 2], [1, 3]])
+    ss = a.solution_space(b)
+
+    assert_equal(1, ss.rank)
+    assert_equal(2, ss.degrees_of_freedom)
+    assert_equal(2, ss.null_space.size)
+    assert_equal([0], ss.consistent_column_indices)
+    assert_equal([1], ss.inconsistent_column_indices)
+    assert_equal([0], ss.pivot_column_indices)
+    assert_equal([1, 2], ss.free_column_indices)
+    assert_equal(2, ss.column_count)
+    assert(!ss.all_consistent?)
+    assert(!ss.none_consistent?)
+
+    assert(ss.consistent?(0))
+    assert(!ss.consistent?(1))
+    assert(ss.solvable?(0))
+    assert(ss.inconsistent?(1))
+
+    assert_equal(Vector[Rational(1), 0, 0], ss.particular(0))
+    assert_equal(ss.particular(0), ss.particular_solution(0))
+    assert_nil(ss.particular(1))
+    assert_nil(ss.solution(1))
+
+    # the particular solution must recompute exactly
+    assert_equal(Vector[1, 2], a * ss.particular(0))
+    assert_equal(ss.rhs_column(0), a * ss.particular(0))
+
+    # the null space is shared and really in the kernel of A
+    ss.null_space.each do |basis|
+      assert((a * basis).zero?, "#{basis.inspect} should be in the null space")
+    end
+
+    assert(ss.verify(0))
+    assert(!ss.verify(1))
+
+    # every member of the solution space recomputes
+    sol = ss.solution(0)
+    assert_equal(2, sol.nullity)
+    assert_equal([1, 2], sol.free_column_indices)
+    assert(!sol.homogeneous?)
+    [sol.at(0, 0), sol.at(1, 0), sol.at(0, 1), sol.at(Rational(1, 2), Rational(-1, 3))].each do |x|
+      assert_equal(ss.rhs_column(0), a * x)
+    end
+    assert_equal(sol.particular, sol.at(0, 0))
+    assert(sol.verify(a, ss.rhs_column(0)))
+
+    assert_equal(Matrix[[-2, -3], [1, 0], [0, 1]], ss.null_space_matrix)
+  end
+
+  def test_solution_space_exact_rationals
+    a = Matrix[[Rational(1, 3), Rational(1, 2)], [Rational(1, 2), Rational(1, 3)]]
+    ss = a.solution_space(Vector[Rational(1, 6), Rational(1, 3)])
+    assert_equal(2, ss.rank)
+    assert_equal(0, ss.nullity)
+    assert(ss.consistent?(0))
+    x = ss.particular(0)
+    assert_equal(Vector[Rational(4, 5), Rational(-1, 5)], x)
+    assert_equal(Vector[Rational(1, 6), Rational(1, 3)], a * x)
+    assert_equal(2, x.map(&:class).count(Rational))
+    assert(ss.verify(0))
+
+    # a rank deficient exact case: 1/2 has no float rounding
+    b = Matrix[[Rational(1, 2), 1], [Rational(1, 4), Rational(1, 2)]]
+    ss_b = b.solution_space(Vector[Rational(1, 2), Rational(1, 4)])
+    assert_equal(1, ss_b.rank)
+    assert_equal(1, ss_b.nullity)
+    assert_equal(Vector[Rational(1), 0], ss_b.particular(0))
+    assert_equal(Vector[Rational(1, 2), Rational(1, 4)], b * ss_b.particular(0))
+    ss_b.null_space.each { |basis| assert((b * basis).zero?) }
+  end
+
+  def test_solution_space_overdetermined
+    a = Matrix[[1, 2], [2, 4], [3, 6]]
+    b = Matrix.columns([[3, 6, 9], [3, 6, 10]])
+    ss = a.solution_space(b)
+    assert_equal(1, ss.rank)
+    assert_equal([0], ss.consistent_column_indices)
+    assert_equal([1], ss.inconsistent_column_indices)
+    assert_equal(Vector[3, 0], ss.particular(0))
+    assert_nil(ss.particular(1))
+    assert_equal(Vector[3, 6, 9], a * ss.particular(0))
+  end
+
+  def test_solution_space_underdetermined
+    a = Matrix[[1, 2, 3, 4]]
+    ss = a.solution_space(Vector[5])
+    assert_equal(1, ss.rank)
+    assert_equal(3, ss.degrees_of_freedom)
+    assert_equal(Vector[5, 0, 0, 0], ss.particular(0))
+    assert_equal(Vector[5], a * ss.particular(0))
+    assert(ss.verify(0))
+  end
+
+  def test_solution_space_square_matches_lup
+    a = Matrix[[2, 0], [1, 3]]
+    ss = a.solution_space(Vector[4, 7])
+    assert_equal(0, ss.nullity)
+    assert(ss.consistent?(0))
+    assert_equal(a.lup.solve(Vector[4, 7]), ss.particular(0))
+    assert_equal(Vector[2, Rational(5, 3)], ss.particular(0))
+    # original entry point unchanged
+    assert_equal(Vector[2, Rational(5, 3)], a.lup.solve(Vector[4, 7]))
+  end
+
+  def test_solution_space_homogeneous_and_inconsistent
+    a = Matrix[[1, 2], [2, 4]]
+    ss = a.solution_space(Vector[0, 0])
+    assert(ss.consistent?(0))
+    assert(ss.solution(0).homogeneous?)
+    assert_equal(Vector[0, 0], ss.particular(0))
+    assert_equal(Vector[0, 0], a * ss.particular(0))
+
+    ss_bad = a.solution_space(Vector[0, 1])
+    assert(!ss_bad.consistent?(0))
+    assert_nil(ss_bad.particular(0))
+    assert(ss_bad.none_consistent?)
+    assert_nil(ss_bad.solution(0))
+  end
+
+  def test_solution_space_empty_matrix
+    # no rows: every target is trivially consistent, all variables are free
+    e0n = Matrix.empty(0, 3)
+    ss = e0n.solution_space
+    assert_equal(0, ss.rank)
+    assert_equal(3, ss.degrees_of_freedom)
+    assert_equal(0, ss.column_count)
+    assert_equal([0, 1, 2], ss.free_column_indices)
+    assert_equal([], ss.pivot_column_indices)
+    assert_equal([Vector[1, 0, 0], Vector[0, 1, 0], Vector[0, 0, 1]], ss.null_space)
+
+    ss_rhs = e0n.solution_space(Vector[])
+    assert_equal(1, ss_rhs.column_count)
+    assert(ss_rhs.consistent?(0))
+    assert_equal(Vector[0, 0, 0], ss_rhs.particular(0))
+
+    # no columns: nullity is 0 and only the zero target is solvable
+    em0 = Matrix.empty(2, 0)
+    ss2 = em0.solution_space
+    assert_equal(0, ss2.rank)
+    assert_equal(0, ss2.degrees_of_freedom)
+    assert_equal([], ss2.null_space)
+
+    ss2z = em0.solution_space(Matrix.columns([[0, 0]]))
+    assert_equal(1, ss2z.column_count)
+    assert_equal([0], ss2z.consistent_column_indices)
+    assert_equal(Vector[], ss2z.particular(0))
+
+    ss2b = em0.solution_space(Matrix.columns([[1, 0]]))
+    assert(!ss2b.consistent?(0))
+    assert_nil(ss2b.particular(0))
+  end
+
+  def test_solution_space_free_column_does_not_stop_elimination
+    # the first column is entirely zero: it is free, but the scan must go on
+    # and pivot on a later column.
+    a = Matrix[[0, 1, 0, 2], [0, 2, 0, 4]]
+    b = Matrix.rows([[2, 1], [4, 3]])
+    ss = a.solution_space(b)
+    assert_equal(1, ss.rank)
+    assert_equal([1], ss.pivot_column_indices)
+    assert_equal([0, 2, 3], ss.free_column_indices)
+    assert_equal(3, ss.nullity)
+    assert_equal([0], ss.consistent_column_indices)
+    assert_equal([1], ss.inconsistent_column_indices)
+    assert_equal(Vector[0, 2, 0, 0], ss.particular(0))
+    assert_equal(Vector[2, 4], a * ss.particular(0))
+    assert_nil(ss.particular(1))
+    assert(ss.verify(0))
+    assert(!ss.verify(1))
+    sol = ss.solution(0)
+    assert_equal(Vector[2, 4], a * sol.at(1, 2, 3))
+    ss.null_space.each { |basis| assert((a * basis).zero?) }
+  end
+
+  def test_solution_space_zero_matrix
+    z = Matrix.zero(2, 3)
+    ss = z.solution_space(Matrix.rows([[0, 1], [0, 2]]))
+    assert_equal(0, ss.rank)
+    assert_equal(3, ss.nullity)
+    assert_equal([0], ss.consistent_column_indices)
+    assert_equal([1], ss.inconsistent_column_indices)
+    assert_equal(Vector[0, 0, 0], ss.particular(0))
+    assert_nil(ss.particular(1))
+    # any target is in the range of the zero matrix
+    assert_equal(Vector[0, 0], Matrix.zero(2, 3) * ss.particular(0))
+  end
+
+  def test_solution_space_no_rhs_columns
+    # degrees of freedom are well defined without any target column
+    ss = Matrix[[1, 2, 3], [2, 4, 6]].solution_space
+    assert_equal(0, ss.column_count)
+    assert_equal(2, ss.nullity)
+    assert_equal(2, ss.null_space.size)
+    assert(!ss.all_consistent?)
+    assert(!ss.none_consistent?)
+    assert_equal([], ss.consistent_column_indices)
+    assert_equal([], ss.inconsistent_column_indices)
+    assert_equal([], ss.to_a)
+  end
+
+  def test_solution_space_argument_errors
+    assert_raise(Matrix::ErrDimensionMismatch) { Matrix[[1, 2]].solution_space(Vector[1, 2, 3]) }
+    assert_raise(Matrix::ErrDimensionMismatch) { Matrix[[1, 2]].solution_space(Matrix[[1], [2]]) }
+    ss = Matrix[[1, 2]].solution_space(Vector[1])
+    assert_raise(IndexError) { ss.particular(3) }
+    assert_raise(IndexError) { ss.consistent?(-3) }
+    assert_raise(ArgumentError) { ss.solution(0).at(0, 0) }
+    assert_raise(IndexError) { Matrix[[1, 2]].solution_space.particular(0) }
+  end
+
   def test_real
     assert_equal(Matrix[[1, 0, 0], [1, 2, 3]], @c1.real)
   end
