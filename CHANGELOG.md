@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- fix: segmentation precision and recall now honor the multi-domain
+  evaluation map (`uem`): boundaries are only counted and matched inside
+  scoring domains, so gaps between domains are no longer mistaken for real
+  segmentation boundaries and the tolerance can no longer match across two
+  distinct domains
+
 ## Version 4.2.0 (2026-10-16)
 
 - BREAKING: require Python 3.11 or newer; Python 3.10 is no longer supported

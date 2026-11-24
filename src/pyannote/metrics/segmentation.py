@@ -272,6 +272,19 @@ class SegmentationPrecision(UEMSupportMixin, BaseMetric):
     >>> precision(reference, hypothesis)
     1.0
 
+    When an evaluation map (`uem`) made of several disjoint scoring domains is
+    provided, each domain is evaluated independently: boundaries are only
+    counted (and matched) strictly *inside* a domain, so the gaps between
+    domains (e.g. unscored silence removed before stitching subtitles back)
+    are never mistaken for actual segmentation boundaries, and the tolerance
+    never bridges two distinct domains.
+
+    >>> uem = Timeline([Segment(0, 2), Segment(4, 6)])
+    >>> reference = Timeline([Segment(0, 2), Segment(4, 6)])
+    >>> hypothesis = Timeline([Segment(0, 2), Segment(4, 6)])
+    >>> SegmentationPrecision()(reference, hypothesis, uem=uem)
+    1.0
+
     """
 
     @classmethod
@@ -287,39 +300,40 @@ class SegmentationPrecision(UEMSupportMixin, BaseMetric):
         super().__init__(**kwargs)
         self.tolerance = tolerance
 
-    def compute_components(
-        self,
-        reference: Annotation | Timeline,
-        hypothesis: Annotation | Timeline,
-        **kwargs,
-    ) -> Details:
+    @staticmethod
+    def _boundaries(timeline: Timeline) -> list[float]:
+        """Return internal boundaries of a (cropped) timeline
 
-        # extract timeline if needed
-        if isinstance(reference, Annotation):
-            reference = reference.get_timeline()
-        if isinstance(hypothesis, Annotation):
-            hypothesis = hypothesis.get_timeline()
+        Only the end time of every segment but the last one is returned.
+        When the timeline has been cropped to a single evaluation domain,
+        these are exactly the boundaries strictly *inside* that domain: the
+        domain edges never show up, so gaps between domains cannot be
+        mistaken for actual segmentation boundaries.
+        """
+        return [segment.end for segment in timeline][:-1]
 
-        detail = self.init_components()
+    @staticmethod
+    def _match_boundaries(
+        ref_boundaries: list[float],
+        hyp_boundaries: list[float],
+        tolerance: float,
+    ) -> float:
+        """Greedy one-to-one matching of reference and hypothesis boundaries
 
-        # number of matches so far...
-        n_matches = 0.0  # make sure it is a float (for later ratio)
+        A pair of boundaries can only be matched when their temporal distance
+        does not exceed `tolerance`. Both lists are expected to come from the
+        same evaluation domain, which guarantees a match can never bridge the
+        gap between two domains.
 
-        # number of boundaries in reference and hypothesis
-        N = max(0, len(reference) - 1)
-        M = max(0, len(hypothesis) - 1)
+        Returns the number of matched boundary pairs.
+        """
 
-        # number of boundaries in hypothesis
-        detail[PR_BOUNDARIES] = M
+        N = len(ref_boundaries)
+        M = len(hyp_boundaries)
 
         # corner case (no boundary in hypothesis or in reference)
         if M == 0 or N == 0:
-            detail[PR_MATCHES] = 0.0
-            return detail
-
-        # reference and hypothesis boundaries
-        ref_boundaries = [segment.end for segment in reference][:-1]
-        hyp_boundaries = [segment.end for segment in hypothesis][:-1]
+            return 0.0
 
         # temporal delta between all pairs of boundaries
         delta = np.zeros((N, M))
@@ -329,11 +343,13 @@ class SegmentationPrecision(UEMSupportMixin, BaseMetric):
 
         # make sure boundaries too far apart from each other cannot be matched
         # (this is what np.inf is used for)
-        delta[np.where(delta > self.tolerance)] = np.inf
+        delta[np.where(delta > tolerance)] = np.inf
 
         # h always contains the minimum value in delta matrix
         # h == np.inf means that no boundary can be matched
         h = np.amin(delta)
+
+        n_matches = 0.0  # make sure it is a float (for later ratio)
 
         # while there are still boundaries to match
         while h < np.inf:
@@ -352,7 +368,59 @@ class SegmentationPrecision(UEMSupportMixin, BaseMetric):
             # update minimum value in delta
             h = np.amin(delta)
 
-        detail[PR_MATCHES] = n_matches
+        return n_matches
+
+    def compute_components(
+        self,
+        reference: Annotation | Timeline,
+        hypothesis: Annotation | Timeline,
+        uem: Timeline | None = None,
+        **kwargs,
+    ) -> Details:
+
+        # extract timeline if needed
+        if isinstance(reference, Annotation):
+            reference = reference.get_timeline()
+        if isinstance(hypothesis, Annotation):
+            hypothesis = hypothesis.get_timeline()
+
+        detail = self.init_components()
+
+        # number of boundaries in hypothesis
+        detail[PR_BOUNDARIES] = 0.0
+        detail[PR_MATCHES] = 0.0
+
+        if uem is None:
+            # ordinary continuous evaluation: boundaries are derived directly
+            # from the (gap-free) input timelines
+            hyp_boundaries = self._boundaries(hypothesis)
+            ref_boundaries = self._boundaries(reference)
+
+            detail[PR_BOUNDARIES] = float(len(hyp_boundaries))
+            detail[PR_MATCHES] = self._match_boundaries(
+                ref_boundaries, hyp_boundaries, self.tolerance
+            )
+            return detail
+
+        # segmented evaluation: the evaluation map (`uem`) is a collection of
+        # disjoint scoring domains. Gaps between domains are not scored and
+        # must not be treated as segmentation boundaries. Each domain is
+        # processed independently, and boundaries are only matched within the
+        # very same domain so that the tolerance can never bridge two domains.
+        for domain in uem.support():
+            domain_uem = Timeline(segments=[domain], uri=uem.uri)
+
+            reference_ = reference.crop(domain_uem, mode="intersection")
+            hypothesis_ = hypothesis.crop(domain_uem, mode="intersection")
+
+            hyp_boundaries = self._boundaries(hypothesis_)
+            ref_boundaries = self._boundaries(reference_)
+
+            detail[PR_BOUNDARIES] += float(len(hyp_boundaries))
+            detail[PR_MATCHES] += self._match_boundaries(
+                ref_boundaries, hyp_boundaries, self.tolerance
+            )
+
         return detail
 
     def compute_metric(self, detail: Details) -> float:
@@ -394,6 +462,11 @@ class SegmentationRecall(SegmentationPrecision):
     >>> recall(reference, hypothesis)
     0.0
 
+    As for :class:`SegmentationPrecision`, providing a multi-domain evaluation
+    map (`uem`) restricts boundary counting and matching to the interior of
+    each scoring domain, ignoring the gaps between domains and preventing the
+    tolerance from matching across two distinct domains.
+
     """
 
     @classmethod
@@ -404,6 +477,7 @@ class SegmentationRecall(SegmentationPrecision):
         self,
         reference: Annotation | Timeline,
         hypothesis: Annotation | Timeline,
+        uem: Timeline | None = None,
         **kwargs,
     ) -> Details:
-        return super().compute_components(hypothesis, reference)
+        return super().compute_components(hypothesis, reference, uem=uem, **kwargs)
