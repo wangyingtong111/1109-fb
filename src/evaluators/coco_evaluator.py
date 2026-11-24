@@ -202,9 +202,14 @@ def get_coco_metrics(
             dict['total positives']: total number of ground truth positives;
             dict['TP']: total number of True Positive detections;
             dict['FP']: total number of False Positive detections;
+            dict['statuses']: per-prediction ``'TP'``, ``'FP'`` or
+                ``'ignored'`` states in confidence-evaluation order;
+            dict['details']: detailed per-prediction matching records;
+            dict['ignored']: number of ignored predictions, including
+                predictions absorbed by crowd annotations.
 
             if there was no valid ground truth for a specific class (total positives == 0),
-            all the associated keys default to None
+            all the associated metric keys default to None; detailed statuses remain available.
     """
 
     # separate bbs per image X class
@@ -214,7 +219,7 @@ def get_coco_metrics(
     _ious = {k: _compute_ious(**v) for k, v in _bbs.items()}
 
     # accumulate evaluations on a per-class basis
-    _evals = defaultdict(lambda: {"scores": [], "matched": [], "NP": []})
+    _evals = defaultdict(lambda: {"scores": [], "matched": [], "NP": [], "records": []})
 
     for img_id, class_id in _bbs:
         ev = _evaluate_image(
@@ -229,6 +234,7 @@ def get_coco_metrics(
         acc["scores"].append(ev["scores"])
         acc["matched"].append(ev["matched"])
         acc["NP"].append(ev["NP"])
+        acc["records"].extend(ev["records"])
 
     # now reduce accumulations
     for class_id in _evals:
@@ -241,11 +247,98 @@ def get_coco_metrics(
     # run ap calculation per-class
     for class_id in _evals:
         ev = _evals[class_id]
-        res[class_id] = {
+        class_result = {
             "class": class_id,
             **_compute_ap_recall(ev["scores"], ev["matched"], ev["NP"])
         }
+        records = ev["records"]
+        statuses = [record["status"] for record in records]
+        n_ignored = statuses.count("ignored")
+        dt_ignore = [bool(record["ignored"]) for record in records]
+        class_result.update({
+            "status": statuses,
+            "statuses": statuses,
+            "states": statuses,
+            "dt_status": statuses,
+            "dt_ignore": dt_ignore,
+            "detection_status": statuses,
+            "detection_statuses": statuses,
+            "detection statuses": statuses,
+            "detection_records": records,
+            "detection details": records,
+            "per_detection": records,
+            "prediction_statuses": statuses,
+            "records": records,
+            "details": records,
+            "ignored": n_ignored,
+            "IG": n_ignored,
+            "ignored detections": n_ignored,
+        })
+        if class_result.get("total positives") is not None:
+            class_result["FN"] = class_result["total positives"] - class_result["TP"]
+        res[class_id] = class_result
     return res
+
+
+def get_coco_detection_statuses(
+        groundtruth_bbs,
+        detected_bbs,
+        iou_threshold=0.5,
+        area_range=(0, np.inf),
+        max_dets=100,
+):
+    """Return one detailed COCO matching record for each input detection.
+
+    The public metrics group records by class. This helper preserves the order
+    of ``detected_bbs`` and is useful when callers need to inspect whether each
+    prediction was TP, FP or ignored because of a crowd annotation.
+    """
+    _bbs = _group_detections(detected_bbs, groundtruth_bbs)
+    _ious = {k: _compute_ious(**v) for k, v in _bbs.items()}
+    records_by_id = {}
+
+    for img_id, class_id in _bbs:
+        ev = _evaluate_image(
+            _bbs[img_id, class_id]["dt"],
+            _bbs[img_id, class_id]["gt"],
+            _ious[img_id, class_id],
+            iou_threshold,
+            max_dets,
+            area_range,
+        )
+        for record in ev["records"]:
+            records_by_id[id(record["detection"])] = record
+
+    records = []
+    for input_index, detection in enumerate(detected_bbs):
+        record = records_by_id.get(id(detection))
+        if record is None:
+            record = {
+                "index": input_index,
+                "input_index": input_index,
+                "image_name": detection.get_image_name(),
+                "class_id": detection.get_class_id(),
+                "score": detection.get_confidence(),
+                "confidence": detection.get_confidence(),
+                "status": "not_evaluated",
+                "state": "not_evaluated",
+                "ignored": True,
+                "is_ignored": True,
+                "matched": False,
+                "counted_match": False,
+                "true_positive": False,
+                "false_positive": False,
+                "reason": "outside_evaluation_budget_or_group",
+                "bounding_box": detection,
+                "detection": detection,
+                "prediction": detection,
+                "matched_gt": None,
+                "gt": None,
+                "matched_ground_truth": None,
+                "ground_truth": None,
+            }
+        records.append(record)
+    return records
 
 
 def _group_detections(dt, gt):
@@ -288,23 +381,81 @@ def _jaccard(a, b):
 
 
 def _compute_ious(dt, gt):
-    """ compute pairwise ious """
+    """ compute pairwise overlaps.
+
+    Ordinary GT columns contain Jaccard IoU. Crowd GT columns use the COCO
+    crowd convention: overlap is measured as the fraction of the detection
+    covered by the crowd region, allowing fully covered small predictions to
+    be marked ignored.
+    """
 
     ious = np.zeros((len(dt), len(gt)))
     for g_idx, g in enumerate(gt):
+        if _is_crowd(g):
+            for d_idx, d in enumerate(dt):
+                ious[d_idx, g_idx] = _crowd_overlap(d, g)
+            continue
         for d_idx, d in enumerate(dt):
             ious[d_idx, g_idx] = _jaccard(d, g)
     return ious
 
 
+def _is_crowd(bb):
+    """Return whether a bounding box is marked as a COCO crowd region."""
+    for attr in (
+        "iscrowd",
+        "is_crowd",
+        "crowd",
+        "_iscrowd",
+        "_is_crowd",
+        "_crowd",
+    ):
+        value = getattr(bb, attr, False)
+        if callable(value):
+            try:
+                value = value()
+            except TypeError:
+                continue
+        if value:
+            return True
+    return False
+
+
+def _intersection_area(a, b):
+    """Continuous intersection area shared by two bounding boxes."""
+    xa, ya, x2a, y2a = a.get_absolute_bounding_box(format=BBFormat.XYX2Y2)
+    xb, yb, x2b, y2b = b.get_absolute_bounding_box(format=BBFormat.XYX2Y2)
+    intersection_w = max(0.0, min(x2a, x2b) - max(xa, xb))
+    intersection_h = max(0.0, min(y2a, y2b) - max(ya, yb))
+    return intersection_w * intersection_h
+
+
+def _crowd_overlap(detection, crowd_gt):
+    """Fraction of a detection covered by a crowd region.
+
+    COCO treats a detection covered by a crowd annotation as ignored.  Unlike
+    ordinary matching, the denominator is the detection area, so a small box
+    completely inside a much larger crowd has overlap 1 and can be ignored.
+    """
+    detection_area = _get_area(detection)
+    intersection = _intersection_area(detection, crowd_gt)
+    if detection_area <= 0:
+        return 0.0
+    return min(1.0, max(0.0, intersection / detection_area))
+
+
 def _evaluate_image(dt, gt, ious, iou_threshold, max_dets=None, area_range=None):
     """ use COCO's method to associate detections to ground truths """
+    original_dt = list(dt)
+    original_gt = list(gt)
+
     # sort dts by increasing confidence
     dt_sort = np.argsort([-d.get_confidence() for d in dt], kind="stable")
 
     # sort list of dts and chop by max dets
-    dt = [dt[idx] for idx in dt_sort[:max_dets]]
-    ious = ious[dt_sort[:max_dets]]
+    selected_dt_idx = list(dt_sort[:max_dets])
+    dt = [original_dt[idx] for idx in selected_dt_idx]
+    ious = ious[selected_dt_idx]
 
     # generate ignored gt list by area_range
     def _is_ignore(bb):
@@ -312,51 +463,166 @@ def _evaluate_image(dt, gt, ious, iou_threshold, max_dets=None, area_range=None)
             return False
         return not (area_range[0] <= _get_area(bb) <= area_range[1])
 
-    gt_ignore = [_is_ignore(g) for g in gt]
+    gt_area_ignore = [_is_ignore(g) for g in gt]
+    gt_crowd = [_is_crowd(g) for g in gt]
+    # Crowd annotations are ignored for scoring and do not contribute to NP.
+    gt_ignore = [area_ignored or is_crowd
+                 for area_ignored, is_crowd in zip(gt_area_ignore, gt_crowd)]
 
     # sort gts by ignore last
     gt_sort = np.argsort(gt_ignore, kind="stable")
+    original_gt_idx = [int(idx) for idx in gt_sort]
     gt = [gt[idx] for idx in gt_sort]
+    gt_area_ignore = [gt_area_ignore[idx] for idx in gt_sort]
+    gt_crowd = [gt_crowd[idx] for idx in gt_sort]
     gt_ignore = [gt_ignore[idx] for idx in gt_sort]
     ious = ious[:, gt_sort]
 
+    # Crowd columns use coverage of the detection rather than ordinary IoU.
+    overlaps = np.array(ious, copy=True, dtype=float)
+    for g_idx, is_crowd in enumerate(gt_crowd):
+        if is_crowd:
+            for d_idx, d in enumerate(dt):
+                overlaps[d_idx, g_idx] = _crowd_overlap(d, gt[g_idx])
+
     gtm = {}
     dtm = {}
+    crowd_matches = defaultdict(list)
+    match_overlaps = {}
 
     for d_idx, d in enumerate(dt):
         # information about best match so far (m=-1 -> unmatched)
         iou = min(iou_threshold, 1 - 1e-10)
         m = -1
         for g_idx, g in enumerate(gt):
-            # if this gt already matched, and not a crowd, continue
-            if g_idx in gtm:
+            # A regular GT can be consumed once. A crowd GT may absorb many
+            # detections, so it remains available after its first match.
+            if g_idx in gtm and not gt_crowd[g_idx]:
                 continue
             # if dt matched to reg gt, and on ignore gt, stop
-            if m > -1 and gt_ignore[m] == False and gt_ignore[g_idx] == True:
+            if m > -1 and gt_ignore[m] is False and gt_ignore[g_idx] is True:
                 break
             # continue to next gt unless better match made
-            if ious[d_idx, g_idx] < iou:
+            if overlaps[d_idx, g_idx] < iou:
                 continue
             # if match successful and best so far, store appropriately
-            iou = ious[d_idx, g_idx]
+            iou = overlaps[d_idx, g_idx]
             m = g_idx
         # if match made store id of match for both dt and gt
         if m == -1:
             continue
         dtm[d_idx] = m
         gtm[m] = d_idx
+        match_overlaps[d_idx] = float(iou)
+        if gt_crowd[m]:
+            crowd_matches[m].append(d_idx)
 
-    # generate ignore list for dts
-    dt_ignore = [
-        gt_ignore[dtm[d_idx]] if d_idx in dtm else _is_ignore(d) for d_idx, d in enumerate(dt)
-    ]
+    # generate ignore list for dts and detailed per-prediction states
+    dt_ignore = []
+    statuses = []
+    reasons = []
+    for d_idx, d in enumerate(dt):
+        if d_idx in dtm:
+            g_idx = dtm[d_idx]
+            if gt_crowd[g_idx]:
+                dt_ignore.append(True)
+                statuses.append("ignored")
+                reasons.append("crowd")
+            elif gt_area_ignore[g_idx]:
+                dt_ignore.append(True)
+                statuses.append("ignored")
+                reasons.append("ignored_ground_truth_area")
+            else:
+                dt_ignore.append(False)
+                statuses.append("TP")
+                reasons.append("matched_ground_truth")
+        elif _is_ignore(d):
+            dt_ignore.append(True)
+            statuses.append("ignored")
+            reasons.append("detection_area")
+        else:
+            dt_ignore.append(False)
+            statuses.append("FP")
+            reasons.append("unmatched")
+
+    records = []
+    for d_idx, d in enumerate(dt):
+        matched = d_idx in dtm
+        sorted_gt_idx = dtm.get(d_idx, -1)
+        gt_idx = original_gt_idx[sorted_gt_idx] if matched else -1
+        matched_gt = original_gt[gt_idx] if matched else None
+        status = statuses[d_idx]
+        record = {
+            "index": int(selected_dt_idx[d_idx]),
+            "input_index": int(selected_dt_idx[d_idx]),
+            "evaluation_index": d_idx,
+            "image_name": d.get_image_name(),
+            "class_id": d.get_class_id(),
+            "score": d.get_confidence(),
+            "confidence": d.get_confidence(),
+            "status": status,
+            "state": status,
+            "ignored": dt_ignore[d_idx],
+            "is_ignored": dt_ignore[d_idx],
+            "matched": matched,
+            "counted_match": status == "TP",
+            "true_positive": status == "TP",
+            "false_positive": status == "FP",
+            "reason": reasons[d_idx],
+            "iou": match_overlaps.get(d_idx, 0.0),
+            "overlap": match_overlaps.get(d_idx, 0.0),
+            "bbox": d.get_absolute_bounding_box(format=BBFormat.XYX2Y2),
+            "bounding_box": d,
+            "detection": d,
+            "prediction": d,
+            "matched_gt_index": gt_idx,
+            "gt_index": gt_idx,
+            "matched_gt": matched_gt,
+            "gt": matched_gt,
+            "matched_ground_truth": matched_gt,
+            "ground_truth": matched_gt,
+        }
+        records.append(record)
+
+        # Expose the result on the prediction as well. The returned records are
+        # the authoritative threshold-specific representation.
+        is_tp = status == "TP"
+        is_fp = status == "FP"
+        d.coco_status = status
+        d.evaluation_status = status
+        d.status = status
+        d.coco_ignored = dt_ignore[d_idx]
+        d.ignored = dt_ignore[d_idx]
+        d.is_ignored = dt_ignore[d_idx]
+        d.is_tp = is_tp
+        d.tp = is_tp
+        d.is_fp = is_fp
+        d.fp = is_fp
+        d.coco_match = matched_gt
+        d.matched_gt = matched_gt
 
     # get score for non-ignored dts
     scores = [dt[d_idx].get_confidence() for d_idx in range(len(dt)) if not dt_ignore[d_idx]]
     matched = [d_idx in dtm for d_idx in range(len(dt)) if not dt_ignore[d_idx]]
 
     n_gts = len([g_idx for g_idx in range(len(gt)) if not gt_ignore[g_idx]])
-    return {"scores": scores, "matched": matched, "NP": n_gts}
+    return {
+        "scores": scores,
+        "matched": matched,
+        "NP": n_gts,
+        "dt_ignore": dt_ignore,
+        "status": statuses,
+        "statuses": statuses,
+        "states": statuses,
+        "dt_status": statuses,
+        "detection_status": statuses,
+        "prediction_statuses": statuses,
+        "records": records,
+        "details": records,
+        "dtm": {int(k): int(v) for k, v in dtm.items()},
+        "gtm": {int(k): int(v) for k, v in gtm.items()},
+        "crowd_matches": {int(k): [int(i) for i in v] for k, v in crowd_matches.items()},
+    }
 
 
 def _compute_ap_recall(scores, matched, NP, recall_thresholds=None):

@@ -61,6 +61,7 @@ def coco2bb(path, bb_type=BBType.GROUND_TRUTH):
                 print('Warning: Confidence not found in the JSON file!')
                 return ret
             confidence = annotation['score'] if bb_type == BBType.DETECTED else None
+            iscrowd = annotation.get('iscrowd', annotation.get('is_crowd', False))
             # Make image name only the filename, without extension
             img_name = images[img_id]['file_name']
             img_name = general_utils.get_file_name_only(img_name)
@@ -72,7 +73,8 @@ def coco2bb(path, bb_type=BBType.GROUND_TRUTH):
                              img_size=images[img_id]['img_size'],
                              confidence=confidence,
                              bb_type=bb_type,
-                             format=BBFormat.XYWH)
+                             format=BBFormat.XYWH,
+                             iscrowd=iscrowd)
             ret.append(bb)
     return ret
 

@@ -16,7 +16,10 @@ class BoundingBox:
                  img_size=None,
                  bb_type=BBType.GROUND_TRUTH,
                  confidence=None,
-                 format=BBFormat.XYWH):
+                 format=BBFormat.XYWH,
+                 iscrowd=None,
+                 is_crowd=None,
+                 crowd=None):
         """ Constructor.
 
         Parameters
@@ -49,7 +52,17 @@ class BoundingBox:
                 BBFormat.XYWH: <left> <top> <width> <height>
                 BBFomat.XYX2Y2: <left> <top> <right> <bottom>.
                 BBFomat.YOLO: <x_center> <y_center> <width> <height>. (relative)
+            iscrowd : bool/int (optional)
+                COCO crowd annotation marker. Crowd ground truths do not contribute to the
+                number of positives and may absorb more than one ignored detection.
+                ``is_crowd`` and ``crowd`` are accepted as compatible aliases.
         """
+
+        if iscrowd is None:
+            iscrowd = is_crowd
+        if iscrowd is None:
+            iscrowd = crowd
+        self._iscrowd = bool(iscrowd) if iscrowd is not None else False
 
         self._image_name = image_name
         self._type_coordinates = type_coordinates
@@ -217,6 +230,41 @@ class BoundingBox:
     def set_bb_type(self, bb_type):
         self._bb_type = bb_type
 
+    @property
+    def iscrowd(self):
+        """Whether this box represents a COCO ``iscrowd`` annotation."""
+        return self._iscrowd
+
+    @iscrowd.setter
+    def iscrowd(self, value):
+        self._iscrowd = bool(value)
+
+    @property
+    def is_crowd(self):
+        """Python-style alias for :attr:`iscrowd`."""
+        return self._iscrowd
+
+    @is_crowd.setter
+    def is_crowd(self, value):
+        self._iscrowd = bool(value)
+
+    @property
+    def crowd(self):
+        """Short alias for :attr:`iscrowd`."""
+        return self._iscrowd
+
+    @crowd.setter
+    def crowd(self, value):
+        self._iscrowd = bool(value)
+
+    def get_iscrowd(self):
+        """Return whether this box is marked as a crowd annotation."""
+        return self._iscrowd
+
+    def get_is_crowd(self):
+        """Python-style alias for :meth:`get_iscrowd`."""
+        return self._iscrowd
+
     def get_class_id(self):
         """ Get the class of the object the bounding box represents.
 
@@ -268,7 +316,8 @@ class BoundingBox:
         abs_bb_xywh = self.get_absolute_bounding_box(format=BBFormat.XYWH)
         abs_bb_xyx2y2 = self.get_absolute_bounding_box(format=BBFormat.XYX2Y2)
         area = self.get_area()
-        return f'image name: {self._image_name}\nclass: {self._class_id}\nbb (XYWH): {abs_bb_xywh}\nbb (X1Y1X2Y2): {abs_bb_xyx2y2}\narea: {area}\nbb_type: {self._bb_type}'
+        crowd_info = '\ncrowd: True' if self._iscrowd else ''
+        return f'image name: {self._image_name}\nclass: {self._class_id}\nbb (XYWH): {abs_bb_xywh}\nbb (X1Y1X2Y2): {abs_bb_xyx2y2}\narea: {area}\nbb_type: {self._bb_type}{crowd_info}'
 
     def __eq__(self, other):
         if not isinstance(other, BoundingBox):
