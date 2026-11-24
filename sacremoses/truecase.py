@@ -15,6 +15,29 @@ from sacremoses.util import parallelize_preprocess, grouper
 perluniprops = Perluniprops()
 
 
+#: Header written as the first line of every model file that records the true
+#: count of *every* surface variant. Count-bearing models can be merged by
+#: adding their per-variant counts; the original Moses/Perl format cannot,
+#: because it writes a placeholder ``(1)`` for every non-best variant, so the
+#: real counts are gone the moment the file is written. The header is the
+#: unambiguous marker that distinguishes the two: a bare ``(1)`` is otherwise
+#: indistinguishable from a variant that genuinely occurred once.
+MODEL_HEADER = "# sacremoses truecase model v2"
+
+
+class LegacyModelError(ValueError):
+    """Raised when a model without recoverable per-variant counts is asked to
+    take part in a merge.
+
+    Files in the original Moses/Perl layout (and every model written before the
+    v2 header existed) stay *readable* for truecasing -- ``MosesTruecaser(path)``
+    still loads them. They only cannot be merged, because a non-best variant is
+    stored as ``(1)`` regardless of its real frequency, so its count cannot be
+    recovered. Re-train such a shard from its corpus with this version, or
+    merge the underlying corpora and train once.
+    """
+
+
 class MosesTruecaser(object):
     """
     This is a Python port of the Moses Truecaser from
@@ -363,6 +386,22 @@ class MosesTruecaser(object):
             tokens[-1] = tokens[-1].strip()  # Token hack, unique to sacremoses.
         return tokens
 
+    @staticmethod
+    def _ranked_variants(variant_counts):
+        """The surface variants of one lowercased token, in a total order.
+
+        Primary key is the true count, most frequent first. Ties are broken by
+        the surface form in ascending lexicographic order, so the result never
+        depends on dict/insertion order. That makes ``_casing_to_model`` -- and
+        every merge built on top of it -- independent of how the corpus was
+        shuffled, split into batches, or the order in which the batches were
+        merged.
+        """
+        return sorted(
+            variant_counts.items(),
+            key=lambda surface_count: (-surface_count[1], surface_count[0]),
+        )
+
     def _casing_to_model(self, casing):
         """
 
@@ -373,8 +412,9 @@ class MosesTruecaser(object):
         known = Counter()
 
         for token_lower in casing:
-            tokens = casing[token_lower].most_common()
-            # Set the most frequent case as the "best" case.
+            tokens = self._ranked_variants(casing[token_lower])
+            # Set the most frequent case as the "best" case. On an exact count
+            # tie the lexicographically smallest surface form wins, deterministically.
             best[token_lower] = tokens[0][0]
             # If it's asr, throw away everything
             if not self.is_asr:
@@ -429,10 +469,13 @@ class MosesTruecaser(object):
             raise
 
     def _write_casing(self, casing, fout):
+        # The header marks a file whose every variant carries its true count,
+        # i.e. one that is safe to merge. See MODEL_HEADER.
+        print(MODEL_HEADER, file=fout)
         for token in casing:
             total_token_count = sum(casing[token].values())
             tokens_counts = []
-            for i, (token, count) in enumerate(casing[token].most_common()):
+            for i, (token, count) in enumerate(self._ranked_variants(casing[token])):
                 if i == 0:
                     out_token = "{} ({}/{})".format(token, count, total_token_count)
                 else:
@@ -444,14 +487,61 @@ class MosesTruecaser(object):
         """
         Loads pre-trained truecasing file.
 
+        Legacy files in the original Moses/Perl layout remain fully readable
+        here: they simply lack the v2 header, and a non-best variant's ``(1)``
+        is the Perl placeholder rather than a recoverable count. Such a file can
+        still drive :meth:`truecase`, but :meth:`merge_models` rejects it with a
+        :class:`LegacyModelError`.
+
         :returns: A dictionary of the best, known objects as values from `_casing_to_model()`
         :rtype: {'best': dict, 'known': Counter}
         """
+        casing = self._read_casing(filename)
+        # Returns the best and known object from `_casing_to_model()`
+        return self._casing_to_model(casing)
+
+    @staticmethod
+    def _parse_count_field(field, filename, lineno):
+        """Parse one ``(count)`` or ``(count/total)`` field into its integer count.
+
+        The ``/total`` suffix only annotates the best variant on a line and is
+        deliberately ignored: totals are recomputed from the per-variant counts
+        on write, and trusting a stored total would let a hand-edited file carry
+        a total that disagrees with the counts it lists.
+        """
+        try:
+            return int(field.split("/")[0].strip("()"))
+        except ValueError:
+            raise ValueError(
+                "malformed truecase model %r: line %d has a "
+                "non-integer count %r" % (filename, lineno, field)
+            ) from None
+
+    def _read_casing(self, filename, require_counts=False):
+        """Read a model file into a ``defaultdict(Counter)`` of variant counts.
+
+        :param require_counts: When True, raise :class:`LegacyModelError` for a
+            headerless file whose per-variant counts cannot be trusted for
+            merging. Loading for inference passes False and reads anything.
+        """
         casing = defaultdict(Counter)
         with open(filename, encoding=self.encoding) as fin:
+            first_nonblank = True
+            saw_header = False
             for lineno, line in enumerate(fin, 1):
-                line = line.strip().split()
-                for token, count in grouper(line, 2):
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                if stripped.startswith("#"):
+                    # Only the header on the first non-blank line is recognised
+                    # as a format marker; later comment lines are just skipped.
+                    if first_nonblank and stripped == MODEL_HEADER:
+                        saw_header = True
+                    first_nonblank = False
+                    continue
+                first_nonblank = False
+                fields = stripped.split()
+                for token, count in grouper(fields, 2):
                     # `grouper` pads a short final pair with None, so a line
                     # with an odd number of fields used to surface as
                     # `AttributeError: 'NoneType' object has no attribute
@@ -464,14 +554,8 @@ class MosesTruecaser(object):
                             "number of fields (expected 'token (count/total)' "
                             "pairs)" % (filename, lineno)
                         )
-                    try:
-                        count = int(count.split("/")[0].strip("()"))
-                    except ValueError:
-                        raise ValueError(
-                            "malformed truecase model %r: line %d has a "
-                            "non-integer count %r" % (filename, lineno, count)
-                        ) from None
-                    casing[token.lower()][token] = count
+                    count = self._parse_count_field(count, filename, lineno)
+                    casing[token.lower()][token] += count
                 if len(casing) > self.MAX_MODEL_ENTRIES:
                     # Loading costs roughly 35x the file size in RSS, so an
                     # oversized model is a memory-exhaustion vector (CWE-400).
@@ -481,8 +565,77 @@ class MosesTruecaser(object):
                         "truecase model %r exceeds MAX_MODEL_ENTRIES (%d) at "
                         "line %d" % (filename, self.MAX_MODEL_ENTRIES, lineno)
                     )
-        # Returns the best and known object from `_casing_to_model()`
-        return self._casing_to_model(casing)
+        if require_counts and not saw_header:
+            # A headerless file is the Moses/Perl layout: every non-best variant
+            # is stored as the placeholder `(1)`, so its real frequency cannot
+            # be recovered and adding the counts would silently invent data.
+            raise LegacyModelError(
+                "cannot merge %r: it has no %r header, so its per-variant "
+                "counts are not recoverable (the original Moses/Perl format "
+                "stores every non-best variant as (1)). It can still be loaded "
+                "for truecasing; re-train this shard with this sacremoses "
+                "version to produce a mergeable model."
+                % (filename, MODEL_HEADER)
+            )
+        return casing
+
+    def merge_models(self, model_files, save_to=None, is_asr=None):
+        """Merge truecaser model shards by adding their true variant counts.
+
+        Each input is a model file produced by :meth:`save_model` (or the
+        ``train-truecase`` CLI) -- typically one shard per batch of the corpus.
+        The original corpus does not have to be reassembled: the per-variant
+        counts already written into the shard files are summed instead.
+
+        The counts of every surface form are added first, and only afterwards is
+        the best (most frequent) form chosen via :meth:`_ranked_variants`. Because
+        integer addition is associative and commutative and the tie-break is a
+        fixed lexicographic rule, splitting into more/fewer batches or merging the
+        shards in any order yields the identical merged model.
+
+        Every input must carry the :data:`MODEL_HEADER`, i.e. its variant counts
+        must be recoverable; a headerless legacy file raises
+        :class:`LegacyModelError` instead of being merged on placeholder counts.
+
+        :param model_files: Paths of the count-bearing model shards to merge.
+        :type model_files: list(str)
+
+        :param save_to: Optional path to write the merged count-bearing model.
+        :type save_to: str or None
+
+        :param is_asr: Override the ASR flag for building the in-memory model.
+            Defaults to this instance's ``self.is_asr``.
+        :type is_asr: bool or None
+
+        :returns: The merged ``{'best', 'known', 'casing'}`` model and sets it on
+            this instance as ``self.model``.
+        :rtype: dict
+        """
+        if not model_files:
+            raise ValueError(
+                "merge_models() requires at least one model file; got an empty list"
+            )
+        merged = defaultdict(Counter)
+        for model_file in model_files:
+            shard = self._read_casing(model_file, require_counts=True)
+            for token_lower, variant_counts in shard.items():
+                # `Counter.__iadd__` drops non-positive results; every parsed
+                # count is a non-negative integer, so a plain loop keeps the
+                # addition explicit and the semantics obvious.
+                for surface, count in variant_counts.items():
+                    merged[token_lower][surface] += count
+
+        previous_is_asr = self.is_asr
+        if is_asr is not None:
+            self.is_asr = is_asr
+        try:
+            self.model = self._casing_to_model(merged)
+        finally:
+            self.is_asr = previous_is_asr
+
+        if save_to:
+            self._save_model_from_casing(merged, save_to)
+        return self.model
 
 
 class MosesDetruecaser(object):
@@ -569,4 +722,4 @@ class MosesDetruecaser(object):
         return " ".join(cased_tokens) if return_str else cased_tokens
 
 
-__all__ = ["MosesTruecaser", "MosesDetruecaser"]
+__all__ = ["MosesTruecaser", "MosesDetruecaser", "LegacyModelError", "MODEL_HEADER"]

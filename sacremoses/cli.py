@@ -7,7 +7,7 @@ from functools import update_wrapper
 import click
 
 from sacremoses.tokenize import MosesTokenizer, MosesDetokenizer
-from sacremoses.truecase import MosesTruecaser, MosesDetruecaser
+from sacremoses.truecase import MosesTruecaser, MosesDetruecaser, LegacyModelError
 from sacremoses.normalize import MosesPunctNormalizer
 from sacremoses.util import parallelize_preprocess
 
@@ -30,6 +30,12 @@ def cli(language, encoding, processes, quiet):
 
 @cli.result_callback()
 def process_pipeline(processors, encoding, **kwargs):
+    # Standalone, file-to-file commands (see `standalone()`) do their work in
+    # the command itself and return this sentinel instead of a stream processor.
+    # They must not be fed through the chained stdin pipeline below.
+    processors = [proc for proc in processors if proc is not STANDALONE_COMMAND]
+    if not processors:
+        return
     # NOTE: each stage is deliberately handed a `list`, not a lazy iterator.
     # Streaming would use less memory, but it would also change behaviour that
     # users can see:
@@ -49,6 +55,23 @@ def process_pipeline(processors, encoding, **kwargs):
         if iterator:
             for item in iterator:
                 click.echo(item)
+
+
+#: Sentinel returned by standalone file-to-file commands so `process_pipeline()`
+#: knows not to treat them as stdin stream processors.
+STANDALONE_COMMAND = object()
+
+
+def standalone(f):
+    """Decorator for commands that operate on named files rather than the stdin
+    stream. The chained group's result callback would otherwise try to call
+    their return value as a stream processor."""
+
+    def new_func(**kwargs):
+        f(**kwargs)
+        return STANDALONE_COMMAND
+
+    return update_wrapper(new_func, f)
 
 
 def processor(f, **kwargs):
@@ -323,6 +346,36 @@ def truecase_file(
     moses = MosesTruecaser(load_from=modelfile, is_asr=is_asr)
     moses_truecase = partial(moses.truecase, return_str=True)
     return parallel_or_not(iterator, moses_truecase, processes, quiet)
+
+
+########################################################################
+# Merge Truecase models
+########################################################################
+
+
+@cli.command("merge-truecase")
+@click.option(
+    "--modelfile", "-m", required=True, help="Filename to write the merged model to."
+)
+@click.argument("model_files", nargs=-1, required=True, type=click.Path(exists=True))
+@standalone
+def merge_truecaser(modelfile, model_files):
+    """Merge count-bearing truecase model shards into one model.
+
+    MODEL_FILES are per-batch models written by ``train-truecase``. Their true
+    per-variant counts are summed -- the original corpus does not need to be
+    reassembled -- and the best surface form is chosen only after the merge.
+    Shards without a version header (the original Moses/Perl layout) cannot be
+    merged because their non-best counts are not recoverable; the command fails
+    and names the offending file.
+    """
+    moses = MosesTruecaser()
+    try:
+        moses.merge_models(list(model_files), save_to=modelfile)
+    except LegacyModelError as exc:
+        # A usage error the operator can act on (re-train the named shard), not a
+        # Python traceback. Click turns this into exit code 2 with the message.
+        raise click.BadParameter(str(exc), param_hint="MODEL_FILES")
 
 
 ########################################################################

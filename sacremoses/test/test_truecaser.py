@@ -6,11 +6,17 @@ Tests for MosesTokenizer
 
 import hashlib
 import os
+import tempfile
 import unittest
 import urllib.error
 import urllib.request
 
-from sacremoses.truecase import MosesTruecaser, MosesDetruecaser
+from sacremoses.truecase import (
+    MosesTruecaser,
+    MosesDetruecaser,
+    LegacyModelError,
+    MODEL_HEADER,
+)
 
 #: Norvig's big.txt, the corpus these tests train a truecase model on. It is
 #: fetched over the network and cached on disk -- and in CI, under a static
@@ -141,6 +147,173 @@ class TestTruecaser(unittest.TestCase):
             ['Start', 'Start', 'start'] # 'Start' is best, but 'start' is okay.
         ])
         self.assertEqual(moses.truecase('" start start', use_known=True), ['"', 'Start', 'start'])
+
+
+class TestTruecaseModelMerging(unittest.TestCase):
+    """Batch-produced truecase models must merge on their true per-variant
+    counts, without reassembling the original corpus, and the result must be
+    independent of batch count and merge order."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+
+    def path(self, name):
+        return os.path.join(self.tmpdir.name, name)
+
+    def train_shard(self, name, sentences):
+        moses = MosesTruecaser()
+        moses.train(sentences)
+        path = self.path(name)
+        moses.save_model(path)
+        return path
+
+    def test_written_model_carries_version_header_and_true_counts(self):
+        path = self.train_shard("a.model", [["x", "Oak", "Oak", "oak"]])
+        with open(path, encoding="utf8") as fin:
+            lines = [line.rstrip("\n") for line in fin if line.strip()]
+        self.assertEqual(lines[0], MODEL_HEADER)
+        # Both the best and the non-best variant carry their real counts, not a
+        # placeholder (1): Oak=2, oak=1.
+        self.assertIn("Oak (2/3)", lines[1])
+        self.assertIn("oak (1)", lines[1])
+
+    def test_merge_sums_true_variant_counts(self):
+        # Shard 1: Oak 4, oak 3. Shard 2: OAK 4, oak 3. Leading 'x' keeps the
+        # target tokens out of the sentence-initial position so they get full
+        # weight, matching the worked example in the feature request.
+        p1 = self.train_shard("b1.model", [["x"] + ["Oak"] * 4 + ["oak"] * 3])
+        p2 = self.train_shard("b2.model", [["x"] + ["OAK"] * 4 + ["oak"] * 3])
+
+        moses = MosesTruecaser()
+        model = moses.merge_models([p1, p2])
+        counts = model["casing"]["oak"]
+        # oak (6) is the most frequent form, but Oak and OAK stay known writes.
+        self.assertEqual(dict(counts), {"oak": 6, "Oak": 4, "OAK": 4})
+        self.assertEqual(model["best"]["oak"], "oak")
+        self.assertEqual(set(counts), {"oak", "Oak", "OAK"})
+
+    def test_merge_equals_training_on_the_whole_corpus(self):
+        sentences = [
+            ["x"] + ["Oak"] * 4 + ["oak"] * 3,
+            ["x"] + ["OAK"] * 4 + ["oak"] * 3,
+        ]
+        p1 = self.train_shard("b1.model", sentences[:1])
+        p2 = self.train_shard("b2.model", sentences[1:])
+        merged = MosesTruecaser().merge_models([p1, p2])
+
+        whole = MosesTruecaser()
+        whole.train(sentences)
+        self.assertEqual(
+            {k: dict(v) for k, v in merged["casing"].items()},
+            {k: dict(v) for k, v in whole.model["casing"].items()},
+        )
+        self.assertEqual(merged["best"], whole.model["best"])
+
+    def test_merge_is_order_independent(self):
+        p1 = self.train_shard("b1.model", [["x"] + ["Oak"] * 4 + ["oak"] * 3])
+        p2 = self.train_shard("b2.model", [["x"] + ["OAK"] * 4 + ["oak"] * 3])
+        out_ab, out_ba = self.path("ab.model"), self.path("ba.model")
+        MosesTruecaser().merge_models([p1, p2], save_to=out_ab)
+        MosesTruecaser().merge_models([p2, p1], save_to=out_ba)
+        # Byte-identical output, not just equal counts: ordering is deterministic.
+        with open(out_ab, "rb") as fin:
+            ab = fin.read()
+        with open(out_ba, "rb") as fin:
+            ba = fin.read()
+        self.assertEqual(ab, ba)
+
+    def test_merge_is_associative_across_more_batches(self):
+        # The same totals split two ways: two shards vs three shards, merged in
+        # different orders, must converge on the identical model.
+        two_a = self.train_shard("two_a.model", [["x"] + ["Oak"] * 4 + ["oak"] * 3])
+        two_b = self.train_shard("two_b.model", [["x"] + ["OAK"] * 4 + ["oak"] * 3])
+        two_out = self.path("two.model")
+        MosesTruecaser().merge_models([two_a, two_b], save_to=two_out)
+
+        three_a = self.train_shard("three_a.model", [["x"] + ["Oak"] * 2 + ["oak"] * 1])
+        three_b = self.train_shard("three_b.model", [["x"] + ["Oak"] * 2 + ["oak"] * 2])
+        three_c = self.train_shard("three_c.model", [["x"] + ["OAK"] * 4 + ["oak"] * 3])
+        for order in ([three_a, three_b, three_c], [three_c, three_a, three_b]):
+            out = self.path("three_%d.model" % len(order))
+            model = MosesTruecaser().merge_models(order, save_to=out)
+            self.assertEqual(
+                dict(model["casing"]["oak"]), {"oak": 6, "Oak": 4, "OAK": 4}
+            )
+            self.assertEqual(model["best"]["oak"], "oak")
+            with open(out, "rb") as fin:
+                three_bytes = fin.read()
+            with open(two_out, "rb") as fin:
+                two_bytes = fin.read()
+            self.assertEqual(three_bytes, two_bytes)
+
+    def test_merged_model_round_trips_through_a_file(self):
+        p1 = self.train_shard("b1.model", [["x"] + ["Oak"] * 4 + ["oak"] * 3])
+        p2 = self.train_shard("b2.model", [["x"] + ["OAK"] * 4 + ["oak"] * 3])
+        out = self.path("merged.model")
+        MosesTruecaser().merge_models([p1, p2], save_to=out)
+        reloaded = MosesTruecaser(load_from=out)
+        self.assertEqual(reloaded.model["best"]["oak"], "oak")
+        self.assertEqual(
+            dict(reloaded.model["casing"]["oak"]),
+            {"oak": 6, "Oak": 4, "OAK": 4},
+        )
+
+    def test_exact_count_tie_breaks_deterministically(self):
+        # tie:2 vs Tie:2 -> the lexicographically smaller surface form wins,
+        # regardless of the order the variants were inserted.
+        p1 = self.train_shard("t1.model", [["x", "tie", "tie"]])
+        p2 = self.train_shard("t2.model", [["x", "Tie", "Tie"]])
+        m1 = MosesTruecaser().merge_models([p1, p2])
+        m2 = MosesTruecaser().merge_models([p2, p1])
+        self.assertEqual(m1["best"]["tie"], "Tie")
+        self.assertEqual(m2["best"]["tie"], "Tie")
+        # The losing variant is still a known surface form.
+        self.assertEqual(set(m1["casing"]["tie"]), {"tie", "Tie"})
+
+    def test_merge_rejects_empty_input(self):
+        with self.assertRaises(ValueError):
+            MosesTruecaser().merge_models([])
+
+    def test_legacy_model_still_loads_but_refuses_to_merge(self):
+        # A headerless file in the original Moses/Perl layout: non-best variants
+        # use the placeholder (1), so their counts are not recoverable.
+        legacy = self.path("legacy.model")
+        with open(legacy, "w", encoding="utf8") as fout:
+            fout.write("cat (5/7) Cat (1) CAt (1)\n")
+            fout.write("dog (2/2)\n")
+
+        # Still readable for inference.
+        loaded = MosesTruecaser(load_from=legacy)
+        self.assertEqual(loaded.model["best"]["cat"], "cat")
+        self.assertEqual(loaded.truecase("CAT ."), ["cat", "."])
+
+        good = self.train_shard("good.model", [["x", "cat", "cat"]])
+        # Merging it must fail loudly and name the offending file.
+        with self.assertRaises(LegacyModelError) as ctx:
+            MosesTruecaser().merge_models([good, legacy])
+        self.assertIn("legacy.model", str(ctx.exception))
+        self.assertIn(MODEL_HEADER, str(ctx.exception))
+
+    def test_genuine_count_of_one_in_v2_is_mergeable(self):
+        # A real (1) under the v2 header must NOT be mistaken for a legacy
+        # placeholder: the header is what distinguishes the two.
+        v2 = self.path("v2.model")
+        with open(v2, "w", encoding="utf8") as fout:
+            fout.write(MODEL_HEADER + "\n")
+            fout.write("foo (2/3) Foo (1)\n")
+        good = self.train_shard("good.model", [["x", "foo", "foo", "foo"]])
+        model = MosesTruecaser().merge_models([v2, good])
+        self.assertEqual(dict(model["casing"]["foo"]), {"foo": 5, "Foo": 1})
+
+    def test_malformed_model_still_reports_location(self):
+        bad = self.path("bad.model")
+        with open(bad, "w", encoding="utf8") as fout:
+            fout.write(MODEL_HEADER + "\n")
+            fout.write("cat (2/3) Cat\n")  # odd number of fields
+        with self.assertRaises(ValueError) as ctx:
+            MosesTruecaser(load_from=bad)
+        self.assertIn("line 2", str(ctx.exception))
 
 
 class TestDetruecaser(unittest.TestCase):

@@ -19,14 +19,16 @@ def model_tokens(filename):
     """
     Reads a truecaser model file and returns the set of surface forms it holds.
 
-    Each line looks like ``cat (2/3) Cat (1)``, so the first whitespace
-    delimited field is the most frequent surface form of that token.
+    Each data line looks like ``cat (2/3) Cat (1)``, so the first whitespace
+    delimited field is the most frequent surface form of that token. The leading
+    ``# ...`` version header (and any comment line) is skipped: it carries
+    format metadata, not a token.
     """
     tokens = set()
     with open(filename, encoding="utf8") as fin:
         for line in fin:
             fields = line.split()
-            if fields:
+            if fields and not fields[0].startswith("#"):
                 tokens.add(fields[0])
     return tokens
 
@@ -70,6 +72,7 @@ class TestCliBasics(CliTestCase):
             "detokenize",
             "normalize",
             "truecase",
+            "merge-truecase",
             "detruecase",
             "train-truecase",
         ]:
@@ -88,6 +91,7 @@ class TestCliBasics(CliTestCase):
             "detokenize",
             "normalize",
             "truecase",
+            "merge-truecase",
             "detruecase",
             "train-truecase",
         ]:
@@ -260,7 +264,8 @@ class TestCliTruecase(CliTestCase):
         modelfile = self.path("counts.model")
         self.run_cli(["train-truecase", "-m", modelfile], self.TEXT)
         with open(modelfile, encoding="utf8") as fin:
-            entries = dict(line.split(None, 1) for line in fin if line.strip())
+            lines = [line for line in fin if line.strip() and not line.startswith("#")]
+        entries = dict(line.split(None, 1) for line in lines)
         # "cat" occurs twice in a non sentence initial position, both lowercase.
         self.assertEqual(entries["cat"].strip(), "(2/2)")
 
@@ -402,6 +407,85 @@ class TestCliTruecaseLanguages(CliTestCase):
         tokens = model_tokens(modelfile)
         self.assertIn("cat", tokens)
         self.assertEqual([token for token in tokens if len(token) == 1], [])
+
+
+class TestCliMergeTruecase(CliTestCase):
+    """The merge-truecase command merges batch shards on their true counts."""
+
+    SHARD_1 = "x Oak Oak Oak Oak oak oak oak\n"   # Oak 4, oak 3
+    SHARD_2 = "x OAK OAK OAK OAK oak oak oak\n"   # OAK 4, oak 3
+
+    def _train(self, name, text):
+        path = self.path(name)
+        self.run_cli(["train-truecase", "-m", path], text)
+        return path
+
+    def test_merge_sums_counts_and_picks_best_after_merge(self):
+        p1 = self._train("b1.model", self.SHARD_1)
+        p2 = self._train("b2.model", self.SHARD_2)
+        out = self.path("merged.model")
+        # merge-truecase is standalone: it writes a file and emits nothing.
+        self.assertEqual(
+            self.run_cli(["merge-truecase", "-m", out, p1, p2]), ""
+        )
+        with open(out, encoding="utf8") as fin:
+            content = fin.read()
+        lines = [line for line in content.splitlines() if line and not line.startswith("#")]
+        self.assertEqual(lines[0], "oak (6/14) OAK (4) Oak (4)")
+        # The merged file is itself a loadable, mergeable model.
+        self.assertIn(
+            "# sacremoses truecase model v2",
+            content.splitlines()[0],
+        )
+
+    def test_merge_order_does_not_change_output(self):
+        p1 = self._train("b1.model", self.SHARD_1)
+        p2 = self._train("b2.model", self.SHARD_2)
+        ab, ba = self.path("ab.model"), self.path("ba.model")
+        self.run_cli(["merge-truecase", "-m", ab, p1, p2])
+        self.run_cli(["merge-truecase", "-m", ba, p2, p1])
+        with open(ab, "rb") as fin:
+            ab_bytes = fin.read()
+        with open(ba, "rb") as fin:
+            ba_bytes = fin.read()
+        self.assertEqual(ab_bytes, ba_bytes)
+
+    def test_legacy_shard_is_rejected_with_a_clear_error(self):
+        good = self._train("good.model", self.SHARD_1)
+        legacy = self.path("legacy.model")
+        with open(legacy, "w", encoding="utf8") as fout:
+            fout.write("cat (5/7) Cat (1)\n")  # headerless, Perl placeholder
+        out = self.path("should_not_exist.model")
+        result = self.runner.invoke(
+            cli, ["-q", "merge-truecase", "-m", out, good, legacy]
+        )
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("not recoverable", result.output)
+        self.assertIn("legacy.model", result.output)
+        # A failed merge must not leave a partial output file behind.
+        self.assertFalse(os.path.exists(out))
+
+    def test_legacy_shard_still_loads_for_truecasing(self):
+        legacy = self.path("legacy.model")
+        with open(legacy, "w", encoding="utf8") as fout:
+            fout.write("cat (5/7) Cat (1)\n")
+        output = self.lines(["truecase", "-m", legacy], "CAT sat .\n")
+        self.assertEqual(output, ["cat sat ."])
+
+    def test_missing_input_file_is_a_usage_error(self):
+        out = self.path("out.model")
+        result = self.runner.invoke(
+            cli,
+            ["-q", "merge-truecase", "-m", out, self.path("nope.model")],
+        )
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertFalse(os.path.exists(out))
+
+    def test_requires_at_least_one_input(self):
+        result = self.runner.invoke(
+            cli, ["-q", "merge-truecase", "-m", self.path("out.model")]
+        )
+        self.assertNotEqual(result.exit_code, 0)
 
 
 class TestCliPipeline(CliTestCase):

@@ -72,6 +72,48 @@ True
 'the ADVENTURES OF SHERLOCK HOLMES'
 ```
 
+### Merging batch-trained models
+
+When the corpus is too large to train in one pass, train one model per batch and
+merge the model files. You do **not** have to reassemble the original corpus:
+each shard already stores the true count of every surface variant, and the merge
+sums those counts.
+
+```python
+>>> from sacremoses import MosesTruecaser
+# Train one shard per batch (here just two small examples).
+>>> MosesTruecaser().train([['x'] + ['Oak']*4 + ['oak']*3], save_to='batch1.model')
+>>> MosesTruecaser().train([['x'] + ['OAK']*4 + ['oak']*3], save_to='batch2.model')
+# Merge on the real per-variant counts; the best form is chosen only afterwards.
+>>> mtr = MosesTruecaser()
+>>> model = mtr.merge_models(['batch1.model', 'batch2.model'], save_to='merged.model')
+>>> dict(model['casing']['oak'])
+{'oak': 6, 'Oak': 4, 'OAK': 4}
+>>> model['best']['oak']      # most frequent form wins; Oak/OAK stay known writes
+'oak'
+```
+
+The merge is pure integer addition over the variant counts, so it is associative
+and commutative: splitting the data into more/fewer batches, or merging the
+shards in a different order, produces the byte-identical model. On an exact
+count tie the lexicographically smallest surface form is chosen, deterministically.
+
+**Model format and old files.** Newly written models start with a version header
+(`# sacremoses truecase model v2`) marking that every variant carries a
+recoverable count, which is what makes merging sound. Models in the original
+Moses/Perl layout have no header and write every non-best variant as the
+placeholder `(1)`, so their real counts cannot be recovered. Such legacy files
+**remain fully loadable** for truecasing, but `merge_models()` raises
+`LegacyModelError` and names the offending file rather than silently merging
+placeholder counts -- re-train that shard with this version to get a mergeable
+model.
+
+The same merge is available from the command line:
+
+```shell
+$ sacremoses merge-truecase -m merged.model batch1.model batch2.model batch3.model
+```
+
 ## Normalizer
 
 ```python
@@ -108,6 +150,7 @@ Options:
 Commands:
   detokenize
   detruecase
+  merge-truecase
   normalize
   tokenize
   train-truecase
