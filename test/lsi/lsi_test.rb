@@ -212,6 +212,41 @@ class LSITest < Minitest::Test
     assert_equal 'This text involves dogs too [...] This text also involves cats', Summarizer.summary([@str1, @str2, @str3, @str4, @str5].join, 2)
   end
 
+  def test_highest_relative_content_matches_itemwise_neighbor_score_sums
+    # Six short documents: the duplicated pair produces tied scores, while
+    # the varied lengths and repeated terms give the documents different norms.
+    docs = [
+      'dogs dogs dogs',
+      'dogs dogs dogs',
+      'cats birds cats',
+      'cats birds',
+      'fish fish fish fish fish',
+      'dogs cats birds fish text'
+    ]
+
+    [false, true].each do |cache_nodes|
+      lsi = ClassifierReborn::LSI.new(cache_node_vectors: cache_nodes)
+      docs.each { |doc| lsi << doc }
+
+      # Reference: sum, item by item, the scores from the existing
+      # full-neighbor entry point (self-similarity included).
+      reference_density = {}
+      lsi.items.each do |item|
+        scores = lsi.proximity_array_for_content(item).to_h
+        reference_density[item] = lsi.items.reduce(0.0) { |sum, other| sum + scores[other] }
+      end
+      expected = reference_density.keys.sort_by { |item| reference_density[item] }.reverse[0..1]
+
+      # The optimized entry must not build a sorted neighbor table per document.
+      def lsi.proximity_array_for_content(*)
+        raise 'highest_relative_content must not build sorted neighbor lists'
+      end
+
+      assert_equal expected, lsi.highest_relative_content(2),
+                   "mismatch with cache_node_vectors: #{cache_nodes}"
+    end
+  end
+
   def test_reset
     lsi = ClassifierReborn::LSI.new
     assert lsi.items.empty?

@@ -198,9 +198,9 @@ module ClassifierReborn
       return [] if needs_rebuild?
 
       avg_density = {}
-      @items.each_key { |item| avg_density[item] = proximity_array_for_content(item).inject(0.0) { |x, y| x + y[1] } }
+      @items.each_key { |item| avg_density[item] = proximity_sum_for_content(item) }
 
-      avg_density.keys.sort_by { |x| avg_density[x] }.reverse[0..max_chunks - 1].map
+      avg_density.keys.sort_by { |x| avg_density[x] }.reverse[0..max_chunks - 1]
     end
 
     # This function is the primitive that find_related and classify
@@ -221,14 +221,7 @@ module ClassifierReborn
       content_node = node_for_content(doc, &block)
       result =
         @items.keys.collect do |item|
-          val = if $SVD == :numo
-                  content_node.search_vector.dot(@items[item].transposed_search_vector)
-                elsif $SVD == :gsl
-                  content_node.search_vector * @items[item].transposed_search_vector
-                else
-                  (Matrix[content_node.search_vector] * @items[item].search_vector)[0]
-                end
-          [item, val]
+          [item, proximity_score(content_node, @items[item])]
         end
       result.sort_by { |x| x[1] }.reverse
     end
@@ -347,6 +340,34 @@ module ClassifierReborn
     end
 
     private
+
+    # The proximity score between a content node and an indexed item's node.
+    # Both plain ContentNodes and CachedContentNodes are scored in the same
+    # rank space via their search vectors (cached nodes simply memoize the
+    # transposition). Shared by proximity_array_for_content and
+    # proximity_sum_for_content so every entry point scores identically.
+    def proximity_score(content_node, item_node)
+      if $SVD == :numo
+        content_node.search_vector.dot(item_node.transposed_search_vector)
+      elsif $SVD == :gsl
+        content_node.search_vector * item_node.transposed_search_vector
+      else
+        (Matrix[content_node.search_vector] * item_node.search_vector)[0]
+      end
+    end
+
+    # Sums the proximity scores between doc and every indexed item, doc
+    # itself included (self-similarity counts, as it always has here).
+    # Unlike proximity_array_for_content, no per-document neighbor list is
+    # built or sorted; only the running total is accumulated. This is the
+    # dedicated entry used by highest_relative_content, which only needs
+    # each item's total density.
+    def proximity_sum_for_content(doc, &block)
+      content_node = node_for_content(doc, &block)
+      @items.values.reduce(0.0) do |sum, item_node|
+        sum + proximity_score(content_node, item_node)
+      end
+    end
 
     def build_reduced_matrix(matrix, cutoff = 0.75)
       # TODO: Check that M>=N on these dimensions! Transpose helps assure this
