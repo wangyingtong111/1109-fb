@@ -45,13 +45,18 @@ classes.
 from typing import List, Union
 
 from jiwer import transforms as tr
-from jiwer.process import process_characters, process_words
+from jiwer.process import (
+    process_characters,
+    process_words,
+    process_words_multi_reference,
+)
 from jiwer.transformations import cer_default, wer_default
 
 __all__ = [
     "cer",
     "mer",
     "wer",
+    "wer_multi_reference",
     "wil",
     "wip",
 ]
@@ -65,23 +70,69 @@ def wer(
     hypothesis: Union[str, List[str]] = None,
     reference_transform: Union[tr.Compose, tr.AbstractTransform] = wer_default,
     hypothesis_transform: Union[tr.Compose, tr.AbstractTransform] = wer_default,
+    method: str = "edit",
 ) -> float:
     """
     Calculate the word error rate (WER) between one or more reference and
     hypothesis sentences.
+
+    When multiple acceptable reference transcriptions are given (as a nested
+    list), a single reference is selected for every sentence according to
+    `method` before the WER is computed.
 
     Args:
         reference: The reference sentence(s)
         hypothesis: The hypothesis sentence(s)
         reference_transform: The transformation(s) to apply to the reference string(s)
         hypothesis_transform: The transformation(s) to apply to the hypothesis string(s)
+        method: Reference selection strategy when multiple references are given:
+                ``"edit"`` (default) selects the minimum-edit reference per sentence,
+                while ``"wer"`` minimizes the WER over the whole batch.
 
     Returns:
         (float): The word error rate of the given reference and
                  hypothesis sentence(s).
     """
     output = process_words(
-        reference, hypothesis, reference_transform, hypothesis_transform
+        reference,
+        hypothesis,
+        reference_transform,
+        hypothesis_transform,
+        method=method,
+    )
+
+    return output.wer
+
+
+def wer_multi_reference(
+    reference: Union[List[str], List[List[str]]] = None,
+    hypothesis: Union[str, List[str]] = None,
+    reference_transform: Union[tr.Compose, tr.AbstractTransform] = wer_default,
+    hypothesis_transform: Union[tr.Compose, tr.AbstractTransform] = wer_default,
+    method: str = "edit",
+) -> float:
+    """
+    Calculate the word error rate (WER) when one or more hypothesis sentences
+    have multiple acceptable reference transcriptions.
+
+    Args:
+        reference: A list of candidate transcriptions for a single sentence, or a
+                   nested list of candidate transcriptions for every sentence.
+        hypothesis: The hypothesis sentence(s)
+        reference_transform: The transformation(s) to apply to the reference string(s)
+        hypothesis_transform: The transformation(s) to apply to the hypothesis string(s)
+        method: ``"edit"`` (default) selects the minimum-edit reference per
+                sentence, while ``"wer"`` minimizes the WER over the whole batch.
+
+    Returns:
+        (float): The word error rate computed on the selected references.
+    """
+    output = process_words_multi_reference(
+        reference,
+        hypothesis,
+        reference_transform,
+        hypothesis_transform,
+        method=method,
     )
 
     return output.wer
@@ -92,6 +143,7 @@ def mer(
     hypothesis: Union[str, List[str]] = None,
     reference_transform: Union[tr.Compose, tr.AbstractTransform] = wer_default,
     hypothesis_transform: Union[tr.Compose, tr.AbstractTransform] = wer_default,
+    method: str = "edit",
 ) -> float:
     """
     Calculate the match error rate (MER) between one or more reference and
@@ -102,13 +154,18 @@ def mer(
         hypothesis: The hypothesis sentence(s)
         reference_transform: The transformation(s) to apply to the reference string(s)
         hypothesis_transform: The transformation(s) to apply to the hypothesis string(s)
+        method: Reference selection strategy when multiple references are given.
 
     Returns:
         (float): The match error rate of the given reference and
                  hypothesis sentence(s).
     """
     output = process_words(
-        reference, hypothesis, reference_transform, hypothesis_transform
+        reference,
+        hypothesis,
+        reference_transform,
+        hypothesis_transform,
+        method=method,
     )
 
     return output.mer
@@ -119,6 +176,7 @@ def wip(
     hypothesis: Union[str, List[str]] = None,
     reference_transform: Union[tr.Compose, tr.AbstractTransform] = wer_default,
     hypothesis_transform: Union[tr.Compose, tr.AbstractTransform] = wer_default,
+    method: str = "edit",
 ) -> float:
     """
     Calculate the word information preserved (WIP) between one or more reference and
@@ -129,13 +187,18 @@ def wip(
         hypothesis: The hypothesis sentence(s)
         reference_transform: The transformation(s) to apply to the reference string(s)
         hypothesis_transform: The transformation(s) to apply to the hypothesis string(s)
+        method: Reference selection strategy when multiple references are given.
 
     Returns:
         (float): The word information preserved of the given reference and
                  hypothesis sentence(s).
     """
     output = process_words(
-        reference, hypothesis, reference_transform, hypothesis_transform
+        reference,
+        hypothesis,
+        reference_transform,
+        hypothesis_transform,
+        method=method,
     )
 
     return output.wip
@@ -146,6 +209,7 @@ def wil(
     hypothesis: Union[str, List[str]] = None,
     reference_transform: Union[tr.Compose, tr.AbstractTransform] = wer_default,
     hypothesis_transform: Union[tr.Compose, tr.AbstractTransform] = wer_default,
+    method: str = "edit",
 ) -> float:
     """
     Calculate the word information lost (WIL) between one or more reference and
@@ -156,13 +220,18 @@ def wil(
         hypothesis: The hypothesis sentence(s)
         reference_transform: The transformation(s) to apply to the reference string(s)
         hypothesis_transform: The transformation(s) to apply to the hypothesis string(s)
+        method: Reference selection strategy when multiple references are given.
 
     Returns:
         (float): The word information lost of the given reference and
                  hypothesis sentence(s).
     """
     output = process_words(
-        reference, hypothesis, reference_transform, hypothesis_transform
+        reference,
+        hypothesis,
+        reference_transform,
+        hypothesis_transform,
+        method=method,
     )
 
     return output.wil

@@ -43,6 +43,62 @@ hypothesis = ["hello duck", "i like python"]
 error = wer(reference, hypothesis)
 ```
 
+## Multiple references per sentence
+
+The same recording can have more than one acceptable transcription. In that
+case, give a nested list of references: for every sentence, provide the list of
+candidate transcriptions. Exactly one complete transcription is then selected
+for each sentence, and `jiwer.process_words` returns a
+`MultiReferenceWordOutput` which additionally contains the index of the
+selected reference (`reference_indices`) and the alignment chunks for the
+selected reference.
+
+Two selection methods are available:
+
+- `method="edit"` (the default): for each sentence independently, the
+  candidate requiring the fewest word edits is selected. Ties keep the first
+  candidate in the provided order.
+- `method="wer"`: the combination of references that minimizes the WER of the
+  whole batch is selected. The total number of words in the selected references
+  is used as the denominator. Ties on the batch WER are broken by, in corpus
+  order, preferring the candidate that was provided first. The existing
+  zero-reference convention remains in place.
+
+For example, with references `east gate` and `west door` and the recognition
+`east door`, both references differ in exactly one word, so the first
+reference is selected:
+
+```python
+import jiwer
+
+out = jiwer.process_words(
+    [["east gate", "west door"]],
+    ["east door"],
+)
+assert out.reference_indices == [0]
+assert out.references == [["east", "gate"]]
+assert out.alignments  # the original alignment chunks for the selected reference
+```
+
+To select references by the WER of an entire batch:
+
+```python
+import jiwer
+
+references = [["a", "a b c d"], ["w x"]]
+hypotheses = ["a b", "w y"]
+
+out = jiwer.process_words(references, hypotheses, method="wer")
+# the longer first reference is selected, giving a batch WER of 1/2
+assert out.reference_indices == [1, 0]
+assert out.wer == 1 / 2
+```
+
+The same is available directly through `jiwer.wer` and the dedicated
+`jiwer.process_words_multi_reference` / `jiwer.wer_multi_reference` entry
+points. The regular one-to-one entry point (string or flat list references)
+keeps working unchanged.
+
 ## Character error rate
 
 We also provide the character error rate:

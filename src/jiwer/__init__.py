@@ -1,11 +1,13 @@
 from .alignment import collect_error_counts, visualize_alignment, visualize_error_counts
-from .measures import cer, mer, wer, wil, wip
+from .measures import cer, mer, wer, wer_multi_reference, wil, wip
 from .process import (
     AlignmentChunk,
     CharacterOutput,
+    MultiReferenceWordOutput,
     WordOutput,
     process_characters,
     process_words,
+    process_words_multi_reference,
 )
 from .transformations import (
     cer_contiguous,
@@ -45,13 +47,16 @@ __all__ = [
     cer,
     mer,
     wer,
+    wer_multi_reference,
     wil,
     wip,
     AlignmentChunk,
     CharacterOutput,
+    MultiReferenceWordOutput,
     WordOutput,
     process_characters,
     process_words,
+    process_words_multi_reference,
     AbstractTransform,
     Compose,
     ExpandCommonEnglishContractions,

@@ -43,6 +43,36 @@ hypothesis = "hello duck"
 error = wer(reference, hypothesis)
 ```
 
+## Multiple references per sentence
+
+A single recording may have more than one acceptable transcription. JiWER
+accepts a nested list of references, where every sentence gets a list of
+candidate transcriptions. One complete transcription is selected per sentence,
+and the selected index is returned together with the regular alignment chunks.
+
+```python3
+import jiwer
+
+# both references differ in one word, so the first one is selected
+out = jiwer.process_words([["east gate", "west door"]], ["east door"])
+assert out.reference_indices == [0]
+
+# select the combination of references that minimizes the WER of the whole batch
+references = [["a", "a b c d"], ["w x"]]
+hypotheses = ["a b", "w y"]
+out = jiwer.process_words(references, hypotheses, method="wer")
+assert out.reference_indices == [1, 0]
+assert out.wer == 1 / 2
+```
+
+Use `method="edit"` (the default) to pick the minimum-edit reference of each
+sentence independently, or `method="wer"` to minimize the WER over the whole
+batch. In batch mode the total number of words in the selected references is
+used as the denominator, zero references follow the existing convention, and
+ties are broken by the order in which the candidates are provided. The
+dedicated `jiwer.process_words_multi_reference` and
+`jiwer.wer_multi_reference` entry points provide the same functionality, while
+the original one-to-one string/list entry point remains unchanged.
 
 ## A note on empty references
 
