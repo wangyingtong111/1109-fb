@@ -50,6 +50,7 @@ class FuzzyMatch
   attr_reader :identities
   attr_reader :stop_words
   attr_accessor :read
+  attr_reader :fields
   attr_reader :default_options
 
   # haystack - a bunch of records that will compete to see who best matches the needle
@@ -58,7 +59,8 @@ class FuzzyMatch
   # * :<tt>identities</tt> - regexps
   # * :<tt>groupings</tt> - regexps
   # * :<tt>stop_words</tt> - regexps
-  # * :<tt>read</tt> - how to interpret each record in the 'haystack', either a Proc or a symbol
+  # * :<tt>read</tt> - how to interpret each record in the 'haystack', either a Proc or a symbol. If it returns an Array, each element is treated as a separate positional field and only matching positions are compared.
+  # * :<tt>fields</tt> (also :projections) - an explicit Array of field readers (symbols/keys/indices/Procs) giving the structured projection. Equivalent to passing <tt>:read => [:a, :b]</tt>.
   #
   # Options (can be specified at initialization or when calling #find)
   # * :<tt>must_match_grouping</tt> - don't return a match unless the needle fits into one of the groupings you specified
@@ -70,17 +72,22 @@ class FuzzyMatch
 
     # rules
     @read = o.delete(:read) || o.delete(:haystack_reader)
+    @fields = o.delete(:fields) || o.delete(:projections)
+    if @fields.nil? and @read.is_a?(::Array)
+      @fields = @read
+      @read = nil
+    end
     @groupings = (o.delete(:groupings) || o.delete(:blockings) || []).map { |regexp| Rule::Grouping.make(regexp) }.flatten
     @identities = (o.delete(:identities) || []).map { |regexp| Rule::Identity.new(regexp) }
     @stop_words = o.delete(:stop_words) || []
-    
+
     # options
     if deprecated = o.delete(:must_match_blocking)
       o[:must_match_grouping] = deprecated
     end
     @default_options = DEFAULT_OPTIONS.merge(o).freeze
 
-    @haystack = haystack.map { |original| Record.new original, :stop_words => @stop_words, :read => @read }
+    @haystack = haystack.map { |original| Record.new original, :stop_words => @stop_words, :read => @read, :fields => @fields }
   end
     
   def last_result
@@ -140,7 +147,7 @@ class FuzzyMatch
     when String
       Record.new needle, :stop_words => stop_words
     else
-      Record.new needle, :read => read, :stop_words => stop_words
+      Record.new needle, :read => read, :fields => fields, :stop_words => stop_words
     end
     
     if gather_last_result
@@ -247,7 +254,11 @@ EOS
       possibly_identical = joint.dup
     end
     
-    similarities = possibly_identical.map { |straw| needle.similarity straw }.sort.reverse
+    similarities = possibly_identical.each_with_index.map do |straw, index|
+      similarity = needle.similarity(straw)
+      similarity.tie_index = index
+      similarity
+    end.sort.reverse
         
     if gather_last_result
       last_result.timeline << <<-EOS
@@ -256,12 +267,34 @@ The competition was sorted in order of similarity to the needle.
 EOS
     end
     
+    if gather_last_result
+      last_result.field_details = similarities.map { |similarity| build_detail_row(similarity) }
+      last_result.details = last_result.field_details
+      if best = similarities.first
+        last_result.field_scores = best.best_score.respond_to?(:field_dices_coefficient_similar) ? best.best_score.field_dices_coefficient_similar : nil
+      end
+      if needle.structured?
+        last_result.timeline << structured_detail_timeline(similarities)
+      end
+    end
+
     if is_find_all_with_score
       memo = []
-      similarities.each do |similarity|
-        if similarity.satisfy?(needle, threshold)
-          bs = similarity.best_score
-          memo << [similarity.record2.original, bs.dices_coefficient_similar, bs.levenshtein_similar]
+      if structured_projection?(needle)
+        # Structured projections return one positional score per field.  The
+        # detail tuples are reported in candidate/projection order because the
+        # order between non-winning candidates is not a ranking statement;
+        # #find still selects via the sorted `similarities` above.
+        possibly_identical.each do |straw|
+          similarity = needle.similarity(straw)
+          next unless similarity.satisfy?(needle, threshold)
+          memo << score_tuple(similarity)
+        end
+      else
+        similarities.each do |similarity|
+          if similarity.satisfy?(needle, threshold)
+            memo << score_tuple(similarity)
+          end
         end
       end
       return memo
@@ -302,13 +335,16 @@ EOS
       if gather_last_result
         last_result.winner = winner
         last_result.score = best_similarity.best_score.dices_coefficient_similar
+        if best_similarity.structured?
+          last_result.winner_field_details = best_similarity.field_details
+          last_result.field_scores = best_similarity.best_score.field_dices_coefficient_similar
+        end
         last_result.timeline << <<-EOS
 A winner was determined because the Dice's Coefficient similarity (#{'%0.5f' % best_similarity.best_score.dices_coefficient_similar}) is greater than zero or because it shared a word with the needle.
 EOS
       end
       if is_find_with_score
-        bs = best_similarity.best_score
-        return [winner, bs.dices_coefficient_similar, bs.levenshtein_similar]
+        return score_tuple(best_similarity, winner)
       else
         return winner
       end
@@ -331,5 +367,69 @@ EOS
   def explain(needle, options = {})
     find needle, options.merge(:gather_last_result => true)
     last_result.explain
+  end
+
+  # Per-field comparison details for the most recent run (requires
+  # :gather_last_result => true).  Each entry describes one candidate and its
+  # positional field statuses (:compared / :not_compared).
+  def details
+    last_result.details
+  end
+
+  def field_details
+    last_result.field_details
+  end
+
+  private
+
+  def structured_projection?(needle)
+    needle.respond_to?(:structured?) && needle.structured?
+  end
+
+  # The score tuple returned by find_*_with_score.  Ordinary records keep the
+  # historical [original, dice, levenshtein] shape.  Structured projections
+  # return one positional dice score per field instead:
+  # [original, field_0_score, field_1_score, ...] where a +nil+ field score
+  # means that position was "not compared".
+  def score_tuple(similarity, original = nil)
+    original ||= similarity.record2.original
+    bs = similarity.best_score
+    if bs.structured?
+      [original, *bs.field_dices_coefficient_similar]
+    else
+      [original, bs.dices_coefficient_similar, bs.levenshtein_similar]
+    end
+  end
+
+  def build_detail_row(similarity)
+    bs = similarity.best_score
+    row = {
+      :record => similarity.record2.original,
+      :score => bs.dices_coefficient_similar,
+      :dice => bs.dices_coefficient_similar,
+      :levenshtein => bs.levenshtein_similar,
+      :structured => bs.structured?
+    }
+    if bs.structured?
+      row[:field_scores] = bs.field_dices_coefficient_similar
+      row[:field_levenshtein] = bs.field_levenshtein_similar
+      row[:fields] = similarity.field_details
+    end
+    row
+  end
+
+  def structured_detail_timeline(similarities)
+    lines = similarities[0, 9].map do |similarity|
+      id = similarity.record2.original.respond_to?(:[]) ? (similarity.record2.original[:id] || similarity.record2.original['id'] || similarity.record2.original) : similarity.record2.original
+      fields = similarity.field_details.map do |detail|
+        if detail[:compared]
+          "field##{detail[:index]}=#{ '%0.3f' % detail[:dice] }"
+        else
+          "field##{detail[:index]}=#{Record::NOT_COMPARED_TEXT_ZH}/#{Record::NOT_COMPARED}"
+        end
+      end.join(', ')
+      "\t#{id.inspect}: #{fields}"
+    end.join("\n")
+    "Positional field comparison (missing positions are marked not compared / 未比较):\n#{lines}\n"
   end
 end

@@ -36,6 +36,39 @@ You can tell `FuzzyMatch` what field or method to use via the `:read` option... 
     >> fz.find('youruguay')
     => #<Country name:"Uruguay" iso_3166_code:"UY">
 
+### Structured reads: compare fields at the same position
+
+Records that share a name but are distinguished by several fields (for example
+`title` and `edition`) can be compared **field by field, at the same position**.
+Just have your `read` projection return an Array (or pass `:fields` /
+`:projections`):
+
+    rows = [
+      { :id => 1, :title => 'elm', :edition => 'oak' }, # fields swapped
+      { :id => 2, :title => 'oak', :edition => nil }     # missing edition
+    ]
+    fz = FuzzyMatch.new(rows, :read => lambda { |r| [r[:title], r[:edition]] })
+
+Only `title ~ title` and `edition ~ edition` are ever scored, so a candidate
+whose two fields are merely swapped cannot collect two hits. With
+`find_all_with_score`, structured projections return one positional similarity
+score per field (`nil` means that position was **not compared** because a field
+was missing on one side):
+
+    fz.find_all_with_score({ :title => 'oak', :edition => 'elm' })
+    # => [[{:id=>1, ...}, 0.0, 0.0],
+    #     [{:id=>2, ...}, 1.0, nil]]
+
+Use `:gather_last_result => true` and `last_result.details` (or
+`winner_field_details`) for the per-field status of every candidate; a missing
+position is reported with `:status => :not_compared` and a `"not compared"` /
+`"未比较"` label. Scores are aggregated over the fields that were actually
+compared, so an absent field is not penalized.
+
+A `read` that returns a single String behaves exactly as before. Grouping and
+identity rules still run against the same explicit projection (its fields
+joined with spaces); they never see any extra flattened source.
+
 ## Optional rules (regular expressions)
 
 You can improve the default matchings with rules. There are 3 different kinds of rules. Each rule is a regular expression.
