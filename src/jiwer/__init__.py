@@ -1,3 +1,12 @@
+from .aggregate import (
+    MergeConflictError,
+    RecordingResult,
+    Summary,
+    load_summary,
+    merge_summaries,
+    save_summary,
+    summarize,
+)
 from .alignment import collect_error_counts, visualize_alignment, visualize_error_counts
 from .measures import cer, mer, wer, wil, wip
 from .process import (
@@ -39,6 +48,13 @@ name = "jiwer"
 
 __version__ = "4.0.0"
 __all__ = [
+    MergeConflictError,
+    RecordingResult,
+    Summary,
+    load_summary,
+    merge_summaries,
+    save_summary,
+    summarize,
     visualize_alignment,
     visualize_error_counts,
     collect_error_counts,
