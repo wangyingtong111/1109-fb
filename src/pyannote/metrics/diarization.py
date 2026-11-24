@@ -144,8 +144,12 @@ class DiarizationErrorRate(IdentificationErrorRate):
     collar : float, optional
         Duration (in seconds) of collars removed from evaluation around
         boundaries of reference segments.
-    skip_overlap : bool, optional
-        Set to True to not evaluate overlap regions.
+    skip_overlap : bool or {"cross_speaker"}, optional
+        Set to True to not evaluate overlap regions (per-track: any pair of
+        overlapping tracks is removed, even for a same speaker). Set to
+        "cross_speaker" to only remove regions where different speakers are
+        active simultaneously: duplicate tracks of a same speaker are kept
+        but their duration is only counted once.
         Defaults to False (i.e. keep overlap regions).
 
     Examples
@@ -185,7 +189,7 @@ class DiarizationErrorRate(IdentificationErrorRate):
     def metric_name(cls) -> str:
         return DER_NAME
 
-    def __init__(self, collar: float = 0.0, skip_overlap: bool = False, **kwargs):
+    def __init__(self, collar: float = 0.0, skip_overlap: bool | str = False, **kwargs):
         super().__init__(collar=collar, skip_overlap=skip_overlap, **kwargs)
         self.mapper_ = HungarianMapper()
 
@@ -252,10 +256,13 @@ class DiarizationErrorRate(IdentificationErrorRate):
 
         # compute identification error rate based on mapped hypothesis
         # NOTE that collar is set to 0.0 because 'uemify' has already
-        # been applied (same reason for setting skip_overlap to False)
+        # been applied. 'skip_overlap' is propagated so that the
+        # "cross_speaker" deduplication of same-speaker tracks applies:
+        # re-extruding overlap regions is idempotent since they have
+        # already been removed from 'uem'.
         mapped = hypothesis.rename_labels(mapping=mapping)
         return super().compute_components(
-            reference, mapped, uem=uem, collar=0.0, skip_overlap=False, **kwargs
+            reference, mapped, uem=uem, collar=0.0, skip_overlap=self.skip_overlap, **kwargs
         )
 
 
@@ -272,8 +279,12 @@ class GreedyDiarizationErrorRate(IdentificationErrorRate):
     collar : float, optional
         Duration (in seconds) of collars removed from evaluation around
         boundaries of reference segments.
-    skip_overlap : bool, optional
-        Set to True to not evaluate overlap regions.
+    skip_overlap : bool or {"cross_speaker"}, optional
+        Set to True to not evaluate overlap regions (per-track: any pair of
+        overlapping tracks is removed, even for a same speaker). Set to
+        "cross_speaker" to only remove regions where different speakers are
+        active simultaneously: duplicate tracks of a same speaker are kept
+        but their duration is only counted once.
         Defaults to False (i.e. keep overlap regions).
 
     Examples
@@ -312,7 +323,7 @@ class GreedyDiarizationErrorRate(IdentificationErrorRate):
     def metric_name(cls):
         return DER_NAME
 
-    def __init__(self, collar: float = 0.0, skip_overlap: bool = False, **kwargs):
+    def __init__(self, collar: float = 0.0, skip_overlap: bool | str = False, **kwargs):
         super().__init__(collar=collar, skip_overlap=skip_overlap, **kwargs)
         self.mapper_ = GreedyMapper()
 
@@ -373,10 +384,13 @@ class GreedyDiarizationErrorRate(IdentificationErrorRate):
 
         # compute identification error rate based on mapped hypothesis
         # NOTE that collar is set to 0.0 because 'uemify' has already
-        # been applied (same reason for setting skip_overlap to False)
+        # been applied. 'skip_overlap' is propagated so that the
+        # "cross_speaker" deduplication of same-speaker tracks applies:
+        # re-extruding overlap regions is idempotent since they have
+        # already been removed from 'uem'.
         mapped = hypothesis.rename_labels(mapping=mapping)
         return super().compute_components(
-            reference, mapped, uem=uem, collar=0.0, skip_overlap=False, **kwargs
+            reference, mapped, uem=uem, collar=0.0, skip_overlap=self.skip_overlap, **kwargs
         )
 
 
@@ -393,8 +407,12 @@ class JaccardErrorRate(DiarizationErrorRate):
     collar : float, optional
         Duration (in seconds) of collars removed from evaluation around
         boundaries of reference segments.
-    skip_overlap : bool, optional
-        Set to True to not evaluate overlap regions.
+    skip_overlap : bool or {"cross_speaker"}, optional
+        Set to True to not evaluate overlap regions (per-track: any pair of
+        overlapping tracks is removed, even for a same speaker). Set to
+        "cross_speaker" to only remove regions where different speakers are
+        active simultaneously: duplicate tracks of a same speaker are kept
+        but their duration is only counted once.
         Defaults to False (i.e. keep overlap regions).
 
     Examples
@@ -628,8 +646,12 @@ class DiarizationHomogeneity(UEMSupportMixin, BaseMetric):
     collar : float, optional
         Duration (in seconds) of collars removed from evaluation around
         boundaries of reference segments.
-    skip_overlap : bool, optional
-        Set to True to not evaluate overlap regions.
+    skip_overlap : bool or {"cross_speaker"}, optional
+        Set to True to not evaluate overlap regions (per-track: any pair of
+        overlapping tracks is removed, even for a same speaker). Set to
+        "cross_speaker" to only remove regions where different speakers are
+        active simultaneously: duplicate tracks of a same speaker are kept
+        but their duration is only counted once.
         Defaults to False (i.e. keep overlap regions).
 
     """
@@ -642,7 +664,7 @@ class DiarizationHomogeneity(UEMSupportMixin, BaseMetric):
     def metric_components(cls):
         return [HOMOGENEITY_ENTROPY, HOMOGENEITY_CROSS_ENTROPY]
 
-    def __init__(self, collar: float = 0.0, skip_overlap: bool = False, **kwargs):
+    def __init__(self, collar: float = 0.0, skip_overlap: bool | str = False, **kwargs):
         super().__init__(**kwargs)
         self.collar = collar
         self.skip_overlap = skip_overlap
@@ -707,8 +729,12 @@ class DiarizationCompleteness(DiarizationHomogeneity):
     collar : float, optional
         Duration (in seconds) of collars removed from evaluation around
         boundaries of reference segments.
-    skip_overlap : bool, optional
-        Set to True to not evaluate overlap regions.
+    skip_overlap : bool or {"cross_speaker"}, optional
+        Set to True to not evaluate overlap regions (per-track: any pair of
+        overlapping tracks is removed, even for a same speaker). Set to
+        "cross_speaker" to only remove regions where different speakers are
+        active simultaneously: duplicate tracks of a same speaker are kept
+        but their duration is only counted once.
         Defaults to False (i.e. keep overlap regions).
 
     """

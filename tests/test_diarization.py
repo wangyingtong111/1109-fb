@@ -185,6 +185,90 @@ def test_leep_overlap(reference_with_overlap, hypothesis):
     npt.assert_almost_equal(total, 34, decimal=3)
 
 
+def test_skip_overlap_cross_speaker():
+    # A is active on [0, 2] and [4, 6] with a duplicate track on [1, 1.5]
+    # B is active on [5, 7] -- scoring region is [0, 7]
+    reference = Annotation()
+    reference[Segment(0, 2), 1] = "A"
+    reference[Segment(4, 6), 1] = "A"
+    reference[Segment(1, 1.5), 2] = "A"  # duplicate track of speaker A
+    reference[Segment(5, 7), 1] = "B"
+    hypothesis = reference.copy()
+    uem = Timeline([Segment(0, 7)])
+
+    # --- collar = 0: only the cross-speaker overlap [5, 6] is removed ---
+    metric = DiarizationErrorRate(collar=0.0, skip_overlap="cross_speaker")
+
+    # effective scoring region and per-speaker speech durations
+    cropped, _, effective_uem = metric.uemify(
+        reference,
+        hypothesis,
+        uem=uem,
+        collar=0.0,
+        skip_overlap="cross_speaker",
+        returns_uem=True,
+    )
+    assert effective_uem == Timeline([Segment(0, 5), Segment(6, 7)])
+    npt.assert_almost_equal(cropped.label_timeline("A").duration(), 3.0, decimal=7)
+    npt.assert_almost_equal(cropped.label_timeline("B").duration(), 1.0, decimal=7)
+
+    # DER details of the same complete call: A's duplicate track [1, 1.5]
+    # is kept but its duration is only counted once
+    details = metric(reference, hypothesis, uem=uem, detailed=True)
+    npt.assert_almost_equal(details["total"], 4.0, decimal=7)
+    npt.assert_almost_equal(details["correct"], 4.0, decimal=7)
+    npt.assert_almost_equal(details["diarization error rate"], 0.0, decimal=7)
+
+    # --- collar = 0.2: collars around every reference boundary (including
+    # those of A's duplicate track at t=1 and t=1.5) are removed, and the
+    # intersection of collars with the cross-speaker overlap is only
+    # removed once ---
+    metric = DiarizationErrorRate(collar=0.2, skip_overlap="cross_speaker")
+
+    cropped, _, effective_uem = metric.uemify(
+        reference,
+        hypothesis,
+        uem=uem,
+        collar=0.2,
+        skip_overlap="cross_speaker",
+        returns_uem=True,
+    )
+    assert effective_uem == Timeline(
+        [
+            Segment(0.1, 0.9),
+            Segment(1.1, 1.4),
+            Segment(1.6, 1.9),
+            Segment(2.1, 3.9),
+            Segment(4.1, 4.9),
+            Segment(6.1, 6.9),
+        ]
+    )
+    npt.assert_almost_equal(cropped.label_timeline("A").duration(), 2.2, decimal=7)
+    npt.assert_almost_equal(cropped.label_timeline("B").duration(), 0.8, decimal=7)
+
+    details = metric(reference, hypothesis, uem=uem, detailed=True)
+    npt.assert_almost_equal(details["total"], 3.0, decimal=7)
+    npt.assert_almost_equal(details["correct"], 3.0, decimal=7)
+    npt.assert_almost_equal(details["diarization error rate"], 0.0, decimal=7)
+
+    # --- legacy per-track mode remains available: A's self-overlapping
+    # duplicate track [1, 1.5] is also extruded ---
+    metric = DiarizationErrorRate(collar=0.0, skip_overlap=True)
+    _, _, effective_uem = metric.uemify(
+        reference,
+        hypothesis,
+        uem=uem,
+        collar=0.0,
+        skip_overlap=True,
+        returns_uem=True,
+    )
+    assert effective_uem == Timeline(
+        [Segment(0, 1), Segment(1.5, 5), Segment(6, 7)]
+    )
+    details = metric(reference, hypothesis, uem=uem, detailed=True)
+    npt.assert_almost_equal(details["total"], 3.5, decimal=7)
+
+
 def test_bug_16():
     reference = Annotation()
     reference[Segment(0, 10)] = "A"

@@ -71,9 +71,12 @@ class IdentificationErrorRate(UEMSupportMixin, BaseMetric):
     collar : float, optional
         Duration (in seconds) of collars removed from evaluation around
         boundaries of reference segments.
-    skip_overlap : bool, optional
-        Set to True to not evaluate overlap regions.
-        Defaults to False (i.e. keep overlap regions).
+    skip_overlap : bool or {"cross_speaker"}, optional
+        Set to True to not evaluate overlap regions (per-track: any pair of
+        overlapping tracks is removed). Set to "cross_speaker" to only remove
+        regions where different speakers are active simultaneously: duplicate
+        tracks of a same speaker are kept but their duration is only counted
+        once. Defaults to False (i.e. keep overlap regions).
     confusion, miss, false_alarm: float, optional
         Optional weights for confusion, miss and false alarm respectively.
         Default to 1. (no weight)
@@ -93,7 +96,7 @@ class IdentificationErrorRate(UEMSupportMixin, BaseMetric):
         miss: float = 1.0,
         false_alarm: float = 1.0,
         collar: float = 0.0,
-        skip_overlap: bool = False,
+        skip_overlap: bool | str = False,
         **kwargs,
     ):
 
@@ -111,7 +114,7 @@ class IdentificationErrorRate(UEMSupportMixin, BaseMetric):
         hypothesis: Annotation,
         uem: Timeline | None = None,
         collar: float | None = None,
-        skip_overlap: float | None = None,
+        skip_overlap: bool | str | None = None,
         **kwargs,
     ) -> Details:
         """
@@ -120,7 +123,7 @@ class IdentificationErrorRate(UEMSupportMixin, BaseMetric):
         ----------
         collar : float, optional
             Override self.collar
-        skip_overlap : bool, optional
+        skip_overlap : bool or {"cross_speaker"}, optional
             Override self.skip_overlap
 
         See also
@@ -146,16 +149,21 @@ class IdentificationErrorRate(UEMSupportMixin, BaseMetric):
             returns_timeline=True,
         )
 
+        # in "cross_speaker" skip_overlap mode, duplicate tracks of a same
+        # speaker are kept by 'uemify': deduplicate them so that their
+        # duration is only counted once
+        unique = skip_overlap == "cross_speaker"
+
         # loop on all segments
         for segment in common_timeline:
             # segment duration
             duration = segment.duration
 
             # list of IDs in reference segment
-            r = R.get_labels(segment, unique=False)
+            r = R.get_labels(segment, unique=unique)
 
             # list of IDs in hypothesis segment
-            h = H.get_labels(segment, unique=False)
+            h = H.get_labels(segment, unique=unique)
 
             counts, _ = self.matcher_(r, h)
 

@@ -36,7 +36,7 @@ class UEMSupportMixin:
         uem: Timeline,
         reference: Annotation,
         collar: float = 0.0,
-        skip_overlap: bool = False,
+        skip_overlap: bool | str = False,
     ) -> Timeline:
         """Extrude reference boundary collars from uem
 
@@ -54,9 +54,13 @@ class UEMSupportMixin:
             When provided, set the duration of collars centered around
             reference segment boundaries that are extruded from both reference
             and hypothesis. Defaults to 0. (i.e. no collar).
-        skip_overlap : bool, optional
-            Set to True to not evaluate overlap regions.
-            Defaults to False (i.e. keep overlap regions).
+        skip_overlap : bool or {"cross_speaker"}, optional
+            Set to True to not evaluate overlap regions (any pair of
+            overlapping tracks is extruded, even when both tracks belong
+            to the same speaker). Set to "cross_speaker" to only extrude
+            regions where different speakers are active simultaneously:
+            duplicate tracks of a same speaker are kept. Defaults to False
+            (i.e. keep overlap regions).
 
         Returns
         -------
@@ -82,9 +86,18 @@ class UEMSupportMixin:
 
         # build list of overlap regions if needed
         if skip_overlap:
+            # in "cross_speaker" mode, only extrude regions where different
+            # speakers are active simultaneously (duplicate tracks of a same
+            # speaker are kept)
+            cross_speaker_only = skip_overlap == "cross_speaker"
             # iterate over pair of intersecting segments
             for (segment1, track1), (segment2, track2) in reference.co_iter(reference):
                 if segment1 == segment2 and track1 == track2:
+                    continue
+                if (
+                    cross_speaker_only
+                    and reference[segment1, track1] == reference[segment2, track2]
+                ):
                     continue
                 # add their intersection
                 overlap_regions.append(segment1 & segment2)
@@ -149,7 +162,7 @@ class UEMSupportMixin:
         hypothesis: Annotation,
         uem: Timeline | None = None,
         collar: float = 0.0,
-        skip_overlap: bool = False,
+        skip_overlap: bool | str = False,
         returns_uem: bool = False,
         returns_timeline: bool = False,
     ) -> (
@@ -169,9 +182,11 @@ class UEMSupportMixin:
             When provided, set the duration of collars centered around
             reference segment boundaries that are extruded from both reference
             and hypothesis. Defaults to 0. (i.e. no collar).
-        skip_overlap : bool, optional
-            Set to True to not evaluate overlap regions.
-            Defaults to False (i.e. keep overlap regions).
+        skip_overlap : bool or {"cross_speaker"}, optional
+            Set to True to not evaluate overlap regions (per-track: any pair
+            of overlapping tracks is extruded). Set to "cross_speaker" to
+            only extrude regions where different speakers are active
+            simultaneously. Defaults to False (i.e. keep overlap regions).
         returns_uem : bool, optional
             Set to True to return extruded uem as well.
             Defaults to False (i.e. only return reference and hypothesis)
