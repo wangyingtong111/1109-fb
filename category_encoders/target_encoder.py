@@ -180,6 +180,14 @@ class TargetEncoder( util.SupervisedTransformerMixin,util.BaseEncoder):
         self.ordinal_encoder = None
         self.mapping = None
         self._mean = None
+        # Fitted hierarchy state used to back unseen leaves at transform time
+        # with the deepest available ancestor's smoothed encoding.
+        self._hier_ordinal_encoder = None
+        self._hier_level_mappings = None
+        # Row-aligned hierarchy supplied to a single transform() call, if any.
+        self._inference_hierarchy = None
+        # Boolean mask of unknown leaves that no fitted ancestor could resolve.
+        self._unresolved_unknown = None
         # Call this in the constructor only for the possible side effect of raising an exception.
         self._generate_inverted_hierarchy()
 
@@ -219,20 +227,21 @@ class TargetEncoder( util.SupervisedTransformerMixin,util.BaseEncoder):
             X_hier = inverted_hierarchy
 
         if isinstance(inverted_hierarchy, (dict, pd.DataFrame)):
-            enc_hier = OrdinalEncoder(
+            self._hier_ordinal_encoder = OrdinalEncoder(
                 verbose=self.verbose,
                 cols=X_hier.columns,
                 handle_unknown='value',
                 handle_missing='value',
             )
-            enc_hier = enc_hier.fit(X_hier)
-            X_hier_ordinal = enc_hier.transform(X_hier)
+            self._hier_ordinal_encoder = self._hier_ordinal_encoder.fit(X_hier)
+            X_hier_ordinal = self._hier_ordinal_encoder.transform(X_hier)
 
         self.ordinal_encoder = OrdinalEncoder(
             verbose=self.verbose, cols=self.cols, handle_unknown='value', handle_missing='value'
         )
         self.ordinal_encoder = self.ordinal_encoder.fit(X)
         X_ordinal = self.ordinal_encoder.transform(X)
+        self._hier_level_mappings = {}
         if inverted_hierarchy is not None:
             self.mapping = self.fit_target_encoding(
                 pd.concat([X_ordinal, X_hier_ordinal], axis=1), y
@@ -265,6 +274,7 @@ class TargetEncoder( util.SupervisedTransformerMixin,util.BaseEncoder):
                 if (isinstance(self.hierarchy, dict) and col in self.hierarchy) or (
                     isinstance(self.hierarchy, pd.DataFrame)
                 ):
+                    self._hier_level_mappings[col] = {}
                     for i in range(self.hierarchy_depth[col]):
                         col_hier = 'HIER_' + str(col) + '_' + str(i + 1)
                         col_hier_m1 = (
@@ -278,6 +288,11 @@ class TargetEncoder( util.SupervisedTransformerMixin,util.BaseEncoder):
                             scalar_hier = (
                                 scalar * (1 - smoove_hier) + stats_hier['mean'] * smoove_hier
                             )
+                            # Keep the smoothed value of every node at this level so that
+                            # unseen leaves can fall back to their deepest fitted ancestor
+                            # at transform time. The series is indexed by the ordinal codes
+                            # of ``col_hier`` (the parent level of ``col_hier_m1``).
+                            self._hier_level_mappings[col][i] = scalar_hier
                             scalar_hier_long = X[[col_hier_m1, col_hier]].drop_duplicates()
                             scalar_hier_long.index = np.arange(1, scalar_hier_long.shape[0] + 1)
                             scalar = scalar_hier_long[col_hier].map(scalar_hier.to_dict())
@@ -295,26 +310,196 @@ class TargetEncoder( util.SupervisedTransformerMixin,util.BaseEncoder):
 
         return mapping
 
+    def transform(
+        self,
+        X: util.X_type,
+        y: util.y_type | None = None,
+        override_return_df: bool = False,
+        hierarchy: dict | pd.DataFrame | None = None,
+    ) -> pd.DataFrame | np.ndarray:
+        """Transform categorical features using the fitted target encoding.
+
+        Parameters
+        ----------
+        X: array-like, shape = [n_samples, n_features]
+            Data to transform.
+        y: array-like, shape = [n_samples] or None
+            Optional target, retained for API compatibility.
+        override_return_df: bool
+            Override ``return_df`` to force a DataFrame result.
+        hierarchy: dict or dataframe, optional
+            Hierarchy information for the rows being transformed, used to back
+            unseen leaves with the smoothed value of their deepest fitted
+            ancestor.
+
+            As a dictionary, it maps an encoded column name to a dict with the
+            same nested form as the fit-time ``hierarchy`` argument, e.g.
+            ``{'store': {'North': ('unknown', ...), 'South': ('other', ...)}}``.
+
+            As a dataframe, it is row-aligned with ``X`` and uses the fitted
+            ``HIER_<col>_<level>`` column names, containing the ancestor label
+            at every level for each row.
+
+            When omitted, unseen categories keep the ordinary
+            ``handle_unknown`` fallback (the global target mean by default).
+            Passing a hierarchy to an encoder that was fitted without one
+            raises a ``ValueError``.
+
+        Returns
+        -------
+        transformed: dataframe or ndarray
+        """
+        self._inference_hierarchy = self._prepare_inference_hierarchy(X, hierarchy)
+        try:
+            return super().transform(X, y, override_return_df=override_return_df)
+        finally:
+            self._inference_hierarchy = None
+
+    def _prepare_inference_hierarchy(
+        self, X: util.X_type, hierarchy: dict | pd.DataFrame | None
+    ) -> pd.DataFrame | None:
+        """Turn the transform-time hierarchy input into fitted HIER_ columns."""
+        if hierarchy is None:
+            return None
+        if self._hier_ordinal_encoder is None or not self._hier_level_mappings:
+            raise ValueError(
+                'A hierarchy was provided at transform time, but this encoder '
+                'was fitted without a hierarchy.'
+            )
+
+        fitted_hier_cols = self._hier_ordinal_encoder.cols
+        if isinstance(X, pd.DataFrame):
+            X_frame = X
+        else:
+            # Array-like input has no column names yet; reattach the fitted
+            # feature names positionally, mirroring the base transform flow.
+            X_frame = pd.DataFrame(X, columns=getattr(self, 'feature_names_in_', None))
+
+        if isinstance(hierarchy, dict):
+            parts = []
+            for col in self.cols:
+                if col not in hierarchy:
+                    continue
+                if col not in self._hier_level_mappings:
+                    raise ValueError(
+                        f'Transform-time hierarchy references column "{col}", '
+                        'which has no fitted hierarchy.'
+                    )
+                inverted = util.flatten_reverse_dict(hierarchy[col])
+                tuple_ok, depth = self._check_dict_key_tuples(inverted)
+                if not tuple_ok or depth != self.hierarchy_depth[col]:
+                    raise ValueError(
+                        f'Transform-time hierarchy for column "{col}" must have '
+                        f'depth {self.hierarchy_depth[col]} with equal level sizes.'
+                    )
+                leaf_to_path = {k: v for t, v in inverted.items() for k in t}
+                colnames = [
+                    f'HIER_{col}_{i + 1}' for i in range(self.hierarchy_depth[col])
+                ]
+                parts.append(
+                    pd.DataFrame(
+                        X_frame[col].map(leaf_to_path).tolist(),
+                        index=X_frame.index,
+                        columns=colnames,
+                    )
+                )
+            if not parts:
+                raise ValueError(
+                    'The transform-time hierarchy does not cover any encoded column.'
+                )
+            inference_hier = pd.concat(parts, axis=1)
+        elif isinstance(hierarchy, pd.DataFrame):
+            missing = [c for c in fitted_hier_cols if c not in hierarchy.columns]
+            if missing:
+                raise ValueError(
+                    'Transform-time hierarchy dataframe is missing columns: '
+                    f'{missing}'
+                )
+            inference_hier = hierarchy[fitted_hier_cols].copy()
+        else:
+            raise ValueError('Given hierarchy mapping is neither a dictionary nor a dataframe')
+
+        if len(inference_hier) != len(X_frame):
+            raise ValueError(
+                'The transform-time hierarchy must be row-aligned with X '
+                f'({len(inference_hier)} hierarchy rows vs {len(X_frame)} data rows).'
+            )
+        inference_hier.index = X_frame.index
+        # Reuse the fitted level encoders: unseen hierarchy nodes become the
+        # unknown sentinel and therefore cannot act as a fallback.
+        return self._hier_ordinal_encoder.transform(inference_hier)
+
     def _transform(self, X: pd.DataFrame, y: pd.Series | None = None) -> pd.DataFrame:
         # Now X is the correct dimensions it works with pre fitted ordinal encoder
         X = self.ordinal_encoder.transform(X)
+        inference_hierarchy = getattr(self, '_inference_hierarchy', None)
 
-        if self.handle_unknown == 'error':
+        if self.handle_unknown == 'error' and inference_hierarchy is None:
             if X[self.cols].isin([util.UNKNOWN_SENTINEL]).any().any():
                 raise ValueError('Unexpected categories found in dataframe')
 
         X = self.target_encode(X)
+
+        if self.handle_unknown == 'error' and inference_hierarchy is not None:
+            # Unknown leaves without a resolvable ancestor still violate 'error'.
+            if self._unresolved_unknown.any().any():
+                raise ValueError('Unexpected categories found in dataframe')
         return X
 
     def target_encode(self, X_in: pd.DataFrame) -> pd.DataFrame:
         """Apply target encoding via encoder mapping."""
         X = X_in.copy(deep=True)
+        inference_hierarchy = getattr(self, '_inference_hierarchy', None)
+        self._unresolved_unknown = pd.DataFrame(False, index=X.index, columns=self.cols)
 
         # Was not mapping extra columns as self.feature_names_in did not include new column
         for col in self.cols:
-            X[col] = X[col].map(self.mapping[col])
+            encoded = X[col].map(self.mapping[col])
+            if inference_hierarchy is not None and col in self._hier_level_mappings:
+                encoded, unresolved = self._apply_hierarchy_fallback(
+                    col, X[col], encoded, inference_hierarchy
+                )
+                self._unresolved_unknown[col] = unresolved
+            X[col] = encoded
 
         return X
+
+    def _apply_hierarchy_fallback(
+        self,
+        col: str,
+        ordinal_codes: pd.Series,
+        encoded: pd.Series,
+        inference_hierarchy: pd.DataFrame,
+    ) -> tuple[pd.Series, pd.Series]:
+        """Back unseen leaves with their deepest fitted ancestor value.
+
+        Returns the encoded series and a boolean mask of unknown leaves whose
+        hierarchy nodes were all unobserved at fit time.
+        """
+        unknown_rows = ordinal_codes == util.UNKNOWN_SENTINEL
+        if not unknown_rows.any():
+            return encoded, pd.Series(False, index=ordinal_codes.index)
+
+        fallback = pd.Series(np.nan, index=ordinal_codes.index, dtype=float)
+        # Walk from the deepest fitted level towards the root; the first level
+        # whose node was observed at fit time wins.
+        for level in sorted(self._hier_level_mappings[col], reverse=True):
+            hier_col = f'HIER_{col}_{level + 1}'
+            if hier_col not in inference_hierarchy.columns:
+                continue
+            unresolved = fallback.isna()
+            if not unresolved.any():
+                break
+            level_mapping = self._hier_level_mappings[col][level]
+            codes = inference_hierarchy[hier_col]
+            known_codes = codes.isin(level_mapping.index)
+            eligible = unresolved & unknown_rows & known_codes
+            fallback[eligible] = codes[eligible].map(level_mapping)
+
+        resolved = unknown_rows & fallback.notna()
+        # Rows without a resolvable ancestor (or without hierarchy information)
+        # keep the ordinary handle_unknown encoding, e.g. the global target mean.
+        return fallback.fillna(encoded), unknown_rows & ~resolved
 
     def _weighting(self, n: int) -> float:
         # monotonically increasing function of n bounded between 0 and 1

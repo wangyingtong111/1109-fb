@@ -507,6 +507,157 @@ class TestTargetEncoder(TestCase):
         with self.assertRaises(ValueError):
             enc.fit_transform(X, y)
 
+    def _fit_store_region_encoder(self):
+        """Fit an encoder whose North/South regions have clearly different means."""
+        train = pd.DataFrame(
+            {
+                'store': ['N1', 'N1', 'N1', 'N2', 'N2', 'S1', 'S1', 'S1'],
+                'target': [1, 1, 1, 1, 1, 0, 0, 0],
+            }
+        )
+        hierarchy = {'store': {'North': ('N1', 'N2'), 'South': ('S1',)}}
+        enc = encoders.TargetEncoder(
+            cols=['store'], hierarchy=hierarchy, min_samples_leaf=20, smoothing=10
+        )
+        return enc.fit(train[['store']], train['target'])
+
+    def test_inference_hierarchy_unseen_leaf_uses_ancestor(self):
+        """An unseen leaf attached to a fitted region gets that region's value."""
+        enc = self._fit_store_region_encoder()
+        north_code = enc._hier_ordinal_encoder.category_mapping[0]['mapping'].loc['North']
+        north_value = enc._hier_level_mappings['store'][0].loc[north_code]
+        south_code = enc._hier_ordinal_encoder.category_mapping[0]['mapping'].loc['South']
+        south_value = enc._hier_level_mappings['store'][0].loc[south_code]
+
+        inference = pd.DataFrame({'store': ['unknown', 'N1', 'S1']})
+
+        # Dictionary form: the new leaf is explicitly attached to North.
+        result = enc.transform(inference, hierarchy={'store': {'North': ('unknown',)}})
+        self.assertAlmostEqual(north_value, result['store'].iloc[0])
+        # Known leaves keep their own fitted encoding.
+        known = enc.transform(pd.DataFrame({'store': ['N1', 'S1']}))
+        pd.testing.assert_series_equal(
+            result['store'].iloc[1:].reset_index(drop=True),
+            known['store'].reset_index(drop=True),
+        )
+
+        # The same leaf attached to South must fall back to South's value instead.
+        south_result = enc.transform(
+            pd.DataFrame({'store': ['unknown']}),
+            hierarchy=pd.DataFrame({'HIER_store_1': ['South']}),
+        )
+        self.assertAlmostEqual(south_value, south_result['store'].iloc[0])
+        self.assertNotAlmostEqual(
+            north_value, south_result['store'].iloc[0]
+        )
+
+    def test_inference_hierarchy_dataframe_form(self):
+        """Row-aligned HIER_ dataframes are accepted as inference-time hierarchies."""
+        enc = self._fit_store_region_encoder()
+        north_code = enc._hier_ordinal_encoder.category_mapping[0]['mapping'].loc['North']
+        north_value = enc._hier_level_mappings['store'][0].loc[north_code]
+
+        inference = pd.DataFrame({'store': ['unknown', 'N1']})
+        hierarchy = pd.DataFrame({'HIER_store_1': ['North', 'North']})
+        result = enc.transform(inference, hierarchy=hierarchy)
+        self.assertAlmostEqual(north_value, result['store'].iloc[0])
+
+    def test_inference_without_hierarchy_uses_global_default(self):
+        """Without hierarchy information unseen leaves keep the global default."""
+        enc = self._fit_store_region_encoder()
+        result = enc.transform(pd.DataFrame({'store': ['unknown']}))
+        self.assertAlmostEqual(enc._mean, result['store'].iloc[0])
+
+    def test_inference_hierarchy_unseen_parent_falls_back_to_global(self):
+        """An unseen hierarchy node cannot be used; the global default remains."""
+        enc = self._fit_store_region_encoder()
+        result = enc.transform(
+            pd.DataFrame({'store': ['unknown']}),
+            hierarchy=pd.DataFrame({'HIER_store_1': ['Atlantis']}),
+        )
+        self.assertAlmostEqual(enc._mean, result['store'].iloc[0])
+
+    def test_inference_hierarchy_is_deterministic_across_batches(self):
+        """Repeated batches with the same leaf and hierarchy encode identically."""
+        enc = self._fit_store_region_encoder()
+        batch = pd.DataFrame({'store': ['unknown']})
+        first = enc.transform(batch, hierarchy={'store': {'North': ('unknown',)}})
+        second = enc.transform(
+            batch, hierarchy=pd.DataFrame({'HIER_store_1': ['North']})
+        )
+        third = enc.transform(batch, hierarchy={'store': {'North': ('unknown',)}})
+        self.assertAlmostEqual(first['store'].iloc[0], second['store'].iloc[0])
+        self.assertAlmostEqual(first['store'].iloc[0], third['store'].iloc[0])
+        # The call-scoped state must not leak onto the fitted encoder.
+        self.assertIsNone(enc._inference_hierarchy)
+
+    def test_inference_hierarchy_uses_deepest_available_ancestor(self):
+        """At deeper levels the nearest fitted ancestor provides the fallback."""
+        train = pd.DataFrame(
+            {
+                'store': ['N1', 'N1', 'N2', 'N2', 'S1', 'S1'],
+                'target': [1, 1, 1, 1, 0, 0],
+            }
+        )
+        hierarchy = {
+            'store': {
+                'North': {'N-town': ('N1', 'N2')},
+                'South': {'S-town': ('S1',)},
+            }
+        }
+        enc = encoders.TargetEncoder(
+            cols=['store'], hierarchy=hierarchy, min_samples_leaf=20, smoothing=10
+        ).fit(train[['store']], train['target'])
+
+        north_code = enc._hier_ordinal_encoder.category_mapping[0]['mapping'].loc['North']
+        ntown_code = enc._hier_ordinal_encoder.category_mapping[1]['mapping'].loc['N-town']
+        north_value = enc._hier_level_mappings['store'][0].loc[north_code]
+        ntown_value = enc._hier_level_mappings['store'][1].loc[ntown_code]
+
+        inference = pd.DataFrame({'store': ['new_north', 'new_lost']})
+        inference_hierarchy = pd.DataFrame(
+            {
+                'HIER_store_1': ['North', 'North'],
+                'HIER_store_2': ['N-town', 'Atlantis'],
+            }
+        )
+        result = enc.transform(inference, hierarchy=inference_hierarchy)
+        # Deepest fitted ancestor (N-town) is used when available...
+        self.assertAlmostEqual(ntown_value, result['store'].iloc[0])
+        # ...otherwise the search continues up to the next fitted ancestor (North).
+        self.assertAlmostEqual(north_value, result['store'].iloc[1])
+
+    def test_inference_hierarchy_resolves_unknown_under_error_strategy(self):
+        """With handle_unknown='error', a hierarchy-resolved leaf is accepted."""
+        enc = self._fit_store_region_encoder()
+        enc.handle_unknown = 'error'
+        inference = pd.DataFrame({'store': ['unknown', 'N1']})
+        hierarchy = pd.DataFrame({'HIER_store_1': ['North', 'North']})
+        result = enc.transform(inference, hierarchy=hierarchy)
+
+        north_code = enc._hier_ordinal_encoder.category_mapping[0]['mapping'].loc['North']
+        north_value = enc._hier_level_mappings['store'][0].loc[north_code]
+        self.assertAlmostEqual(north_value, result['store'].iloc[0])
+
+        # An unseen parent still cannot resolve the leaf and must raise.
+        with self.assertRaises(ValueError):
+            enc.transform(
+                pd.DataFrame({'store': ['unknown']}),
+                hierarchy=pd.DataFrame({'HIER_store_1': ['Atlantis']}),
+            )
+
+    def test_inference_hierarchy_without_fitted_hierarchy_raises(self):
+        """Passing an inference hierarchy to a hierarchy-free fit is an error."""
+        train = pd.DataFrame({'store': ['a', 'a', 'b'], 'target': [1, 0, 1]})
+        enc = encoders.TargetEncoder(cols=['store']).fit(
+            train[['store']], train['target']
+        )
+        with self.assertRaises(ValueError):
+            enc.transform(
+                pd.DataFrame({'store': ['c']}),
+                hierarchy={'store': {'a': ('c',)}},
+            )
+
     def test_hierarchy_with_scikit_learn_column_transformer(self) -> None:
         """Test that the encoder works with a scikit-learn ColumnTransformer."""
         features: list[str] = ["cat_feature", "int_feature"]
