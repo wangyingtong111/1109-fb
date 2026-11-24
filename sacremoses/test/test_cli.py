@@ -221,6 +221,17 @@ class TestCliDetruecase(CliTestCase):
             ["The Adventures of Sherlock Holmes"],
         )
 
+    def test_detruecase_subtitle_boundary(self):
+        # The colon opens a subtitle; the quote and markup are skipped and
+        # 'of', an otherwise always-lower word, gets the sentence-start case.
+        self.assertEqual(
+            self.lines(
+                ["detruecase", "-a", "--subtitle-boundary"],
+                'road to the USA : “ <em> of mice and men </em> ”\n',
+            ),
+            ['Road to the USA : “ <em> Of Mice and Men </em> ”'],
+        )
+
 
 class TestCliTruecase(CliTestCase):
     # Deliberately free of single letter words, so that any one character entry

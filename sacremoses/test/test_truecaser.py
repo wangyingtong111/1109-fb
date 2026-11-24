@@ -6,6 +6,7 @@ Tests for MosesTokenizer
 
 import hashlib
 import os
+import re
 import unittest
 import urllib.error
 import urllib.request
@@ -167,3 +168,126 @@ class TestDetruecaser(unittest.TestCase):
         expected_str = "MLB Baseball standings"
         assert moses.detruecase(text) == expected
         assert moses.detruecase(text, return_str=True) == expected_str
+
+    def test_moses_detruecase_subtitle_boundary(self):
+        """The colon declares a subtitle boundary: the first actual word after
+        it is treated as a sentence start, even across quotes and markup, and
+        even when it is an ALWAYS_LOWER word such as 'of'."""
+        moses = MosesDetruecaser()
+        text = 'road to the USA : “ <em> of mice and men </em> ”'
+        expected_str = 'Road to the USA : “ <em> Of Mice and Men </em> ”'
+        assert (
+            moses.detruecase(
+                text, is_headline=True, return_str=True, subtitle_boundary=True
+            )
+            == expected_str
+        )
+        # Same handling in non-headline mode.
+        assert moses.detruecase(
+            text, return_str=True, subtitle_boundary=True
+        ) == 'Road to the USA : “ <em> Of mice and men </em> ”'
+
+        # Piece-level positions are checkable against the input: same number
+        # of pieces, whitespace fixed, every non-space piece only re-cased.
+        pieces_in = re.split(r"(\s+)", text)
+        pieces_out = moses.detruecase(
+            text, is_headline=True, subtitle_boundary=True
+        )
+        assert len(pieces_in) == len(pieces_out)
+        assert all(
+            a == b for a, b in zip(pieces_in, pieces_out) if a.isspace()
+        )
+        assert all(
+            a.lower() == b.lower()
+            for a, b in zip(pieces_in, pieces_out)
+            if not a.isspace()
+        )
+        # Token order and the markup/quote/boundary/acronym positions survive.
+        for kept in (":", "“", "”", "<em>", "</em>", "USA"):
+            assert kept in pieces_out
+        assert pieces_out.index(":") == pieces_in.index(":")
+        assert pieces_out.index("<em>") == pieces_in.index("<em>")
+        assert pieces_out.index("USA") == pieces_in.index("USA")
+        # The preposition in the middle of the ordinary headline stays lower.
+        assert "to" in pieces_out and "the" in pieces_out
+
+    def test_moses_detruecase_subtitle_boundary_empty_tokens(self):
+        """An empty span between identical markup after the colon does not
+        consume the boundary; only the next actual word does."""
+        moses = MosesDetruecaser()
+        text = "road to the USA : <em> </em> mice and men"
+        assert moses.detruecase(
+            text, is_headline=True, return_str=True, subtitle_boundary=True
+        ) == "Road to the USA : <em> </em> Mice and Men"
+
+        # Empty tokens (double spaces) and nested tags next to the boundary are
+        # likewise skipped, and the double space is preserved at its position.
+        nested = "a tale :  “ <em> <b> of </b> two cities </em> ”"
+        out = moses.detruecase(
+            nested, is_headline=True, subtitle_boundary=True
+        )
+        assert out == [
+            "A", " ", "Tale", " ", ":", "  ", "“", " ",
+            "<em>", " ", "<b>", " ", "Of", " ", "</b>", " ",
+            "Two", " ", "Cities", " ", "</em>", " ", "”",
+        ]
+        assert (
+            moses.detruecase(
+                nested, is_headline=True, return_str=True,
+                subtitle_boundary=True,
+            )
+            == "A Tale :  “ <em> <b> Of </b> Two Cities </em> ”"
+        )
+
+    def test_moses_detruecase_subtitle_boundary_custom_and_disabled(self):
+        moses = MosesDetruecaser()
+        # An explicit boundary token via string or an iterable.
+        assert moses.detruecase(
+            "part one — of the sea",
+            is_headline=True,
+            return_str=True,
+            subtitle_boundary="—",
+        ) == "Part One — Of the Sea"
+        assert moses.detruecase(
+            "a ; b : c", return_str=True, subtitle_boundary={";", ":"}
+        ) == "A ; B : C"
+
+        # Disabled (default / False / None) keeps the legacy behaviour,
+        # headline and non-headline alike.
+        text = 'road to the USA : “ <em> of mice and men </em> ”'
+        legacy_headline = "Road to the USA : “ <em> of Mice and Men </em> ”"
+        assert (
+            moses.detruecase(text, is_headline=True, return_str=True)
+            == legacy_headline
+        )
+        assert (
+            moses.detruecase(
+                text, is_headline=True, return_str=True,
+                subtitle_boundary=False,
+            )
+            == legacy_headline
+        )
+        assert (
+            moses.detruecase(
+                text, is_headline=True, return_str=True,
+                subtitle_boundary=None,
+            )
+            == legacy_headline
+        )
+        # The legacy list return shape (whitespace-free tokens) is unchanged.
+        assert moses.detruecase(
+            "the adventures of Sherlock Holmes"
+        ) == ["The", "adventures", "of", "Sherlock", "Holmes"]
+
+    def test_moses_detruecase_subtitle_keeps_known_forms(self):
+        """Already-cased forms such as acronyms pass through untouched, and an
+        ALWAYS_LOWER word mid-headline stays lowercase away from boundaries."""
+        moses = MosesDetruecaser()
+        out = moses.detruecase(
+            "the FBI and the cia in paris",
+            is_headline=True,
+            return_str=True,
+            subtitle_boundary=True,
+        )
+        assert out == "The FBI and the Cia in Paris"
+        assert "FBI" in out.split()

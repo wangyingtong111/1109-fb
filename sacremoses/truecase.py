@@ -486,6 +486,13 @@ class MosesTruecaser(object):
 
 
 class MosesDetruecaser(object):
+    #: A token shaped like an XML/markup tag, e.g. ``<em>`` or ``</em>``.
+    #: Such tokens are transparent to the sentence-start bookkeeping.
+    XML_TAG_REGEX = re.compile(r"<\S[^>]*>")
+    #: A token that contains at least one character that can be cased, i.e.
+    #: an actual word rather than punctuation, a tag or an empty token.
+    LETTER_REGEX = re.compile(r"[^\W\d_]", re.UNICODE)
+
     def __init__(self):
         # Initialize the object.
         super(MosesDetruecaser, self).__init__()
@@ -540,33 +547,164 @@ class MosesDetruecaser(object):
             "with",
         }
 
-    def detruecase(self, text, is_headline=False, return_str=False):
+    def _resolve_subtitle_boundaries(self, subtitle_boundary):
+        """Normalise the ``subtitle_boundary`` argument into a set of tokens.
+
+        ``False``/``None`` disables the feature (empty set), ``True`` selects
+        the single default boundary ``:`` (the subtitle separator), and an
+        explicit string or iterable names the boundary token(s) to declare.
+        """
+        if not subtitle_boundary:
+            return set()
+        if subtitle_boundary is True:
+            return {":"}
+        if isinstance(subtitle_boundary, str):
+            return {subtitle_boundary}
+        return set(subtitle_boundary)
+
+    def detruecase(
+        self,
+        text,
+        is_headline=False,
+        return_str=False,
+        subtitle_boundary=False,
+    ):
         """
         Detruecase the translated files from a model that learnt from truecased
         tokens.
 
         :param text: A single string, i.e. sentence text.
         :type text: str
-        """
-        # `cased_tokens` keep tracks of detruecased tokens.
-        cased_tokens = []
-        sentence_start = True
-        # Capitalize token if it's at the sentence start.
-        for token in text.split():
-            token = token[:1].upper() + token[1:] if sentence_start else token
-            cased_tokens.append(token)
-            if token in self.SENT_END:
-                sentence_start = True
-            elif not token in self.DELAYED_SENT_START:
-                sentence_start = False
-        # Check if it's a headline, if so then use title case.
-        if is_headline:
-            cased_tokens = [
-                token if token in self.ALWAYS_LOWER else token[:1].upper() + token[1:]
-                for token in cased_tokens
-            ]
 
-        return " ".join(cased_tokens) if return_str else cased_tokens
+        :param is_headline: When True, apply title case: words in
+            ``ALWAYS_LOWER`` (prepositions, articles, conjunctions) stay
+            lowercase mid-headline.
+        :type is_headline: bool
+
+        :param subtitle_boundary: Optional subtitle boundary handling. When
+            truthy, a boundary token (default ``:`` when ``True`` is passed, or
+            the token(s) named by a string/iterable) declares the start of a
+            subtitle. The boundary itself is emitted unchanged and the *first
+            actual word* after it -- skipping XML/markup tags such as
+            ``<em>``, quote/delayed-start tokens and empty tokens -- is treated
+            as a sentence start and capitalised even if it is an
+            ``ALWAYS_LOWER`` word. Whitespace, empty tokens, markup and token
+            order are preserved at positions that can be checked against the
+            input. Already cased forms (e.g. acronyms such as ``USA``) are left
+            untouched, matching the word model. When falsy (the default) the
+            legacy title and non-title behaviour is used unchanged.
+        :type subtitle_boundary: bool or str or iterable(str)
+        """
+        boundaries = self._resolve_subtitle_boundaries(subtitle_boundary)
+
+        # Legacy path, byte-for-byte the old behaviour, when the option is off.
+        if not boundaries:
+            # `cased_tokens` keep tracks of detruecased tokens.
+            cased_tokens = []
+            sentence_start = True
+            # Capitalize token if it's at the sentence start.
+            for token in text.split():
+                token = token[:1].upper() + token[1:] if sentence_start else token
+                cased_tokens.append(token)
+                if token in self.SENT_END:
+                    sentence_start = True
+                elif token not in self.DELAYED_SENT_START:
+                    sentence_start = False
+            # Check if it's a headline, if so then use title case.
+            if is_headline:
+                cased_tokens = [
+                    token
+                    if token in self.ALWAYS_LOWER
+                    else token[:1].upper() + token[1:]
+                    for token in cased_tokens
+                ]
+
+            return " ".join(cased_tokens) if return_str else cased_tokens
+
+        # Subtitle-boundary path. Splitting on captured whitespace keeps every
+        # whitespace run and empty token, so output positions can be checked
+        # against the input one piece at a time.
+        pieces = re.split(r"(\s+)", text)
+        cased_pieces = []
+        sentence_start = True
+        # Sticky flag set by a boundary token. Only an actual word (a piece
+        # containing a cased letter) can consume it; tags, quotes, empty
+        # tokens and punctuation leave it pending.
+        subtitle_start = False
+        for piece in pieces:
+            # Whitespace runs and empty tokens carry no casing and never
+            # consume either flag; they are passed through untouched.
+            if not piece or piece.isspace():
+                cased_pieces.append(piece)
+                continue
+            token = piece
+            # XML/markup tags are transparent: emit as-is and keep every
+            # pending sentence/subtitle start in place.
+            if self.XML_TAG_REGEX.fullmatch(token):
+                cased_pieces.append(token)
+                continue
+            # Quote/bracket openers hold the sentence start open but never
+            # consume a pending subtitle boundary.
+            if token in self.DELAYED_SENT_START:
+                cased_pieces.append(token)
+                continue
+            # A declared boundary (e.g. ':') opens a subtitle. It is emitted
+            # unchanged and its boundary stays pending until a real word.
+            if token in boundaries:
+                cased_pieces.append(token)
+                sentence_start = True
+                subtitle_start = True
+                continue
+            # Sentence-ending punctuation reopens the sentence start, mirroring
+            # the legacy behaviour, without consuming a subtitle boundary.
+            if token in self.SENT_END:
+                cased_pieces.append(token)
+                sentence_start = True
+                continue
+
+            if self.LETTER_REGEX.search(token):
+                # An actual word. The first word after a subtitle boundary is
+                # a sentence start even when it would otherwise be forced
+                # lowercase by ALWAYS_LOWER (e.g. 'of').
+                if subtitle_start:
+                    token = token[:1].upper() + token[1:]
+                elif is_headline and token in self.ALWAYS_LOWER:
+                    # Prepositions/articles/conjunctions stay lowercase in the
+                    # middle of an ordinary headline. Sentence-initial ones were
+                    # already capitalised on the first pass equivalent below.
+                    token = (
+                        token[:1].upper() + token[1:]
+                        if sentence_start
+                        else token
+                    )
+                else:
+                    token = (
+                        token[:1].upper() + token[1:]
+                        if (sentence_start or is_headline)
+                        else token
+                    )
+                # Only an actual word consumes the pending starts.
+                sentence_start = False
+                subtitle_start = False
+            else:
+                # Punctuation and other letter-less tokens do not consume the
+                # pending subtitle boundary; they clear only the plain
+                # sentence start, as the legacy loop does.
+                sentence_start = False
+            cased_pieces.append(token)
+
+        # The legacy path strips surrounding whitespace via str.split() before
+        # rejoining with single spaces; mirror that boundary behaviour while
+        # keeping every internal piece (and hence every checkable position).
+        while cased_pieces and (
+            cased_pieces[0] == "" or cased_pieces[0].isspace()
+        ):
+            cased_pieces.pop(0)
+        while cased_pieces and (
+            cased_pieces[-1] == "" or cased_pieces[-1].isspace()
+        ):
+            cased_pieces.pop()
+        return "".join(cased_pieces) if return_str else cased_pieces
 
 
 __all__ = ["MosesTruecaser", "MosesDetruecaser"]

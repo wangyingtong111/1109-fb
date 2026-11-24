@@ -338,10 +338,25 @@ def truecase_file(
     is_flag=True,
     help="Whether the file are headlines.",
 )
+@click.option(
+    "--subtitle-boundary",
+    "-b",
+    default=False,
+    is_flag=True,
+    help=(
+        "Treat ':' as a subtitle boundary and capitalise the first actual "
+        "word after it, skipping markup, quotes and empty tokens."
+    ),
+)
 @processor
-def detruecase_file(iterator, language, processes, quiet, is_headline):
+def detruecase_file(
+    iterator, language, processes, quiet, is_headline, subtitle_boundary
+):
     moses = MosesDetruecaser()
     moses_detruecase = partial(
-        moses.detruecase, return_str=True, is_headline=is_headline
+        moses.detruecase,
+        return_str=True,
+        is_headline=is_headline,
+        subtitle_boundary=subtitle_boundary,
     )
     return parallel_or_not(iterator, moses_detruecase, processes, quiet)
