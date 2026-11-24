@@ -20,3 +20,7 @@ extract_iter
 extractOne
 ----------
 .. autofunction:: rapidfuzz.process.extractOne
+
+scorer_distance
+---------------
+.. autofunction:: rapidfuzz.process.scorer_distance

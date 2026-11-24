@@ -516,3 +516,20 @@ try:
 
 except ImportError:
     pass
+
+
+@overload
+def scorer_distance(
+    func: _Scorer[_StringType1_contra, _StringType2_contra, _ResultType_contra, _ResultType_co],
+) -> _Scorer[_StringType1_contra, _StringType2_contra, _ResultType_contra, _ResultType_co]: ...
+@overload
+def scorer_distance(
+    func: None = None,
+    *,
+    optimal_score: int | float = 0,
+    worst_score: int | float = 2**63 - 1,
+    flags: int | None = None,
+) -> Callable[
+    [_Scorer[_StringType1_contra, _StringType2_contra, _ResultType_contra, _ResultType_co]],
+    _Scorer[_StringType1_contra, _StringType2_contra, _ResultType_contra, _ResultType_co],
+]: ...

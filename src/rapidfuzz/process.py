@@ -8,7 +8,7 @@ import os
 
 from rapidfuzz._feature_detector import AVX2, SSE2, supports
 
-__all__ = ["cdist", "cpdist", "extract", "extractOne", "extract_iter"]
+__all__ = ["cdist", "cpdist", "extract", "extractOne", "extract_iter", "scorer_distance"]
 
 _impl = os.environ.get("RAPIDFUZZ_IMPLEMENTATION")
 if _impl == "cpp":
@@ -22,6 +22,7 @@ if _impl == "cpp":
                 extract_iter,
                 extractOne,
             )
+            from rapidfuzz.process_py import scorer_distance
 
             _imported = True
 
@@ -34,6 +35,7 @@ if _impl == "cpp":
                 extract_iter,
                 extractOne,
             )
+            from rapidfuzz.process_py import scorer_distance
 
             _imported = True
 
@@ -45,8 +47,9 @@ if _impl == "cpp":
             extract_iter,
             extractOne,
         )
+        from rapidfuzz.process_py import scorer_distance
 elif _impl == "python":
-    from rapidfuzz.process_py import cdist, cpdist, extract, extract_iter, extractOne
+    from rapidfuzz.process_py import cdist, cpdist, extract, extract_iter, extractOne, scorer_distance
 else:
     _imported = False
     if supports(AVX2):
@@ -58,6 +61,7 @@ else:
                 extract_iter,
                 extractOne,
             )
+            from rapidfuzz.process_py import scorer_distance
 
             _imported = True
 
@@ -70,6 +74,7 @@ else:
                 extract_iter,
                 extractOne,
             )
+            from rapidfuzz.process_py import scorer_distance
 
             _imported = True
 
@@ -82,6 +87,7 @@ else:
                 extract_iter,
                 extractOne,
             )
+            from rapidfuzz.process_py import scorer_distance
 
             _imported = True
 
@@ -92,4 +98,5 @@ else:
             extract,
             extract_iter,
             extractOne,
+            scorer_distance,
         )

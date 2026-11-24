@@ -29,40 +29,46 @@ if _impl == "cpp":
     if supports(AVX2):
         with contextlib.suppress(ImportError):
             from {module}_cpp_avx2 import {includes} # pyright: ignore[reportMissingImports]
+            {extra_imports_cpp}
             _imported = True
 
     if not _imported and supports(SSE2):
         with contextlib.suppress(ImportError):
             from {module}_cpp_sse2 import {includes} # pyright: ignore[reportMissingImports]
+            {extra_imports_cpp}
             _imported = True
 
     if not _imported:
         from {module}_cpp import {includes} # pyright: ignore[reportMissingImports]
+        {extra_imports_cpp}
 elif _impl == "python":
-    from {module}_py import {includes}
+    from {module}_py import {includes_py}
 else:
     _imported = False
     if supports(AVX2):
         with contextlib.suppress(ImportError):
             from {module}_cpp_avx2 import {includes} # pyright: ignore[reportMissingImports]
+            {extra_imports_cpp}
             _imported = True
 
     if not _imported and supports(SSE2):
         with contextlib.suppress(ImportError):
             from {module}_cpp_sse2 import {includes} # pyright: ignore[reportMissingImports]
+            {extra_imports_cpp}
             _imported = True
 
     if not _imported:
         with contextlib.suppress(ImportError):
             from {module}_cpp import {includes} # pyright: ignore[reportMissingImports]
+            {extra_imports_cpp}
             _imported = True
 
     if not _imported:
-        from {module}_py import {includes}
+        from {module}_py import {includes_py}
 """
 
 
-def generate(module, importModule, includes):
+def generate(module, importModule, includes, extra_includes=None):
     segments = module.split(".")
     segments[-1] = segments[-1] + ".py"
     path = Path(__file__).parent.parent / "src"
@@ -70,14 +76,27 @@ def generate(module, importModule, includes):
         path = path.joinpath(segment)
 
     print(f"generating {path}")
+    extra_includes = extra_includes or []
     if isinstance(includes, list):
         includesStr = ", ".join(includes)
-        exportStr = ", ".join(f'"{x}"' for x in sorted(includes))
+        exportStr = ", ".join(f'"{x}"' for x in sorted(includes + extra_includes))
     else:
         includesStr = ", ".join(f"{k} as {v}" for k, v in includes.items())
-        exportStr = ", ".join(f'"{x}"' for x in sorted(includes.values()))
+        exportStr = ", ".join(f'"{x}"' for x in sorted(list(includes.values()) + extra_includes))
 
-    formatted = format.format(module=importModule, includes=includesStr, exports=exportStr)
+    py_includes = list(includes) if isinstance(includes, list) else list(includes.values())
+    includes_py = ", ".join(py_includes + extra_includes)
+    extra_imports_cpp = (
+        f"from {importModule}_py import ({', '.join(extra_includes)})" if extra_includes else ""
+    )
+
+    formatted = format.format(
+        module=importModule,
+        includes=includesStr,
+        includes_py=includes_py,
+        extra_imports_cpp=extra_imports_cpp,
+        exports=exportStr,
+    )
 
     config = isort.settings.Config(combine_as_imports=True)
     formatted = isort.code(formatted, config=config)
@@ -119,6 +138,7 @@ generate(
         "cdist",
         "cpdist",
     ],
+    extra_includes=["scorer_distance"],
 )
 
 generate(

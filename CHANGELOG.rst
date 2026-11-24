@@ -2,6 +2,15 @@ Changelog
 ---------
 [Unreleased]
 ^^^^^^^^^^^^
+Added
+~~~~~
+* added ``rapidfuzz.process.scorer_distance``, a public entry point to declare a custom
+  scorer as an edit distance. Declared scorers are handled with the distance contract
+  (smaller scores are better, the ``worst_score`` is used as the initial ``score_cutoff``
+  and ``extractOne`` terminates as soon as the declared ``optimal_score`` is reached) by
+  ``extractOne``, ``extract`` and ``extract_iter``. Undeclared custom scorers keep the
+  legacy similarity contract.
+
 Fixed
 ~~~~~
 * keep the ``score_cutoff`` of normalized scorers in double precision: a score equal to the

@@ -19,9 +19,10 @@ from rapidfuzz.process_cpp_impl import (
     extract,
     extract_iter,
     extractOne,
+    scorer_distance,
 )
 
-__all__ = ["cdist", "cpdist", "extract", "extractOne", "extract_iter"]
+__all__ = ["cdist", "cpdist", "extract", "extractOne", "extract_iter", "scorer_distance"]
 
 
 def _dtype_to_type_num(dtype):

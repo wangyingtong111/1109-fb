@@ -3,6 +3,7 @@
 from rapidfuzz.fuzz import WRatio, ratio
 
 from . import process_py
+from rapidfuzz._utils import scorer_distance
 
 cimport cython
 from cpp_common cimport (

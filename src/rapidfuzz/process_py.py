@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import heapq
 
-from rapidfuzz._utils import ScorerFlag, is_none, setupPandas
+from rapidfuzz._utils import ScorerFlag, is_none, scorer_distance, setupPandas
 from rapidfuzz.fuzz import WRatio, ratio
 
-__all__ = ["cdist", "extract", "extractOne", "extract_iter"]
+__all__ = ["cdist", "extract", "extractOne", "extract_iter", "scorer_distance"]
 
 
 def _get_scorer_flags_py(scorer, scorer_kwargs):
