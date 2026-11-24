@@ -251,6 +251,112 @@ def test_study_optimize_with_failed_trials() -> None:
         assert a in all_suggested_values
 
 
+def test_failed_trial_is_retried_until_complete() -> None:
+    # x=0 fails on the first attempt and completes on the second, while x=1 succeeds once.
+    # With one extra attempt per leaf, the study runs three trials in total and the completed
+    # leaf (x=1) must not be sampled again.
+    n_calls = {"x=0": 0, "x=1": 0}
+
+    def objective(trial: Trial) -> float:
+        x = trial.suggest_int("x", 0, 1)
+        n_calls[f"x={x}"] += 1
+        if x == 0 and n_calls["x=0"] == 1:
+            raise RuntimeError("First attempt of x=0 fails.")
+        return float(x)
+
+    study = optuna.create_study(
+        sampler=samplers.BruteForceSampler(seed=0, failed_trials_retry_count=1)
+    )
+    study.optimize(objective, catch=(RuntimeError,))
+
+    assert n_calls == {"x=0": 2, "x=1": 1}
+    assert len(study.trials) == 3
+    x0_trials = [t for t in study.trials if t.params == {"x": 0}]
+    assert [t.state for t in x0_trials] == [
+        optuna.trial.TrialState.FAIL,
+        optuna.trial.TrialState.COMPLETE,
+    ]
+    x1_trials = [t for t in study.trials if t.params == {"x": 1}]
+    assert len(x1_trials) == 1
+    assert x1_trials[0].state == optuna.trial.TrialState.COMPLETE
+
+
+def test_failed_trial_retry_budget_exhausted() -> None:
+    # Every leaf keeps failing. Each leaf must be tried at most failed_trials_retry_count + 1
+    # times, after which the study stops normally without exceeding the budget.
+    def objective(trial: Trial) -> float:
+        trial.suggest_int("x", 0, 1)
+        raise RuntimeError("Always fails.")
+
+    study = optuna.create_study(
+        sampler=samplers.BruteForceSampler(seed=0, failed_trials_retry_count=2)
+    )
+    study.optimize(objective, catch=(RuntimeError,))
+
+    counts = [0, 0]
+    for t in study.trials:
+        counts[t.params["x"]] += 1
+    assert counts == [3, 3]  # One original attempt plus two retries per leaf.
+    assert all(t.state == optuna.trial.TrialState.FAIL for t in study.trials)
+
+
+def test_failed_trial_retry_follows_conditional_path() -> None:
+    # The retry must follow the same define-by-run branch, including parameters that only show
+    # up conditionally.
+    n_calls: dict[tuple[int, int], int] = {}
+
+    def objective(trial: Trial) -> float:
+        x = trial.suggest_categorical("x", [0, 1])
+        if x == 0:
+            y = trial.suggest_int("y", 0, 1)
+            key = (x, y)
+            if key == (0, 0) and n_calls.get(key, 0) == 0:
+                n_calls[key] = 1
+                raise RuntimeError("Conditional failure.")
+            n_calls[key] = n_calls.get(key, 0) + 1
+            return float(y)
+        return -1.0
+
+    study = optuna.create_study(
+        sampler=samplers.BruteForceSampler(seed=0, failed_trials_retry_count=1)
+    )
+    study.optimize(objective, catch=(RuntimeError,))
+
+    # Three unique leaves plus one retry for the failed (x=0, y=0) leaf.
+    assert len(study.trials) == 4
+    retried = [t for t in study.trials if t.params == {"x": 0, "y": 0}]
+    assert [t.state for t in retried] == [
+        optuna.trial.TrialState.FAIL,
+        optuna.trial.TrialState.COMPLETE,
+    ]
+    assert all(set(t.params) == {"x", "y"} for t in retried)
+
+
+def test_parallel_workers_do_not_share_retry_leaf() -> None:
+    study = optuna.create_study(
+        sampler=samplers.BruteForceSampler(seed=0, failed_trials_retry_count=1)
+    )
+    failed_trial = study.ask()
+    failed_x = failed_trial.suggest_int("x", 0, 1)
+    study.tell(failed_trial, state=optuna.trial.TrialState.FAIL)
+
+    # The failed leaf is retryable, but two simultaneously running workers must not both take it.
+    running_trials = [study.ask(), study.ask()]
+    picked = [t.suggest_int("x", 0, 1) for t in running_trials]
+    assert picked[0] != picked[1]
+    assert failed_x in picked
+
+    with patch.object(study, "stop", return_value=None):
+        study.tell(running_trials[0], float(picked[0]))
+        study.tell(running_trials[1], float(picked[1]))
+    assert len(study.trials) == 3
+
+
+def test_invalid_failed_trials_retry_count() -> None:
+    with pytest.raises(ValueError):
+        samplers.BruteForceSampler(failed_trials_retry_count=-1)
+
+
 def test_parallel_optimize() -> None:
     study = optuna.create_study(sampler=samplers.BruteForceSampler())
     trial1 = study.ask()

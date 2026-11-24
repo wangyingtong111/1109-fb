@@ -118,6 +118,9 @@ class _TreeNode:
     children: dict[float, _TreeNode | _UnexpandedTreeNode] | None = None
     is_running: bool = False
     choices_args: ChoicesArgsType | None = None
+    # Number of FAIL trials that reached this node as their last node. It is used to determine
+    # whether the leaf can be retried within `failed_trials_retry_count`.
+    n_failed: int = 0
 
     def _validate_search_space_consistency(
         self, param_name: str | None, choices_args: ChoicesArgsType | None
@@ -267,11 +270,30 @@ class BruteForceSampler(BaseSampler):
             When this option is not enabled (default), the sampler applies a looser criterion for
             determining when to stop the search, which may result in incomplete coverage of the
             search space. For more information, see https://github.com/optuna/optuna/issues/5780.
+        failed_trials_retry_count:
+            The maximum number of additional attempts for each combination of parameter values
+            (i.e., each leaf of the search tree) when its trial finishes with
+            :class:`~optuna.trial.TrialState.FAIL`. Only leaves without any score are retried,
+            while completed (including pruned) leaves are never sampled again. The retries follow
+            the same conditional paths in the define-by-run search space. When the budget is
+            exhausted, the leaf is regarded as covered and the study stops as usual. Defaults to
+            :obj:`0`, which means failed leaves are not retried.
     """
 
-    def __init__(self, seed: int | None = None, avoid_premature_stop: bool = False) -> None:
+    def __init__(
+        self,
+        seed: int | None = None,
+        avoid_premature_stop: bool = False,
+        failed_trials_retry_count: int = 0,
+    ) -> None:
+        if failed_trials_retry_count < 0:
+            raise ValueError(
+                "failed_trials_retry_count must be a non-negative integer, but got "
+                f"{failed_trials_retry_count}."
+            )
         self._rng = LazyRandomState(seed)
         self._avoid_premature_stop = avoid_premature_stop
+        self._failed_trials_retry_count = failed_trials_retry_count
 
     def infer_relative_search_space(
         self, study: Study, trial: FrozenTrial
@@ -284,7 +306,12 @@ class BruteForceSampler(BaseSampler):
         return {}
 
     @staticmethod
-    def _populate_tree(tree: _TreeNode, trials: list[FrozenTrial], params: dict[str, Any]) -> None:
+    def _populate_tree(
+        tree: _TreeNode,
+        trials: list[FrozenTrial],
+        params: dict[str, Any],
+        failed_trials_retry_count: int = 0,
+    ) -> None:
         # Populate tree under given params from the given trials.
         cat_internal_repr_cache: dict[str, dict[CategoricalChoiceType, float]] = {}
         params_items = params.items()
@@ -322,10 +349,32 @@ class BruteForceSampler(BaseSampler):
                     continue
             if (leaf := tree.add_path(_get_trial_path(trial))) is not None:
                 # The parameters are on the defined grid.
-                if trial.state.is_finished():
+                if trial.state == TrialState.FAIL:
+                    # Count failures per leaf. The leaf is left expandable later as long as the
+                    # retry budget remains, so the same params can be sampled again.
+                    leaf.n_failed += 1
+                elif trial.state.is_finished():
                     leaf.set_leaf()
                 else:
                     leaf.set_running()
+        BruteForceSampler._finalize_retryable_failed_leaves(tree, failed_trials_retry_count)
+
+    @staticmethod
+    def _finalize_retryable_failed_leaves(
+        node: _TreeNode | _UnexpandedTreeNode, failed_trials_retry_count: int
+    ) -> None:
+        # A leaf whose trials only failed is kept expandable while the retry budget remains.
+        # Once the number of failures exceeds the budget, mark it as a terminal leaf so that the
+        # search space is considered exhausted and the study can stop.
+        if node is _UNEXPANDED_NODE:
+            return
+        node = cast(_TreeNode, node)
+        if node.children is None:
+            if node.n_failed > failed_trials_retry_count and not node.is_running:
+                node.set_leaf()
+            return
+        for child in node.children.values():
+            BruteForceSampler._finalize_retryable_failed_leaves(child, failed_trials_retry_count)
 
     def sample_independent(
         self,
@@ -348,7 +397,9 @@ class BruteForceSampler(BaseSampler):
         # Populating must happen after the initialization above to prevent `tree` from
         # being initialized as an empty graph, which is created with n_jobs > 1
         # where we get trials[i].params = {} for some i.
-        self._populate_tree(tree, trials, trial.params)
+        self._populate_tree(
+            tree, trials, trial.params, self._failed_trials_retry_count
+        )
         if tree.is_any_expandable(exclude_running):
             param_val = tree.sample_child(self._rng.rng, exclude_running)
         else:
@@ -382,7 +433,7 @@ class BruteForceSampler(BaseSampler):
         for param_name in reversed(trial.params.keys()):
             params.pop(param_name)
             tree = _TreeNode()
-            self._populate_tree(tree, trials, params)
+            self._populate_tree(tree, trials, params, self._failed_trials_retry_count)
             if tree.is_any_expandable(exclude_running):
                 return
         study.stop()
