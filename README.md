@@ -81,6 +81,39 @@ True
 'THIS EBOOK IS OTHERWISE PROVIDED TO YOU "AS-IS."'
 ```
 
+## Subword Tokenizer (BPE)
+
+`SubwordTokenizer` learns merge rules from a training vocabulary and can save
+those rules so unseen words are encoded deterministically later:
+
+```python
+>>> from sacremoses import SubwordTokenizer
+>>> bpe = SubwordTokenizer('vocab.txt')
+>>> bpe.learn(1000)                  # records merges in learning order
+>>> bpe.save_merge_rules('rules.bpe')
+>>> same = SubwordTokenizer.load_merge_rules('rules.bpe')
+>>> same.encode('abc')               # earlier a+b wins over later b+c
+['ab', 'c']
+```
+
+Encoding always merges the currently adjacent pair with the earliest learned
+rank. Rules carrying the internal end-of-word marker (written as the private
+`U+E000` sentinel, or as `</w>` when loading subword-nmt code files) only
+match the word-final symbol, so they never fire inside a word. Characters
+unknown to training are returned as their own pieces and are never dropped.
+
+Pass a vocabulary (set/list/dict of pieces, or a vocab file) to expand only
+merged pieces the vocabulary rejects:
+
+```python
+>>> same.encode('abc', vocab={'a', 'b', 'c'})
+['a', 'b', 'c']
+```
+
+`save_rules`/`save_codes`/`save_model` and the matching `load_*` names are
+provided as aliases; a plain `left right` rule file is also accepted directly
+by the constructor (`SubwordTokenizer('rules.bpe')`).
+
 # Usage (CLI)
 
 Since version `0.0.42`, the pipeline feature for CLI is introduced, thus there
