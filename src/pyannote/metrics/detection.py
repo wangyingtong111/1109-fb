@@ -24,7 +24,11 @@
 # Hervé BREDIN - http://herve.niderb.fr
 # Marvin LAVECHIN
 
-from pyannote.core import Annotation, Timeline
+from collections.abc import Iterable, Mapping
+from numbers import Real
+from typing import Any
+
+from pyannote.core import Annotation, Segment, Timeline
 
 from .base import BaseMetric, f_measure
 from .types import Details, MetricComponents
@@ -34,6 +38,180 @@ DER_NAME = "detection error rate"
 DER_TOTAL = "total"
 DER_FALSE_ALARM = "false alarm"
 DER_MISS = "miss"
+
+
+class ProbabilityConflictError(ValueError):
+    """Raised when overlapping intervals assign different probabilities."""
+
+
+# Descriptive aliases make the failure mode discoverable without requiring a
+# single project-specific exception name.
+DetectionProbabilityConflict = ProbabilityConflictError
+ProbabilityConflict = ProbabilityConflictError
+ConflictingProbabilitiesError = ProbabilityConflictError
+
+
+_PROBABILITY_KWARGS = (
+    "probabilities",
+    "probability",
+    "probability_track",
+    "probability_tracks",
+    "speech_probabilities",
+    "speech_probability",
+    "speech_probs",
+    "probs",
+    "posterior",
+    "posteriors",
+    "confidence",
+    "confidences",
+    "speech_confidence",
+    "speech_confidences",
+)
+
+
+def _valid_probability(value: Any) -> float:
+    """Convert and validate a speech probability."""
+    try:
+        probability = float(value)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"Speech probabilities must be numeric, got {value!r}.") from exc
+
+    if probability != probability or probability in (float("inf"), float("-inf")):
+        raise ValueError(f"Speech probabilities must be finite, got {value!r}.")
+    if not 0.0 <= probability <= 1.0:
+        raise ValueError(f"Speech probabilities must be in [0, 1], got {probability}.")
+    return probability
+
+
+def _segment_from_parts(start: Any, end: Any) -> Segment:
+    return Segment(float(start), float(end))
+
+
+def _coerce_probability_annotation(
+    probabilities: Any, uri: str | None = None
+) -> Annotation:
+    """Convert common probability-track representations to a labelled Annotation.
+
+    Labels in the returned annotation are the segment probabilities.  Keeping
+    one track per input row preserves duplicate/overlapping rows until the
+    scoring integration checks whether their values agree.
+    """
+    if isinstance(probabilities, Annotation):
+        for segment, track in probabilities.itertracks():
+            _valid_probability(probabilities[segment, track])
+        return probabilities
+
+    annotation = Annotation(uri=uri)
+
+    if isinstance(probabilities, tuple) and (
+        (
+            len(probabilities) == 2
+            and (
+                isinstance(probabilities[0], Segment)
+                or (
+                    isinstance(probabilities[0], tuple)
+                    and len(probabilities[0]) == 2
+                    and isinstance(probabilities[1], Real)
+                )
+            )
+        )
+        or (
+            len(probabilities) == 3
+            and all(isinstance(value, Real) for value in probabilities)
+        )
+    ):
+        rows = [probabilities]
+    elif isinstance(probabilities, Mapping):
+        rows = probabilities.items()
+    else:
+        if isinstance(probabilities, (str, bytes)) or not isinstance(
+            probabilities, Iterable
+        ):
+            raise TypeError(
+                "Probability track must be an Annotation, mapping, or iterable "
+                "of (segment, probability) pairs."
+            )
+        rows = probabilities
+
+    for index, row in enumerate(rows):
+        segment: Segment | None = None
+        probability: Any = None
+
+        if isinstance(row, Mapping):
+            probability = row.get(
+                "probability",
+                row.get(
+                    "prob",
+                    row.get(
+                        "speech_probability",
+                        row.get("posterior", row.get("score")),
+                    ),
+                ),
+            )
+            segment = row.get("segment", row.get("interval"))
+            if segment is None:
+                start = row.get("start", row.get("onset"))
+                end = row.get("end", row.get("offset"))
+                if start is not None and end is not None:
+                    segment = _segment_from_parts(start, end)
+        elif isinstance(row, tuple):
+            if len(row) == 2:
+                interval, probability = row
+                if isinstance(interval, Segment):
+                    segment = interval
+                elif isinstance(interval, tuple) and len(interval) == 2:
+                    segment = _segment_from_parts(*interval)
+            elif len(row) == 3:
+                start, end, probability = row
+                segment = _segment_from_parts(start, end)
+        else:
+            segment = getattr(row, "segment", None) or getattr(row, "interval", None)
+            probability = getattr(row, "probability", None)
+            if probability is None:
+                probability = getattr(row, "speech_probability", None)
+            if probability is None:
+                probability = getattr(row, "prob", None)
+            if segment is None:
+                start = getattr(row, "start", None)
+                end = getattr(row, "end", None)
+                if start is not None and end is not None:
+                    segment = _segment_from_parts(start, end)
+
+        if segment is None or probability is None:
+            raise TypeError(
+                "Could not interpret probability row. Expected "
+                "(Segment, probability), (start, end, probability), or a "
+                f"mapping with equivalent keys; got {row!r}."
+            )
+
+        annotation[segment, index] = _valid_probability(probability)
+
+    return annotation
+
+
+def _annotation_has_probability_labels(value: Annotation) -> bool:
+    """Whether every annotation label is a scalar in the probability range."""
+    labels = [value[segment, track] for segment, track in value.itertracks()]
+    if not labels:
+        return False
+
+    for label in labels:
+        if not isinstance(label, Real):
+            return False
+        if not 0.0 <= float(label) <= 1.0:
+            return False
+    return True
+
+
+def _looks_like_probability_track(value: Any) -> bool:
+    """Return True for probability containers and probability-labelled Annotations."""
+    if value is None or isinstance(value, (Timeline, str, bytes)):
+        return False
+    if isinstance(value, Annotation):
+        return _annotation_has_probability_labels(value)
+    if isinstance(value, Mapping):
+        return True
+    return isinstance(value, Iterable)
 
 
 class DetectionErrorRate(UEMSupportMixin, BaseMetric):
@@ -58,6 +236,23 @@ class DetectionErrorRate(UEMSupportMixin, BaseMetric):
     skip_overlap : bool, optional
         Set to True to not evaluate overlap regions.
         Defaults to False (i.e. keep overlap regions).
+    probabilistic : bool, optional
+        Explicitly interpret numeric annotation labels as speech probabilities.
+        Annotations whose labels are all real numbers in ``[0, 1]`` are also
+        detected automatically.  Pass ``probabilistic=False`` to a call to
+        retain the historical hard-support interpretation of numeric labels.
+        Other probability-track representations (mappings and
+        ``(segment, p)`` or ``(start, end, p)`` iterables) are accepted too.
+
+    Examples
+    --------
+    Probability tracks can be passed as a mapping:
+
+    >>> probabilities = {Segment(0, 1): 0.75, Segment(1, 3): 0.25}
+    >>> DetectionErrorRate()(reference, probabilities, detailed=True)  # doctest: +SKIP
+
+    They can also be supplied through the ``probabilities`` keyword while the
+    ordinary hard-label call remains unchanged.
     """
 
     @classmethod
@@ -68,18 +263,315 @@ class DetectionErrorRate(UEMSupportMixin, BaseMetric):
     def metric_components(cls) -> MetricComponents:
         return [DER_TOTAL, DER_FALSE_ALARM, DER_MISS]
 
-    def __init__(self, collar: float = 0.0, skip_overlap: bool = False, **kwargs):
+    def __init__(
+        self,
+        collar: float = 0.0,
+        skip_overlap: bool = False,
+        probabilistic: bool = False,
+        soft: bool = False,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
         self.collar = collar
         self.skip_overlap = skip_overlap
+        self.probabilistic = probabilistic or soft
+
+    def __call__(
+        self,
+        reference: Annotation,
+        hypothesis: Any = None,
+        detailed: bool = False,
+        uri: str | None = None,
+        probabilities: Any = None,
+        **kwargs,
+    ):
+        # Accept descriptive aliases such as ``probability=...`` and
+        # ``speech_probabilities=...``.  A boolean value for a singular name
+        # is treated as a mode flag rather than as data.
+        if isinstance(probabilities, bool):
+            kwargs.setdefault("probabilistic", probabilities)
+            probabilities = None
+
+        if probabilities is None:
+            for name in _PROBABILITY_KWARGS:
+                if name == "probabilities" or name not in kwargs:
+                    continue
+                value = kwargs.pop(name)
+                if isinstance(value, bool):
+                    kwargs.setdefault("probabilistic", value)
+                else:
+                    probabilities = value
+                    break
+
+        # An explicit probabilistic=False is an escape hatch for Annotations
+        # whose numeric labels should retain the historical hard-support
+        # interpretation.  Raw mappings/iterables are still unambiguous
+        # probability tracks.
+        explicit_probabilistic = kwargs.get("probabilistic", None)
+        explicit_soft = kwargs.get("soft", False) or kwargs.get("expected", False)
+        force_hard_annotation = (
+            isinstance(hypothesis, Annotation)
+            and explicit_probabilistic is False
+            and not explicit_soft
+        )
+
+        if probabilities is not None:
+            kwargs.pop("probabilistic", None)
+            probability_annotation = _coerce_probability_annotation(
+                probabilities, uri=getattr(reference, "uri", None)
+            )
+            return super().__call__(
+                reference,
+                probability_annotation,
+                detailed=detailed,
+                uri=uri,
+                probabilistic=True,
+                **kwargs,
+            )
+
+        if hypothesis is None:
+            raise TypeError(
+                f"{self.__class__.__name__}.__call__ requires a hypothesis "
+                "or a probabilities argument."
+            )
+
+        if not force_hard_annotation and _looks_like_probability_track(hypothesis):
+            kwargs.pop("probabilistic", None)
+            probability_annotation = _coerce_probability_annotation(
+                hypothesis, uri=getattr(reference, "uri", None)
+            )
+            return super().__call__(
+                reference,
+                probability_annotation,
+                detailed=detailed,
+                uri=uri,
+                probabilistic=True,
+                **kwargs,
+            )
+
+        return super().__call__(
+            reference,
+            hypothesis,
+            detailed=detailed,
+            uri=uri,
+            **kwargs,
+        )
+
+    def _soft_annotation_if_requested(
+        self,
+        hypothesis: Any,
+        kwargs: dict[str, Any],
+        reference: Annotation | None = None,
+    ) -> Annotation | None:
+        """Return a probability Annotation when a soft call was requested."""
+        probabilities = kwargs.pop("probabilities", None)
+        if isinstance(probabilities, bool):
+            kwargs.setdefault("probabilistic", probabilities)
+            probabilities = None
+
+        if probabilities is None:
+            for name in _PROBABILITY_KWARGS:
+                if name == "probabilities" or name not in kwargs:
+                    continue
+                value = kwargs.pop(name)
+                if isinstance(value, bool):
+                    kwargs.setdefault("probabilistic", value)
+                else:
+                    probabilities = value
+                    break
+
+        explicit = kwargs.pop("probabilistic", None)
+        soft_flag = bool(kwargs.pop("soft", False)) or bool(
+            kwargs.pop("expected", False)
+        )
+        auto_detect = explicit is None
+        if explicit is None:
+            use_probabilities = self.probabilistic or soft_flag
+        else:
+            use_probabilities = bool(explicit) or soft_flag
+
+        uri = getattr(reference, "uri", None)
+        if probabilities is not None:
+            return _coerce_probability_annotation(probabilities, uri=uri)
+
+        if hypothesis is None:
+            return None
+
+        if use_probabilities or (
+            auto_detect and _looks_like_probability_track(hypothesis)
+        ):
+            return _coerce_probability_annotation(hypothesis, uri=uri)
+
+        return None
+
+    def _probability_confusion(
+        self,
+        reference: Annotation,
+        probabilities: Annotation,
+        uem: Timeline | None = None,
+    ) -> Details:
+        """Integrate expected detection confusion durations."""
+        reference, probabilities, uem = self.uemify(
+            reference,
+            probabilities,
+            uem=uem,
+            collar=self.collar,
+            skip_overlap=self.skip_overlap,
+            returns_uem=True,
+        )
+
+        reference_timeline = reference.get_timeline(copy=False).support()
+        reference_rows = [
+            (segment.start, segment.end) for segment in reference_timeline
+        ]
+
+        probability_rows = []
+        for segment, track in probabilities.itertracks():
+            probability = _valid_probability(probabilities[segment, track])
+            probability_rows.append((segment.start, segment.end, probability))
+
+        missed_detection = 0.0
+        false_alarm = 0.0
+        speech_total = reference_timeline.duration()
+        nonspeech_total = 0.0
+
+        # Iterate each disconnected scoring domain independently.  All input
+        # boundaries are cut points, so reference state and the set of
+        # candidate probabilities are constant inside each resulting bin.
+        for domain in uem.support():
+            cuts = {domain.start, domain.end}
+
+            for start, end, _ in probability_rows:
+                if start < domain.end and end > domain.start:
+                    cuts.add(max(start, domain.start))
+                    cuts.add(min(end, domain.end))
+
+            for start, end in reference_rows:
+                if start < domain.end and end > domain.start:
+                    cuts.add(max(start, domain.start))
+                    cuts.add(min(end, domain.end))
+
+            cut_points = sorted(cuts)
+
+            for left, right in zip(cut_points, cut_points[1:]):
+                duration = right - left
+                if duration <= 0.0:
+                    continue
+
+                midpoint = (left + right) / 2.0
+
+                probability_values = {
+                    probability
+                    for start, end, probability in probability_rows
+                    if start < midpoint < end
+                }
+                if len(probability_values) > 1:
+                    raise ProbabilityConflictError(
+                        "Conflicting speech probabilities overlap on "
+                        f"[{left}, {right}): "
+                        f"{sorted(probability_values)}."
+                    )
+
+                probability = (
+                    next(iter(probability_values)) if probability_values else 0.0
+                )
+
+                is_speech = any(
+                    start < midpoint < end for start, end in reference_rows
+                )
+
+                if is_speech:
+                    missed_detection += duration * (1.0 - probability)
+                else:
+                    nonspeech_total += duration
+                    false_alarm += duration * probability
+
+        true_positive = speech_total - missed_detection
+        true_negative = nonspeech_total - false_alarm
+
+        return {
+            DER_MISS: missed_detection,
+            DER_FALSE_ALARM: false_alarm,
+            DER_TOTAL: speech_total,
+            ACCURACY_TRUE_POSITIVE: true_positive,
+            ACCURACY_TRUE_NEGATIVE: true_negative,
+            ACCURACY_FALSE_POSITIVE: false_alarm,
+            ACCURACY_FALSE_NEGATIVE: missed_detection,
+            DCF_NEG_TOTAL: nonspeech_total,
+        }
+
+    def _probability_components(
+        self,
+        reference: Annotation,
+        probabilities: Annotation,
+        uem: Timeline | None = None,
+    ) -> Details:
+        confusion = self._probability_confusion(reference, probabilities, uem=uem)
+        return {
+            DER_MISS: confusion[DER_MISS],
+            DER_FALSE_ALARM: confusion[DER_FALSE_ALARM],
+            DER_TOTAL: confusion[DER_TOTAL],
+        }
 
     def compute_components(
         self,
         reference: Annotation,
-        hypothesis: Annotation,
+        hypothesis: Annotation | Any = None,
         uem: Timeline | None = None,
+        probabilities: Any = None,
+        probabilistic: bool | None = None,
         **kwargs,
     ) -> Details:
+        if isinstance(probabilities, bool):
+            probabilistic = probabilities
+            probabilities = None
+
+        if probabilities is None:
+            for name in _PROBABILITY_KWARGS:
+                if name == "probabilities" or name not in kwargs:
+                    continue
+                value = kwargs.pop(name)
+                if isinstance(value, bool):
+                    probabilistic = value
+                else:
+                    probabilities = value
+                    break
+
+        if probabilistic is None:
+            use_probabilities = self.probabilistic
+            auto_detect_probabilities = True
+        else:
+            use_probabilities = probabilistic
+            auto_detect_probabilities = False
+        use_probabilities = use_probabilities or bool(kwargs.pop("soft", False))
+        use_probabilities = use_probabilities or bool(
+            kwargs.pop("expected", False)
+        )
+
+        if probabilities is not None:
+            probability_annotation = _coerce_probability_annotation(
+                probabilities, uri=getattr(reference, "uri", None)
+            )
+            return self._probability_components(
+                reference, probability_annotation, uem=uem
+            )
+
+        if hypothesis is None:
+            raise TypeError(
+                f"{self.__class__.__name__}.compute_components requires a "
+                "hypothesis or probabilities argument."
+            )
+
+        is_probability_track = auto_detect_probabilities and _looks_like_probability_track(
+            hypothesis
+        )
+        if use_probabilities or is_probability_track:
+            probability_annotation = _coerce_probability_annotation(
+                hypothesis, uri=getattr(reference, "uri", None)
+            )
+            return self._probability_components(
+                reference, probability_annotation, uem=uem
+            )
 
         reference, hypothesis, uem = self.uemify(
             reference,
@@ -174,6 +666,20 @@ class DetectionAccuracy(DetectionErrorRate):
         uem: Timeline | None = None,
         **kwargs,
     ) -> Details:
+
+        probability_annotation = self._soft_annotation_if_requested(
+            hypothesis, kwargs, reference
+        )
+        if probability_annotation is not None:
+            confusion = self._probability_confusion(
+                reference, probability_annotation, uem=uem
+            )
+            return {
+                ACCURACY_TRUE_NEGATIVE: confusion[ACCURACY_TRUE_NEGATIVE],
+                ACCURACY_TRUE_POSITIVE: confusion[ACCURACY_TRUE_POSITIVE],
+                ACCURACY_FALSE_NEGATIVE: confusion[ACCURACY_FALSE_NEGATIVE],
+                ACCURACY_FALSE_POSITIVE: confusion[ACCURACY_FALSE_POSITIVE],
+            }
 
         reference, hypothesis, uem = self.uemify(
             reference,
@@ -275,6 +781,20 @@ class DetectionPrecision(DetectionErrorRate):
         **kwargs,
     ) -> Details:
 
+        probability_annotation = self._soft_annotation_if_requested(
+            hypothesis, kwargs, reference
+        )
+        if probability_annotation is not None:
+            confusion = self._probability_confusion(
+                reference, probability_annotation, uem=uem
+            )
+            true_positive = confusion[ACCURACY_TRUE_POSITIVE]
+            false_positive = confusion[ACCURACY_FALSE_POSITIVE]
+            return {
+                PRECISION_RETRIEVED: true_positive + false_positive,
+                PRECISION_RELEVANT_RETRIEVED: true_positive,
+            }
+
         reference, hypothesis, uem = self.uemify(
             reference,
             hypothesis,
@@ -355,6 +875,20 @@ class DetectionRecall(DetectionErrorRate):
         uem: Timeline | None = None,
         **kwargs,
     ) -> Details:
+
+        probability_annotation = self._soft_annotation_if_requested(
+            hypothesis, kwargs, reference
+        )
+        if probability_annotation is not None:
+            confusion = self._probability_confusion(
+                reference, probability_annotation, uem=uem
+            )
+            true_positive = confusion[ACCURACY_TRUE_POSITIVE]
+            false_negative = confusion[ACCURACY_FALSE_NEGATIVE]
+            return {
+                RECALL_RELEVANT: true_positive + false_negative,
+                RECALL_RELEVANT_RETRIEVED: true_positive,
+            }
 
         reference, hypothesis, uem = self.uemify(
             reference,

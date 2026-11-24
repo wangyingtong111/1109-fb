@@ -35,6 +35,7 @@ from pyannote.metrics.detection import (
     DetectionPrecision,
     DetectionPrecisionRecallFMeasure,
     DetectionRecall,
+    ProbabilityConflictError,
 )
 
 # Time        0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20
@@ -140,3 +141,231 @@ def test_decision_cost_function(reference, hypothesis, uem):
     dcf = DetectionCostFunction(fa_weight=0.25, miss_weight=0.75)
     actual = dcf(reference, hypothesis, uem=uem)
     npt.assert_almost_equal(actual, expected, decimal=7)
+
+
+def test_probabilistic_detection_error_components():
+    reference = Annotation()
+    reference[Segment(0, 2)] = "speech"
+
+    probabilities = [
+        (Segment(0, 1), 0.75),
+        (Segment(1, 3), 0.25),
+    ]
+
+    details = DetectionErrorRate()(
+        reference,
+        probabilities,
+        uem=Timeline([Segment(0, 3)]),
+        detailed=True,
+    )
+
+    npt.assert_almost_equal(details["miss"], 1.0)
+    npt.assert_almost_equal(details["false alarm"], 0.25)
+    npt.assert_almost_equal(details["total"], 2.0)
+    npt.assert_almost_equal(details["detection error rate"], 1.25 / 2.0)
+
+
+def test_probabilistic_detection_accepts_mapping_and_annotation_labels():
+    reference = Annotation()
+    reference[Segment(0, 2)] = "speech"
+    uem = Timeline([Segment(0, 3)])
+
+    probability_mapping = {
+        Segment(0, 1): 0.75,
+        Segment(1, 3): 0.25,
+    }
+    from_mapping = DetectionErrorRate()(
+        reference, probability_mapping, uem=uem, detailed=True
+    )
+    npt.assert_almost_equal(from_mapping["miss"], 1.0)
+    npt.assert_almost_equal(from_mapping["false alarm"], 0.25)
+
+    probability_annotation = Annotation()
+    probability_annotation[Segment(0, 1), 0] = 0.75
+    probability_annotation[Segment(1, 3), 0] = 0.25
+
+    from_annotation = DetectionErrorRate(probabilistic=True)(
+        reference, probability_annotation, uem=uem, detailed=True
+    )
+    npt.assert_almost_equal(from_annotation["miss"], 1.0)
+    npt.assert_almost_equal(from_annotation["false alarm"], 0.25)
+
+    # Numeric probability labels are also detected automatically in an
+    # otherwise ordinary Annotation call.
+    automatic_annotation = DetectionErrorRate()(
+        reference, probability_annotation, uem=uem, detailed=True
+    )
+    npt.assert_almost_equal(automatic_annotation["miss"], 1.0)
+    npt.assert_almost_equal(automatic_annotation["false alarm"], 0.25)
+
+    from_keyword = DetectionErrorRate()(
+        reference,
+        probabilities=probability_annotation,
+        uem=uem,
+        detailed=True,
+    )
+    npt.assert_almost_equal(from_keyword["miss"], 1.0)
+    npt.assert_almost_equal(from_keyword["false alarm"], 0.25)
+
+
+def test_binary_probabilities_match_hard_detection():
+    reference = Annotation()
+    reference[Segment(0, 2)] = "speech"
+    uem = Timeline([Segment(0, 3)])
+
+    binary_probabilities = [
+        (0, 1, 1.0),
+        (1, 3, 0.0),
+    ]
+    soft = DetectionErrorRate()(
+        reference, binary_probabilities, uem=uem, detailed=True
+    )
+
+    hard_hypothesis = Annotation()
+    hard_hypothesis[Segment(0, 1)] = "speech"
+    hard = DetectionErrorRate()(
+        reference, hard_hypothesis, uem=uem, detailed=True
+    )
+
+    npt.assert_almost_equal(soft["miss"], hard["miss"])
+    npt.assert_almost_equal(soft["false alarm"], hard["false alarm"])
+    npt.assert_almost_equal(soft["total"], hard["total"])
+    npt.assert_almost_equal(
+        soft["detection error rate"], hard["detection error rate"]
+    )
+
+    binary_annotation = Annotation()
+    binary_annotation[Segment(0, 1), 0] = 1
+    binary_annotation[Segment(1, 3), 0] = 0
+    automatic = DetectionErrorRate()(
+        reference, binary_annotation, uem=uem, detailed=True
+    )
+    npt.assert_almost_equal(automatic["miss"], hard["miss"])
+    npt.assert_almost_equal(automatic["false alarm"], hard["false alarm"])
+    npt.assert_almost_equal(automatic["total"], hard["total"])
+
+    # Numeric labels can still be evaluated as historical hard support when
+    # the caller explicitly requests that interpretation.
+    forced_hard = DetectionErrorRate()(
+        reference,
+        binary_annotation,
+        uem=uem,
+        probabilistic=False,
+        detailed=True,
+    )
+    npt.assert_almost_equal(forced_hard["miss"], 0.0)
+    npt.assert_almost_equal(forced_hard["false alarm"], 1.0)
+
+
+def test_probabilistic_uem_gap_and_duplicate_same_value():
+    reference = Annotation()
+    reference[Segment(0, 2)] = "speech"
+
+    uem = Timeline([Segment(0, 1.5), Segment(2.25, 3)])
+
+    # The nested [1.25, 2.5] row repeats the same 0.25 value as [1, 3].
+    # It must not double-count that probability.  The UEM gap [1.5, 2.25]
+    # is not integrated.
+    probabilities = [
+        (0, 1, 0.75),
+        (1, 3, 0.25),
+        (1.25, 2.5, 0.25),
+    ]
+
+    details = DetectionErrorRate()(
+        reference, probabilities, uem=uem, detailed=True
+    )
+
+    npt.assert_almost_equal(details["miss"], 0.625)
+    npt.assert_almost_equal(details["false alarm"], 0.1875)
+    npt.assert_almost_equal(details["total"], 1.5)
+    npt.assert_almost_equal(
+        details["detection error rate"], (0.625 + 0.1875) / 1.5
+    )
+
+
+def test_exact_duplicate_probability_segments_count_once():
+    reference = Annotation()
+    reference[Segment(0, 1)] = "speech"
+
+    probabilities = {
+        Segment(0, 1): 0.25,
+    }
+    # Add an identical second row through an iterable instead of a mapping.
+    probability_rows = [
+        (Segment(0, 1), 0.25),
+        (Segment(0, 1), 0.25),
+    ]
+
+    mapping_details = DetectionErrorRate()(
+        reference, probabilities, uem=Timeline([Segment(0, 1)]), detailed=True
+    )
+    rows_details = DetectionErrorRate()(
+        reference, probability_rows, uem=Timeline([Segment(0, 1)]), detailed=True
+    )
+
+    npt.assert_almost_equal(mapping_details["miss"], 0.75)
+    npt.assert_almost_equal(rows_details["miss"], 0.75)
+
+
+def test_conflicting_probabilities_in_scored_domain_raise():
+    reference = Annotation()
+    reference[Segment(0, 2)] = "speech"
+
+    probabilities = [
+        (0, 1, 0.5),
+        (0.5, 1.5, 0.25),
+    ]
+
+    with pytest.raises(
+        ProbabilityConflictError, match="Conflicting speech probabilities"
+    ):
+        DetectionErrorRate()(
+            reference,
+            probabilities,
+            uem=Timeline([Segment(0, 1)]),
+            detailed=True,
+        )
+
+
+def test_conflict_at_touching_boundary_or_outside_uem_is_ignored():
+    reference = Annotation()
+    reference[Segment(0, 2)] = "speech"
+
+    probabilities = [
+        (0, 1, 0.5),
+        (0.5, 1.5, 0.25),
+    ]
+
+    details = DetectionErrorRate()(
+        reference,
+        probabilities,
+        uem=Timeline([Segment(0, 0.5)]),
+        detailed=True,
+    )
+    npt.assert_almost_equal(details["miss"], 0.25)
+
+    touching_boundary = DetectionErrorRate()(
+        reference,
+        probabilities,
+        uem=Timeline([Segment(1, 1.5)]),
+        detailed=True,
+    )
+    npt.assert_almost_equal(touching_boundary["miss"], 0.375)
+
+
+def test_probabilistic_components_accumulate():
+    reference = Annotation()
+    reference[Segment(0, 1)] = "speech"
+    probabilities = [(0, 1, 0.5)]
+    uem = Timeline([Segment(0, 1)])
+
+    metric = DetectionErrorRate()
+    first = metric(reference, probabilities, uem=uem, detailed=True)
+    second = metric(reference, probabilities, uem=uem, detailed=True)
+
+    npt.assert_almost_equal(first["miss"], 0.5)
+    npt.assert_almost_equal(second["miss"], 0.5)
+    npt.assert_almost_equal(metric["miss"], 1.0)
+    npt.assert_almost_equal(metric["total"], 2.0)
+    npt.assert_almost_equal(abs(metric), 0.5)
