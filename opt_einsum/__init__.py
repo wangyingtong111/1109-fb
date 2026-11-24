@@ -5,8 +5,9 @@ from opt_einsum._version import __version__
 from opt_einsum.contract import contract, contract_expression, contract_path
 from opt_einsum.parser import get_symbol
 from opt_einsum.path_random import RandomGreedy
-from opt_einsum.paths import BranchBound, DynamicProgramming
+from opt_einsum.paths import BranchBound, DynamicProgramming, FixedNodeStep
 from opt_einsum.sharing import shared_intermediates
+from opt_einsum.typing import FixedNodePathType
 
 __all__ = [
     "__version__",
@@ -21,6 +22,8 @@ __all__ = [
     "RandomGreedy",
     "BranchBound",
     "DynamicProgramming",
+    "FixedNodeStep",
+    "FixedNodePathType",
     "shared_intermediates",
 ]
 

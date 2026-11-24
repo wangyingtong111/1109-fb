@@ -13,7 +13,14 @@ from collections.abc import Callable, Generator, Sequence
 from typing import Any
 
 from opt_einsum.helpers import compute_size_by_dict, flop_count
-from opt_einsum.typing import ArrayIndexType, PathSearchFunctionType, PathType, TensorShapeType
+from opt_einsum.typing import (
+    ArrayIndexType,
+    FixedNodePathType,
+    FixedNodeStep,
+    PathSearchFunctionType,
+    PathType,
+    TensorShapeType,
+)
 
 __all__ = [
     "optimal",
@@ -25,6 +32,11 @@ __all__ = [
     "get_path_fn",
     "DynamicProgramming",
     "dynamic_programming",
+    "FixedNodeStep",
+    "is_fixed_node_path",
+    "validate_fixed_node_path",
+    "fixed_node_to_linear",
+    "fixed_node_dependencies",
 ]
 
 _UNLIMITED_MEM = {-1, None, float("inf")}
@@ -146,6 +158,223 @@ def linear_to_ssa(path: PathType) -> PathType:
             del linear_to_ssa[id_]
         linear_to_ssa.append(next(new_ids))
     return ssa_path
+
+
+def is_fixed_node_path(path: Any) -> bool:
+    """Detect whether ``path`` is a fixed-node contraction plan.
+
+    A fixed-node plan is a sequence of steps, where every step is either a
+    :class:`~opt_einsum.typing.FixedNodeStep` or a length-two
+    ``(inputs, output)`` pair - ``inputs`` itself being a sequence of integer
+    node ids and ``output`` a single integer node id. This distinguishes the
+    explicit fixed-node format from the legacy linear position paths, whose
+    steps are flat integer tuples such as ``(0, 2)``. An empty sequence is
+    treated as the legacy empty path rather than a fixed-node plan.
+
+    Example:
+        ```python
+        is_fixed_node_path([((0, 2), 9), ((9, 1), 11)])
+        #> True
+        is_fixed_node_path([(0, 2), (0, 1)])
+        #> False
+        ```
+    """
+    if isinstance(path, (str, bytes)) or not isinstance(path, Sequence):
+        return False
+
+    has_steps = False
+    for step in path:
+        if isinstance(step, FixedNodeStep):
+            has_steps = True
+            continue
+        if not (isinstance(step, Sequence) and len(step) == 2):
+            return False
+        inputs, output = step
+        if isinstance(inputs, (str, bytes)) or not isinstance(inputs, Sequence):
+            return False
+        if not isinstance(output, int) or isinstance(output, bool):
+            return False
+        if not all(isinstance(node, int) and not isinstance(node, bool) for node in inputs):
+            return False
+        has_steps = True
+
+    # an empty sequence is ambiguous - keep the legacy empty-path semantics
+    return has_steps
+
+
+def _coerce_fixed_node_step(step: Any, step_num: int) -> FixedNodeStep:
+    """Coerce one user supplied fixed-node step into a :class:`FixedNodeStep`."""
+    if isinstance(step, FixedNodeStep):
+        return step
+
+    if not isinstance(step, Sequence) or isinstance(step, (str, bytes)) or len(step) != 2:
+        raise ValueError(
+            f"Fixed-node plan step {step_num} is invalid: each step must be a (inputs, output) pair "
+            f"of consumed node ids and the produced node id, got {step!r}."
+        )
+
+    inputs, output = step
+    if isinstance(inputs, (str, bytes)) or not isinstance(inputs, Sequence):
+        raise ValueError(
+            f"Fixed-node plan step {step_num} is invalid: the consumed nodes must be a sequence of "
+            f"integer node ids, got {inputs!r}."
+        )
+    if not isinstance(output, int) or isinstance(output, bool):
+        raise ValueError(
+            f"Fixed-node plan step {step_num} is invalid: the produced node id must be an integer, "
+            f"got {output!r}."
+        )
+
+    coerced_inputs: list[int] = []
+    for node in inputs:
+        if not isinstance(node, int) or isinstance(node, bool):
+            raise ValueError(
+                f"Fixed-node plan step {step_num} is invalid: consumed node {node!r} is not an integer id."
+            )
+        coerced_inputs.append(node)
+
+    return FixedNodeStep(tuple(coerced_inputs), output)
+
+
+def validate_fixed_node_path(path: FixedNodePathType, num_inputs: int) -> list[FixedNodeStep]:
+    """Validate a fixed-node contraction plan against an equation.
+
+    The number of input operands is taken from the equation (``num_inputs``),
+    never inferred from the plan, so a plan that stops early cannot make the
+    expression look like one with fewer operands.
+
+    Parameters:
+        path: A sequence of ``(inputs, output)`` fixed-node steps.
+        num_inputs: The number of input arrays of the equation.
+
+    Returns:
+        The plan as a list of validated :class:`FixedNodeStep` objects.
+
+    Raises:
+        ValueError: At the first step that is malformed, references an unknown
+            or already consumed node, produces a node with a colliding id, or
+            leaves input nodes orphaned.
+    """
+    if not isinstance(num_inputs, int) or isinstance(num_inputs, bool) or num_inputs < 1:
+        raise ValueError(f"The number of input operands must be a positive integer, got {num_inputs!r}.")
+    if isinstance(path, (str, bytes)) or not isinstance(path, Sequence):
+        raise ValueError(f"A fixed-node plan must be a sequence of (inputs, output) steps, got {path!r}.")
+
+    steps = [_coerce_fixed_node_step(step, step_num) for step_num, step in enumerate(path)]
+
+    # Nodes that currently exist: the input arrays plus every produced node.
+    live_nodes = set(range(num_inputs))
+    # Every node id ever assigned (input or produced), for detecting reused names.
+    known_nodes = set(range(num_inputs))
+    consumed_nodes: set[int] = set()
+
+    for step_num, step in enumerate(steps):
+        if not step.inputs:
+            raise ValueError(
+                f"Fixed-node plan step {step_num} is invalid: it does not consume any nodes."
+            )
+
+        seen_inputs: set[int] = set()
+        duplicate_inputs: list[int] = []
+        for node in step.inputs:
+            if node in seen_inputs and node not in duplicate_inputs:
+                duplicate_inputs.append(node)
+            seen_inputs.add(node)
+        if duplicate_inputs:
+            raise ValueError(
+                f"Fixed-node plan step {step_num} is invalid: node(s) {duplicate_inputs} are listed "
+                f"more than once among the consumed nodes."
+            )
+
+        for node in step.inputs:
+            if node in consumed_nodes:
+                raise ValueError(
+                    f"Fixed-node plan step {step_num} is invalid: node {node} was already consumed "
+                    f"by an earlier step and cannot be reused."
+                )
+            if node not in live_nodes:
+                raise ValueError(
+                    f"Fixed-node plan step {step_num} is invalid: node {node} does not exist - it is "
+                    f"neither an input (0..{num_inputs - 1}) nor the output of an earlier step."
+                )
+
+        if step.output in known_nodes:
+            raise ValueError(
+                f"Fixed-node plan step {step_num} is invalid: produced node {step.output} collides "
+                f"with an existing input or intermediate node id; node ids must be unique."
+            )
+
+        consumed_nodes.update(step.inputs)
+        live_nodes.difference_update(step.inputs)
+        live_nodes.add(step.output)
+        known_nodes.add(step.output)
+
+    orphaned_inputs = sorted(set(range(num_inputs)) - consumed_nodes)
+    if orphaned_inputs:
+        raise ValueError(
+            f"Fixed-node plan ended early and left input node(s) {orphaned_inputs} unconsumed; "
+            f"all {num_inputs} input operand(s) must take part in the contraction."
+        )
+
+    if len(live_nodes) != 1:
+        raise ValueError(
+            f"Fixed-node plan must end with exactly one live node (the final result), "
+            f"but {len(live_nodes)} node(s) remain: {sorted(live_nodes)}."
+        )
+
+    return steps
+
+
+def fixed_node_to_linear(path: FixedNodePathType, num_inputs: int) -> PathType:
+    """Convert a validated fixed-node plan to a legacy linear position path.
+
+    Parameters:
+        path: A fixed-node plan, validated with :func:`validate_fixed_node_path`.
+        num_inputs: The number of input arrays of the equation.
+
+    Returns:
+        The equivalent contraction path using recycled linear positions, ready
+        for the existing contraction machinery.
+
+    Example:
+        ```python
+        fixed_node_to_linear([((2,), 9), ((0, 3, 9), 12), ((1, 12), 13)], 4)
+        #> [(2,), (0, 2, 3), (0, 1)]
+        ```
+    """
+    steps = validate_fixed_node_path(path, num_inputs)
+
+    # Track the fixed node id currently held at each live linear position, then
+    # model the same removals/append the linear executor performs.
+    live_nodes = list(range(num_inputs))
+    linear_path: list[tuple[int, ...]] = []
+
+    for step in steps:
+        consumed_positions = tuple(sorted(live_nodes.index(node) for node in step.inputs))
+        linear_path.append(consumed_positions)
+
+        for position in sorted(consumed_positions, reverse=True):
+            live_nodes.pop(position)
+        live_nodes.append(step.output)
+
+    return linear_path
+
+
+def fixed_node_dependencies(path: FixedNodePathType, num_inputs: int) -> dict[int, tuple[int, ...]]:
+    """Return the direct dependencies of every produced node in a fixed plan.
+
+    Parameters:
+        path: A fixed-node plan, validated with :func:`validate_fixed_node_path`.
+        num_inputs: The number of input arrays of the equation.
+
+    Returns:
+        Mapping from each produced (intermediate or final) fixed node id to the
+        tuple of node ids directly consumed to make it. Imported input nodes
+        appear within these dependency tuples and can therefore be traced back
+        through the graph.
+    """
+    steps = validate_fixed_node_path(path, num_inputs)
+    return {step.output: step.inputs for step in steps}
 
 
 def calc_k12_flops(

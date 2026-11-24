@@ -115,3 +115,53 @@ More details about
 [`opt_einsum.paths.RandomOptimizer`](../api_reference.md#opt_einsumpath_randomrandomoptimizer)
 options can
 be found in [`RandomGreedyPathPage`](./random_greedy_path.md) section.
+
+
+## Fixed-node plans
+
+The usual path format uses *linear positions*: at each step the integers name
+positions in the current, shrinking list of tensors, and positions are recycled
+as intermediate results are appended. This makes the format awkward to serialize
+from an external system that labels every tensor with a fixed node id,
+especially when those ids are not contiguous.
+
+A **fixed-node plan** instead describes every step with both the static node
+ids it *consumes* and the node id it *produces*. Input arrays occupy node ids
+`0, 1, ..., num_inputs - 1`, intermediate nodes may use any other integer ids,
+and ids are never recycled - a node that has been consumed cannot be referenced
+again. Each step is a `(inputs, output)` pair (or an
+[`opt_einsum.FixedNodeStep`](#opt_einsum.FixedNodeStep)):
+
+```python
+import opt_einsum as oe
+import numpy as np
+
+eq = "ab,bc,cd,da->a"
+shapes = [(2, 3), (3, 4), (4, 5), (5, 2)]
+
+# node ids 9, 12, 13 are deliberately non-contiguous
+fixed_plan = [
+    ((2,), 9),        # unary reduction of input 2 -> node 9
+    ((0, 3, 9), 12),  # combine inputs 0, 3 with node 9 -> node 12
+    ((1, 12), 13),    # merge input 1 with node 12 -> node 13
+]
+
+path, info = oe.contract_path(eq, *shapes, shapes=True, optimize=fixed_plan)
+print(path)
+#> [(2,), (0, 2, 3), (0, 1)]
+print(info.node_dependencies)
+#> {9: (2,), 12: (0, 3, 9), 13: (1, 12)}
+```
+
+The plan is validated against the equation **before any array data is read**,
+and the first invalid step raises a `ValueError` naming both the step index and
+the offending node - for example, reusing an already consumed node, referencing a
+node that does not exist, producing a node with a duplicate id, or stopping
+early and leaving input operands orphaned. The helper functions
+[`opt_einsum.paths.validate_fixed_node_path`](#opt_einsum.paths.validate_fixed_node_path),
+[`opt_einsum.paths.fixed_node_to_linear`](#opt_einsum.paths.fixed_node_to_linear)
+and
+[`opt_einsum.paths.fixed_node_dependencies`](#opt_einsum.paths.fixed_node_dependencies)
+expose the same validation, conversion and dependency lookup directly. Legacy
+linear position paths continue to work unchanged.
+

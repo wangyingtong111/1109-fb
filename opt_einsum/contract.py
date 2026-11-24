@@ -12,6 +12,8 @@ from opt_einsum.typing import (
     ArrayType,
     BackendType,
     ContractionListType,
+    FixedNodePathType,
+    FixedNodeStep,
     OptimizeKind,
     PathType,
     TensorShapeType,
@@ -45,6 +47,8 @@ class PathInfo:
         opt_cost: int,
         size_list: Sequence[int],
         size_dict: dict[str, int],
+        fixed_node_path: FixedNodePathType | None = None,
+        node_dependencies: dict[int, tuple[int, ...]] | None = None,
     ):
         self.contraction_list = contraction_list
         self.input_subscripts = input_subscripts
@@ -57,6 +61,11 @@ class PathInfo:
         self.speedup = self.naive_cost / max(self.opt_cost, Decimal(1))
         self.size_list = size_list
         self.size_dict = size_dict
+
+        # Fixed-node plan information; only populated when a fixed-node plan
+        # was supplied via `optimize`, otherwise these stay empty.
+        self.fixed_node_path: list[FixedNodeStep] = list(fixed_node_path) if fixed_node_path is not None else []
+        self.node_dependencies: dict[int, tuple[int, ...]] = dict(node_dependencies or {})
 
         self.shapes = [tuple(size_dict[k] for k in ks) for ks in input_subscripts.split(",")]
         self.eq = f"{input_subscripts}->{output_subscript}"
@@ -185,6 +194,10 @@ def contract_path(
           use_blas: Do you use BLAS for valid operations, may use extra memory for more intermediates.
           optimize: Choose the type of path the contraction will be optimized with.
                 - if a list is given uses this as the path.
+                - a fixed-node plan may be supplied as a list of ``(inputs, output)``
+                pairs (or :class:`~opt_einsum.typing.FixedNodeStep` objects), where
+                each step explicitly names the fixed node ids it consumes and the
+                node id it produces; see :func:`opt_einsum.paths.fixed_node_to_linear`.
                 - `'optimal'` An algorithm that explores all possible ways of
                 contracting the listed tensors. Scales factorially with the number of
                 terms in the contraction.
@@ -341,6 +354,16 @@ def contract_path(
     inner_product = (sum(len(x) for x in input_sets) - len(indices)) > 0
     naive_cost = helpers.flop_count(indices, inner_product, num_ops, size_dict)
 
+    # Fixed-node plans carry explicit consumed/produced node ids; validate them
+    # against the equation (using the real operand count) and translate to the
+    # legacy linear position path before any array data is touched.
+    fixed_node_steps: list[FixedNodeStep] | None = None
+    node_dependencies: dict[int, tuple[int, ...]] | None = None
+    if paths.is_fixed_node_path(optimize):
+        fixed_node_steps = paths.validate_fixed_node_path(optimize, num_ops)  # type: ignore[arg-type]
+        node_dependencies = {step.output: step.inputs for step in fixed_node_steps}
+        optimize = paths.fixed_node_to_linear(fixed_node_steps, num_ops)
+
     # Compute the path
     if optimize is False:
         path_tuple: PathType = [tuple(range(num_ops))]
@@ -425,6 +448,8 @@ def contract_path(
         opt_cost,
         size_list,
         size_dict,
+        fixed_node_path=fixed_node_steps,
+        node_dependencies=node_dependencies,
     )
 
     return path_tuple, path_print
