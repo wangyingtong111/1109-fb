@@ -7,6 +7,9 @@ and this gem adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Fixed
+- `FuzzyMatch.soundex` now follows the classic vowel/H-W separation rule: same-coded consonants separated by a vowel are coded twice (`BABA` → `B100`), while H and W do not restart the code (`BHBA` → `B000`)
+
 ## [0.10.0] - 2026-05-09
 
 ### Added

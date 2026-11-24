@@ -12,6 +12,10 @@ module Philiprehberger
         'R' => '6'
       }.freeze
 
+      # Letters that are skipped without resetting the previous code, so
+      # same-coded consonants separated only by H or W are coded once.
+      NON_RESETTING = %w[H W].freeze
+
       def self.code(string)
         return '' if string.nil? || string.empty?
 
@@ -23,7 +27,13 @@ module Philiprehberger
 
         upper[1..].each_char do |char|
           char_code = CODES[char]
-          next if char_code.nil? || char_code == prev_code
+          if char_code.nil?
+            # Vowels (and other uncoded letters) separate: the next consonant
+            # may repeat the previous code. H and W do not separate.
+            prev_code = nil unless NON_RESETTING.include?(char)
+            next
+          end
+          next if char_code == prev_code
 
           result << char_code
           prev_code = char_code

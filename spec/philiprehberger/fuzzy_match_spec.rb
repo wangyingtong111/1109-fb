@@ -321,6 +321,35 @@ RSpec.describe Philiprehberger::FuzzyMatch do
     it 'returns empty string for empty input' do
       expect(described_class.soundex('')).to eq('')
     end
+
+    it 'returns empty string for nil input' do
+      expect(described_class.soundex(nil)).to eq('')
+    end
+
+    it 'returns empty string for hyphen-only input' do
+      expect(described_class.soundex('---')).to eq('')
+    end
+
+    it 'codes same-code consonants twice when separated by a vowel' do
+      expect(described_class.soundex('BABA')).to eq('B100')
+    end
+
+    it 'codes same-code consonants once when separated only by H' do
+      expect(described_class.soundex('BHBA')).to eq('B000')
+    end
+
+    it 'codes same-code consonants once when separated only by W' do
+      expect(described_class.soundex('BWBA')).to eq('B000')
+    end
+
+    it 'merges a repeated first letter into a single code' do
+      expect(described_class.soundex('BB')).to eq('B000')
+    end
+
+    it 'encodes mixed-case names the same as uppercase' do
+      expect(described_class.soundex('bAbA')).to eq('B100')
+      expect(described_class.soundex('bHbA')).to eq('B000')
+    end
   end
 
   describe '.metaphone' do
@@ -348,6 +377,16 @@ RSpec.describe Philiprehberger::FuzzyMatch do
 
     it 'returns false for empty strings' do
       expect(described_class.phonetic_match?('', '')).to be false
+    end
+
+    it 'recalls mixed-case query candidates through the same matching entry' do
+      candidates = %w[BABA BHBA BIBI SMITH]
+      recalled = candidates.select { |c| described_class.phonetic_match?('bAbA', c) }
+      expect(recalled).to eq(%w[BABA BIBI])
+    end
+
+    it 'does not match names differing only by an H separator' do
+      expect(described_class.phonetic_match?('bAbA', 'bHbA')).to be false
     end
   end
 
