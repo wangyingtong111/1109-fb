@@ -2,6 +2,15 @@
 
 List of new feature changes (excluding most bug fixes and optimizations)
 
+## Unreleased
+
+* Add `Matrix#cholesky` / `Matrix::CholeskyDecomposition`: pivoted,
+  optionally incomplete Cholesky factorization of Hermitian positive
+  semidefinite matrices.  Zero diagonal entries are handled by symmetric
+  pivoting, a relative tolerance can stop the factorization early (`#resume`
+  continues it), and clearly negative directions raise
+  `Matrix::ErrNotPositiveSemidefinite`.
+
 ## v0.4.0
 
 * Add `Matrix#rotate_entries` [#19]

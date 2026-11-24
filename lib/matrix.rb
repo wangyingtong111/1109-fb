@@ -35,6 +35,35 @@ module ExceptionForMatrix # :nodoc:
     end
   end
 
+  #
+  # Raised when a decomposition needs a Hermitian matrix and the receiver is
+  # not Hermitian (within the requested tolerance).
+  #
+  class ErrNotHermitian < StandardError
+    def initialize(val = nil)
+      if val
+        super(val)
+      else
+        super("Not a Hermitian matrix")
+      end
+    end
+  end
+
+  #
+  # Raised when a positive semidefinite factorization meets a clearly negative
+  # direction.  Residuals that are only numerically close to zero are
+  # truncated instead, see +Matrix::CholeskyDecomposition+.
+  #
+  class ErrNotPositiveSemidefinite < ErrNotRegular
+    def initialize(val = nil)
+      if val
+        super(val)
+      else
+        super("Matrix is not positive semidefinite")
+      end
+    end
+  end
+
   class ErrOperationNotDefined < StandardError
     def initialize(vals)
       if vals.is_a?(Array)
@@ -61,6 +90,7 @@ end
 class Matrix
   include Enumerable
   include ExceptionForMatrix
+  autoload :CholeskyDecomposition, "matrix/cholesky_decomposition"
   autoload :EigenvalueDecomposition, "matrix/eigenvalue_decomposition"
   autoload :LUPDecomposition, "matrix/lup_decomposition"
 
@@ -1539,6 +1569,71 @@ class Matrix
   #--
   # DECOMPOSITIONS -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
   #++
+
+  #
+  # Returns the pivoted Cholesky factorization of the matrix; see
+  # +CholeskyDecomposition+.
+  #
+  # The matrix must be Hermitian and positive semidefinite; unlike a plain
+  # Cholesky factorization it does not have to be of full rank.  Columns are
+  # picked by symmetric pivoting on the largest remaining diagonal entry, so a
+  # zero diagonal does not hide a later positive pivot.
+  #
+  # An optional relative tolerance stops the factorization as soon as the
+  # largest remaining residual is negligible compared to the original
+  # diagonal scale.  A residual that is only numerically close to zero is
+  # truncated (and can be resumed), while a clearly negative direction raises
+  # +Matrix::ErrNotPositiveSemidefinite+.
+  #
+  #   m = Matrix.diagonal(0, 4, 1)
+  #   c = m.cholesky
+  #   c.rank                    # => 2
+  #   c.pivots                  # => [1, 2]
+  #   c.order                   # => [1, 2, 0]
+  #   c.p * m * c.p.adjoint == c.l * c.u # => true
+  #   c.factor * c.factor.adjoint == m   # => true
+  #
+  #   m.cholesky(1e-12).resume  # => continue past a truncated residual
+  #
+  # The relative tolerance may also be given as a keyword:
+  # <tt>m.cholesky(relative_tolerance: 1e-12)</tt>.
+  #
+  def cholesky(rel_tolerance = nil, relative_tolerance: nil, check_hermitian: true)
+    if relative_tolerance
+      raise ArgumentError, "give the relative tolerance only once" unless rel_tolerance.nil?
+      rel_tolerance = relative_tolerance
+    end
+    CholeskyDecomposition.new(self, rel_tolerance, check_hermitian: check_hermitian)
+  end
+  alias_method :cholesky_decomposition, :cholesky
+  alias_method :cholesky_factorization, :cholesky
+
+  #
+  # Returns +true+ if the matrix is Hermitian and positive semidefinite, +false+
+  # otherwise.  This is the non-raising counterpart of #cholesky: it uses the
+  # same pivoted factorization with the given relative tolerance, so it also
+  # returns +false+ for a matrix with a clearly negative direction.
+  #
+  #   Matrix.diagonal(0, 4, 1).positive_semidefinite? # => true
+  #   Matrix[[0, 1], [1, 0]].positive_semidefinite?    # => false
+  #
+  def positive_semidefinite?(rel_tolerance = nil)
+    CholeskyDecomposition.new(self, rel_tolerance)
+    true
+  rescue ErrNotHermitian, ErrNotPositiveSemidefinite, ErrDimensionMismatch
+    false
+  end
+  alias_method :positive_semi_definite?, :positive_semidefinite?
+
+  #
+  # Returns +true+ if the matrix is Hermitian and positive definite, i.e.
+  # positive semidefinite with full rank.
+  #
+  def positive_definite?(rel_tolerance = nil)
+    cholesky(rel_tolerance).complete?
+  rescue ErrNotHermitian, ErrNotPositiveSemidefinite, ErrDimensionMismatch
+    false
+  end
 
   #
   # Returns the Eigensystem of the matrix; see +EigenvalueDecomposition+.

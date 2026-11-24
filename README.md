@@ -30,6 +30,17 @@ m = Matrix[[1, 2], [3, 4]]
 m.determinant # => -2
 ```
 
+Pivoted Cholesky factorization of a Hermitian (semi)definite matrix, including
+rank deficient ones:
+
+```ruby
+m = Matrix.diagonal(0, 4, 1)
+c = m.cholesky
+c.rank                            # => 2
+c.pivots                          # => [1, 2]
+c.factor * c.factor.adjoint == m  # => true
+```
+
 ## Development
 
 After checking out the repo, run `bin/setup` to install dependencies. Then, run `rake test` to run the tests. You can also run `bin/console` for an interactive prompt that will allow you to experiment.

@@ -502,6 +502,134 @@ class TestMatrix < Test::Unit::TestCase
     assert_equal(m.lup.solve([2, 5]), Vector[1, Rational(1,2)])
   end
 
+  def assert_close(expected, actual, delta = 1e-9)
+    assert_equal(expected.row_count, actual.row_count)
+    assert_equal(expected.column_count, actual.column_count)
+    expected.each_with_index(:all) do |e, i, j|
+      assert_in_delta(e.is_a?(Complex) ? e.real : e,
+                      actual[i, j].is_a?(Complex) ? actual[i, j].real : actual[i, j], delta)
+      next unless e.is_a?(Complex) || actual[i, j].is_a?(Complex)
+      assert_in_delta(e.is_a?(Complex) ? e.imaginary : 0,
+                      actual[i, j].is_a?(Complex) ? actual[i, j].imaginary : 0, delta)
+    end
+  end
+
+  def test_cholesky
+    m = Matrix[[4, 2, 1], [2, 5, 3], [1, 3, 6]]
+    c = m.cholesky
+    assert(c.complete?)
+    assert(!c.truncated?)
+    assert_equal(3, c.rank)
+    assert_equal([0, 1, 2].sort, c.pivots.sort)
+    assert(c.l.lower_triangular?)
+    assert(c.u.upper_triangular?)
+    assert_close(m, c.factor * c.factor.adjoint)
+    assert_close(c.p * m * c.p.adjoint, c.l * c.u)
+    assert(c.p.permutation?)
+
+    l, u, p = m.cholesky
+    assert_equal([c.l, c.u, c.p], [l, u, p])
+
+    assert_equal(Rational(1, 4), Matrix[[Rational(1,4)]].cholesky.det)
+    assert_in_delta(m.det.to_f, c.det, 1e-9)
+  end
+
+  def test_cholesky_semidefinite_pivoting
+    m = Matrix.diagonal(0, 4, 1)
+    c = m.cholesky
+    assert_equal([1, 2], c.pivots)
+    assert_equal([1, 2, 0], c.order)
+    assert_equal(2, c.rank)
+    assert(c.singular?)
+    assert(c.truncated?)
+    assert(c.negligible?)
+    assert_equal(0, c.residual)
+    assert_equal(Matrix[[0, 0], [2, 0], [0, 1]], c.factor)
+    assert_equal(m, c.factor * c.factor.adjoint)
+    assert_equal(c.l * c.u, c.p * m * c.p.adjoint)
+  end
+
+  def test_cholesky_zero_diagonal_negative_direction
+    # A vanishing diagonal does not mean positive semidefinite: the remaining
+    # coupling is a clearly negative direction.
+    assert_raise(Matrix::ErrNotPositiveSemidefinite) do
+      Matrix[[0, 1], [1, 0]].cholesky
+    end
+    assert_raise(Matrix::ErrNotPositiveSemidefinite) do
+      Matrix[[0, Complex(0, 1)], [Complex(0, -1), 0]].cholesky
+    end
+    assert_raise(Matrix::ErrNotPositiveSemidefinite) do
+      Matrix[[1, 2], [2, 1]].cholesky
+    end
+    assert_equal(1, Matrix[[1, 2], [2, 4]].cholesky.rank)
+    assert_equal(0, Matrix.zero(2).cholesky.rank)
+  end
+
+  def test_cholesky_relative_tolerance
+    # A tiny but numerically meaningful pivot: above rounding noise, below the
+    # requested relative tolerance.
+    m = Matrix[[4.0, 0.0, 0.0], [0.0, 1e-13, 0.0], [0.0, 0.0, 1.0]]
+    c = m.cholesky(1e-12)
+    assert_equal(2, c.rank)
+    assert(c.truncated?)
+    assert(c.tolerance_limited?)
+    assert(!c.negligible?)
+    assert(c.relative_residual <= 1e-12)
+
+    resumed = c.resume(1e-20)
+    assert_equal(3, resumed.rank)
+    assert(!resumed.truncated?)
+    assert_equal(2, c.rank, "resume must not modify the receiver")
+
+    assert_equal(3, c.recompute.rank)
+    assert_raise(Matrix::ErrNotPositiveSemidefinite) do
+      Matrix[[1.0, 3.0], [3.0, 1.0]].cholesky(1e-3)
+    end
+  end
+
+  def test_cholesky_complex_hermitian
+    m = Matrix[[2, Complex(1, 1)], [Complex(1, -1), 3]]
+    c = m.cholesky
+    assert(c.complete?)
+    assert_close(c.p * m * c.p.adjoint, c.l * c.u)
+    assert_close(m, c.factor * c.factor.adjoint)
+
+    v = Matrix.column_vector([Complex(1, 1), Complex(2, 0)])
+    outer = v * v.conjugate.transpose
+    g = outer.cholesky
+    assert_equal(1, g.rank)
+    assert(c.p.permutation?)
+  end
+
+  def test_cholesky_errors_and_solve
+    assert_raise(Matrix::ErrDimensionMismatch) { Matrix[[1, 2, 3], [4, 5, 6]].cholesky }
+    assert_raise(Matrix::ErrNotHermitian) { Matrix[[1, 2], [3, 4]].cholesky }
+    # With the check disabled only the lower triangle is trusted, as in
+    # LAPACK's uplo = 'L'.
+    unchecked = Matrix[[4, 0], [2, 3]].cholesky(nil, check_hermitian: false)
+    assert_equal(2, unchecked.rank)
+    assert_close(Matrix[[4, 2], [2, 3]], unchecked.factor * unchecked.factor.adjoint)
+
+    m = Matrix.diagonal(4, 9)
+    b = Vector[8, 27]
+    assert_equal(Vector[2, 3], m.cholesky.solve(b))
+    assert_equal(m.lup.solve(b), m.cholesky.solve(b))
+
+    assert_raise(Matrix::ErrNotRegular) { Matrix.diagonal(1, 0).cholesky.solve(Vector[1, 2]) }
+    assert_equal(0, Matrix.diagonal(1, 0).cholesky.det)
+  end
+
+  def test_positive_semidefinite_predicates
+    assert(Matrix.diagonal(0, 4, 1).positive_semidefinite?)
+    assert(!Matrix.diagonal(0, 4, 1).positive_definite?)
+    assert(Matrix[[2, 1], [1, 2]].positive_definite?)
+    assert(!Matrix[[0, 1], [1, 0]].positive_semidefinite?)
+    assert(!Matrix[[1, 2], [3, 4]].positive_semidefinite?)
+    assert(!Matrix[[1, 2, 3], [4, 5, 6]].positive_semidefinite?)
+    assert(!Matrix.diagonal(1, 0).positive_definite?)
+    assert(Matrix.diagonal(1, 0).positive_semidefinite?)
+  end
+
   def test_real
     assert_equal(Matrix[[1, 0, 0], [1, 2, 3]], @c1.real)
   end
