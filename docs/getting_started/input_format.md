@@ -98,10 +98,39 @@ oe.contract(x, ('a', 'b'))
 >>> oe.contract(x, ('b', 'a'))
 #> array([[0, 2],
 #>        [1, 0]])
+```
 
-# relative sequence undefined, can't determine output
->>> oe.contract(x, (0, 'a'))
-#> TypeError: For this input type lists must contain either Ellipsis
-#> or hashable and comparable object (e.g. int, str)
+Labels of *different* comparable types, such as `int` and `str`, can also be
+mixed freely - each type keeps its own sorted order and the groups are ordered
+by type name, so integers sort before strings. Note that this means the
+integer `7` and the string `'7'` label two distinct axes:
+
+```python
+x = np.random.rand(2, 3)
+
+# 7 and '7' are different axes - no transpose happens
+oe.contract(x, [7, '7'])
+
+# the transpose
+oe.contract(x, ['7', 7])
+```
+
+When a contraction path is generated from interleaved input, the internal
+single-character symbols shown in the contraction list can be translated back
+to the original labels via `PathInfo.original_contraction_list`. This records,
+for every step, the original axis labels of each input and of the produced
+intermediate, as well as the positions at which any summed-over (including
+repeated, i.e. trace) labels appeared in the step's inputs. Ellipsis axes are
+reported as `(Ellipsis, i)` tuples, where `i` is the right-aligned broadcast
+position of the axis:
+
+```python
+a = np.random.rand(2, 3)
+b = np.random.rand(3, 4)
+_, info = oe.contract_path(a, [7, 'channel'], b, ['channel', 'time'], [7, 'time'])
+info.original_contraction_list[0].inputs
+#> (('channel', 'time'), (7, 'channel'))
+info.original_contraction_list[0].removed
+#> {'channel': ((0,), (1,))}
 ```
 

@@ -2,7 +2,7 @@
 
 import itertools
 from collections.abc import Iterator, Sequence
-from typing import Any
+from typing import Any, Literal, overload
 
 from opt_einsum.typing import ArrayType, TensorShapeType
 
@@ -17,6 +17,7 @@ __all__ = [
     "find_output_str",
     "find_output_shape",
     "possibly_convert_to_numpy",
+    "sort_user_symbols",
     "parse_einsum_input",
 ]
 
@@ -254,8 +255,56 @@ def convert_subscripts(old_sub: list[Any], symbol_map: dict[Any, Any]) -> str:
     return new_sub
 
 
-def convert_interleaved_input(operands: Sequence[Any]) -> tuple[str, tuple[Any, ...]]:
-    """Convert 'interleaved' input to standard einsum input."""
+_UNCOMPARABLE_ERROR = (
+    "For this input type lists must contain either Ellipsis or hashable and comparable object (e.g. int, str)."
+)
+
+
+def sort_user_symbols(symbols: set[Any]) -> list[Any]:
+    """Sort user supplied labels, retaining the intrinsic order of mutually
+    comparable labels. Labels of incomparable types (e.g. ``int`` and ``str``)
+    are grouped by type name and sorted within each group, so that mixed
+    labels such as ``7`` and ``'7'`` remain distinct, consistently ordered axes.
+
+    Examples:
+    --------
+    >>> oe.parser.sort_user_symbols({2, 0, 1})
+    [0, 1, 2]
+
+    >>> oe.parser.sort_user_symbols({'time', 7, 'channel'})
+    [7, 'channel', 'time']
+    """
+    try:
+        return sorted(symbols)
+    except TypeError:
+        # mixed, mutually incomparable types (e.g. int and str) - group by
+        # type name and sort within each group
+        try:
+            return sorted(symbols, key=lambda x: (type(x).__name__, x))
+        except TypeError:  # uncomparable object
+            raise TypeError(_UNCOMPARABLE_ERROR)
+
+
+@overload
+def convert_interleaved_input(operands: Sequence[Any]) -> tuple[str, tuple[Any, ...]]: ...
+
+
+@overload
+def convert_interleaved_input(
+    operands: Sequence[Any], return_symbol_map: Literal[True]
+) -> tuple[str, tuple[Any, ...], dict[Any, str]]: ...
+
+
+def convert_interleaved_input(
+    operands: Sequence[Any], return_symbol_map: bool = False
+) -> tuple[str, tuple[Any, ...]] | tuple[str, tuple[Any, ...], dict[Any, str]]:
+    """Convert 'interleaved' input to standard einsum input.
+
+    Parameters:
+        operands: The interleaved ``array, subscripts, array, subscripts, ...`` input.
+        return_symbol_map: Whether to also return the map from user supplied
+            labels to the internal single-character symbols.
+    """
     tmp_operands = list(operands)
     operand_list = []
     subscript_list = []
@@ -273,24 +322,35 @@ def convert_interleaved_input(operands: Sequence[Any]) -> tuple[str, tuple[Any, 
 
         # remove Ellipsis because it can not be compared with other objects
         symbol_set.discard(Ellipsis)
+    except TypeError:  # unhashable object
+        raise TypeError(_UNCOMPARABLE_ERROR)
 
-        # build the map based on sorted user symbols, retaining the order we lost in the `set`
-        symbol_map = {symbol: get_symbol(idx) for idx, symbol in enumerate(sorted(symbol_set))}
-
-    except TypeError:  # unhashable or uncomparable object
-        raise TypeError(
-            "For this input type lists must contain either Ellipsis or hashable and comparable object (e.g. int, str)."
-        )
+    # build the map based on sorted user symbols, retaining the order we lost in the `set`
+    symbol_map = {symbol: get_symbol(idx) for idx, symbol in enumerate(sort_user_symbols(symbol_set))}
 
     subscripts = ",".join(convert_subscripts(sub, symbol_map) for sub in subscript_list)
     if output_list is not None:
         subscripts += "->"
         subscripts += convert_subscripts(output_list, symbol_map)
 
+    if return_symbol_map:
+        return subscripts, tuple(operand_list), symbol_map
     return subscripts, tuple(operand_list)
 
 
-def parse_einsum_input(operands: Any, shapes: bool = False) -> tuple[str, str, list[ArrayType]]:
+@overload
+def parse_einsum_input(operands: Any, shapes: bool = ...) -> tuple[str, str, list[ArrayType]]: ...
+
+
+@overload
+def parse_einsum_input(
+    operands: Any, shapes: bool = ..., *, return_label_map: Literal[True]
+) -> tuple[str, str, list[ArrayType], dict[str, Any]]: ...
+
+
+def parse_einsum_input(
+    operands: Any, shapes: bool = False, return_label_map: bool = False
+) -> tuple[str, str, list[ArrayType]] | tuple[str, str, list[ArrayType], dict[str, Any]]:
     """A reproduction of einsum c side einsum parsing in python.
 
     Parameters:
@@ -298,11 +358,17 @@ def parse_einsum_input(operands: Any, shapes: bool = False) -> tuple[str, str, l
             supported keyword argument is:
         shapes: Whether ``parse_einsum_input`` should assume arrays (the default) or
             array shapes have been supplied.
+        return_label_map: Whether to also return a map from the internal,
+            single-character symbols to the original user supplied labels. Axes
+            covered by an ellipsis are mapped to ``(Ellipsis, i)`` tuples, where
+            ``i`` is the right-aligned broadcast position of the ellipsis axis.
 
     Returns:
         input_strings: Parsed input strings
         output_string: Parsed output string
         operands: The operands to use in the numpy contraction
+        label_map: Only if ``return_label_map`` is set, the map from internal
+            symbols to the original labels.
 
     Examples:
         The operand list is simplified to reduce printing:
@@ -320,6 +386,9 @@ def parse_einsum_input(operands: Any, shapes: bool = False) -> tuple[str, str, l
     if len(operands) == 0:
         raise ValueError("No input operands")
 
+    label_map: dict[str, Any] | None = None
+    ellipsis_label_map: dict[str, Any] = {}
+
     if isinstance(operands[0], str):
         subscripts = operands[0].replace(" ", "")
         if shapes:
@@ -330,7 +399,10 @@ def parse_einsum_input(operands: Any, shapes: bool = False) -> tuple[str, str, l
                 )
         operands = operands[1:]
     else:
-        subscripts, operands = convert_interleaved_input(operands)
+        subscripts, operands, symbol_map = convert_interleaved_input(operands, return_symbol_map=True)
+        # invert the map so that internal symbols can be translated back to
+        # the original user supplied labels
+        label_map = {internal: original for original, internal in symbol_map.items()}
 
     if shapes:
         operand_shapes = operands
@@ -386,6 +458,9 @@ def parse_einsum_input(operands: Any, shapes: bool = False) -> tuple[str, str, l
             out_ellipse = ""
         else:
             out_ellipse = ellipse_inds[-longest:]
+            # record which right-aligned broadcast position each internally
+            # generated ellipsis symbol corresponds to
+            ellipsis_label_map.update((sym, (Ellipsis, i)) for i, sym in enumerate(out_ellipse))
 
         if out_sub:
             subscripts += "->" + output_sub.replace("...", out_ellipse)
@@ -415,5 +490,15 @@ def parse_einsum_input(operands: Any, shapes: bool = False) -> tuple[str, str, l
             f"Number of einsum subscripts, {len(input_subscripts.split(','))}, must be equal to the "
             f"number of operands, {len(operands)}."
         )
+
+    if return_label_map:
+        if label_map is None:
+            label_map = {}
+        # identity-map any remaining symbols (i.e. those from string format
+        # equations), then overlay the ellipsis broadcast positions
+        for char in input_subscripts.replace(",", "") + output_subscript:
+            label_map.setdefault(char, char)
+        label_map.update(ellipsis_label_map)
+        return input_subscripts, output_subscript, operands, label_map
 
     return input_subscripts, output_subscript, operands

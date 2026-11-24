@@ -3,7 +3,7 @@
 from collections.abc import Collection, Iterable, Sequence
 from decimal import Decimal
 from functools import lru_cache
-from typing import Any, Literal, overload
+from typing import Any, Literal, NamedTuple, overload
 
 from opt_einsum import backends, blas, helpers, parser, paths, sharing
 from opt_einsum.typing import (
@@ -22,6 +22,7 @@ __all__ = [
     "contract",
     "format_const_einsum_str",
     "ContractExpression",
+    "OriginalContraction",
     "shape_only",
 ]
 
@@ -30,8 +31,39 @@ __all__ = [
 _MemoryLimit = None | int | Decimal | Literal["max_input"]
 
 
+class OriginalContraction(NamedTuple):
+    """The original, user supplied axis labels involved in a single
+    contraction step, as opposed to the internal single-character symbols
+    shown in ``PathInfo.contraction_list``.
+
+    Attributes:
+        inputs: The original axis labels of each input to the step, in the
+            same order as the inputs of the corresponding entry of
+            ``PathInfo.contraction_list``.
+        output: The original axis labels of the tensor produced by the step.
+        removed: A dictionary mapping each original label summed over in this
+            step to the positions it appeared at in each of the step's inputs.
+            Repeated (trace) labels therefore appear with multiple positions
+            in a single input.
+
+    Axes covered by an ellipsis in the original subscripts are labelled
+    ``(Ellipsis, i)``, where ``i`` is the right-aligned broadcast position of
+    the ellipsis axis.
+    """
+
+    inputs: tuple[tuple[Any, ...], ...]
+    output: tuple[Any, ...]
+    removed: dict[Any, tuple[tuple[int, ...], ...]]
+
+
 class PathInfo:
-    """A printable object to contain information about a contraction path."""
+    """A printable object to contain information about a contraction path.
+
+    Attributes:
+        original_contraction_list: A tuple of :class:`OriginalContraction`
+            entries, parallel to ``contraction_list``, describing each step
+            in terms of the original, user supplied axis labels.
+    """
 
     def __init__(
         self,
@@ -45,6 +77,7 @@ class PathInfo:
         opt_cost: int,
         size_list: Sequence[int],
         size_dict: dict[str, int],
+        original_contraction_list: tuple[OriginalContraction, ...] | None = None,
     ):
         self.contraction_list = contraction_list
         self.input_subscripts = input_subscripts
@@ -57,6 +90,7 @@ class PathInfo:
         self.speedup = self.naive_cost / max(self.opt_cost, Decimal(1))
         self.size_list = size_list
         self.size_dict = size_dict
+        self.original_contraction_list = original_contraction_list
 
         self.shapes = [tuple(size_dict[k] for k in ks) for ks in input_subscripts.split(",")]
         self.eq = f"{input_subscripts}->{output_subscript}"
@@ -228,6 +262,12 @@ def contract_path(
           contracted first, the result of this contraction is then appended to the end of
           the contraction list.
 
+          While ``PathInfo.contraction_list`` is expressed in the internal
+          single-character symbols, ``PathInfo.original_contraction_list``
+          describes every step in terms of the original, user supplied axis
+          labels, including the positions at which summed-over (repeated)
+          labels appeared in the step's inputs.
+
     Examples:
           We can begin with a chain dot example. In this case, it is optimal to
           contract the b and c tensors represented by the first element of the path (1,
@@ -292,7 +332,9 @@ def contract_path(
 
     # Python side parsing
     operands_ = [subscripts] + list(operands)
-    input_subscripts, output_subscript, operands_prepped = parser.parse_einsum_input(operands_, shapes=shapes)
+    input_subscripts, output_subscript, operands_prepped, label_map = parser.parse_einsum_input(
+        operands_, shapes=shapes, return_label_map=True
+    )
 
     # Build a few useful list and sets
     input_list = input_subscripts.split(",")
@@ -361,6 +403,7 @@ def contract_path(
     scale_list = []
     size_list = []
     contraction_list = []
+    original_contraction_list = []
 
     # Build contraction tuple (positions, gemm, einsum_str, remaining)
     for cnum, contract_inds in enumerate(path_tuple):
@@ -399,6 +442,17 @@ def contract_path(
 
         einsum_str = ",".join(tmp_inputs) + "->" + idx_result
 
+        # translate the internal single-character symbols of this step back to
+        # the original user supplied labels, so that the axes of every
+        # intermediate can be queried without manually undoing the conversion
+        original_inputs = tuple(tuple(label_map[c] for c in tmp_input) for tmp_input in tmp_inputs)
+        original_output = tuple(label_map[c] for c in idx_result)
+        original_removed = {
+            label_map[c]: tuple(tuple(pos for pos, x in enumerate(tmp_input) if x == c) for tmp_input in tmp_inputs)
+            for c in sorted(idx_removed)
+        }
+        original_contraction_list.append(OriginalContraction(original_inputs, original_output, original_removed))
+
         # for large expressions saving the remaining terms at each step can
         # incur a large memory footprint - and also be messy to print
         if len(input_list) <= 20:
@@ -425,6 +479,7 @@ def contract_path(
         opt_cost,
         size_list,
         size_dict,
+        original_contraction_list=tuple(original_contraction_list),
     )
 
     return path_tuple, path_print

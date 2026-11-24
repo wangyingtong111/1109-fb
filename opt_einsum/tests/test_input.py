@@ -271,3 +271,64 @@ def test_hashable_object_input_format() -> None:
     for i in range(1, 10):
         transpose_output = contract(x, ("b" * i, "a" * i))
         assert np.allclose(transpose_output, x.T)
+
+
+def test_mixed_int_and_str_labels() -> None:
+    a = np.random.rand(2, 3)
+    b = np.random.rand(3, 4)
+
+    # mixed integer and string labels with an explicit output
+    result = contract(a, [7, "channel"], b, ["channel", "time"], [7, "time"])
+    assert np.allclose(result, a @ b)
+
+    # comparable groups retain their implicit sorted order, with integers
+    # sorted before strings and strings sorted alphabetically
+    _, path_info = contract_path(a, [7, "channel"], b, ["channel", "time"], [7, "time"])
+    assert path_info.eq == "ab,bc->ac"
+
+    # the integer 7 and the string '7' are two distinct axes
+    x = np.random.rand(2, 3)
+    assert np.allclose(contract(x, [7, "7"]), x)
+    assert np.allclose(contract(x, ["7", 7]), x.T)
+
+
+def test_interleaved_path_original_axes() -> None:
+    # two ellipsis axes in the first input, one in the second, and a repeated
+    # (trace) label after the ellipsis of the first input
+    a = np.random.rand(2, 3, 5, 4, 4)
+    b = np.random.rand(3, 7)
+    c = np.random.rand(7, 8)
+
+    subs_a = [Ellipsis, 7, "trace", "trace"]
+    subs_b = [Ellipsis, "time"]
+    subs_c = ["time", "feature"]
+    out_subs = [Ellipsis, 7, "feature"]
+
+    # evaluation matches the equivalent string equation
+    result = contract(a, subs_a, b, subs_b, c, subs_c, out_subs)
+    expected = np.einsum("hiadd,ic,cb->hiab", a, b, c)
+    assert np.allclose(result, expected)
+
+    # force the first two operands to contract first, keeping 'time' around
+    # for the third operand
+    path, path_info = contract_path(a, subs_a, b, subs_b, c, subs_c, out_subs, optimize=[(0, 1), (0, 1)])
+    assert path == [(0, 1), (0, 1)]
+    assert path_info.eq == "hiadd,ic,cb->hiab"
+
+    step1, step2 = path_info.original_contraction_list or ()
+
+    # the ellipsis is right aligned: the single ellipsis axis of the second
+    # operand lines up with the last of the two ellipsis broadcast axes
+    assert step1.inputs == (
+        ((Ellipsis, 1), "time"),
+        ((Ellipsis, 0), (Ellipsis, 1), 7, "trace", "trace"),
+    )
+    assert step1.output == ((Ellipsis, 1), "time", (Ellipsis, 0), 7)
+
+    # both positions of the repeated 'trace' label are summed over together in
+    # the first step
+    assert step1.removed == {"trace": ((), (3, 4))}
+
+    # 'time' is only reduced in the second step, against the third operand
+    assert step2.removed == {"time": ((1,), (0,))}
+    assert step2.output == ((Ellipsis, 0), (Ellipsis, 1), 7, "feature")

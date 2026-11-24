@@ -31,6 +31,11 @@ toc_depth: 1
 ::: opt_einsum.contract.PathInfo
     <!-- :docstring: -->
 
+### `opt_einsum.contract.OriginalContraction`
+
+::: opt_einsum.contract.OriginalContraction
+    <!-- :docstring: -->
+
 ### `opt_einsum.get_symbol`
 
 ::: opt_einsum.parser.get_symbol
