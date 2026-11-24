@@ -9,8 +9,28 @@ __license__: str = "MIT"
 __version__: str = "3.14.6"
 
 from rapidfuzz import distance, fuzz, process, utils
+from rapidfuzz.fuzz import (
+    CoverageDetails,
+    CoverageScore,
+    multiset_coverage,
+    multiset_token_set_ratio,
+)
+from rapidfuzz.process import CoverageHit, CoverageResult, extract_coverage
 
-__all__ = ["distance", "fuzz", "get_include", "process", "utils"]
+__all__ = [
+    "CoverageDetails",
+    "CoverageHit",
+    "CoverageResult",
+    "CoverageScore",
+    "distance",
+    "extract_coverage",
+    "fuzz",
+    "get_include",
+    "multiset_coverage",
+    "multiset_token_set_ratio",
+    "process",
+    "utils",
+]
 
 
 def get_include() -> str:

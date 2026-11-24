@@ -8,7 +8,26 @@ import os
 
 from rapidfuzz._feature_detector import AVX2, SSE2, supports
 
-__all__ = ["cdist", "cpdist", "extract", "extractOne", "extract_iter"]
+__all__ = [
+    "CoverageHit",
+    "CoverageResult",
+    "cdist",
+    "coverage_extract",
+    "coverage_search",
+    "cpdist",
+    "extract",
+    "extractCoverage",
+    "extractOne",
+    "extractWithDetails",
+    "extractWithExplanations",
+    "extract_coverage",
+    "extract_iter",
+    "extract_with_details",
+    "extract_with_coverage",
+    "extract_with_explanations",
+    "multiset_extract",
+    "search_directory",
+]
 
 _impl = os.environ.get("RAPIDFUZZ_IMPLEMENTATION")
 if _impl == "cpp":
@@ -93,3 +112,21 @@ else:
             extract_iter,
             extractOne,
         )
+
+# Auditable coverage retrieval is implemented in the pure-Python module and is
+# independent of the selected core implementation.
+from rapidfuzz.process_py import (  # noqa: E402
+    CoverageHit,
+    CoverageResult,
+    coverage_extract,
+    coverage_search,
+    extract_coverage,
+    extract_with_details,
+    extract_with_coverage,
+    extract_with_explanations,
+    extractCoverage,
+    extractWithDetails,
+    extractWithExplanations,
+    multiset_extract,
+    search_directory,
+)

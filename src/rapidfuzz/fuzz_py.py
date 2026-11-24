@@ -2,6 +2,7 @@
 # Copyright (C) 2022 Max Bachmann
 from __future__ import annotations
 
+from collections import Counter
 from math import ceil
 
 from rapidfuzz._common_py import conv_sequences
@@ -58,6 +59,310 @@ def _join_splitted_sequence(seq_list):
         joined += seq
         joined += [ord(" ")]
     return joined[:-1]
+
+
+class CoverageDetails(Counter):
+    """Positive-frequency differences and the frequency snapshots used for them.
+
+    The dictionary itself contains the tokens missing from the right-hand side,
+    i.e. the uncovered tokens on the left.  Both directions are available as
+    attributes/mapping keys so callers can audit a result without recomputing
+    token frequencies.
+    """
+
+    def __init__(
+        self,
+        left_uncovered,
+        right_uncovered,
+        *,
+        left_counts,
+        right_counts,
+        common_counts,
+        common_count,
+        score,
+    ):
+        super().__init__(left_uncovered)
+        self.left_uncovered = dict(left_uncovered)
+        self.right_uncovered = dict(right_uncovered)
+        self.left_counts = dict(left_counts)
+        self.right_counts = dict(right_counts)
+        self.common_counts = dict(common_counts)
+        self.common_count = common_count
+        self.total_count = sum(self.left_counts.values()) + sum(self.right_counts.values())
+        self.score = float(score)
+
+    _LEFT_ALIASES = {
+        "left",
+        "left_uncovered",
+        "uncovered_left",
+        "left_missing",
+        "missing_left",
+        "left_gap",
+        "missing_words_left",
+        "missing_words",
+        "missing_word_counts",
+        "uncovered_words",
+        "uncovered_words_left",
+        "left_uncovered_counts",
+        "query_missing",
+        "query_uncovered",
+        "missing_query",
+        "missing",
+        "query_diff",
+        "a_minus_b",
+    }
+    _RIGHT_ALIASES = {
+        "right",
+        "right_uncovered",
+        "uncovered_right",
+        "right_missing",
+        "missing_right",
+        "right_gap",
+        "missing_words_right",
+        "uncovered_words_right",
+        "right_uncovered_counts",
+        "extra_words",
+        "extra_word_counts",
+        "candidate_extra",
+        "candidate_uncovered",
+        "extra_candidate",
+        "right_extra",
+        "extra_right",
+        "candidate_diff",
+        "extra",
+        "b_minus_a",
+    }
+
+    @property
+    def gaps(self):
+        return {"left": self.left_uncovered, "right": self.right_uncovered}
+
+    def _alias_value(self, key):
+        if key == "gaps":
+            return self.gaps
+        if key in self._LEFT_ALIASES:
+            return self.left_uncovered
+        if key in self._RIGHT_ALIASES:
+            return self.right_uncovered
+        if key == "score":
+            return self.score
+        raise KeyError(key)
+
+    def __getattr__(self, name):
+        try:
+            return self._alias_value(name)
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+
+    def __getitem__(self, key):
+        # Actual token frequencies take precedence over audit aliases so a
+        # vocabulary word such as "score" cannot be shadowed.
+        if dict.__contains__(self, key):
+            return dict.__getitem__(self, key)
+
+        try:
+            return self._alias_value(key)
+        except KeyError:
+            # Preserve Counter's zero-count behavior for ordinary tokens.
+            if isinstance(key, str):
+                return 0
+            raise
+
+    def get(self, key, default=None):
+        if dict.__contains__(self, key):
+            return dict.__getitem__(self, key)
+        try:
+            return self._alias_value(key)
+        except KeyError:
+            return default
+
+    def to_dict(self):
+        return {
+            "score": self.score,
+            "left_uncovered": dict(self.left_uncovered),
+            "right_uncovered": dict(self.right_uncovered),
+            "left_counts": dict(self.left_counts),
+            "right_counts": dict(self.right_counts),
+            "common_counts": dict(self.common_counts),
+            "common_count": self.common_count,
+        }
+
+
+class CoverageScore(float):
+    """Float score carrying the coverage details calculated in the same pass."""
+
+    __slots__ = ("details",)
+
+    def __new__(cls, score, details):
+        obj = float.__new__(cls, score)
+        obj.details = details
+        return obj
+
+    @property
+    def score(self):
+        return float(self)
+
+    @property
+    def left_uncovered(self):
+        return self.details.left_uncovered
+
+    @property
+    def right_uncovered(self):
+        return self.details.right_uncovered
+
+    @property
+    def missing_left(self):
+        return self.details.left_uncovered
+
+    @property
+    def missing_right(self):
+        return self.details.right_uncovered
+
+    def __iter__(self):
+        # Allow score, left_uncovered, right_uncovered = coverage(...)
+        yield float(self)
+        yield self.details.left_uncovered
+        yield self.details.right_uncovered
+
+    def __len__(self):
+        return 3
+
+    def __getitem__(self, item):
+        if isinstance(item, int):
+            if item == 0:
+                return float(self)
+            if item == 1:
+                return self.details.left_uncovered
+            if item == 2:
+                return self.details.right_uncovered
+            raise IndexError(item)
+        if isinstance(item, str):
+            if item == "score":
+                return float(self)
+            return self.details[item]
+        raise TypeError(item)
+
+    def to_tuple(self):
+        return float(self), dict(self.details.left_uncovered), dict(self.details.right_uncovered)
+
+
+def _coverage_frequencies(value, processor=None):
+    if processor is not None:
+        value = processor(value)
+
+    if is_none(value):
+        return Counter()
+
+    return Counter(_split_sequence(value))
+
+
+def _multiset_coverage_from_counts(left_counts, right_counts):
+    # Counter intersection keeps min(left_frequency, right_frequency) for every
+    # token.  This is the multiset intersection required for repeated words.
+    common_counts = left_counts & right_counts
+    common_count = sum(common_counts.values())
+    total_count = sum(left_counts.values()) + sum(right_counts.values())
+
+    if not left_counts or not right_counts:
+        score = 0.0
+    else:
+        score = 200.0 * common_count / total_count
+
+    left_uncovered = left_counts - right_counts
+    right_uncovered = right_counts - left_counts
+    details = CoverageDetails(
+        left_uncovered,
+        right_uncovered,
+        left_counts=left_counts,
+        right_counts=right_counts,
+        common_counts=common_counts,
+        common_count=common_count,
+        score=score,
+    )
+    return CoverageScore(score, details)
+
+
+def multiset_coverage(
+    s1,
+    s2,
+    *,
+    processor=None,
+    details=False,
+    return_details=False,
+):
+    """
+    Compute multiset token coverage and uncovered token frequencies.
+
+    The score is ``200 * sum(min(freq1[token], freq2[token])) /
+    (sum(freq1.values()) + sum(freq2.values()))``, i.e. twice the multiset
+    intersection size normalized by both sides' token counts.
+
+    The returned object compares equal to its float score while also carrying
+    a :class:`CoverageDetails` snapshot.  It can be unpacked as
+    ``(score, left_uncovered, right_uncovered)``.
+    """
+    _ = details, return_details
+    setupPandas()
+    if is_none(s1) or is_none(s2):
+        left_counts = Counter() if is_none(s1) else _coverage_frequencies(s1, processor)
+        right_counts = Counter() if is_none(s2) else _coverage_frequencies(s2, processor)
+        return _multiset_coverage_from_counts(left_counts, right_counts)
+
+    left_counts = _coverage_frequencies(s1, processor)
+    right_counts = _coverage_frequencies(s2, processor)
+    return _multiset_coverage_from_counts(left_counts, right_counts)
+
+
+def multiset_token_set_ratio(
+    s1,
+    s2,
+    *,
+    processor=None,
+    score_cutoff=None,
+    details=False,
+    return_details=False,
+    with_details=False,
+):
+    """
+    Repeated-token aware alternative to :func:`token_set_ratio`.
+
+    Unlike the default set-based scorer, repeated occurrences contribute to
+    both the intersection and the denominator.  The returned float carries
+    coverage details on its ``details`` attribute.  The boolean detail
+    arguments are accepted for call-site readability; details are always
+    attached to the returned float.
+    """
+    _ = details, return_details, with_details
+    coverage = multiset_coverage(s1, s2, processor=processor)
+
+    if score_cutoff is not None and coverage < score_cutoff:
+        return CoverageScore(0.0, coverage.details)
+
+    return coverage
+
+
+# Descriptive aliases for callers expecting "coverage" rather than the
+# historical token_set_ratio naming.
+multiset_coverage_score = multiset_token_set_ratio
+multiset_score = multiset_token_set_ratio
+coverage_score = multiset_token_set_ratio
+multiset_coverage_ratio = multiset_token_set_ratio
+multiset_f1_ratio = multiset_token_set_ratio
+coverage_ratio = multiset_token_set_ratio
+token_coverage_ratio = multiset_token_set_ratio
+token_f1_ratio = multiset_token_set_ratio
+token_multiset_ratio = multiset_token_set_ratio
+repeated_token_set_ratio = multiset_token_set_ratio
+
+
+def multiset_coverage_details(
+    s1,
+    s2,
+    *,
+    processor=None,
+):
+    """Return a :class:`CoverageDetails` object including the coverage score."""
+    return multiset_coverage(s1, s2, processor=processor).details
 
 
 def ratio(
@@ -398,6 +703,12 @@ def token_set_ratio(
     *,
     processor=None,
     score_cutoff=None,
+    multiset=False,
+    repeated=False,
+    count_repeats=False,
+    details=False,
+    return_details=False,
+    with_details=False,
 ):
     """
     Compares the words in the strings based on unique and common words between them
@@ -439,6 +750,14 @@ def token_set_ratio(
     >>> fuzz.token_set_ratio("fuzzy was a bear but not a dog", "fuzzy was a bear but not a cat")
     92.3076923076923
     """
+    if multiset or repeated or count_repeats:
+        return multiset_token_set_ratio(
+            s1,
+            s2,
+            processor=processor,
+            score_cutoff=score_cutoff,
+        )
+
     setupPandas()
     if is_none(s1) or is_none(s2):
         return 0
@@ -881,6 +1200,17 @@ add_scorer_attrs(ratio, fuzz_attribute)
 add_scorer_attrs(partial_ratio, fuzz_attribute)
 add_scorer_attrs(token_sort_ratio, fuzz_attribute)
 add_scorer_attrs(token_set_ratio, fuzz_attribute)
+add_scorer_attrs(multiset_token_set_ratio, fuzz_attribute)
+add_scorer_attrs(multiset_coverage_score, fuzz_attribute)
+add_scorer_attrs(multiset_score, fuzz_attribute)
+add_scorer_attrs(coverage_score, fuzz_attribute)
+add_scorer_attrs(multiset_coverage_ratio, fuzz_attribute)
+add_scorer_attrs(multiset_f1_ratio, fuzz_attribute)
+add_scorer_attrs(coverage_ratio, fuzz_attribute)
+add_scorer_attrs(token_coverage_ratio, fuzz_attribute)
+add_scorer_attrs(token_f1_ratio, fuzz_attribute)
+add_scorer_attrs(token_multiset_ratio, fuzz_attribute)
+add_scorer_attrs(repeated_token_set_ratio, fuzz_attribute)
 add_scorer_attrs(token_ratio, fuzz_attribute)
 add_scorer_attrs(partial_token_sort_ratio, fuzz_attribute)
 add_scorer_attrs(partial_token_set_ratio, fuzz_attribute)

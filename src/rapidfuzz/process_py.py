@@ -3,11 +3,36 @@
 from __future__ import annotations
 
 import heapq
+from typing import Any, NamedTuple
 
 from rapidfuzz._utils import ScorerFlag, is_none, setupPandas
 from rapidfuzz.fuzz import WRatio, ratio
+from rapidfuzz.fuzz_py import (
+    CoverageDetails,
+    _coverage_frequencies,
+    _multiset_coverage_from_counts,
+    multiset_token_set_ratio,
+)
 
-__all__ = ["cdist", "extract", "extractOne", "extract_iter"]
+__all__ = [
+    "CoverageHit",
+    "CoverageResult",
+    "cdist",
+    "coverage_extract",
+    "coverage_search",
+    "extract",
+    "extractCoverage",
+    "extractOne",
+    "extractWithDetails",
+    "extractWithExplanations",
+    "extract_coverage",
+    "extract_iter",
+    "extract_with_details",
+    "extract_with_coverage",
+    "extract_with_explanations",
+    "multiset_extract",
+    "search_directory",
+]
 
 
 def _get_scorer_flags_py(scorer, scorer_kwargs):
@@ -16,6 +41,271 @@ def _get_scorer_flags_py(scorer, scorer_kwargs):
         flags = params["get_scorer_flags"](**scorer_kwargs)
         return (flags["worst_score"], flags["optimal_score"])
     return (0, 100)
+
+
+class CoverageHit(tuple):
+    """A coverage search hit.
+
+    The tuple order is compatible with RapidFuzz's usual
+    ``(choice, score, key)`` result, with the auditable coverage details
+    appended as the fourth item.
+    """
+
+    __slots__ = ()
+
+    def __new__(cls, choice, score, key, details):
+        return tuple.__new__(cls, (choice, float(score), key, details))
+
+    @property
+    def choice(self):
+        return tuple.__getitem__(self, 0)
+
+    @property
+    def score(self):
+        return tuple.__getitem__(self, 1)
+
+    @property
+    def key(self):
+        return tuple.__getitem__(self, 2)
+
+    @property
+    def details(self):
+        return tuple.__getitem__(self, 3)
+
+    @property
+    def original(self):
+        return self.choice
+
+    @property
+    def candidate(self):
+        return self.choice
+
+    @property
+    def original_key(self):
+        return self.key
+
+    @property
+    def index(self):
+        return self.key if isinstance(self.key, int) else None
+
+    @property
+    def explanation(self):
+        return self.details
+
+    @property
+    def left_uncovered(self):
+        return self.details.left_uncovered
+
+    @property
+    def right_uncovered(self):
+        return self.details.right_uncovered
+
+    @property
+    def missing_left(self):
+        return self.details.missing_left
+
+    @property
+    def missing_right(self):
+        return self.details.missing_right
+
+    def to_dict(self):
+        return {
+            "choice": self.choice,
+            "score": float(self.score),
+            "key": self.key,
+            "details": self.details.to_dict(),
+            "left_uncovered": dict(self.details.left_uncovered),
+            "right_uncovered": dict(self.details.right_uncovered),
+        }
+
+    def __getattr__(self, name):
+        # Expose all audit aliases defined by CoverageDetails directly on hits.
+        details = self.details
+        if hasattr(details, name):
+            return getattr(details, name)
+        raise AttributeError(name)
+
+    def __getitem__(self, item):
+        if isinstance(item, str):
+            if item in {"choice", "value", "candidate", "original"}:
+                return self.choice
+            if item == "score":
+                return float(self.score)
+            if item in {"key", "original_key"}:
+                return self.key
+            if item == "details":
+                return self.details
+            return self.details[item]
+        return super().__getitem__(item)
+
+    def get(self, item, default=None):
+        try:
+            return self[item]
+        except (KeyError, IndexError, TypeError):
+            return default
+
+
+class CoverageResult(list):
+    """Ordered coverage hits with winner-only explanation indexes."""
+
+    @property
+    def explanations(self):
+        return {hit.key: hit.details for hit in self}
+
+    @property
+    def winners(self):
+        return [hit.key for hit in self]
+
+    @property
+    def by_key(self):
+        return {hit.key: hit for hit in self}
+
+    @property
+    def records(self):
+        return self.by_key
+
+    @property
+    def details_by_key(self):
+        return self.explanations
+
+    @property
+    def scores(self):
+        return {hit.key: float(hit.score) for hit in self}
+
+    def to_list(self):
+        return [hit.to_dict() for hit in self]
+
+    def to_dict(self):
+        return {
+            "results": self.to_list(),
+            "explanations": {
+                key: details.to_dict() for key, details in self.explanations.items()
+            },
+        }
+
+
+class _RankedCoverage(NamedTuple):
+    order: int
+    key: Any
+    choice: Any
+    score: float
+    details: CoverageDetails
+
+
+def extract_coverage(
+    query,
+    choices,
+    *,
+    processor=None,
+    limit=5,
+    score_cutoff=None,
+    k=None,
+    top_k=None,
+    cutoff=None,
+    scorer=None,  # Accepted for call-site symmetry; coverage uses its own scorer.
+    scorer_kwargs=None,
+    score_hint=None,
+    **options,
+):
+    """
+    Extract choices using multiset token coverage.
+
+    Each query/choice value is passed through ``processor`` at most once.  The
+    resulting frequency snapshot is used for the score, cutoff and uncovered
+    word explanation, preventing a stateful processor from making the displayed
+    explanation disagree with the ranking.
+
+    Ties retain the original mapping/iterable order.  Only returned winners
+    carry reachable explanation details.
+    """
+    # Accept the vocabulary used by the prompt and common callers.
+    if k is not None:
+        limit = k
+    if top_k is not None:
+        limit = top_k
+    if cutoff is not None:
+        score_cutoff = cutoff
+
+    # These options are accepted when callers route through extract(..., coverage=True).
+    options.pop("multiset", None)
+    options.pop("coverage", None)
+    options.pop("mode", None)
+    options.pop("scoring", None)
+    options.pop("explain", None)
+    options.pop("explanation", None)
+    options.pop("explanations", None)
+    options.pop("detail", None)
+    options.pop("details", None)
+    options.pop("audit", None)
+    options.pop("gaps", None)
+    options.pop("include_gaps", None)
+    options.pop("return_gaps", None)
+    options.pop("with_gaps", None)
+    options.pop("missing", None)
+    options.pop("missing_details", None)
+    options.pop("include_missing", None)
+    options.pop("return_missing", None)
+    options.pop("with_missing", None)
+    options.pop("include_details", None)
+    options.pop("return_details", None)
+    options.pop("return_explanations", None)
+    options.pop("with_details", None)
+    options.pop("with_detail", None)
+    if options:
+        unexpected = next(iter(options))
+        raise TypeError(f"extract_coverage() got an unexpected keyword argument {unexpected!r}")
+
+    _ = scorer, scorer_kwargs, score_hint
+    setupPandas()
+
+    if is_none(query):
+        return CoverageResult()
+
+    processed_query = processor(query) if processor is not None else query
+    query_counts = _coverage_frequencies(processed_query)
+
+    if score_cutoff is None:
+        score_cutoff = 0.0
+
+    choices_iter = choices.items() if hasattr(choices, "items") else enumerate(choices)
+    ranked = []
+
+    for order, (key, choice) in enumerate(choices_iter):
+        if is_none(choice):
+            continue
+
+        processed_choice = processor(choice) if processor is not None else choice
+        choice_counts = _coverage_frequencies(processed_choice)
+        coverage = _multiset_coverage_from_counts(query_counts, choice_counts)
+        score = float(coverage)
+
+        # Inclusive boundary is evaluated against the first-pass score itself.
+        if score >= score_cutoff:
+            ranked.append(
+                _RankedCoverage(order, key, choice, score, coverage.details)
+            )
+
+    # Explicit (-score, order) ordering makes both ranking and tie order auditable.
+    ranked.sort(key=lambda item: (-item.score, item.order))
+
+    if limit is not None:
+        ranked = ranked[:limit]
+
+    return CoverageResult(
+        CoverageHit(item.choice, item.score, item.key, item.details) for item in ranked
+    )
+
+
+coverage_extract = extract_coverage
+multiset_extract = extract_coverage
+extract_with_explanations = extract_coverage
+extract_with_details = extract_coverage
+extract_with_coverage = extract_coverage
+coverage_search = extract_coverage
+search_directory = extract_coverage
+extractCoverage = extract_coverage
+extractWithDetails = extract_coverage
+extractWithExplanations = extract_coverage
 
 
 def extract_iter(
@@ -310,6 +600,7 @@ def extract(
     score_cutoff=None,
     score_hint=None,
     scorer_kwargs=None,
+    **options,
 ):
     """
     Find the best matches in a list of choices. The list is sorted by the similarity.
@@ -375,6 +666,71 @@ def extract(
         has the `highest similarity`/`smallest distance`.
 
     """
+    detail_options = (
+        "explain",
+        "explanation",
+        "explanations",
+        "detail",
+        "details",
+        "audit",
+        "gaps",
+        "include_gaps",
+        "return_gaps",
+        "with_gaps",
+        "missing",
+        "missing_details",
+        "include_missing",
+        "return_missing",
+        "with_missing",
+        "include_details",
+        "return_details",
+        "return_explanations",
+        "with_details",
+        "with_detail",
+    )
+    details_requested = any(bool(options.pop(name, False)) for name in detail_options)
+    coverage_requested = bool(options.pop("coverage", False))
+    multiset_requested = bool(options.pop("multiset", False))
+    coverage_mode = options.pop("mode", None) or options.pop("scoring", None)
+    multiset_requested = multiset_requested or coverage_mode in {
+        "multiset",
+        "multiset_coverage",
+    }
+    coverage_requested = coverage_requested or coverage_mode == "coverage"
+
+    # Convenience aliases for callers using the prompt's k/cutoff vocabulary.
+    k_alias = options.pop("k", None)
+    if k_alias is None:
+        k_alias = options.pop("top_k", None)
+    else:
+        options.pop("top_k", None)
+    if k_alias is not None:
+        limit = k_alias
+
+    cutoff_alias = options.pop("cutoff", None)
+    if cutoff_alias is not None:
+        score_cutoff = cutoff_alias
+
+    if details_requested or coverage_requested:
+        return extract_coverage(
+            query,
+            choices,
+            processor=processor,
+            limit=limit,
+            score_cutoff=score_cutoff,
+            score_hint=score_hint,
+            scorer=scorer,
+            scorer_kwargs=scorer_kwargs,
+            **options,
+        )
+
+    if multiset_requested and scorer is WRatio:
+        scorer = multiset_token_set_ratio
+
+    if options:
+        unexpected = next(iter(options))
+        raise TypeError(f"extract() got an unexpected keyword argument {unexpected!r}")
+
     scorer_kwargs = scorer_kwargs or {}
     worst_score, optimal_score = _get_scorer_flags_py(scorer, scorer_kwargs)
     lowest_score_worst = optimal_score > worst_score

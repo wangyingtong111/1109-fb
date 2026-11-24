@@ -9,14 +9,29 @@ import os
 from rapidfuzz._feature_detector import AVX2, SSE2, supports
 
 __all__ = [
+    "CoverageDetails",
+    "CoverageScore",
     "QRatio",
     "WRatio",
+    "coverage_ratio",
+    "coverage_score",
+    "multiset_coverage",
+    "multiset_coverage_details",
+    "multiset_coverage_ratio",
+    "multiset_coverage_score",
+    "multiset_f1_ratio",
+    "multiset_score",
+    "multiset_token_set_ratio",
     "partial_ratio",
     "partial_ratio_alignment",
     "partial_token_ratio",
     "partial_token_set_ratio",
     "partial_token_sort_ratio",
     "ratio",
+    "repeated_token_set_ratio",
+    "token_coverage_ratio",
+    "token_f1_ratio",
+    "token_multiset_ratio",
     "token_ratio",
     "token_set_ratio",
     "token_sort_ratio",
@@ -159,3 +174,23 @@ else:
             token_set_ratio,
             token_sort_ratio,
         )
+
+# Coverage helpers are pure Python and remain available regardless of whether
+# the accelerated scorers are selected above.
+from rapidfuzz.fuzz_py import (  # noqa: E402
+    CoverageDetails,
+    CoverageScore,
+    coverage_ratio,
+    coverage_score,
+    multiset_coverage,
+    multiset_coverage_details,
+    multiset_coverage_ratio,
+    multiset_coverage_score,
+    multiset_f1_ratio,
+    multiset_score,
+    multiset_token_set_ratio,
+    repeated_token_set_ratio,
+    token_coverage_ratio,
+    token_f1_ratio,
+    token_multiset_ratio,
+)
