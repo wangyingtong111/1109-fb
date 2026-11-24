@@ -278,10 +278,23 @@ class MiniFTS
 
   # Replaces an existing document with an updated version (same ID). Equivalent
   # to {#discard} followed by {#add}.
+  #
+  # Indexing callbacks can raise after some fields have already been added. In
+  # that case the complete pre-replacement index state is restored before the
+  # original error is re-raised, so a failed replacement leaves the old document
+  # searchable and leaves statistics, stored fields, and dirt count unchanged.
   def replace(updated_document)
-    id = @options[:extract_field].call(updated_document, @options[:id_field])
-    discard(id)
-    add(updated_document)
+    snapshot = snapshot_index_state
+
+    begin
+      id = @options[:extract_field].call(updated_document, @options[:id_field])
+      discard(id)
+      add(updated_document)
+    rescue StandardError
+      restore_index_state(snapshot)
+      raise
+    end
+
     nil
   end
 
@@ -482,6 +495,48 @@ class MiniFTS
     @next_id = 0
     @stored_fields = {}
     @dirt_count = 0
+  end
+
+  # Copies every engine-owned mutable container that replace/discard/add can
+  # change. Scalar values and the objects held as stored field values are shared.
+  def snapshot_index_state
+    field_length = {}
+    @field_length.each { |short_id, lengths| field_length[short_id] = lengths.dup }
+
+    stored_fields = {}
+    @stored_fields.each { |short_id, fields| stored_fields[short_id] = fields.dup }
+
+    {
+      index: SearchableMap.new(deep_dup_hash(@index.tree), @index.prefix),
+      document_count: @document_count,
+      document_ids: @document_ids.dup,
+      id_to_short_id: @id_to_short_id.dup,
+      field_ids: @field_ids.dup,
+      field_length: field_length,
+      avg_field_length: @avg_field_length.dup,
+      next_id: @next_id,
+      stored_fields: stored_fields,
+      dirt_count: @dirt_count
+    }
+  end
+
+  def restore_index_state(snapshot)
+    @index = snapshot[:index]
+    @document_count = snapshot[:document_count]
+    @document_ids = snapshot[:document_ids]
+    @id_to_short_id = snapshot[:id_to_short_id]
+    @field_ids = snapshot[:field_ids]
+    @field_length = snapshot[:field_length]
+    @avg_field_length = snapshot[:avg_field_length]
+    @next_id = snapshot[:next_id]
+    @stored_fields = snapshot[:stored_fields]
+    @dirt_count = snapshot[:dirt_count]
+  end
+
+  def deep_dup_hash(hash)
+    hash.each_with_object({}) do |(key, value), copy|
+      copy[key] = value.is_a?(Hash) ? deep_dup_hash(value) : value
+    end
   end
 
   def load_plain_object(js)
