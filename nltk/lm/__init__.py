@@ -188,6 +188,36 @@ perplexity with respect to sequences of ngrams.
 It is advisable to preprocess your test text exactly the same way as you did
 the training text.
 
+When an MLE model meets an unseen ngram, its perplexity is infinite. On a
+corpus of short sentences this only tells you that *something* broke, not
+where. The `evaluate` method scores the text sentence by sentence so the
+offending ngram and its context can be located. It accepts the same
+single-pass iterators as `fit`, keeps the original per-word overall figures,
+and reports the contribution of each sentence separately.
+
+    >>> eval_lm = MLE(2)
+    >>> eval_train, eval_vocab = padded_everygram_pipeline(2, [["a", "b"]])
+    >>> eval_lm.fit(eval_train, eval_vocab)
+    >>> eval_ngrams, _ = padded_everygram_pipeline(2, [["a", "b"], ["a", "c"]])
+    >>> evaluation = eval_lm.evaluate(eval_ngrams)
+    >>> evaluation.is_infinite
+    True
+    >>> # The overall perplexity stays infinite ...
+    >>> evaluation.perplexity
+    inf
+    >>> # ... while the first sentence retains its finite contribution.
+    >>> round(evaluation.sentences[0].perplexity, 4)
+    2.2082
+    >>> evaluation.sentences[1].is_infinite
+    True
+    >>> # (sentence index, the zero-probability ngram with its context)
+    >>> evaluation.zero_probability_ngrams[0]
+    (1, ('a', 'c'))
+
+The history is reset at every sentence boundary and zero-probability ngrams
+are reported as-is rather than being patched with a non-zero probability. The
+flat `entropy` and `perplexity` calls above keep working unchanged.
+
 One cool feature of ngram models is that they can be used to generate text.
 
     >>> lm.generate(1, random_seed=3)
@@ -210,6 +240,7 @@ on 2 preceding words. If you pass in a 4-word context, the first two words
 will be ignored.
 """
 
+from nltk.lm.api import SentenceScore, TextScore
 from nltk.lm.counter import NgramCounter
 from nltk.lm.models import (
     MLE,
@@ -232,4 +263,6 @@ __all__ = [
     "KneserNeyInterpolated",
     "AbsoluteDiscountingInterpolated",
     "StupidBackoff",
+    "TextScore",
+    "SentenceScore",
 ]
