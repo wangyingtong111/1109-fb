@@ -1,6 +1,18 @@
 Changelog
 =========
 
+## Unreleased
+
+**New Features**
+
+- `contract`, `contract_path` and `ContractExpression` accept a `conjugate`
+  keyword declaring which operands are conjugated as part of the contraction.
+  It takes a single boolean or one boolean per operand. On the NumPy path the
+  conjugation is fused into the contraction (using a native kernel when
+  available, otherwise a blocked kernel), so no full operand-sized conjugate
+  copy is materialized and the input arrays are never modified. Backends
+  without such a kernel still return the same value in their own array type.
+
 ## 3.4.0 / 2024-09-26
 
 NumPy has been removed from `opt_einsum` as a dependency allowing for more flexible installs.

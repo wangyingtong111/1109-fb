@@ -105,3 +105,29 @@ oe.contract(x, ('a', 'b'))
 #> or hashable and comparable object (e.g. int, str)
 ```
 
+
+## Conjugating operands
+
+For complex contractions, such as a conjugate inner product, `contract` and
+`contract_expression` accept a `conjugate` keyword declaring which operands
+should be conjugated as part of the contraction rather than beforehand:
+
+```python
+a = np.array([1 + 1j, 2.0])
+b = np.array([1.0, 1j])
+
+oe.contract("i,i->", a, b, conjugate=(True, False))
+#> (1+1j)
+```
+
+`conjugate` is either a single boolean applied to every operand or a sequence
+of booleans with one entry per operand. The supplied arrays are never modified,
+and on the NumPy path the conjugation is fused into the contraction - no full
+operand-sized conjugate copy is materialized. A compiled expression keeps the
+declaration as its default, while still allowing a per-call override:
+
+```python
+expr = oe.contract_expression("i,i->", a.shape, b.shape)
+expr(a, b, conjugate=(True, False))  # conjugated for this call only
+expr(a, b)                            # plain contraction as compiled
+```

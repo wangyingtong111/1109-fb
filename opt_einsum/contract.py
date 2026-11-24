@@ -6,6 +6,7 @@ from functools import lru_cache
 from typing import Any, Literal, overload
 
 from opt_einsum import backends, blas, helpers, parser, paths, sharing
+from opt_einsum.backends import numpy_conj
 from opt_einsum.typing import (
     ArrayIndexType,
     ArrayShaped,
@@ -80,7 +81,7 @@ class PathInfo:
         ]
 
         for n, contraction in enumerate(self.contraction_list):
-            _, _, einsum_str, remaining, do_blas = contraction
+            _, _, einsum_str, remaining, do_blas, _ = contraction
 
             if remaining is not None:
                 remaining_str = ",".join(remaining) + "->" + self.output_subscript
@@ -119,7 +120,81 @@ def _choose_memory_arg(memory_limit: _MemoryLimit, size_list: list[int]) -> int 
     return int(memory_limit)
 
 
+def _handle_empty_subscripts(
+    input_subscripts: str,
+    output_subscript: str,
+    operands_prepped: Sequence[ArrayType],
+    einsum_call: bool,
+) -> Any:
+    """Replicate the legacy handling of an empty subscript string: a single
+    degenerate contraction step (``einsum_call=True``, consumed by
+    :func:`contract`) or a :class:`PathInfo` describing that step. The actual
+    backend einsum call later raises the informative dtype/casting validation
+    errors for such invalid input.
+    """
+    equation = f"{input_subscripts}->{output_subscript}"
+    num_operands = len(operands_prepped)
+
+    if einsum_call:
+        contraction: tuple[Any, ArrayIndexType, str, tuple[str, ...], bool, tuple[bool, ...]] = (
+            tuple(range(num_operands))[::-1],
+            frozenset(),
+            equation,
+            (output_subscript or "",),
+            False,
+            tuple(False for _ in range(num_operands)),
+        )
+        return list(operands_prepped), [contraction]
+
+    # build a PathInfo mirroring the legacy degenerate single-step path
+    path_tuple: PathType = [tuple(range(num_operands))]
+    contraction_list: ContractionListType = [
+        (
+            tuple(range(num_operands))[::-1],
+            frozenset(),
+            equation,
+            (output_subscript or "",),
+            False,
+            tuple(False for _ in range(num_operands)),
+        )
+    ]
+    path_info = PathInfo(
+        contraction_list,
+        input_subscripts,
+        output_subscript,
+        frozenset(),
+        path_tuple,
+        [0],
+        1,
+        1,
+        [1] * (num_operands + 1),
+        {},
+    )
+    return path_tuple, path_info
+
+
 _EinsumDefaultKeys = Literal["order", "casting", "dtype", "out"]
+
+
+def _normalize_conjugate(conjugate: bool | Collection[bool] | None, num_operands: int) -> tuple[bool, ...]:
+    """Validate and normalize a ``conjugate`` declaration into one boolean
+    flag per (full, interleaving-resolved) operand.
+    """
+    if conjugate is None:
+        return tuple(False for _ in range(num_operands))
+
+    if isinstance(conjugate, bool):
+        flags = (conjugate,) * num_operands
+    else:
+        flags = tuple(conjugate)
+
+    if len(flags) != num_operands:
+        raise ValueError(
+            f"`conjugate` must provide one flag per operand: expected {num_operands}, got {len(flags)}."
+        )
+    if any(not isinstance(flag, bool) for flag in flags):
+        raise TypeError("`conjugate` must be a boolean or a sequence of booleans.")
+    return flags
 
 
 def _filter_einsum_defaults(kwargs: dict[_EinsumDefaultKeys, Any]) -> dict[_EinsumDefaultKeys, Any]:
@@ -151,6 +226,7 @@ def contract_path(
     optimize: OptimizeKind = True,
     memory_limit: _MemoryLimit = None,
     shapes: bool = False,
+    conjugate: bool | Collection[bool] | None = None,
     **kwargs: Any,
 ) -> tuple[PathType, PathInfo]: ...
 
@@ -164,6 +240,7 @@ def contract_path(
     optimize: OptimizeKind = True,
     memory_limit: _MemoryLimit = None,
     shapes: bool = False,
+    conjugate: bool | Collection[bool] | None = None,
     **kwargs: Any,
 ) -> tuple[PathType, PathInfo]: ...
 
@@ -175,6 +252,7 @@ def contract_path(
     optimize: OptimizeKind = True,
     memory_limit: _MemoryLimit = None,
     shapes: bool = False,
+    conjugate: bool | Collection[bool] | None = None,
     **kwargs: Any,
 ) -> tuple[PathType, PathInfo]:
     """Find a contraction order `path`, without performing the contraction.
@@ -287,12 +365,31 @@ def contract_path(
 
     # Hidden option, only einsum should call this
     einsum_call_arg = kwargs.pop("einsum_call", False)
-    if len(kwargs):
-        raise TypeError(f"Did not understand the following kwargs: {kwargs.keys()}")
 
     # Python side parsing
     operands_ = [subscripts] + list(operands)
     input_subscripts, output_subscript, operands_prepped = parser.parse_einsum_input(operands_, shapes=shapes)
+
+    # empty subscript strings are invalid input: with no subscript labels the
+    # path machinery has nothing to optimize, so build a single degenerate
+    # contraction step (or a matching PathInfo); for an actual contraction the
+    # backend einsum subsequently raises its informative validation errors
+    if isinstance(subscripts, str) and not subscripts.strip():
+        return _handle_empty_subscripts(
+            input_subscripts,
+            output_subscript,
+            operands_prepped,
+            einsum_call=einsum_call_arg,
+        )
+
+    # ``order``/``casting``/``dtype`` are valid einsum kwargs forwarded to the
+    # backend kernels; anything else is not understood by the path machinery
+    unknown_kwargs = [key for key in kwargs if key not in ("order", "casting", "dtype")]
+    if unknown_kwargs:
+        raise TypeError(f"Did not understand the following kwargs: {unknown_kwargs}")
+
+    # which of the original operands should be conjugated before contraction
+    conjugate_flags = _normalize_conjugate(conjugate, len(operands_prepped))
 
     # Build a few useful list and sets
     input_list = input_subscripts.split(",")
@@ -362,6 +459,10 @@ def contract_path(
     size_list = []
     contraction_list = []
 
+    # per current-operand conjugation flags, parallel to ``input_list``;
+    # freshly created intermediates are never themselves conjugated
+    input_conjugate = list(conjugate_flags)
+
     # Build contraction tuple (positions, gemm, einsum_str, remaining)
     for cnum, contract_inds in enumerate(path_tuple):
         # Make sure we remove inds from right to left
@@ -378,6 +479,7 @@ def contract_path(
 
         tmp_inputs = [input_list.pop(x) for x in contract_inds]
         tmp_shapes = [input_shapes.pop(x) for x in contract_inds]
+        tmp_conjugate = tuple(input_conjugate.pop(x) for x in contract_inds)
 
         if use_blas:
             do_blas = blas.can_blas(tmp_inputs, "".join(out_inds), idx_removed, tmp_shapes)
@@ -396,6 +498,7 @@ def contract_path(
 
         input_list.append(idx_result)
         input_shapes.append(shp_result)
+        input_conjugate.append(False)
 
         einsum_str = ",".join(tmp_inputs) + "->" + idx_result
 
@@ -406,7 +509,7 @@ def contract_path(
         else:
             remaining = None
 
-        contraction = (contract_inds, idx_removed, einsum_str, remaining, do_blas)
+        contraction = (contract_inds, idx_removed, einsum_str, remaining, do_blas, tmp_conjugate)
         contraction_list.append(contraction)
 
     opt_cost = sum(cost_list)
@@ -483,6 +586,7 @@ def contract(
     optimize: OptimizeKind = ...,
     memory_limit: _MemoryLimit = ...,
     backend: BackendType = ...,
+    conjugate: bool | Collection[bool] | None = ...,
     **kwargs: Any,
 ) -> ArrayType: ...
 
@@ -496,6 +600,7 @@ def contract(
     optimize: OptimizeKind = ...,
     memory_limit: _MemoryLimit = ...,
     backend: BackendType = ...,
+    conjugate: bool | Collection[bool] | None = ...,
     **kwargs: Any,
 ) -> ArrayType: ...
 
@@ -508,6 +613,7 @@ def contract(
     optimize: OptimizeKind = True,
     memory_limit: _MemoryLimit = None,
     backend: BackendType = "auto",
+    conjugate: bool | Collection[bool] | None = None,
     **kwargs: Any,
 ) -> ArrayType:
     """Evaluates the Einstein summation convention on the operands. A drop in
@@ -559,6 +665,12 @@ def contract(
             `contract_expression` for generating expressions which convert
             numpy arrays to and from the backend library automatically.
 
+        conjugate: Declares which operands should be conjugated as part of the
+            contraction rather than beforehand. Either a single boolean applied
+            to every operand, or a sequence of booleans with one entry per
+            operand. The supplied arrays are never modified and no full
+            operand-sized conjugate copy is materialized on the NumPy path.
+
     Returns:
         The result of the einsum expression.
 
@@ -584,11 +696,27 @@ def contract(
     if optimize is False:
         input_subscripts, output_subscript, arrays = parser.parse_einsum_input(operands_list)
         _backend = parse_backend(arrays, backend)
+        conj_flags = _normalize_conjugate(conjugate, len(arrays))
+        if any(conj_flags) and _backend == "numpy":
+            return numpy_conj.conjugate_einsum(
+                f"{input_subscripts}->{output_subscript}",
+                *arrays,
+                conjugate=conj_flags,
+                out=out,
+                **kwargs,
+            )
+        if any(conj_flags):
+            # backend without a fused conjugate kernel: conjugate in the
+            # backend's own array type, preserving the returned array type
+            arrays = [
+                numpy_conj.conjugate(x) if flag else x for x, flag in zip(arrays, conj_flags)
+            ]
         return _einsum(f"{input_subscripts}->{output_subscript}", *arrays, backend=_backend, out=out, **kwargs)
 
     # Grab non-einsum kwargs
     gen_expression = kwargs.pop("_gen_expression", False)
     constants_dict = kwargs.pop("_constants_dict", {})
+    expression_conjugate = kwargs.pop("_conjugate", ())
 
     if gen_expression:
         full_str = operands_list[0]
@@ -596,12 +724,20 @@ def contract(
     # Build the contraction list and operand
     contraction_list: ContractionListType
     operands, contraction_list = contract_path(  # type: ignore
-        *operands_list, optimize=optimize, memory_limit=memory_limit, einsum_call=True, use_blas=use_blas
+        *operands_list,
+        optimize=optimize,
+        memory_limit=memory_limit,
+        einsum_call=True,
+        use_blas=use_blas,
+        **kwargs,
+        conjugate=conjugate,
     )
 
     # check if performing contraction or just building expression
     if gen_expression:
-        return ContractExpression(full_str, contraction_list, constants_dict, **kwargs)
+        return ContractExpression(
+            full_str, contraction_list, constants_dict, conjugate=expression_conjugate, **kwargs
+        )
 
     return _core_contract(operands, contraction_list, backend=backend, out=out, **kwargs)
 
@@ -653,7 +789,7 @@ def _core_contract(
 
     # Start contraction loop
     for num, contraction in enumerate(contraction_list):
-        inds, idx_rm, einsum_str, _, blas_flag = contraction
+        inds, idx_rm, einsum_str, _, blas_flag, conj_flags = contraction
 
         # check if we are performing the pre-pass of an expression with constants,
         #     if so, break out upon finding first non-constant (None) operand
@@ -664,6 +800,16 @@ def _core_contract(
 
         # Do we need to deal with the output?
         handle_out = specified_out and ((num + 1) == len(contraction_list))
+
+        use_conjugate = any(conj_flags)
+        if use_conjugate and backend != "numpy":
+            # backends without a native conjugate-aware kernel still need the
+            # same numerical result: form the (backend-native) conjugate array
+            # per operand instead.  The NumPy fused path never takes this.
+            tmp_operands = [
+                numpy_conj.conjugate(x) if flag else x for x, flag in zip(tmp_operands, conj_flags)
+            ]
+            use_conjugate = False
 
         # Call tensordot (check if should prefer einsum, but only if available)
         if blas_flag and ("EINSUM" not in blas_flag or no_einsum):  # type: ignore
@@ -687,7 +833,12 @@ def _core_contract(
                 axes = ((), ())
 
             # Contract!
-            new_view = _tensordot(*tmp_operands, axes=axes, backend=backend, **kwargs)
+            if use_conjugate:
+                new_view = numpy_conj.conjugate_tensordot(
+                    *tmp_operands, axes=axes, conjugate=conj_flags, **kwargs
+                )
+            else:
+                new_view = _tensordot(*tmp_operands, axes=axes, backend=backend, **kwargs)
 
             # Build a new view if needed
             if (tensor_result != results_index) or handle_out:
@@ -700,9 +851,23 @@ def _core_contract(
         else:
             # Call einsum
             out_kwarg: None | ArrayType = None
-            if handle_out:
+            # while sharing intermediates, cached arrays must not alias a
+            # user-supplied ``out``; the result is copied in afterwards
+            if handle_out and not sharing.currently_sharing():
                 out_kwarg = out
-            new_view = _einsum(einsum_str, *tmp_operands, backend=backend, out=out_kwarg, **kwargs)
+            if use_conjugate:
+                new_view = numpy_conj.conjugate_einsum(
+                    einsum_str,
+                    *tmp_operands,
+                    conjugate=conj_flags,
+                    out=out_kwarg,
+                    **kwargs,
+                )
+            else:
+                new_view = _einsum(einsum_str, *tmp_operands, backend=backend, out=out_kwarg, **kwargs)
+
+            if handle_out and sharing.currently_sharing():
+                out[...] = new_view  # type: ignore
 
         # Append new items and dereference what we can
         operands.append(new_view)
@@ -750,6 +915,7 @@ class ContractExpression:
         contraction: str,
         contraction_list: ContractionListType,
         constants_dict: dict[int, ArrayType],
+        conjugate: tuple[bool, ...] = (),
         **kwargs: Any,
     ):
         self.contraction = format_const_einsum_str(contraction, constants_dict.keys())
@@ -764,6 +930,8 @@ class ContractExpression:
         self._full_contraction_list = contraction_list
 
         self._constants_dict = constants_dict
+        # conjugation flags for the full operand list
+        self._conjugate = tuple(conjugate) if conjugate else tuple(False for _ in range(self._full_num_args))
         self._evaluated_constants: dict[str, Any] = {}
         self._backend_expressions: dict[str, Any] = {}
 
@@ -812,9 +980,11 @@ class ContractExpression:
         out: ArrayType | None = None,
         backend: str | None = "auto",
         evaluate_constants: bool = False,
+        contraction_list: ContractionListType | None = None,
     ) -> ArrayType:
         """The normal, core contraction."""
-        contraction_list = self._full_contraction_list if evaluate_constants else self.contraction_list
+        if contraction_list is None:
+            contraction_list = self._full_contraction_list if evaluate_constants else self.contraction_list
 
         return _core_contract(
             list(arrays),
@@ -824,6 +994,20 @@ class ContractExpression:
             evaluate_constants=evaluate_constants,
             **self.kwargs,
         )
+
+    def _remap_conjugate(self, conjugate: tuple[bool, ...]) -> ContractionListType:
+        """Rebuild the contraction list with different per-operand
+        conjugation flags. The contraction path itself is unchanged, only the
+        sixth (conjugation) element of each contraction step is recomputed.
+        """
+        flags = list(conjugate)
+        remapped: ContractionListType = []
+        for inds, idx_rm, einsum_str, remaining, do_blas, _ in self._full_contraction_list:
+            step_inds = tuple(sorted(inds, reverse=True))
+            step_flags = tuple(flags.pop(x) for x in step_inds)
+            flags.append(False)
+            remapped.append((inds, idx_rm, einsum_str, remaining, do_blas, step_flags))
+        return remapped
 
     def _contract_with_conversion(
         self,
@@ -858,6 +1042,7 @@ class ContractExpression:
         out: None | ArrayType = None,
         backend: str = "auto",
         evaluate_constants: bool = False,
+        conjugate: bool | Collection[bool] | None = None,
     ) -> ArrayType:
         """Evaluate this expression with a set of arrays.
 
@@ -868,6 +1053,11 @@ class ContractExpression:
                 are supplied then try to convert them to and from the correct
                 backend array type.
             evaluate_constants: Pre-evaluates constants with the appropriate backend.
+            conjugate: Optionally override which operands are conjugated for this
+                call. Takes the same form as :func:`contract`'s ``conjugate``
+                argument and must provide one flag per operand of the original
+                expression (including constant positions). When omitted, the
+                flags given when the expression was built are used.
 
         Returns:
             The contracted result.
@@ -881,6 +1071,11 @@ class ContractExpression:
                 f"This `ContractExpression` takes exactly {self.num_args} array arguments but received {len(arrays)}."
             )
 
+        if conjugate is not None:
+            call_conjugate = _normalize_conjugate(conjugate, self._full_num_args)
+        else:
+            call_conjugate = self._conjugate
+
         if self._constants_dict and not evaluate_constants:
             # fill in the missing non-constant terms with newly supplied arrays
             ops_var, ops_const = iter(arrays), self._get_evaluated_constants(backend)
@@ -888,13 +1083,30 @@ class ContractExpression:
         else:
             ops = arrays
 
+        # if the conjugation pattern differs from the cached one, run the same
+        # path with a re-flagged contraction list rather than mutating state
+        if (not evaluate_constants) and call_conjugate != self._conjugate:
+            contraction_list = self._remap_conjugate(call_conjugate)
+        else:
+            contraction_list = None
+
         try:
             # Check if the backend requires special preparation / calling
             #   but also ignore non-numpy arrays -> assume user wants same type back
-            if backends.has_backend(backend) and all(infer_backend(x) == "numpy" for x in arrays):
+            if (
+                backends.has_backend(backend)
+                and all(infer_backend(x) == "numpy" for x in arrays)
+                and contraction_list is None
+            ):
                 return self._contract_with_conversion(ops, out, backend, evaluate_constants=evaluate_constants)
 
-            return self._contract(ops, out=out, backend=backend, evaluate_constants=evaluate_constants)
+            return self._contract(
+                ops,
+                out=out,
+                backend=backend,
+                evaluate_constants=evaluate_constants,
+                contraction_list=contraction_list,
+            )
 
         except ValueError as err:
             original_msg = str(err.args) if err.args else ""
@@ -911,13 +1123,19 @@ class ContractExpression:
             constants_repr = f", constants={sorted(self._constants_dict)}"
         else:
             constants_repr = ""
-        return f"<ContractExpression('{self.contraction}'{constants_repr})>"
+        if any(self._conjugate):
+            conjugate_repr = f", conjugate={list(self._conjugate)}"
+        else:
+            conjugate_repr = ""
+        return f"<ContractExpression('{self.contraction}'{constants_repr}{conjugate_repr})>"
 
     def __str__(self) -> str:
         s = [self.__repr__()]
         for i, c in enumerate(self.contraction_list):
             s.append(f"\n  {i + 1}.  ")
-            s.append(f"'{c[2]}'" + (f" [{c[-1]}]" if c[-1] else ""))
+            s.append(f"'{c[2]}'" + (f" [{c[4]}]" if c[4] else ""))
+            if any(c[5]):
+                s.append(f" conjugate={list(c[5])}")
             s.append(f"\neinsum_kwargs={self.kwargs}")
         return "".join(s)
 
@@ -938,6 +1156,7 @@ def contract_expression(
     use_blas: bool = ...,
     optimize: OptimizeKind = ...,
     memory_limit: _MemoryLimit = ...,
+    conjugate: bool | Collection[bool] | None = ...,
     **kwargs: Any,
 ) -> ContractExpression: ...
 
@@ -951,6 +1170,7 @@ def contract_expression(
     use_blas: bool = ...,
     optimize: OptimizeKind = ...,
     memory_limit: _MemoryLimit = ...,
+    conjugate: bool | Collection[bool] | None = ...,
     **kwargs: Any,
 ) -> ContractExpression: ...
 
@@ -962,6 +1182,7 @@ def contract_expression(
     use_blas: bool = True,
     optimize: OptimizeKind = True,
     memory_limit: _MemoryLimit = None,
+    conjugate: bool | Collection[bool] | None = None,
     **kwargs: Any,
 ) -> ContractExpression:
     """Generate a reusable expression for a given contraction with
@@ -977,6 +1198,10 @@ def contract_expression(
             between calls will be reused. Additionally, if a GPU-enabled backend is
             used for example, then the constant tensors will be kept on the GPU,
             minimizing transfers.
+        conjugate: Declares which operands are conjugated as part of the
+            contraction. Either a single boolean or one boolean per operand.
+            The default can be overridden on individual calls to the returned
+            :class:`ContractExpression`.
         kwargs: Passed on to `contract_path` or `einsum`. See `contract`.
 
     Returns:
@@ -1037,9 +1262,19 @@ def contract_expression(
     constants_dict = {i: shapes[i] for i in constants}
     kwargs["_constants_dict"] = constants_dict
 
+    # conjugation is expressed against the full operand list
+    conjugate_flags = _normalize_conjugate(conjugate, len(shapes))
+    kwargs["_conjugate"] = conjugate_flags
+
     # apart from constant arguments, make dummy arrays
     dummy_arrays = [s if i in constants else shape_only(s) for i, s in enumerate(shapes)]  # type: ignore
 
     return contract(
-        subscripts, *dummy_arrays, use_blas=use_blas, optimize=optimize, memory_limit=memory_limit, **kwargs
+        subscripts,
+        *dummy_arrays,
+        use_blas=use_blas,
+        optimize=optimize,
+        memory_limit=memory_limit,
+        conjugate=conjugate_flags,
+        **kwargs,
     )

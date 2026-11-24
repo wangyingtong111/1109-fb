@@ -12,7 +12,9 @@ ArrayType = Any
 ArrayIndexType = frozenset[str]
 ArrayShaped = namedtuple("ArrayShaped", ["shape"])
 
-ContractionListType = list[tuple[Any, ArrayIndexType, str, tuple[str, ...] | None, str | bool]]
+ContractionListType = list[
+    tuple[Any, ArrayIndexType, str, tuple[str, ...] | None, str | bool, tuple[bool, ...]]
+]
 PathSearchFunctionType = Callable[[list[ArrayIndexType], ArrayIndexType, dict[str, int], int | None], PathType]
 
 # Contract kwargs

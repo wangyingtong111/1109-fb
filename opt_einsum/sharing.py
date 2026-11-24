@@ -25,6 +25,8 @@ __all__ = [
     "count_cached_ops",
     "transpose_cache_wrap",
     "einsum_cache_wrap",
+    "conjugate_einsum_cache_wrap",
+    "conjugate_tensordot_cache_wrap",
     "to_backend_cache_wrap",
 ]
 
@@ -136,7 +138,7 @@ def tensordot_cache_wrap(tensordot: Any) -> Any:
     """
 
     @functools.wraps(tensordot)
-    def cached_tensordot(x, y, axes=2, backend="numpy"):
+    def cached_tensordot(x, y, axes=2, backend="numpy", conjugate=()):
         if not currently_sharing():
             return tensordot(x, y, axes, backend=backend)
 
@@ -148,7 +150,9 @@ def tensordot_cache_wrap(tensordot: Any) -> Any:
                 list(range(len(y.shape)))[:axes],
             )
         axes = tuple(axes[0]), tuple(axes[1])
-        key = "tensordot", backend, id(x), id(y), axes
+        # different conjugation patterns must never share a cached contraction
+        conjugate_key = tuple(bool(flag) for flag in conjugate)
+        key = "tensordot", backend, id(x), id(y), axes, conjugate_key
         return _memoize(key, tensordot, x, y, axes, backend=backend)
 
     return cached_tensordot
@@ -166,6 +170,9 @@ def einsum_cache_wrap(einsum: Any) -> Any:
 
         # hash modulo commutativity by computing a canonical ordering and names
         backend = kwargs.pop("backend", "numpy")
+        # conjugation is handled by a dedicated fused kernel, but keep the
+        # cache correct if a backend ever passes it through here
+        conjugate = tuple(bool(flag) for flag in kwargs.pop("conjugate", ()))
         equation = args[0]
         inputs, output, operands = parse_einsum_input(args)
         inputs = inputs.split(",")
@@ -178,10 +185,65 @@ def einsum_cache_wrap(einsum: Any) -> Any:
         canonical_inputs = ",".join(input_ for input_, _ in canonical)
         canonical_equation = alpha_canonicalize(canonical_inputs + "->" + output)
 
-        key = "einsum", backend, canonical_equation, canonical_ids
+        key = "einsum", backend, canonical_equation, canonical_ids, conjugate
         return _memoize(key, einsum, equation, *operands, backend=backend)
 
     return cached_einsum
+
+
+def conjugate_einsum_cache_wrap(conjugate_einsum: Any) -> Any:
+    """Decorates a fused conjugate-aware ``einsum()`` implementation to be
+    memoized inside a :func:`shared_intermediates` context. The conjugation
+    pattern is part of the cache key.
+    """
+
+    @functools.wraps(conjugate_einsum)
+    def cached_conjugate_einsum(equation, *operands, conjugate=(), **kwargs):
+        if not currently_sharing():
+            return conjugate_einsum(equation, *operands, conjugate=conjugate, **kwargs)
+
+        # mirror ``einsum_cache_wrap``: memoized results are shared, so an ``out``
+        # target (which would alias the cached array) is not used inside the cache
+        kwargs.pop("out", None)
+
+        inputs, output, arrays = parse_einsum_input((equation, *operands))
+        inputs_list = inputs.split(",")
+        _save_tensors(*arrays)
+
+        canonical = sorted(zip(inputs_list, map(id, arrays)), key=lambda x: x[1])
+        canonical_ids = tuple(id_ for _, id_ in canonical)
+        canonical_inputs = ",".join(input_ for input_, _ in canonical)
+        canonical_equation = alpha_canonicalize(canonical_inputs + "->" + output)
+        conjugate_key = tuple(bool(flag) for flag in conjugate)
+
+        key = "conjugate_einsum", canonical_equation, canonical_ids, conjugate_key
+        return _memoize(key, conjugate_einsum, equation, *operands, conjugate=conjugate, **kwargs)
+
+    return cached_conjugate_einsum
+
+
+def conjugate_tensordot_cache_wrap(conjugate_tensordot: Any) -> Any:
+    """Decorates a fused conjugate-aware ``tensordot()`` implementation to be
+    memoized inside a :func:`shared_intermediates` context.
+    """
+
+    @functools.wraps(conjugate_tensordot)
+    def cached_conjugate_tensordot(x, y, axes, *, conjugate=(), **kwargs):
+        if not currently_sharing():
+            return conjugate_tensordot(x, y, axes, conjugate=conjugate, **kwargs)
+
+        _save_tensors(x, y)
+        if isinstance(axes, numbers.Number):
+            axes = (
+                list(range(len(x.shape)))[len(x.shape) - int(axes) :],
+                list(range(len(y.shape)))[: int(axes)],
+            )
+        axes = tuple(axes[0]), tuple(axes[1])
+        conjugate_key = tuple(bool(flag) for flag in conjugate)
+        key = "conjugate_tensordot", id(x), id(y), axes, conjugate_key
+        return _memoize(key, conjugate_tensordot, x, y, axes, conjugate=conjugate, **kwargs)
+
+    return cached_conjugate_tensordot
 
 
 def to_backend_cache_wrap(to_backend: Any = None, constants: Any = False) -> Any:
