@@ -157,6 +157,13 @@ text_features: {
 }
 ```
 
+By default, words are selected for the model by total term frequency. To select them by the number of training documents they appear in instead, use `document_frequency: true`. With `Eps::TextEncoder` directly, you can also pass document identifiers so a word is counted at most once per document, even when a document spans multiple lines:
+
+```ruby
+encoder = Eps::TextEncoder.new(max_features: 100, document_frequency: true)
+encoder.fit(lines, documents: document_ids)
+```
+
 ## Full Example
 
 We recommend putting all the model code in a single file. This makes it easy to rebuild the model as needed.

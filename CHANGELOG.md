@@ -1,3 +1,7 @@
+## 0.7.1 (unreleased)
+
+- Added `document_frequency` option to `TextEncoder` to select vocabulary by number of training documents, with support for document identifiers
+
 ## 0.7.0 (2026-04-14)
 
 - Dropped support for Daru

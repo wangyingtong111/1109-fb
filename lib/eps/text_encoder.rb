@@ -7,8 +7,8 @@ module Eps
       @vocabulary = options[:vocabulary] || []
     end
 
-    def fit(arr)
-      counts, fit = count_and_fit(arr)
+    def fit(arr, documents: nil)
+      counts, fit = count_and_fit(arr, documents: documents)
 
       min_length = options[:min_length]
       if min_length
@@ -42,7 +42,7 @@ module Eps
 
     private
 
-    def count_and_fit(arr)
+    def count_and_fit(arr, documents: nil)
       tokenizer = options[:tokenizer]
       stop_words = Array(options[:stop_words])
 
@@ -66,9 +66,26 @@ module Eps
 
       counts = Hash.new(0)
 
-      fit.each do |xc|
-        xc.each do |k2, v2|
-          counts[k2] += v2
+      if options[:document_frequency]
+        # count each word once per document
+        # lines without a document identifier are their own document
+        documents ||= arr.each_index.to_a
+        raise ArgumentError, "Number of documents differs from number of lines" if documents.size != fit.size
+
+        seen = {}
+        fit.each_with_index do |xc, i|
+          xc.each_key do |k2|
+            key = [k2, documents[i]]
+            next if seen[key]
+            seen[key] = true
+            counts[k2] += 1
+          end
+        end
+      else
+        fit.each do |xc|
+          xc.each do |k2, v2|
+            counts[k2] += v2
+          end
         end
       end
 
