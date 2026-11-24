@@ -79,7 +79,100 @@ module Eps
           features[name] = "categorical"
         end
 
-        Evaluators::LinearRegression.new(coefficients: coefficients, features: features, text_features: text_features)
+        field_settings = parse_field_settings(data, features)
+
+        Evaluators::LinearRegression.new(
+          coefficients: coefficients,
+          features: features,
+          text_features: text_features,
+          field_settings: field_settings
+        )
+      end
+
+      def parse_field_settings(data, features)
+        domains = pmml_domains(data)
+        settings = {}
+
+        data.css("MiningField").each do |node|
+          name = node.attribute("name")&.value
+          next unless name && features.key?(name)
+
+          usage_type = node.attribute("usageType")&.value
+          next if %w[target predicted].include?(usage_type)
+
+          data_type = domains.dig(name, :data_type)
+          invalid_treatment = node.attribute("invalidValueTreatment")&.value
+          invalid_replacement = node.attribute("invalidValueReplacement")&.value
+          invalid_policy_declared = invalid_treatment || invalid_replacement
+
+          settings[name] = (domains[name] || {}).merge(
+            missing_replacement: parse_scalar(node.attribute("missingValueReplacement")&.value, data_type),
+            missing_treatment: node.attribute("missingValueTreatment")&.value,
+            invalid_treatment: invalid_treatment || (invalid_replacement ? "asValue" : "returnInvalid"),
+            invalid_replacement: parse_scalar(invalid_replacement, data_type),
+            invalid_policy_declared: !!invalid_policy_declared,
+            outliers: node.attribute("outliers")&.value || "asIs",
+            low_value: parse_number(node.attribute("lowValue")&.value),
+            high_value: parse_number(node.attribute("highValue")&.value)
+          )
+        end
+
+        features.each_key do |name|
+          settings[name] ||= domains[name] if domains[name]
+        end
+
+        settings
+      end
+
+      def pmml_domains(data)
+        data.css("DataDictionary DataField").each_with_object({}) do |node, domains|
+          name = node.attribute("name").value
+          data_type = node.attribute("dataType")&.value
+          values = node.css("Value")
+
+          domains[name] = {
+            data_type: data_type,
+            optype: node.attribute("optype")&.value,
+            valid_values: pmml_values(values, "valid", data_type),
+            invalid_values: pmml_values(values, "invalid", data_type),
+            missing_values: pmml_values(values, "missing", data_type),
+            intervals: node.css("Interval").map { |interval| parse_interval(interval) }
+          }
+        end
+      end
+
+      def pmml_values(nodes, property, data_type)
+        values = nodes.select do |node|
+          (node.attribute("property")&.value || "valid") == property
+        end
+        values.map { |node| parse_scalar(node.attribute("value").value, data_type) }
+      end
+
+      def parse_interval(node)
+        {
+          closure: node.attribute("closure").value,
+          left: parse_number(node.attribute("leftMargin")&.value),
+          right: parse_number(node.attribute("rightMargin")&.value)
+        }
+      end
+
+      def parse_scalar(value, data_type)
+        return nil if value.nil?
+
+        case data_type
+        when "integer"
+          value.to_i
+        when "float", "double", "real", "number"
+          value.to_f
+        when "boolean"
+          value == "true" || value == "1"
+        else
+          value
+        end
+      end
+
+      def parse_number(value)
+        value&.to_f
       end
 
       def naive_bayes

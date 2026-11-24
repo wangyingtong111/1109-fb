@@ -63,10 +63,20 @@ module Eps
       singular = data.is_a?(Hash)
       data = [data] if singular
 
+      row_count = data.size
       data = Eps::DataFrame.new(data)
 
       @evaluator.features.each do |k, type|
         values = data.columns[k]
+
+        if !values && @evaluator.respond_to?(:missing_replacement_for)
+          replacement = @evaluator.missing_replacement_for(k)
+          if !replacement.nil?
+            values = Array.new(row_count)
+            data.columns[k] = values
+          end
+        end
+
         raise ArgumentError, "Missing column: #{k}" if !values
         column_type = Utils.column_type(values.compact, k) if values
 
