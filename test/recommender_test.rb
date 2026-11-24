@@ -1,3 +1,4 @@
+require "json"
 require_relative "test_helper"
 
 class RecommenderTest < Minitest::Test
@@ -162,6 +163,79 @@ class RecommenderTest < Minitest::Test
     recommender.fit(data)
     assert_equal [1, 2], recommender.user_ids
     assert_equal ["A", "B"], recommender.item_ids
+  end
+
+  def test_project_snapshot_by_external_item_ids
+    recommender = Disco::Recommender.new(factors: 1, epochs: 2, top_items: true)
+    recommender.fit([
+      {user_id: "u", item_id: "tea"},
+      {user_id: "u", item_id: "rice"},
+      {user_id: "v", item_id: "tofu"}
+    ])
+
+    state = JSON.parse(recommender.to_json)
+    state["item_factors"] = [[1, 5, 9].pack("f*")].pack("m0")
+    state["user_factors"] = [[1, 1].pack("f*")].pack("m0")
+    state["item_count"] = [3, 5, 7]
+    state["item_sum"] = [3.0, 25.0, 63.0]
+    recommender = Disco::Recommender.load_json(JSON.generate(state))
+
+    json = recommender.to_json(item_ids: ["tofu", "tea"])
+    released = Disco::Recommender.load_json(json)
+    released_state = JSON.parse(json)
+
+    assert_equal ["tofu", "tea"], released.item_ids
+    assert_equal [2, 1], released.item_factors.shape
+    assert_equal [2, 1], released.user_factors.shape
+    assert_equal [9.0, 1.0], released.predict([
+      {user_id: "u", item_id: "tofu"},
+      {user_id: "u", item_id: "tea"}
+    ])
+    assert_equal [1], released_state["rated"][0]
+    assert_equal [7, 3], released_state["item_count"]
+    assert_equal [63.0, 3.0], released_state["item_sum"]
+    assert_equal ["tofu"], released.user_recs("u", count: 5).map { |r| r[:item_id] }
+    assert_empty released.user_recs("u", item_ids: ["rice"])
+    assert_equal recommender.user_factors.to_binary, released.user_factors.to_binary
+  end
+
+  def test_project_returns_recommender_and_load_json_accepts_projection
+    recommender = Disco::Recommender.new(factors: 2, epochs: 2, top_items: true)
+    recommender.fit([
+      {user_id: 1, item_id: "tea"},
+      {user_id: 1, item_id: "rice"},
+      {user_id: 2, item_id: "tofu"}
+    ])
+
+    projected = recommender.project(["tofu", "tea"])
+    assert_kind_of Disco::Recommender, projected
+    assert_equal ["tofu", "tea"], projected.item_ids
+    assert_equal %w[tea rice tofu], recommender.item_ids
+    assert_equal recommender.user_factors.shape, projected.user_factors.shape
+
+    loaded = Disco::Recommender.load_json(projected)
+    assert_equal ["tofu", "tea"], loaded.item_ids
+    assert_equal recommender.predict([{user_id: 1, item_id: "tea"}]),
+                 loaded.predict([{user_id: 1, item_id: "tea"}])
+
+    loaded_with_option = Disco::Recommender.load_json(recommender.to_json, item_ids: ["tofu", "tea"])
+    assert_equal ["tofu", "tea"], loaded_with_option.item_ids
+  end
+
+  def test_project_empty_item_ids
+    recommender = Disco::Recommender.new(factors: 2, epochs: 2, top_items: true)
+    recommender.fit([
+      {user_id: 1, item_id: "tea"},
+      {user_id: 2, item_id: "tofu"}
+    ])
+
+    released = Disco::Recommender.load_json(recommender.to_json(item_ids: []))
+    assert_empty released.item_ids
+    assert_equal [0, 2], released.item_factors.shape
+    assert_empty released.user_recs(1)
+    assert_empty released.top_items
+    assert_equal [recommender.global_mean],
+                 released.predict([{user_id: 1, item_id: "tea"}])
   end
 
   def test_factors

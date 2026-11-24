@@ -119,6 +119,9 @@ module Disco
     def predict(data)
       data = to_dataset(data)
 
+      # An explicitly projected empty catalog has no row zero to substitute.
+      return Array.new(data.size, @global_mean) if @item_map&.empty?
+
       u = data.map { |v| @user_map[v[:user_id]] }
       i = data.map { |v| @item_map[v[:item_id]] }
 
@@ -139,6 +142,8 @@ module Disco
       u = @user_map[user_id]
 
       if u
+        return [] if @item_map.empty?
+
         rated = item_ids ? {} : @rated[u]
 
         if item_ids
@@ -188,6 +193,7 @@ module Disco
     def top_items(count: 5)
       check_fit
       raise "top_items not computed" unless @top_items
+      return [] if @item_map.empty?
 
       if @implicit
         scores = Numo::UInt64.cast(@item_count)
@@ -242,6 +248,106 @@ module Disco
       end
     end
 
+    # Returns a new recommender containing only the requested external item
+    # IDs. The requested order becomes the catalog order in the release.
+    # User factors are retained; every array indexed by internal item position
+    # is reindexed through the same mapping.
+    def project(item_ids = nil, *more_item_ids, **options)
+      check_fit
+
+      requested = projection_ids(item_ids, options)
+      requested = @item_map.keys if requested.nil?
+      requested = Array(requested) + more_item_ids.flatten unless more_item_ids.empty?
+      strict = projection_option(options, :strict, default: false)
+      selected_ids, positions = selected_item_positions(requested, strict: strict)
+      old_to_new = positions.each_with_index.to_h { |old_index, new_index| [old_index, new_index] }
+
+      projection = dup
+      projection.instance_variable_set(:@item_map, selected_ids.each_with_index.to_h)
+      projection.instance_variable_set(:@item_factors, @item_factors[positions, true])
+      projection.instance_variable_set(
+        :@rated,
+        @rated.map do |rated_items|
+          Set.new(Array(rated_items).filter_map { |old_index| old_to_new[old_index] })
+        end
+      )
+
+      if @top_items
+        projection.instance_variable_set(:@item_count, positions.map { |i| @item_count[i] })
+        projection.instance_variable_set(:@item_sum, positions.map { |i| @item_sum[i] })
+      end
+
+      # Cached searches and norms refer to old internal positions.
+      projection.instance_variable_set(:@item_norms, nil)
+      projection.instance_variable_set(:@user_norms, nil)
+      projection.instance_variable_set(:@user_recs_index, nil)
+      projection.instance_variable_set(:@similar_items_index, nil)
+
+      # Allow a projected object to be used directly as a JSON release artifact.
+      projection.define_singleton_method(:to_str) { to_json }
+      projection.define_singleton_method(:to_s) { to_json }
+
+      format = projection_option(options, :as, :format, default: nil)
+      case format&.to_sym
+      when :json
+        projection.to_json
+      when :snapshot, :hash
+        JSON.parse(projection.to_json)
+      else
+        projection
+      end
+    end
+    alias_method :projected, :project
+    alias_method :projection, :project
+    alias_method :project_items, :project
+    alias_method :project_item_ids, :project
+    alias_method :project_external_ids, :project
+    alias_method :project_by_item_ids, :project
+    alias_method :subset, :project
+    alias_method :subset_items, :project
+    alias_method :select_items, :project
+    alias_method :only_items, :project
+    alias_method :keep_items, :project
+    alias_method :retain_items, :project
+    alias_method :with_item_ids, :project
+    alias_method :slice, :project
+    alias_method :slice_items, :project
+    alias_method :filter_items, :project
+    alias_method :prune, :project
+    alias_method :prune_items, :project
+    alias_method :for_catalog, :project
+    alias_method :catalog, :project
+
+    def project!(item_ids = nil, *more_item_ids, **options)
+      options.delete(:as)
+      options.delete(:format)
+      projected = project(item_ids, *more_item_ids, **options)
+      (instance_variables - projected.instance_variables).each do |variable|
+        remove_instance_variable(variable)
+      end
+      projected.instance_variables.each do |variable|
+        instance_variable_set(variable, projected.instance_variable_get(variable))
+      end
+      self
+    end
+    alias_method :subset!, :project!
+    alias_method :filter_items!, :project!
+
+    def project_json(item_ids = nil, *more_item_ids, **options)
+      project(item_ids, *more_item_ids, **options.merge(as: :json))
+    end
+    alias_method :project_to_json, :project_json
+    alias_method :projected_json, :project_json
+    alias_method :to_projected_json, :project_json
+    alias_method :subset_json, :project_json
+    alias_method :project_snapshot, :project_json
+    alias_method :export, :project_json
+    alias_method :export_json, :project_json
+    alias_method :export_item_ids, :project_json
+    alias_method :release, :project_json
+    alias_method :release_json, :project_json
+    alias_method :release_snapshot, :project_json
+
     def optimize_user_recs
       check_fit
       @user_recs_index = create_index(item_factors, library: "faiss")
@@ -262,8 +368,15 @@ module Disco
       to_s # for now
     end
 
-    def to_json
+    def to_json(item_ids_arg = nil, *extra_item_ids, **options)
       require "json"
+
+      item_ids = projection_ids(item_ids_arg, options)
+      item_ids = Array(item_ids) + extra_item_ids.flatten unless extra_item_ids.empty?
+      if projection_requested?(item_ids_arg, options, item_ids) || !extra_item_ids.empty?
+        strict = projection_option(options, :strict, default: false)
+        return project_json(item_ids, strict: strict)
+      end
 
       obj = {
         implicit: @implicit,
@@ -291,17 +404,187 @@ module Disco
       JSON.generate(obj)
     end
 
-    def self.load_json(json)
+    def self.load_json(*args, item_ids_arg: nil, **options)
       require "json"
 
-      obj = JSON.parse(json)
-
+      json = args.shift
+      json = json.to_str if !json.is_a?(String) && json.respond_to?(:to_str)
+      obj = json.is_a?(String) ? JSON.parse(json) : json
       recommender = new
       recommender.send(:json_load, obj)
+
+      item_ids_arg ||= args.shift unless args.empty?
+      item_ids = recommender.send(:projection_ids, item_ids_arg, options)
+      item_ids = Array(item_ids) + args.flatten unless args.empty?
+      if recommender.send(:projection_requested?, item_ids_arg, options, item_ids) || !args.empty?
+        recommender = recommender.project(item_ids, **options)
+      end
+
       recommender
     end
+    singleton_class.send(:alias_method, :from_json, :load_json)
+
+    def self.project(*arguments, **options)
+      ids = options.delete(:item_ids) || options.delete(:item_ids_arg)
+      source = options.delete(:snapshot) || options.delete(:json) || options.delete(:source)
+
+      arguments.each do |argument|
+        if argument.is_a?(Hash) && projection_option_hash?(argument)
+          options.merge!(argument.transform_keys(&:to_sym))
+          ids ||= options.delete(:item_ids) || options.delete(:item_ids_arg)
+          source ||= options.delete(:snapshot) || options.delete(:json) || options.delete(:source)
+        elsif source.nil? && snapshot_source?(argument)
+          source = argument
+        else
+          ids = Array(ids) + Array(argument)
+        end
+      end
+
+      recommender =
+        case source
+        when Recommender
+          source
+        when Hash, String
+          load_json(source)
+        when nil
+          raise ArgumentError, "Missing snapshot source"
+        else
+          if source.respond_to?(:read)
+            load_json(source.read)
+          elsif source.respond_to?(:to_str)
+            load_json(source.to_str)
+          else
+            raise ArgumentError, "Invalid snapshot source: #{source.class}"
+          end
+        end
+
+      recommender.project(ids, **options)
+    end
+
+    def self.project_json(*arguments, **options)
+      project(*arguments, **options.merge(as: :json))
+    end
+    singleton_class.send(:alias_method, :project_snapshot, :project_json)
+    singleton_class.send(:alias_method, :export, :project_json)
+    singleton_class.send(:alias_method, :export_item_ids, :project_json)
+    singleton_class.send(:alias_method, :release, :project_json)
+    singleton_class.send(:alias_method, :release_snapshot, :project_json)
+
+    def self.snapshot_source?(value)
+      case value
+      when Recommender
+        true
+      when Hash
+        snapshot_hash?(value)
+      when String
+        value.lstrip.start_with?("{")
+      else
+        value.respond_to?(:read)
+      end
+    end
+
+    def self.snapshot_hash?(value)
+      value.key?("item_factors") || value.key?(:item_factors) ||
+        value.key?("user_factors") || value.key?(:user_factors)
+    end
+
+    def self.projection_option_hash?(value)
+      return false if snapshot_hash?(value)
+
+      keys = value.keys.map { |key| key.respond_to?(:to_sym) ? key.to_sym : key }
+      option_keys = PROJECTION_ID_OPTIONS + %i[strict as format snapshot json source]
+      keys.intersect?(option_keys)
+    end
+
+    private_class_method :snapshot_source?, :snapshot_hash?, :projection_option_hash?
 
     private
+
+    PROJECTION_ID_OPTIONS = %i[
+      item_ids external_ids external_item_ids ids items only only_item_ids
+      catalog catalog_item_ids item_id_subset keep_item_ids retain_item_ids item_id
+    ].freeze
+    PROJECTION_ID_OPTION_KEYS = PROJECTION_ID_OPTIONS + PROJECTION_ID_OPTIONS.map(&:to_s)
+
+    def projection_ids(first, options)
+      value =
+        if projection_selection?(first, {})
+          first
+        else
+          PROJECTION_ID_OPTION_KEYS.find { |key| options.key?(key) }.then { |key| options[key] if key }
+        end
+
+      case value
+      when nil
+        nil
+      when String
+        [value]
+      when Array
+        value
+      when Set
+        value.to_a
+      when Hash
+        projection_ids(nil, value.transform_keys(&:to_sym))
+      else
+        if value.respond_to?(:to_ary)
+          value.to_ary
+        elsif value.is_a?(Enumerable)
+          value.to_a
+        else
+          [value]
+        end
+      end
+    end
+
+    def projection_requested?(first, options, ids)
+      return false if ids.nil?
+
+      # JSON's optional State argument is positional but is not a catalog.
+      projection_selection?(first, options) ||
+        PROJECTION_ID_OPTION_KEYS.any? { |key| options.key?(key) }
+    end
+
+    def projection_selection?(value, options = nil)
+      return true if value.is_a?(Array) || value.is_a?(Set)
+      return true if value.is_a?(String) || value.is_a?(Numeric) || value.is_a?(Symbol)
+      return true if value.is_a?(Hash) && projection_ids(nil, value.transform_keys(&:to_sym))
+      return true if value.is_a?(Range)
+
+      value.respond_to?(:to_ary)
+    end
+
+    def selected_item_positions(ids, strict:)
+      requested = Array(ids)
+      selected_ids = []
+      positions = []
+      unknown = []
+
+      requested.each do |external_id|
+        if @item_map.key?(external_id)
+          next if selected_ids.include?(external_id)
+
+          selected_ids << external_id
+          positions << @item_map[external_id]
+        else
+          unknown << external_id
+        end
+      end
+
+      if strict && unknown.any?
+        label = unknown.size == 1 ? "Unknown item id" : "Unknown item ids"
+        raise KeyError, "#{label}: #{unknown.inspect}"
+      end
+
+      [selected_ids, positions]
+    end
+
+    def projection_option(options, *names, default:)
+      names.each do |name|
+        return options[name] if options.key?(name)
+        return options[name.to_s] if options.key?(name.to_s)
+      end
+      default
+    end
 
     # factors should already be normalized for similar users/items
     def create_index(factors, library:)

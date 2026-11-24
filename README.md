@@ -194,6 +194,15 @@ json = File.read("recommender.json")
 recommender = Disco::Recommender.load_json(json)
 ```
 
+To create a smaller release artifact for a specific catalog without retraining, project the snapshot by external item IDs:
+
+```ruby
+release_json = recommender.to_json(item_ids: ["tofu", "tea"])
+release = Disco::Recommender.load_json(release_json)
+```
+
+The requested order is used in the release. Item factors, viewed-item sets, and top-item counts/sums are reindexed with the same mapping; user factors are unchanged. `project(item_ids: ["tofu", "tea"])` returns the projected recommender itself.
+
 Alternatively, you can store only the factors and use a library like [Neighbor](https://github.com/ankane/neighbor). See the [examples](https://github.com/ankane/neighbor/tree/master/examples/disco).
 
 ## Algorithms
