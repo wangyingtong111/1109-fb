@@ -2,13 +2,14 @@ module Disco
   class Recommender
     attr_reader :global_mean
 
-    def initialize(factors: 8, epochs: 20, verbose: nil, top_items: false)
+    def initialize(factors: 8, epochs: 20, verbose: nil, top_items: false, item_prior: nil)
       @factors = factors
       @epochs = epochs
       @verbose = verbose
       @user_map = {}
       @item_map = {}
       @top_items = top_items
+      @item_prior = item_prior
     end
 
     def fit(train_set, validation_set: nil)
@@ -104,6 +105,27 @@ module Disco
 
       @global_mean = model.bias
 
+      # item prior for cold-start predictions (explicit feedback only)
+      # computed from the training set only, so the validation set never pollutes the stats
+      if !@implicit && @item_prior
+        raise ArgumentError, "item_prior must be non-negative" if !@item_prior.is_a?(Numeric) || @item_prior < 0
+
+        @item_prior_mean = Array.new(@item_map.size, @global_mean.to_f)
+        item_sum = Array.new(@item_map.size, 0.0)
+        item_count = Array.new(@item_map.size, 0)
+        train_set.each do |v|
+          i = @item_map[v[:item_id]]
+          item_sum[i] += v[:rating]
+          item_count[i] += 1
+        end
+        @item_prior_mean.each_index do |i|
+          # shrink the item mean toward the global mean
+          @item_prior_mean[i] = (item_sum[i] + (@item_prior * @global_mean)) / (item_count[i] + @item_prior)
+        end
+      else
+        @item_prior_mean = nil
+      end
+
       @user_factors = model.p_factors(format: :numo)
       @item_factors = model.q_factors(format: :numo)
 
@@ -122,15 +144,30 @@ module Disco
       u = data.map { |v| @user_map[v[:user_id]] }
       i = data.map { |v| @item_map[v[:item_id]] }
 
+      # unknown users with known items can use the item prior
+      prior_index =
+        if @item_prior_mean
+          data.each_index.select { |index| u[index].nil? && !i[index].nil? }
+        else
+          []
+        end
+
+      # anything else with an unknown user or item falls back to the global mean
       new_index = data.each_index.select { |index| u[index].nil? || i[index].nil? }
-      new_index.each do |j|
+      (new_index - prior_index).each do |j|
         u[j] = 0
         i[j] = 0
+      end
+      prior_index.each do |j|
+        u[j] = 0
       end
 
       predictions = @user_factors[u, true].inner(@item_factors[i, true])
       predictions.inplace.clip(@min_rating, @max_rating) if @min_rating
-      predictions[new_index] = @global_mean
+      predictions[new_index - prior_index] = @global_mean
+      prior_index.each do |j|
+        predictions[j] = @item_prior_mean[i[j]]
+      end
       predictions.to_a
     end
 
@@ -286,6 +323,11 @@ module Disco
       if @top_items
         obj[:item_count] = @item_count
         obj[:item_sum] = @item_sum
+      end
+
+      if @item_prior_mean
+        obj[:item_prior] = @item_prior
+        obj[:item_prior_mean] = @item_prior_mean
       end
 
       JSON.generate(obj)
@@ -448,6 +490,10 @@ module Disco
         @item_count = obj["item_count"]
         @item_sum = obj["item_sum"]
       end
+
+      # older models don't store item prior stats, so keep the global mean fallback
+      @item_prior = obj.key?("item_prior") ? obj["item_prior"] : nil
+      @item_prior_mean = obj["item_prior_mean"]
     end
   end
 end

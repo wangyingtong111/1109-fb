@@ -1,4 +1,5 @@
 require_relative "test_helper"
+require "json"
 
 class RecommenderTest < Minitest::Test
   def test_explicit
@@ -289,6 +290,163 @@ class RecommenderTest < Minitest::Test
     recommender = Disco::Recommender.new(factors: 20)
     recommender.fit(data)
     assert_equal [recommender.global_mean], recommender.predict([{user_id: 1, item_id: "New movie"}])
+  end
+
+  def test_item_prior_new_user_known_item
+    recommender = Disco::Recommender.new(factors: 2, item_prior: 1, verbose: false)
+    recommender.fit([
+      {user_id: 1, item_id: "A", rating: 5},
+      {user_id: 2, item_id: "B", rating: 1},
+      {user_id: 3, item_id: "B", rating: 3}
+    ])
+
+    assert_in_delta 3.0, recommender.global_mean
+    # item mean (5) shrunk toward the global mean (3) with strength 1
+    # (5 + 1 * 3) / (1 + 1) = 4
+    assert_in_delta 4.0, recommender.predict([{user_id: 99, item_id: "A"}]).first
+  end
+
+  def test_item_prior_unknown_user_and_item
+    recommender = Disco::Recommender.new(factors: 2, item_prior: 1, verbose: false)
+    recommender.fit([
+      {user_id: 1, item_id: "A", rating: 5},
+      {user_id: 2, item_id: "B", rating: 1},
+      {user_id: 3, item_id: "B", rating: 3}
+    ])
+
+    assert_in_delta 3.0, recommender.predict([{user_id: 99, item_id: "Z"}]).first
+  end
+
+  def test_item_prior_keeps_factor_predictions
+    data = [
+      {user_id: 1, item_id: "A", rating: 5},
+      {user_id: 2, item_id: "B", rating: 1},
+      {user_id: 3, item_id: "B", rating: 3}
+    ]
+    recommender = Disco::Recommender.new(factors: 2, item_prior: 1, verbose: false)
+    recommender.fit(data)
+
+    # known users and items use the factors (clipped to the rating range), not the prior
+    factor_predictions = data.map do |v|
+      u = recommender.user_factors(v[:user_id])
+      i = recommender.item_factors(v[:item_id])
+      u.inner(i).clamp(recommender.instance_variable_get(:@min_rating), recommender.instance_variable_get(:@max_rating))
+    end
+    predictions = recommender.predict(data)
+
+    factor_predictions.each_with_index do |expected, j|
+      assert_in_delta expected, predictions[j]
+    end
+    # and they differ from the cold-start values
+    refute_includes predictions.map { |v| v.round(6) }, 3.0
+    refute_includes predictions.map { |v| v.round(6) }, 4.0
+  end
+
+  def test_item_prior_mixed_batch
+    recommender = Disco::Recommender.new(factors: 2, item_prior: 1, verbose: false)
+    recommender.fit([
+      {user_id: 1, item_id: "A", rating: 5},
+      {user_id: 2, item_id: "B", rating: 1},
+      {user_id: 3, item_id: "B", rating: 3}
+    ])
+
+    known_prediction = recommender.predict([{user_id: 1, item_id: "A"}]).first
+    predictions = recommender.predict([
+      {user_id: 99, item_id: "A"},  # item prior
+      {user_id: 1, item_id: "A"},   # factors
+      {user_id: 99, item_id: "Z"},  # global mean
+      {user_id: 2, item_id: "B"}    # factors
+    ])
+
+    assert_in_delta 4.0, predictions[0]
+    assert_in_delta known_prediction, predictions[1]
+    assert_in_delta 3.0, predictions[2]
+    assert_in_delta recommender.predict([{user_id: 2, item_id: "B"}]).first, predictions[3]
+  end
+
+  def test_item_prior_reload
+    recommender = Disco::Recommender.new(factors: 2, item_prior: 1, verbose: false)
+    recommender.fit([
+      {user_id: 1, item_id: "A", rating: 5},
+      {user_id: 2, item_id: "B", rating: 1},
+      {user_id: 3, item_id: "B", rating: 3}
+    ])
+
+    loaded = Disco::Recommender.load_json(recommender.to_json)
+
+    assert_in_delta 4.0, loaded.predict([{user_id: 99, item_id: "A"}]).first
+    assert_in_delta 3.0, loaded.predict([{user_id: 99, item_id: "Z"}]).first
+    assert_in_delta recommender.predict([{user_id: 1, item_id: "A"}]).first,
+      loaded.predict([{user_id: 1, item_id: "A"}]).first
+  end
+
+  def test_item_prior_old_model_fallback
+    recommender = Disco::Recommender.new(factors: 2, item_prior: 1, verbose: false)
+    recommender.fit([
+      {user_id: 1, item_id: "A", rating: 5},
+      {user_id: 2, item_id: "B", rating: 1},
+      {user_id: 3, item_id: "B", rating: 3}
+    ])
+
+    obj = JSON.parse(recommender.to_json)
+    obj.delete("item_prior")
+    obj.delete("item_prior_mean")
+    loaded = Disco::Recommender.load_json(JSON.generate(obj))
+
+    assert_nil loaded.instance_variable_get(:@item_prior_mean)
+    assert_in_delta 3.0, loaded.predict([{user_id: 99, item_id: "A"}]).first
+    assert_in_delta 3.0, loaded.predict([{user_id: 99, item_id: "Z"}]).first
+  end
+
+  def test_item_prior_validation_set_not_polluted
+    train_set = [
+      {user_id: 1, item_id: "A", rating: 5},
+      {user_id: 2, item_id: "B", rating: 1},
+      {user_id: 3, item_id: "B", rating: 3}
+    ]
+    validation_set = [{user_id: 4, item_id: "A", rating: 1}]
+
+    with_validation = Disco::Recommender.new(factors: 2, item_prior: 1, verbose: false)
+    with_validation.fit(train_set, validation_set: validation_set)
+
+    without_validation = Disco::Recommender.new(factors: 2, item_prior: 1, verbose: false)
+    without_validation.fit(train_set)
+
+    assert_equal without_validation.predict([{user_id: 99, item_id: "A"}]),
+      with_validation.predict([{user_id: 99, item_id: "A"}])
+  end
+
+  def test_item_prior_disabled_keeps_global_mean
+    recommender = Disco::Recommender.new(factors: 2, verbose: false)
+    recommender.fit([
+      {user_id: 1, item_id: "A", rating: 5},
+      {user_id: 2, item_id: "B", rating: 1},
+      {user_id: 3, item_id: "B", rating: 3}
+    ])
+
+    assert_nil recommender.instance_variable_get(:@item_prior_mean)
+    assert_equal [3.0], recommender.predict([{user_id: 99, item_id: "A"}])
+  end
+
+  def test_item_prior_implicit_ignored
+    recommender = Disco::Recommender.new(factors: 2, item_prior: 1, verbose: false)
+    recommender.fit([
+      {user_id: 1, item_id: "A"},
+      {user_id: 2, item_id: "A"}
+    ])
+
+    assert_nil recommender.instance_variable_get(:@item_prior_mean)
+    assert_equal [0.0], recommender.predict([{user_id: 99, item_id: "A"}])
+  end
+
+  def test_item_prior_invalid
+    error = assert_raises(ArgumentError) do
+      Disco::Recommender.new(item_prior: -1).fit([
+        {user_id: 1, item_id: "A", rating: 5},
+        {user_id: 2, item_id: "B", rating: 1}
+      ])
+    end
+    assert_equal "item_prior must be non-negative", error.message
   end
 
   def test_predict_user_recs_consistent

@@ -1,3 +1,7 @@
+## 1.1.0 (unreleased)
+
+- Added `item_prior` option for cold-start predictions of new users with explicit feedback
+
 ## 1.0.0 (2026-04-17)
 
 - Switched to `numo-narray-alt`

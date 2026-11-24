@@ -242,6 +242,18 @@ recommender.top_items
 
 This uses [Wilson score](https://www.evanmiller.org/how-not-to-sort-by-average-rating.html) for explicit feedback and item frequency for implicit feedback.
 
+### Item Prior
+
+For explicit feedback, use an item prior to get predictions for new users. The item mean is shrunk toward the global mean, with the shrinkage controlled by `item_prior`.
+
+```ruby
+recommender = Disco::Recommender.new(item_prior: 1)
+recommender.fit(data)
+recommender.predict([{user_id: new_user_id, item_id: item_id}])
+```
+
+With a global mean of 3 and an item with a single rating of 5, the prediction for a new user is `(5 + 1 * 3) / (1 + 1) = 4`. A higher value shrinks predictions more strongly toward the global mean, while `0` uses the raw item mean. When both the user and item are unknown, the global mean is used instead. The prior is computed from the training set only, so a validation set never affects it.
+
 ## Data
 
 Data can be an array of hashes
