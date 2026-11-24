@@ -67,6 +67,65 @@ class TestCatBoostEncoder(TestCase):
             [prior, prior, prior / 2, (1 + prior) / 3, prior, prior / 2, (2 + prior) / 4],
         )
 
+    def test_cat_boost_time_aware(self):
+        """Test the time-aware training mode with an initial prior.
+
+        Rows of the same day are backfilled at end of day, so they must not
+        see each other's target. Only strictly earlier days contribute.
+        """
+        X = pd.DataFrame({'col1': ['A', 'A', 'A'], 'day': [1, 1, 2]})
+        y = pd.Series([0, 1, 1])
+        enc = encoders.CatBoostEncoder(cols=['col1'], time_col='day', prior=0.25, a=1)
+        obtained = enc.fit_transform(X, y)
+        self.assertEqual(
+            list(obtained['col1']),
+            [0.25, 0.25, 1.25 / 3],
+            'Same-day rows both get the prior; the second day reads the merged history.',
+        )
+
+    def test_cat_boost_time_aware_row_order_invariant(self):
+        """Shuffled input returns per-row results; same-day swaps change nothing."""
+        X = pd.DataFrame({'col1': ['A', 'A', 'A'], 'day': [1, 1, 2]})
+        y = pd.Series([0, 1, 1])
+        enc = encoders.CatBoostEncoder(cols=['col1'], time_col='day', prior=0.25, a=1)
+        expected = list(enc.fit_transform(X, y)['col1'])
+
+        # Globally shuffled input: each row keeps its own encoding.
+        perm = [2, 0, 1]
+        X_shuffled = X.iloc[perm].reset_index(drop=True)
+        y_shuffled = y.iloc[perm].reset_index(drop=True)
+        enc_shuffled = encoders.CatBoostEncoder(cols=['col1'], time_col='day', prior=0.25, a=1)
+        obtained = enc_shuffled.fit_transform(X_shuffled, y_shuffled)
+        self.assertEqual(list(obtained['col1']), [expected[i] for i in perm])
+
+        # Swapping rows within the same day does not change any encoding.
+        swap = [1, 0, 2]
+        X_swapped = X.iloc[swap].reset_index(drop=True)
+        y_swapped = y.iloc[swap].reset_index(drop=True)
+        enc_swapped = encoders.CatBoostEncoder(cols=['col1'], time_col='day', prior=0.25, a=1)
+        obtained = enc_swapped.fit_transform(X_swapped, y_swapped)
+        self.assertEqual(list(obtained['col1']), [expected[i] for i in swap])
+
+    def test_cat_boost_time_aware_default_prior(self):
+        """Without an explicit prior, the global target mean is used."""
+        X = pd.DataFrame({'col1': ['A', 'A', 'A'], 'day': [1, 1, 2]})
+        y = pd.Series([0, 1, 1])
+        enc = encoders.CatBoostEncoder(cols=['col1'], time_col='day', a=1)
+        obtained = enc.fit_transform(X, y)
+        mean = 2.0 / 3
+        self.assertEqual(list(obtained['col1']), [mean, mean, (1 + mean) / 3])
+
+    def test_cat_boost_time_aware_transform_without_y(self):
+        """Scoring new data still uses the full-history mapping."""
+        X = pd.DataFrame({'col1': ['A', 'A', 'A'], 'day': [1, 1, 2]})
+        y = pd.Series([0, 1, 1])
+        enc = encoders.CatBoostEncoder(cols=['col1'], time_col='day', prior=0.25, a=1)
+        enc.fit(X, y)
+        X_t = pd.DataFrame({'col1': ['A'], 'day': [3]})
+        obtained = enc.transform(X_t)
+        # (sum + global_mean * a) / (count + a), as in the classic mode
+        self.assertEqual(list(obtained['col1']), [(2 + 2.0 / 3) / 4])
+
     def test_cat_boost_reference_2(self):
         """Test another reference case stated in a video.
 

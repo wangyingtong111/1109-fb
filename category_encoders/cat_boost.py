@@ -57,6 +57,19 @@ class CatBoostEncoder(util.SupervisedTransformerMixin, util.BaseEncoder):
     a: float
         additive smoothing (it is the same variable as "m" in m-probability estimate).
         By default, set to 1.
+    time_col: str
+        name of a column in X that carries the timestamp (period) of each row.
+        When set, the training-time encoding (transform with y passed) becomes
+        strictly time-aware: each row is encoded only from rows with a strictly
+        smaller timestamp, so rows within the same period (e.g. features
+        backfilled at the end of the day) never see each other's target,
+        regardless of their order in the data. The output rows stay aligned
+        with the input order. When None (default), the classic row-order
+        running mean is used and behavior is unchanged.
+    prior: float
+        initial prior for the target mean, used in the time-aware training
+        mode (time_col) before any history has been observed. When None
+        (default), the global target mean of the training data is used.
 
     Example
     -------
@@ -119,6 +132,8 @@ class CatBoostEncoder(util.SupervisedTransformerMixin, util.BaseEncoder):
         random_state=None,
         sigma=None,
         a=1,
+        time_col=None,
+        prior=None,
         min_group_size: int | float | None = None,
         min_group_name: str | None = None,
         combine_min_nan_groups: bool | str | None = None,
@@ -143,9 +158,13 @@ class CatBoostEncoder(util.SupervisedTransformerMixin, util.BaseEncoder):
         self.random_state = random_state
         self.sigma = sigma
         self.a = a
+        self.time_col = time_col
+        self.prior = prior
 
     def _fit(self, X, y, **kwargs):
         X = X.copy(deep=True)
+        if self.time_col is not None and self.time_col not in X.columns:
+            raise ValueError(f"time_col '{self.time_col}' is not a column of X")
         self._mean = y.mean()
         self.mapping = {col: self._fit_column_map(X[col], y) for col in self.cols}
 
@@ -156,6 +175,16 @@ class CatBoostEncoder(util.SupervisedTransformerMixin, util.BaseEncoder):
         if y is not None:
             # Convert bools to numbers (the target must be summable)
             y = y.astype('double')
+
+        # In time-aware training mode each row is encoded only from rows with a
+        # strictly smaller timestamp (rows of the same period never see each
+        # other's target, no matter in which order they were persisted).
+        times = None
+        if self.time_col is not None and y is not None:
+            if self.time_col not in X.columns:
+                raise ValueError(f"time_col '{self.time_col}' is not a column of X")
+            times = X[self.time_col]
+        prior = self._mean if self.prior is None else self.prior
 
         for col, colmap in self.mapping.items():
             level_notunique = colmap['count'] > 1
@@ -186,11 +215,17 @@ class CatBoostEncoder(util.SupervisedTransformerMixin, util.BaseEncoder):
                 # Still, it works better than leave-one-out without any noise.
                 # See:
                 #   https://tech.yandex.com/catboost/doc/dg/concepts/algorithm-main-stages_cat-to-numberic-docpage/
-                # Cumsum does not work nicely with None (while cumcount does).
-                # As a workaround, we cast the grouping column as string.
-                # See: issue #209
-                temp = y.groupby(X[col].astype(str).fillna('nan')).agg(['cumsum', 'cumcount'])
-                X[col] = (temp['cumsum'] - y + self._mean * self.a) / (temp['cumcount'] + self.a)
+                if times is not None:
+                    # Time-aware mode: only rows with a strictly smaller timestamp
+                    # contribute to the encoding of a row. The encoding of a row
+                    # therefore does not depend on the row order within a period.
+                    X[col] = self._encode_with_time(X[col], times, y, prior)
+                else:
+                    # Cumsum does not work nicely with None (while cumcount does).
+                    # As a workaround, we cast the grouping column as string.
+                    # See: issue #209
+                    temp = y.groupby(X[col].astype(str).fillna('nan')).agg(['cumsum', 'cumcount'])
+                    X[col] = (temp['cumsum'] - y + self._mean * self.a) / (temp['cumcount'] + self.a)
 
             if self.handle_unknown == 'value':
                 if X[col].dtype.name == 'category':
@@ -219,6 +254,34 @@ class CatBoostEncoder(util.SupervisedTransformerMixin, util.BaseEncoder):
         tags = super().__sklearn_tags__()
         tags.predict_depends_on_y = True
         return tags
+
+    def _encode_with_time(self, series, times, y, prior):
+        """Encode each row using only rows with a strictly smaller timestamp.
+
+        Rows within the same period (e.g. the same day, backfilled at end of
+        day) do not see each other's target, so the encoding of a row is
+        invariant to the row order within a period and the result stays
+        aligned with the input row order.
+        """
+        temp = pd.DataFrame(
+            {
+                'cat': series.astype(str).fillna('nan').to_numpy(),
+                't': np.asarray(times),
+                'y': np.asarray(y, dtype='double'),
+            }
+        )
+        # Aggregate per (category, period) first: every row of a period reads
+        # the same merged history of all previous periods.
+        bucketed = temp.groupby(['cat', 't'], sort=True)['y'].agg(['sum', 'count'])
+        cumulative = bucketed.groupby(level='cat').cumsum()
+        bucketed['prev_sum'] = cumulative['sum'] - bucketed['sum']
+        bucketed['prev_count'] = cumulative['count'] - bucketed['count']
+        merged = temp[['cat', 't']].join(
+            bucketed[['prev_sum', 'prev_count']], on=['cat', 't']
+        )
+        prev_sum = merged['prev_sum'].to_numpy()
+        prev_count = merged['prev_count'].to_numpy()
+        return (prev_sum + prior * self.a) / (prev_count + self.a)
 
     def _fit_column_map(self, series, y):
         category = pd.Categorical(series)
