@@ -56,6 +56,16 @@ posting, merged by the combinators, transcribed into the public result Hash in
 Hash; this is an internal, allocation-driven shape only, one of several such wins in
 [allocation-tuning](/benchmarks/allocation-tuning.md).
 
+Query-tree nodes may also carry a local `filter`. `execute_query` transcribes that
+node's raw record with the same result shape and applies the predicate immediately
+after the node's own terms/children have combined, but **before its parent
+combinator runs**. That ordering is the whole point for a conditional `AND_NOT`:
+a `pine` subtree filtered by `dept == "old"` contributes only the old-department
+posting to `AND_NOT`, so a new-department document that also contains `pine`
+survives and never merges the negative subtree's evidence. The final `search`
+filter is a separate stage; it still receives the final score and the fully merged
+match evidence.
+
 # The dirt model: why discard is lazy
 
 `remove` needs the full original document (to reverse exactly what indexing did);

@@ -1,3 +1,8 @@
+## Unreleased
+
+- Query-tree nodes can define a local `filter` that narrows only that node's
+  candidates before combination, including conditional `AND_NOT` subtrees.
+
 ## [1.0.1] - 2026-07-18
 
 - Require MFA for gem pushes (`rubygems_mfa_required` gemspec metadata). No

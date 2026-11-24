@@ -337,20 +337,7 @@ class MiniFTS
     results = []
 
     raw_results.each do |doc_id, data|
-      terms = data[R_TERMS]
-      quality = terms.empty? ? 1 : terms.length
-
-      match = data[R_MATCH]
-      result = {
-        id: @document_ids[doc_id],
-        score: data[R_SCORE] * quality,
-        terms: match.keys,
-        query_terms: terms,
-        match: match
-      }
-
-      stored = @stored_fields[doc_id]
-      result.merge!(stored) if stored
+      result = result_from_raw(doc_id, data)
 
       filter = search_options_with_defaults[:filter]
       results.push(result) if filter.nil? || filter.call(result)
@@ -680,8 +667,76 @@ class MiniFTS
   R_MATCH = 2
   private_constant :R_SCORE, :R_TERMS, :R_MATCH
 
+  def result_from_raw(doc_id, data)
+    terms = data[R_TERMS]
+    quality = terms.empty? ? 1 : terms.length
+    match = data[R_MATCH]
+
+    result = {
+      id: @document_ids[doc_id],
+      score: data[R_SCORE] * quality,
+      terms: match.keys,
+      query_terms: terms,
+      match: match
+    }
+
+    stored = @stored_fields[doc_id]
+    result.merge!(stored) if stored
+    result
+  end
+
+  # A query-node filter is intentionally applied to that node's own raw result
+  # set before parent combinators run. This is what lets an AND_NOT subtree
+  # exclude only the candidates accepted by its local predicate.
+  def apply_node_filter(results, filter)
+    return results if filter.nil?
+
+    results.keys.each do |doc_id|
+      candidate = result_from_raw(doc_id, results[doc_id])
+      results.delete(doc_id) unless filter.call(candidate)
+    end
+
+    results
+  end
+
+  def term_node_spec(query)
+    spec = query.dup
+    spec[:prefix] = false if spec[:prefix].nil?
+    spec[:fuzzy] = false if spec[:fuzzy].nil?
+    spec[:term_boost] = 1 if spec[:term_boost].nil?
+    spec
+  end
+
   def execute_query(query, search_options = {})
     return execute_wildcard_query(search_options) if wildcard_query?(query)
+
+    if query.is_a?(Hash)
+      node_filter = query[:filter]
+      options = search_options.merge(query)
+      options.delete(:queries)
+      options.delete(:filter)
+
+      results =
+        if query.key?(:queries)
+          raw_child_queries = query[:queries]
+          child_queries = raw_child_queries.is_a?(Array) ? raw_child_queries : [raw_child_queries]
+          child_results = child_queries.map { |subquery| execute_query(subquery, options) }
+          combine_results(child_results, options[:combine_with])
+        elsif query.key?(:term)
+          execute_query_spec(term_node_spec(query), options)
+        else
+          leaf_query = if query.key?(:query)
+                         query[:query]
+                       elsif query.key?(:query_string)
+                         query[:query_string]
+                       else
+                         query[:q]
+                       end
+          execute_query(leaf_query, options)
+        end
+
+      return apply_node_filter(results, node_filter)
+    end
 
     unless query.is_a?(String)
       options = search_options.merge(query)

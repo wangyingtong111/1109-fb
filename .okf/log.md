@@ -1,5 +1,8 @@
 # Update Log
 
+## 2026-11-25
+* **Feature note**: Query-tree nodes now accept a local `filter`; recorded the ordering invariant in [search-engine](/architecture/search-engine.md). The trap is that the old public `filter` runs only after `execute_query` returns, so encoding a local condition there cannot change which candidates an `AND_NOT` subtree removes. The local predicate must run after that node's own combination but before the parent combinator, while the outer filter and its final score/merged-evidence contract remain unchanged.
+
 ## 2026-07-18
 * **Update**: Recorded the MFA requirement in [gem-packaging](/toolchain/gem-packaging.md) — `rubygems_mfa_required` now travels with the gemspec, so it survives a change of owner rather than resting on an account setting. The non-obvious part is *when* it applies: gem metadata is per-version and immutable once published, so enabling it protects nothing already on RubyGems. 1.0.0 shipped without it and permanently lacks it; 1.0.1 is the first version to carry it. Also made the packaging prose version-agnostic — the durable knowledge is the eight-file *list*, not the version it was last checked against — and replaced the `gem contents` check with an unpack that needs no install and works on any version.
 * **Update**: The bundle site is live at <https://serradura.github.io/minifts/> — first workflow run green in 23 s, publishing all 13 concepts with the Mermaid diagrams rendering. Noted in [ruby-floor-ci](/toolchain/ruby-floor-ci.md) that the one thing the workflow file cannot carry is the repository setting that enables it (Pages source: "GitHub Actions"), so a fork reproduces the workflow but publishes nothing until someone flips it.

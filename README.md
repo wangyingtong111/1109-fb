@@ -93,6 +93,24 @@ ms.search(
 )
 ```
 
+Each query-tree node can also have its own `filter`. Such a filter narrows that
+node's candidates before parent combinators run, so it can make a subtree act as
+a conditional `AND_NOT` exclusion:
+
+```ruby
+ms.search(
+  combine_with: "AND_NOT",
+  queries: [
+    "oak",
+    { queries: ["pine"], filter: ->(r) { r["dept"] == "old" } }
+  ]
+)
+```
+
+A filtered leaf can also be written as `{ query: "pine", filter: ... }`. The
+outer `search(..., filter: ...)` remains a final result filter; its block still
+receives the final score and merged match evidence.
+
 Supported search options: `:fields`, `:filter`, `:boost`, `:boost_term`,
 `:weights`, `:boost_document`, `:prefix`, `:fuzzy`, `:max_fuzzy`,
 `:combine_with`, `:tokenize`, `:process_term`, `:bm25`.
