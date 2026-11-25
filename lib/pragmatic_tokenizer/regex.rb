@@ -8,7 +8,7 @@ module PragmaticTokenizer
     # - check multiple punctuation regex
 
     # Text that needs to be tokenized is initially split into chunks of this length:
-    CHUNK_LONG_INPUT_TEXT         = /\S.{1,10000}(?!\S)/m
+    CHUNK_LONG_INPUT_TEXT         = /\S.{0,10000}(?!\S)/m
 
     # Ranges
     RANGE_DINGBATS                = /[\u2701-\u27BE]/ # e.g. ✁✎✳❄➾
