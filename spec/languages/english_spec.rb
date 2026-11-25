@@ -357,6 +357,93 @@ describe PragmaticTokenizer do
         end
       end
 
+      context 'option (remove_emoji_sequences)' do
+        let(:woman_technologist) { "\u{1F469}\u{1F3FD}\u200d\u{1F4BB}" } # woman + medium skin tone + ZWJ + laptop
+        let(:keycap_one)         { "1\ufe0f\u20e3" }                      # digit + variation selector-16 + combining enclosing keycap
+        let(:keycap_hash)        { "#\ufe0f\u20e3" }                      # hash + variation selector-16 + combining enclosing keycap
+        let(:mixed_emoji)        { "\u{1F47F}\u{1F60D}\u{1F631}\u{1F414}\u{1F31A}" } # five single emoji
+        let(:us_flag)            { "\u{1F1FA}\u{1F1F8}" }                 # regional indicator pair
+        let(:pirate_flag)        { "\u{1F3F4}\u200d\u2620\ufe0f" }        # black flag + ZWJ + skull + variation selector-16
+
+        it 'removes a complete ZWJ sequence with skin-tone modifier and keeps the surrounding words split' do
+          text = "red#{woman_technologist}oak"
+          pt = PragmaticTokenizer::Tokenizer.new(
+              remove_emoji_sequences: true
+          )
+          expect(pt.tokenize(text)).to eq(["red", "oak"])
+        end
+
+        it 'removes a complete keycap sequence while leaving bare digits and the hash sign untouched' do
+          text = "red#{keycap_one}oak 1 #"
+          pt = PragmaticTokenizer::Tokenizer.new(
+              remove_emoji_sequences: true
+          )
+          expect(pt.tokenize(text)).to eq(["red", "oak", "1", "#"])
+        end
+
+        it 'removes every emoji in mixed input without touching punctuation and digits' do
+          text = "Return the emoji #{mixed_emoji}. \u{1F31A} 1 #"
+          pt = PragmaticTokenizer::Tokenizer.new(
+              remove_emoji_sequences: true
+          )
+          expect(pt.tokenize(text)).to eq(["return", "the", "emoji", ".", "1", "#"])
+        end
+
+        it 'removes snowflake sequences completely' do
+          text = "hello\u2744\ufe0f\u2744\ufe0f\u2744\ufe0f"
+          pt = PragmaticTokenizer::Tokenizer.new(
+              remove_emoji_sequences: true
+          )
+          expect(pt.tokenize(text)).to eq(["hello"])
+        end
+
+        it 'removes flag and tag sequences' do
+          text = "flag #{us_flag} and #{pirate_flag} done"
+          pt = PragmaticTokenizer::Tokenizer.new(
+              remove_emoji_sequences: true
+          )
+          expect(pt.tokenize(text)).to eq(["flag", "and", "done"])
+        end
+
+        it 'removes a keycap hash but keeps a bare hash as punctuation/hashtag' do
+          text = "#tag 1 #{keycap_hash}"
+          pt = PragmaticTokenizer::Tokenizer.new(
+              remove_emoji_sequences: true
+          )
+          expect(pt.tokenize(text)).to eq(["#tag", "1"])
+        end
+
+        it 'can be enabled via the remove_emoji :sequences option' do
+          text = "red#{woman_technologist}oak red#{keycap_one}oak 1 #"
+          pt = PragmaticTokenizer::Tokenizer.new(
+              remove_emoji: :sequences
+          )
+          expect(pt.tokenize(text)).to eq(["red", "oak", "red", "oak", "1", "#"])
+        end
+
+        it 'can be enabled via the remove_emoji :full option' do
+          text = "red#{woman_technologist}oak"
+          pt = PragmaticTokenizer::Tokenizer.new(
+              remove_emoji: :full
+          )
+          expect(pt.tokenize(text)).to eq(["red", "oak"])
+        end
+
+        it 'leaves the default tokenization unchanged' do
+          text = "red#{woman_technologist}oak"
+          pt = PragmaticTokenizer::Tokenizer.new
+          expect(pt.tokenize(text)).to eq(["red", "\u{1F469}", "\u{1F3FD}", "\u200d", "\u{1F4BB}", "oak"])
+        end
+
+        it 'leaves the legacy remove_emoji behavior unchanged' do
+          text = "red#{woman_technologist}oak"
+          pt = PragmaticTokenizer::Tokenizer.new(
+              remove_emoji: true
+          )
+          expect(pt.tokenize(text)).to eq(["red", "\u200d", "oak"])
+        end
+      end
+
       context 'option (hashtags)' do
         it 'tokenizes a string #001' do
           text = "This is a #hashtag yay!"

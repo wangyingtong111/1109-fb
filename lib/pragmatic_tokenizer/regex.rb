@@ -16,6 +16,26 @@ module PragmaticTokenizer
     RANGE_FULLWIDTH               = /[\uFF01-\ufF1F]/ # e.g. ！＂＃＇？
     RANGE_ALPHANUMERIC_SUPPLEMENT = /[\u{1F100}-\u{1F1FF}]/
     RANGE_UNUSUAL_AND_EMOJI       = /[\u203C-\u3299\u{1F000}-\u{1F644}]/
+    RANGE_REGIONAL_INDICATORS     = /[\u{1F1E6}-\u{1F1FF}]/ # pairs of these build flag sequences
+    RANGE_TAGS                    = /[\u{E0000}-\u{E007F}]/ # used in subdivision flag sequences
+    COMBINING_ENCLOSING_KEYCAP    = /\u20E3/
+
+    # An extended grapheme cluster (\X) is treated as an emoji when any of its
+    # code points matches one of these ranges/properties. This keeps full emoji
+    # sequences together (e.g. the woman + skin-tone + ZWJ + laptop sequence
+    # and the digit + variation selector + keycap sequence) instead of splitting
+    # them into their base, skin-tone modifier, variation selector, ZWJ and
+    # keycap parts.
+    EMOJI_SEQUENCE_COMPONENT = Regexp.union(
+      /\p{Emoji_Presentation}/,
+      RANGE_REGIONAL_INDICATORS,
+      RANGE_TAGS,
+      COMBINING_ENCLOSING_KEYCAP,
+      RANGE_VARIATION_SELECTORS,
+      RANGE_DINGBATS,
+      RANGE_UNUSUAL_AND_EMOJI
+    )
+    GRAPHEME_CLUSTER          = /\X/
 
     # Regular expressions which do not need to capture anything are enclosed in /(?: … )/ to enhance performance
     COLON1                        = /(?:(:)([[:print:]]{2,}))/ # two non-space after colon prevent matching emoticons

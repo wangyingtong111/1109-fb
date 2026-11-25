@@ -50,6 +50,7 @@ module PragmaticTokenizer
     # @option opts [Boolean] :clean - (default: false)
     # @option opts [Boolean] :classic_filter - removes dots from acronyms and 's from the end of tokens - (default: false)
     # @option opts [Boolean] :remove_emoji - (default: false)
+    # @option opts [Boolean] :remove_emoji_sequences - (default: false) removes complete emoji sequences (including skin-tone modifiers, variation selectors, ZWJ and keycap parts) as whole grapheme clusters, inserting a space so the text on either side remains tokenized separately; bare digits and punctuation (e.g. "1", "#") are not touched. Can also be enabled by passing :sequences (or :full) to :remove_emoji.
     # @option opts [Boolean] :remove_emails - (default: false)
     # @option opts [Boolean] :remove_urls - (default: false)
     # @option opts [Boolean] :remove_domains - (default: false)
@@ -68,7 +69,8 @@ module PragmaticTokenizer
       @downcase            = opts[:downcase].nil? ? true : opts[:downcase]
       @clean               = opts[:clean]
       @classic_filter      = opts[:classic_filter]
-      @remove_emoji        = opts[:remove_emoji]
+      @remove_emoji_sequences = opts[:remove_emoji_sequences] || opts[:remove_emoji] == :sequences || opts[:remove_emoji] == :full
+      @remove_emoji        = opts[:remove_emoji] == true
       @remove_emails       = opts[:remove_emails]
       @remove_urls         = opts[:remove_urls]
       @remove_domains      = opts[:remove_domains]
@@ -104,11 +106,23 @@ module PragmaticTokenizer
       return [] unless text
       raise "In PragmaticTokenizer text must be a String or subclass of String" unless text.class <= String
       CGI.unescapeHTML(text)
+          .then { |unescaped| @remove_emoji_sequences ? remove_emoji_sequences(unescaped) : unescaped }
           .scan(Regex::CHUNK_LONG_INPUT_TEXT)
           .flat_map { |segment| process_segment(segment) }
     end
 
     private
+
+      # Removes complete emoji sequences as whole extended grapheme clusters.
+      # Each removed cluster is replaced by a space so the words on either side
+      # stay separate tokens. Bare characters that merely carry the Emoji
+      # unicode property (e.g. "1", "#") are preserved when they are not part
+      # of an actual emoji sequence such as a variation-selector + keycap cluster.
+      def remove_emoji_sequences(text)
+        text.gsub(Regex::GRAPHEME_CLUSTER) do |cluster|
+          cluster.match?(Regex::EMOJI_SEQUENCE_COMPONENT) ? SPACE : cluster
+        end
+      end
 
       def process_segment(segment)
         pre_processed = pre_process(segment)

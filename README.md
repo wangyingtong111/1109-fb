@@ -139,6 +139,17 @@ options = {
   Removes any token that contains an emoji.
 - `false`   
   Leaves tokens as is.
+- `:sequences` / `:full`  
+  Removes complete emoji sequences as whole grapheme clusters (including skin-tone modifiers, variation selectors, ZWJ joiners and keycap parts). A space is inserted in place of each removed sequence so the text on either side stays tokenized separately. Bare digits and punctuation (e.g. `1` and `#`) are preserved; only full emoji sequences such as the keycap `1️⃣` are removed. This can also be enabled with the `remove_emoji_sequences: true` option.
+
+<hr>
+
+##### `remove_emoji_sequences`
+  **default** = `false`
+- `true`  
+  Removes complete emoji sequences as whole grapheme clusters (e.g. `👩🏽‍💻` and `1️⃣`) and keeps the surrounding words as separate tokens. For instance `red👩🏽‍💻oak` becomes `["red", "oak"]` with no skin-tone modifier or ZWJ joiner left over. Bare digits and punctuation (e.g. a standalone `1` or `#`) follow the normal rules and are not removed.
+- `false`   
+  Leaves tokens as is.
 
 <hr>
 
