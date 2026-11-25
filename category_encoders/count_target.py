@@ -30,7 +30,8 @@ class CountTargetEncoder(util.SupervisedTransformerMixin, util.BaseEncoder):
 
     For a category c and class k let n_k(c) be the number of training rows in
     category c with class k, n(c) their sum, and prior_k the global class
-    probability. The empirical class shares are blended with the prior by an
+    probability. Both are weighted sums when the fit receives sample weights
+    (see below). The empirical class shares are blended with the prior by an
     S-shaped weight::
 
         w(c) = expit((n(c) - min_samples_leaf) / smoothing)
@@ -46,6 +47,15 @@ class CountTargetEncoder(util.SupervisedTransformerMixin, util.BaseEncoder):
     overfitting that raw counts would otherwise introduce on id-like columns.
     A category never observed at fit time encodes to 0 ("no evidence against
     the prior") under the default ``handle_unknown='value'``.
+
+    Sample weights are supported through ``fit(X, y, sample_weight=...)``. The
+    weight of a row is its multiplicity: counts become weighted counts (so a
+    positive row of weight 3 counts as 3), and the smoothing support ``n(c)``
+    and the global prior are weighted sums too. Integer weights therefore give
+    exactly the same encoding as fitting on the correspondingly expanded data.
+    A row with weight 0 does not take part in the fit at all: it neither
+    creates a category nor contributes a class column or prior mass, and its
+    categories are treated as unknown at transform time.
 
     Parameters
     ----------
@@ -78,6 +88,8 @@ class CountTargetEncoder(util.SupervisedTransformerMixin, util.BaseEncoder):
     counts_ : dict
         Maps every encoded column to a DataFrame with the per-class counts
         observed at fit time (rows are the categories, columns the classes).
+        With sample weights these are weighted counts, so the table can be
+        checked against the fit input.
 
     Examples
     --------
@@ -93,6 +105,17 @@ class CountTargetEncoder(util.SupervisedTransformerMixin, util.BaseEncoder):
     2  0.043099
     3  0.043099
     4  0.043099
+
+    Weighted fit: a positive row of weight 3 and a negative row of weight 1
+    yield per-class counts of 3 and 1.
+
+    >>> weights = [3, 1]
+    >>> enc = CountTargetEncoder().fit(
+    ...     pd.DataFrame({'city': ['chicago', 'chicago']}), [1, 0], sample_weight=weights
+    ... )
+    >>> enc.counts_['city']
+             0  1
+    chicago  1  3
 
     References
     ----------
@@ -142,7 +165,30 @@ class CountTargetEncoder(util.SupervisedTransformerMixin, util.BaseEncoder):
         self._class_labels = None
         self._prior = None
 
-    def _fit(self, X: util.X_type, y: util.y_type, **kwargs) -> None:
+    def _validate_sample_weight(
+        self, sample_weight: util.y_type | None, n_rows: int
+    ) -> np.ndarray | None:
+        """Validate the fit-time sample weights and return them as a float array.
+
+        Weights are multiplicities: a row of weight 3 behaves like three copies of
+        that row. Zero weights are allowed (the row takes no part in the fit),
+        negative or non-finite weights are not.
+        """
+        if sample_weight is None:
+            return None
+        weights = np.asarray(sample_weight, dtype=float)
+        if weights.ndim != 1 or weights.shape[0] != n_rows:
+            raise ValueError(
+                'sample_weight must be one-dimensional with one weight per row, got shape '
+                f'{weights.shape} for {n_rows} rows.'
+            )
+        if not np.all(np.isfinite(weights)):
+            raise ValueError('sample_weight must not contain NaN or infinite values.')
+        if (weights < 0).any():
+            raise ValueError('sample_weight must not contain negative values.')
+        return weights
+
+    def _fit(self, X: util.X_type, y: util.y_type, sample_weight=None, **kwargs) -> None:
         # y arrives here label-encoded: bool/int stay, strings/categoricals are
         # coded by BaseEncoder.fit through LabelEncoder. Anything else (float,
         # complex) is a continuous target and out of scope for v1.
@@ -151,34 +197,68 @@ class CountTargetEncoder(util.SupervisedTransformerMixin, util.BaseEncoder):
         if self.smoothing <= 0:
             raise ValueError('smoothing must be strictly bigger than 0.')
 
+        weights = self._validate_sample_weight(sample_weight, X.shape[0])
+        if weights is None:
+            X_fit, y_fit = X, y
+        else:
+            # zero-weight rows take no part in the fit: they must not register a
+            # category, a class column or prior mass, so drop them before the
+            # ordinal encoding even sees them
+            keep = np.flatnonzero(weights > 0)
+            if keep.size == 0:
+                raise ValueError('All sample weights are zero, so there is nothing to fit on.')
+            X_fit = X.iloc[keep]
+            y_fit = y.iloc[keep]
+            weights = weights[keep]
+
         self.ordinal_encoder = OrdinalEncoder(
             verbose=self.verbose, cols=self.cols, handle_unknown='value', handle_missing='value'
         )
-        self.ordinal_encoder = self.ordinal_encoder.fit(X)
-        X_ordinal = self.ordinal_encoder.transform(X)
+        self.ordinal_encoder = self.ordinal_encoder.fit(X_fit)
+        X_ordinal = self.ordinal_encoder.transform(X_fit)
 
-        self._classes = np.sort(y.unique())
-        class_counts = y.value_counts().reindex(self._classes)
-        self._prior = class_counts / class_counts.sum()
+        self._classes = np.sort(y_fit.unique())
+        if weights is None:
+            class_totals = y_fit.value_counts().reindex(self._classes).to_numpy(dtype=float)
+        else:
+            # sum the row weights per class; self._classes is sorted so searchsorted
+            # maps each label to its class position
+            class_totals = np.bincount(
+                np.searchsorted(self._classes, y_fit.to_numpy()),
+                weights=weights,
+                minlength=len(self._classes),
+            )
+        self._prior = pd.Series(class_totals / class_totals.sum(), index=self._classes)
         if self.lab_encoder_ is not None:
             self._class_labels = self.lab_encoder_.inverse_transform(self._classes)
         else:
             self._class_labels = self._classes
 
-        self.mapping, self.counts_ = self._fit_mapping(X_ordinal, y)
+        # integer-weighted fits reproduce an expanded unweighted fit, including
+        # its integral count table; fractional weights must stay as they are
+        integral = weights is None or bool(np.all(weights == np.floor(weights)))
+        self.mapping, self.counts_ = self._fit_mapping(X_ordinal, y_fit, weights, integral)
 
     def _fit_mapping(
-        self, X_ordinal: pd.DataFrame, y: pd.Series
+        self,
+        X_ordinal: pd.DataFrame,
+        y: pd.Series,
+        weights: np.ndarray | None = None,
+        integral_counts: bool = True,
     ) -> tuple[dict[str, pd.Series | pd.DataFrame], dict[str, pd.DataFrame]]:
         """Compute per-column count tables and smoothed log-odds tables.
 
         Returns the transform-time mapping (ordinal code -> encoded value(s))
-        and the inspectable per-class count tables (category -> counts).
+        and the inspectable per-class count tables (category -> counts). With
+        sample weights the counts are weighted counts, so an integer weight acts
+        as the row's multiplicity; the smoothing support and the prior are
+        weighted sums as well.
         """
         mapping: dict[str, pd.Series | pd.DataFrame] = {}
         counts_tables: dict[str, pd.DataFrame] = {}
         is_binary = len(self._classes) == 2
         prior = self._prior.to_numpy(dtype=float)
+        counts_dtype = np.int64 if integral_counts else float
 
         for switch in self.ordinal_encoder.category_mapping:
             col = switch.get('col')
@@ -187,9 +267,15 @@ class CountTargetEncoder(util.SupervisedTransformerMixin, util.BaseEncoder):
             # per-class counts per ordinal code; rows are observed codes only.
             # raw arrays, not Series: crosstab would align their (possibly
             # duplicated) indexes instead of pairing values positionally
-            counts = pd.crosstab(X_ordinal[col].to_numpy(), y.to_numpy()).reindex(
-                columns=self._classes, fill_value=0
-            )
+            codes = X_ordinal[col].to_numpy()
+            if weights is None:
+                counts = pd.crosstab(codes, y.to_numpy())
+            else:
+                # weighted crosstab: absent (code, class) pairs are NaN rather
+                # than 0 under aggfunc='sum', and reindex does not fill them
+                counts = pd.crosstab(codes, y.to_numpy(), values=weights, aggfunc='sum')
+                counts = counts.fillna(0.0)
+            counts = counts.reindex(columns=self._classes, fill_value=0)
             counts_np = counts.to_numpy(dtype=float)
             n = counts_np.sum(axis=1)
             weight = expit((n - self.min_samples_leaf) / self.smoothing)
@@ -215,7 +301,7 @@ class CountTargetEncoder(util.SupervisedTransformerMixin, util.BaseEncoder):
             code_to_category = pd.Series(values.index.to_numpy(), index=values.to_numpy())
             categories = code_to_category.reindex(counts.index).to_numpy()
             counts_tables[col] = pd.DataFrame(
-                counts_np.astype(np.int64), index=categories, columns=self._class_labels
+                counts_np.astype(counts_dtype), index=categories, columns=self._class_labels
             )
 
         return mapping, counts_tables

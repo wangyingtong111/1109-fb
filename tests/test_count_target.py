@@ -295,3 +295,156 @@ class TestCountTargetEncoder(TestCase):
 
         self.assertListEqual(list(result.columns), ['city_maybe', 'city_no', 'city_yes'])
         th.verify_numeric(result)
+
+    def test_sample_weight_weighted_counts_are_checkable(self):
+        """A positive row of weight 3 and a negative row of weight 1 count 3 and 1."""
+        train = pd.DataFrame({'city': ['chicago', 'chicago']})
+
+        enc = encoders.CountTargetEncoder().fit(train, [1, 0], sample_weight=[3, 1])
+
+        counts = enc.counts_['city']
+        self.assertEqual(counts.loc['chicago', 1], 3)
+        self.assertEqual(counts.loc['chicago', 0], 1)
+        self.assertEqual(counts.to_numpy().sum(), 4)
+
+    def test_integer_weights_match_expanded_unweighted_fit(self):
+        """Integer weights act as multiplicities of the rows."""
+        train = pd.DataFrame({'x': ['a', 'a', 'b', 'c', 'c', 'c'], 'num': range(6)})
+        target = np.array([1, 0, 1, 1, 0, 1])
+        weights = np.array([2, 3, 1, 1, 2, 3])
+
+        weighted = encoders.CountTargetEncoder(cols=['x']).fit(
+            train, target, sample_weight=weights
+        )
+        expanded_rows = np.repeat(np.arange(len(train)), weights)
+        expanded = encoders.CountTargetEncoder(cols=['x']).fit(
+            train.iloc[expanded_rows].reset_index(drop=True),
+            target[expanded_rows],
+        )
+
+        pd.testing.assert_frame_equal(weighted.counts_['x'], expanded.counts_['x'])
+        probe = pd.DataFrame({'x': ['a', 'b', 'c'], 'num': [0, 0, 0]})
+        np.testing.assert_allclose(
+            weighted.transform(probe)['x'].to_numpy(),
+            expanded.transform(probe)['x'].to_numpy(),
+        )
+
+    def test_non_integer_weights_are_preserved(self):
+        """Fractional weights are kept as-is instead of being rounded away."""
+        train = pd.DataFrame({'x': ['a', 'a', 'b', 'b']})
+
+        enc = encoders.CountTargetEncoder(cols=['x']).fit(
+            train, [0, 1, 0, 1], sample_weight=[0.5, 1.5, 2.25, 0.75]
+        )
+
+        counts = enc.counts_['x']
+        self.assertAlmostEqual(counts.loc['a', 0], 0.5)
+        self.assertAlmostEqual(counts.loc['a', 1], 1.5)
+        self.assertAlmostEqual(counts.loc['b', 0], 2.25)
+        self.assertAlmostEqual(counts.loc['b', 1], 0.75)
+        self.assertEqual(counts.to_numpy().sum(), 5.0)
+
+    def test_zero_weight_row_does_not_create_category_or_class(self):
+        """A zero-weight row contributes no category, no class column and no prior mass."""
+        # duplicate index on purpose: alignment must stay positional. The last row
+        # carries a category ('zzz') and a label (3) that no other row uses.
+        train = pd.DataFrame(
+            {'x': ['a', 'b', 'c', 'a', 'b', 'c', 'zzz'], 'num': range(7)},
+            index=[0, 0, 1, 1, 2, 2, 0],
+        )
+        target = pd.Series([0, 1, 2, 0, 1, 2, 3], index=train.index)
+        weights = [1, 1, 1, 1, 1, 0, 0]
+
+        enc = encoders.CountTargetEncoder(cols=['x']).fit(
+            train, target, sample_weight=weights
+        )
+
+        self.assertListEqual(list(enc.counts_['x'].index), ['a', 'b', 'c'])
+        self.assertNotIn('zzz', enc.counts_['x'].index)
+        self.assertListEqual(list(enc._class_labels), [0, 1, 2])
+        self.assertAlmostEqual(enc._prior.loc[0], 2 / 5)
+        self.assertAlmostEqual(enc._prior.loc[1], 2 / 5)
+        self.assertAlmostEqual(enc._prior.loc[2], 1 / 5)
+        self.assertAlmostEqual(enc._prior.sum(), 1.0)
+
+        result = enc.transform(train)
+        self.assertListEqual(list(result.columns), ['x_0', 'x_1', 'x_2', 'num'])
+        # the zero-weight unique category is now unseen: default encodes to zero evidence
+        self.assertTrue(
+            np.allclose(result.iloc[-1][['x_0', 'x_1', 'x_2']].to_numpy(dtype=float), 0.0)
+        )
+
+    def test_zero_weight_row_does_not_add_a_multiclass_column(self):
+        """A zero-weight row with a brand-new label must not widen a binary fit."""
+        train = pd.DataFrame({'x': ['a', 'b', 'new']})
+        target = [1, 0, 2]
+        weights = [1, 1, 0]
+
+        enc = encoders.CountTargetEncoder(cols=['x']).fit(
+            train, target, sample_weight=weights
+        )
+        result = enc.transform(train)
+
+        # still binary: the log-odds column replaces the input, no _0/_1/_2 expansion
+        self.assertListEqual(list(result.columns), ['x'])
+        self.assertListEqual(list(enc._class_labels), [0, 1])
+        self.assertListEqual(list(enc.counts_['x'].index), ['a', 'b'])
+        # the zero-weight category is unseen: zero evidence against the prior
+        self.assertEqual(result.loc[2, 'x'], 0.0)
+
+    def test_zero_weight_rows_are_dropped_from_smoothing_support(self):
+        """The smoothing support n(c) is the weighted count, not the number of rows."""
+        train = pd.DataFrame({'x': ['a'] * 4})
+        target = [1, 1, 0, 0]
+        weights = [2, 0, 1, 0]
+
+        weighted = encoders.CountTargetEncoder(cols=['x']).fit(
+            train, target, sample_weight=weights
+        )
+        expanded = encoders.CountTargetEncoder(cols=['x']).fit(
+            pd.DataFrame({'x': ['a', 'a', 'a']}), [1, 1, 0]
+        )
+
+        probe = pd.DataFrame({'x': ['a']})
+        self.assertAlmostEqual(
+            float(weighted.transform(probe).iloc[0, 0]),
+            float(expanded.transform(probe).iloc[0, 0]),
+        )
+
+    def test_unweighted_fit_keeps_counts_and_column_order(self):
+        """Without sample weights the counts stay integral and the columns unchanged."""
+        train = pd.DataFrame({'x': ['a', 'b', 'c', 'a', 'b', 'c'], 'num': range(6)})
+        target = [0, 1, 2, 0, 1, 2]
+
+        enc = encoders.CountTargetEncoder(cols=['x']).fit(train, target)
+
+        counts = enc.counts_['x']
+        self.assertTrue(np.issubdtype(counts.to_numpy().dtype, np.integer))
+        self.assertEqual(counts.loc['c', 2], 2)
+        self.assertListEqual(
+            list(enc.transform(train).columns), ['x_0', 'x_1', 'x_2', 'num']
+        )
+
+    def test_fit_transform_accepts_sample_weight(self):
+        """fit_transform forwards sample weights to fit."""
+        train = pd.DataFrame({'city': ['chicago', 'denver']})
+        target = [1, 0]
+
+        result = encoders.CountTargetEncoder().fit_transform(
+            train, target, sample_weight=[2, 1]
+        )
+
+        self.assertListEqual(list(result.columns), ['city'])
+        self.assertEqual(len(result), 2)
+
+    def test_negative_weights_raise(self):
+        """Negative sample weights are rejected."""
+        train = pd.DataFrame({'city': ['chicago', 'denver']})
+        with self.assertRaises(ValueError):
+            encoders.CountTargetEncoder().fit(train, [1, 0], sample_weight=[1, -1])
+
+    def test_mismatched_weights_raise(self):
+        """The weights must provide one value per row."""
+        train = pd.DataFrame({'city': ['chicago', 'denver']})
+        with self.assertRaises(ValueError):
+            encoders.CountTargetEncoder().fit(train, [1, 0], sample_weight=[1, 2, 3])

@@ -1,3 +1,17 @@
+v.2.11.3
+========
+
+* Feat: ``CountTargetEncoder`` now accepts ``sample_weight`` in ``fit``
+  (and forwards it through ``fit_transform``). Weights are multiplicities: the
+  per-class counts stored in ``counts_`` become weighted counts (a positive row
+  of weight 3 counts as 3), so integer weights give exactly the same encoding
+  as fitting on the correspondingly expanded data. The smoothing support and
+  the global prior are weighted sums too. A zero-weight row takes no part in
+  the fit, so it neither creates a category nor a class column; its categories
+  are treated as unseen at transform time. Non-integer weights are preserved,
+  and fitting without ``sample_weight`` keeps the previous integer counts and
+  column order.
+
 v.2.11.2
 ========
 
