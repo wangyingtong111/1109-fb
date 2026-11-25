@@ -47,6 +47,7 @@ def partial_ratio(
 def partial_ratio_alignment(
     s1: Sequence[Hashable],
     s2: Sequence[Hashable],
+    anchors: Sequence[tuple[int, int]] | None = None,
     *,
     processor: None = None,
     score_cutoff: float | None = 0,
@@ -55,6 +56,7 @@ def partial_ratio_alignment(
 def partial_ratio_alignment(
     s1: _UnprocessedType1,
     s2: _UnprocessedType2,
+    anchors: Sequence[tuple[int, int]] | None = None,
     *,
     processor: Callable[[_UnprocessedType1 | _UnprocessedType2], Sequence[Hashable]],
     score_cutoff: float | None = 0,

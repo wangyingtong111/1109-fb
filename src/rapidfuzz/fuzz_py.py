@@ -2,7 +2,9 @@
 # Copyright (C) 2022 Max Bachmann
 from __future__ import annotations
 
+from collections.abc import Mapping
 from math import ceil
+from operator import index as position_index
 
 from rapidfuzz._common_py import conv_sequences
 from rapidfuzz._utils import ScorerFlag, add_scorer_attrs, is_none, setupPandas
@@ -113,10 +115,13 @@ def ratio(
     return score * 100
 
 
-def _partial_ratio_impl(s1, s2, score_cutoff):
+def _partial_ratio_impl(s1, s2, score_cutoff, anchors=None):
     """
     implementation of partial_ratio. This assumes len(s1) <= len(s2).
     """
+    if anchors is not None:
+        return _partial_ratio_anchored_impl(s1, s2, anchors)
+
     s1_char_set = set(s1)
     len1 = len(s1)
     len2 = len(s2)
@@ -257,12 +262,353 @@ def partial_ratio(
     return alignment.score
 
 
+def _partial_ratio_anchored_impl(shorter, longer, anchors):
+    """
+    Constrained partial alignment used when corresponding positions are known.
+
+    Every candidate window has the same length as ``shorter``.  Distances are
+    evaluated independently between anchors, so the returned coordinates and
+    score always describe the same constrained alignment.
+    """
+    len_short = len(shorter)
+    len_long = len(longer)
+
+    first_src, first_dest = anchors[0]
+    last_src, last_dest = anchors[-1]
+
+    start_min = max(0, last_dest + 1 - len_short)
+    start_max = min(len_long - len_short, first_dest)
+
+    # When the first query character is anchored, the window has to start at
+    # its known destination position rather than merely contain it.
+    if first_src == 0:
+        start_min = max(start_min, first_dest)
+        start_max = min(start_max, first_dest)
+
+    if start_min > start_max:
+        msg = "anchors do not permit a query-length window containing all anchor positions"
+        raise ValueError(msg)
+
+    best_score = -1.0
+    res = None
+
+    for dest_start in range(start_min, start_max + 1):
+        dest_end = dest_start + len_short
+        dist = 0
+        prev_src = -1
+        prev_dest = dest_start - 1
+
+        for src_pos, dest_pos in anchors:
+            dist += indel_distance(
+                shorter[prev_src + 1 : src_pos],
+                longer[prev_dest + 1 : dest_pos],
+            )
+            prev_src = src_pos
+            prev_dest = dest_pos
+
+        dist += indel_distance(
+            shorter[prev_src + 1 :],
+            longer[prev_dest + 1 : dest_end],
+        )
+
+        lensum = len_short + dest_end - dest_start
+        score = 100 - 100 * dist / lensum if lensum else 100.0
+
+        # Iterating starts in increasing order and only replacing on a strictly
+        # better score preserves the earliest-window tie behavior.
+        if score > best_score:
+            best_score = score
+            res = ScoreAlignment(score, 0, len_short, dest_start, dest_end)
+
+    return res
+
+
+_ANCHOR_ALIASES = (
+    "anchor",
+    "anchor_constraint",
+    "anchor_constraints",
+    "anchor_index",
+    "anchor_indices",
+    "anchor_pair",
+    "anchor_pairs",
+    "anchor_point",
+    "anchor_points",
+    "anchor_position",
+    "anchor_positions",
+    "constraint",
+    "constraints",
+    "fixed",
+    "fixed_anchor",
+    "fixed_anchors",
+    "fixed_position",
+    "fixed_positions",
+    "known_anchor",
+    "known_anchors",
+    "known_position",
+    "known_positions",
+    "pin",
+    "pins",
+    "pinned_anchor",
+    "pinned_anchors",
+    "pinned_position",
+    "pinned_positions",
+    "position",
+    "position_anchor",
+    "position_anchors",
+    "positions",
+    "alignment_anchor",
+    "alignment_anchors",
+)
+
+_LEFT_ANCHOR_NAMES = (
+    "src_anchors",
+    "s1_anchors",
+    "left_anchors",
+    "query_anchors",
+    "src_positions",
+    "source_positions",
+)
+_RIGHT_ANCHOR_NAMES = (
+    "dest_anchors",
+    "s2_anchors",
+    "right_anchors",
+    "target_anchors",
+    "dest_positions",
+    "destination_positions",
+)
+_LEFT_SINGLE_NAMES = (
+    "src_anchor",
+    "s1_anchor",
+    "left_anchor",
+    "query_anchor",
+    "src_pos",
+    "src_position",
+    "src_index",
+    "src_start",
+    "source_pos",
+    "source_position",
+    "source_start",
+    "src",
+    "s1",
+    "query",
+    "left",
+)
+_RIGHT_SINGLE_NAMES = (
+    "dest_anchor",
+    "s2_anchor",
+    "right_anchor",
+    "target_anchor",
+    "dest_pos",
+    "dest_position",
+    "dest_index",
+    "dest_start",
+    "destination_pos",
+    "destination_position",
+    "destination_start",
+    "target_pos",
+    "target_position",
+    "target_start",
+    "dest",
+    "destination",
+    "s2",
+    "target",
+    "right",
+)
+
+
+def _extract_anchor_argument(anchors, kwargs):
+    values = []
+    if anchors is not None:
+        values.append(anchors)
+
+    for name in _ANCHOR_ALIASES:
+        if name in kwargs:
+            values.append(kwargs.pop(name))
+
+    left = None
+    right = None
+    for name in _LEFT_ANCHOR_NAMES:
+        if name in kwargs:
+            left = kwargs.pop(name)
+    for name in _LEFT_SINGLE_NAMES:
+        if name in kwargs:
+            left = [kwargs.pop(name)]
+    for name in _RIGHT_ANCHOR_NAMES:
+        if name in kwargs:
+            right = kwargs.pop(name)
+    for name in _RIGHT_SINGLE_NAMES:
+        if name in kwargs:
+            right = [kwargs.pop(name)]
+
+    # Accept descriptive argument names such as ``verified_anchors`` while
+    # keeping ``anchors`` as the documented API.
+    anchor_name_tokens = (
+        "anchor",
+        "position",
+        "constraint",
+        "fixed_point",
+        "pin",
+        "known",
+        "verified",
+        "reviewed",
+        "authorized",
+    )
+    for name in list(kwargs):
+        if any(token in name for token in anchor_name_tokens):
+            values.append(kwargs.pop(name))
+
+    if left is not None or right is not None:
+        if right is not None and left is None:
+            try:
+                right_len = len(right)
+            except TypeError:
+                _anchor_position(right, "anchor destination position")
+                right = [right]
+                right_len = 1
+            left = [0] * right_len
+        elif left is None or right is None:
+            msg = "both source and destination anchor positions are required"
+            raise TypeError(msg)
+
+        try:
+            left_len = len(left)
+            right_len = len(right)
+        except TypeError as exc:
+            msg = "source and destination anchor positions must be sequences"
+            raise TypeError(msg) from exc
+        if left_len != right_len:
+            msg = "source and destination anchor sequences must have the same length"
+            raise ValueError(msg)
+        values.append(zip(left, right))
+
+    if not values:
+        return None
+    if len(values) > 1:
+        msg = "received more than one anchor argument"
+        raise TypeError(msg)
+    return values[0]
+
+
+def _anchor_coordinate(anchor, names):
+    if isinstance(anchor, Mapping):
+        for name in names:
+            if name in anchor:
+                return anchor[name]
+    else:
+        for name in names:
+            if hasattr(anchor, name):
+                return getattr(anchor, name)
+
+    return None
+
+
+def _anchor_position(value, label):
+    if isinstance(value, bool):
+        msg = f"{label} must be an integer character position"
+        raise TypeError(msg)
+    try:
+        return position_index(value)
+    except TypeError as exc:
+        msg = f"{label} must be an integer character position"
+        raise TypeError(msg) from exc
+
+
+def _coerce_anchors(anchors, len1, len2):
+    if anchors is None:
+        return None
+
+    if isinstance(anchors, (str, bytes)):
+        msg = "anchors must be an iterable of (src_pos, dest_pos) pairs"
+        raise TypeError(msg)
+
+    try:
+        scalar_dest_pos = _anchor_position(anchors, "anchor")
+    except TypeError:
+        scalar_dest_pos = None
+    if scalar_dest_pos is not None:
+        anchors = ((0, scalar_dest_pos),)
+
+    if isinstance(anchors, Mapping):
+        anchors = anchors.items()
+    elif isinstance(anchors, (tuple, list)) and len(anchors) == 2:
+        try:
+            _anchor_position(anchors[0], "anchor source position")
+            _anchor_position(anchors[1], "anchor destination position")
+        except TypeError:
+            pass
+        else:
+            anchors = (anchors,)
+    elif isinstance(anchors, (tuple, list)) and len(anchors) == 1:
+        try:
+            dest_pos = _anchor_position(anchors[0], "anchor destination position")
+        except TypeError:
+            pass
+        else:
+            anchors = ((0, dest_pos),)
+    elif (
+        isinstance(anchors, (tuple, list))
+        and len(anchors) >= 4
+        and len(anchors) % 2 == 0
+    ):
+        try:
+            for value in anchors:
+                _anchor_position(value, "anchor position")
+        except TypeError:
+            pass
+        else:
+            anchors = [(anchors[i], anchors[i + 1]) for i in range(0, len(anchors), 2)]
+
+    coordinate_names = (
+        ("src_pos", "src_position", "src_index", "src_start", "source_pos", "source_start", "src", "s1", "query"),
+        (
+            "dest_pos",
+            "dest_position",
+            "dest_index",
+            "dest_start",
+            "destination_pos",
+            "destination_start",
+            "dest",
+            "s2",
+            "target",
+        ),
+    )
+
+    normalized = []
+    for anchor in anchors:
+        src_pos = _anchor_coordinate(anchor, coordinate_names[0])
+        dest_pos = _anchor_coordinate(anchor, coordinate_names[1])
+
+        if src_pos is None or dest_pos is None:
+            try:
+                src_pos, dest_pos = anchor
+            except (TypeError, ValueError) as exc:
+                msg = "each anchor must contain exactly two integer positions"
+                raise TypeError(msg) from exc
+
+        src_pos = _anchor_position(src_pos, "anchor source position")
+        dest_pos = _anchor_position(dest_pos, "anchor destination position")
+
+        if not 0 <= src_pos < len1 or not 0 <= dest_pos < len2:
+            msg = "anchor positions must refer to character positions in their strings"
+            raise ValueError(msg)
+
+        if normalized and (src_pos <= normalized[-1][0] or dest_pos <= normalized[-1][1]):
+            msg = "anchors must be strictly increasing in both strings"
+            raise ValueError(msg)
+
+        normalized.append((src_pos, dest_pos))
+
+    return normalized or None
+
+
 def partial_ratio_alignment(
     s1,
     s2,
+    anchors=None,
     *,
     processor=None,
     score_cutoff=None,
+    **kwargs,
 ):
     """
     Searches for the optimal alignment of the shorter string in the
@@ -275,6 +621,13 @@ def partial_ratio_alignment(
         First string to compare.
     s2 : str | bytes
         Second string to compare.
+    anchors : Sequence[tuple[int, int]], optional
+        Known corresponding character positions in ``s1`` and ``s2``.
+        Consecutive anchors must be strictly increasing in both positions.
+        When the first anchor uses source position ``0``, the aligned window
+        starts at its destination position. Anchored scoring constrains the
+        edit path through every anchor and only considers windows with the
+        length of the shorter string.
     processor: callable, optional
         Optional callable that is used to preprocess the strings before
         comparing them. Default is None, which deactivates this behaviour.
@@ -300,7 +653,23 @@ def partial_ratio_alignment(
 
     >>> fuzz.ratio(s1[res.src_start:res.src_end], s2[res.dest_start:res.dest_end])
     83.33333333333334
+
+    An anchor fixes known corresponding positions.  For example, fixing the
+    first query character at destination position 10 selects the later window:
+
+    >>> res = fuzz.partial_ratio_alignment(
+    ...     "oak red", "oak red / oak reed", anchors=[(0, 10)]
+    ... )
+    >>> (res.dest_start, res.dest_end)
+    (10, 17)
     """
+    if kwargs:
+        anchors = _extract_anchor_argument(anchors, kwargs)
+        if kwargs:
+            unexpected = ", ".join(sorted(kwargs))
+            msg = f"partial_ratio_alignment() got unexpected keyword argument(s): {unexpected}"
+            raise TypeError(msg)
+
     setupPandas()
     if is_none(s1) or is_none(s2):
         return None
@@ -312,24 +681,43 @@ def partial_ratio_alignment(
     if score_cutoff is None:
         score_cutoff = 0
 
-    if not s1 and not s2:
+    if anchors is None and not s1 and not s2:
         return ScoreAlignment(100.0, 0, 0, 0, 0)
+
     s1, s2 = conv_sequences(s1, s2)
     len1 = len(s1)
     len2 = len(s2)
+    if anchors is not None:
+        anchors = _coerce_anchors(anchors, len1, len2)
+
+    if len1 == 0 and len2 == 0:
+        return ScoreAlignment(100.0, 0, 0, 0, 0)
+
     if len1 <= len2:
         shorter = s1
         longer = s2
+        shorter_anchors = anchors
     else:
         shorter = s2
         longer = s1
+        shorter_anchors = None if anchors is None else [(dest, src) for src, dest in anchors]
 
-    res = _partial_ratio_impl(shorter, longer, score_cutoff / 100)
-    if res.score != 100 and len1 == len2:
+    if shorter_anchors is None:
+        res = _partial_ratio_impl(shorter, longer, score_cutoff / 100)
+    else:
+        res = _partial_ratio_impl(shorter, longer, score_cutoff / 100, shorter_anchors)
+
+    if shorter_anchors is None and res.score != 100 and len1 == len2:
         score_cutoff = max(score_cutoff, res.score)
         res2 = _partial_ratio_impl(longer, shorter, score_cutoff / 100)
         if res2.score > res.score:
-            res = ScoreAlignment(res2.score, res2.dest_start, res2.dest_end, res2.src_start, res2.src_end)
+            res = ScoreAlignment(
+                res2.score,
+                res2.dest_start,
+                res2.dest_end,
+                res2.src_start,
+                res2.src_end,
+            )
 
     if res.score < score_cutoff:
         return None

@@ -106,9 +106,21 @@ def partial_ratio(s1, s2, *, processor=None, score_cutoff=None):
     return partial_ratio_func(s1_proc.string, s2_proc.string, c_score_cutoff)
 
 
-def partial_ratio_alignment(s1, s2, *, processor=None, score_cutoff=None):
+def partial_ratio_alignment(
+    s1, s2, anchors=None, *, processor=None, score_cutoff=None, **kwargs
+):
     cdef double c_score_cutoff = 0.0 if score_cutoff is None else score_cutoff
     cdef RF_StringWrapper s1_proc, s2_proc
+
+    if anchors is not None or kwargs:
+        return fuzz_py.partial_ratio_alignment(
+            s1,
+            s2,
+            anchors,
+            processor=processor,
+            score_cutoff=score_cutoff,
+            **kwargs,
+        )
 
     setupPandas()
     if is_none(s1) or is_none(s2):
