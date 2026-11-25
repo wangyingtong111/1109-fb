@@ -52,7 +52,40 @@ text = "This is a sentence\ncut off in the middle because pdf."
 ps = PragmaticSegmenter::Cleaner.new(text: text, doc_type: 'pdf')
 ps.clean
 # => "This is a sentence cut off in the middle because pdf."
+
+# Protect Markdown code spans while segmenting technical documentation
+# Inline code never introduces a sentence boundary and fenced code blocks
+# are returned verbatim as their own segments.
+text = "Use `obj.Run?No`. Next step."
+ps = PragmaticSegmenter::Segmenter.new(text: text, language: 'en', protect_code: true)
+ps.segment
+# => ["Use `obj.Run?No`.", "Next step."]
+
+text = "First sentence.\n```ruby\nx = 1\nputs x\n```\nSecond sentence."
+ps = PragmaticSegmenter::Segmenter.new(text: text, protect_code: true)
+ps.segment
+# => ["First sentence.", "\n```ruby\nx = 1\nputs x\n```", "Second sentence."]
 ```
+
+### Code protection mode (`protect_code: true`)
+
+When segmenting technical documentation you can opt into code protection with
+the `protect_code` keyword argument. It is disabled by default, so plain text
+keeps using the existing entry point and end-of-sentence cleanup rules.
+
+When enabled:
+
+* **Inline code** (`` `code` ``, including `` ``double backtick`` `` spans where
+  a single backtick is a literal symbol) is swapped for an inert placeholder
+  before segmentation. Punctuation such as `.`, `?` and `!` inside the code can
+  therefore never affect natural sentence boundaries, and the code is restored
+  verbatim in the segment it belongs to.
+* **Fenced code blocks** (<code>```</code> or `~~~`) are returned as their own
+  independent, untouched segments.
+* Sentence boundaries are only detected *outside* of the code.
+* Only closed spans are matched, so an unclosed backtick remains a literal
+  character and cannot swallow the following natural sentence.
+
 
 ## Live Demo
 
@@ -893,6 +926,9 @@ To test the relative performance of different segmentation tools and libraries I
 **Version 0.3.24**
 * Fix catastrophic backtracking in regular expression for numerical references
 * Remove unicode dependency
+
+**Unreleased**
+* Add optional code protection mode (`protect_code: true`) for technical documentation: inline code spans never affect natural sentence boundaries and fenced code blocks are returned verbatim as independent segments
 
 ## Contributing
 

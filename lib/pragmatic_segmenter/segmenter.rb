@@ -2,17 +2,23 @@
 # frozen_string_literal: true
 
 require 'pragmatic_segmenter/languages'
+require 'pragmatic_segmenter/code_protector'
 
 module PragmaticSegmenter
   # This class segments a text into an array of sentences.
   class Segmenter
     attr_reader :text, :language, :doc_type
 
-    def initialize(text:, language: 'en', doc_type: nil, clean: true)
+    def initialize(text:, language: 'en', doc_type: nil, clean: true, protect_code: false)
       return unless text
       @language = language
       @language_module = Languages.get_language_by_code(language)
       @doc_type = doc_type
+
+      if protect_code
+        @code_protector = CodeProtector.new
+        text = @code_protector.protect(text)
+      end
 
       if clean
         @text = cleaner.new(text: text, doc_type: @doc_type, language: @language_module).clean
@@ -23,7 +29,8 @@ module PragmaticSegmenter
 
     def segment
       return [] unless @text
-      processor.new(language: @language_module).process(text: @text)
+      segments = processor.new(language: @language_module).process(text: @text)
+      @code_protector ? @code_protector.restore(segments) : segments
     end
 
     private
