@@ -320,6 +320,32 @@ tube_evaluator = TubeEvaluator(annot_filepath, preds_filepath)
 res, mAP = tube_evaluator.evaluate(thr=0.5)
 ```
 
+##### Variable frame rate
+
+By default every frame has weight one, preserving the equal-frame tube IoU.
+For variable frame-rate videos, pass one duration table per video. Predictions
+and ground truths with the same `video_id` use the same table:
+
+```python
+frame_durations = {
+    1: {0: 1.0, 1: 3.0},  # first frame lasts 1 s, second lasts 3 s
+    2: {0: 3.0, 1: 1.0},
+}
+
+tube_evaluator = TubeEvaluator(
+    annot_filepath,
+    preds_filepath,
+    frame_durations=frame_durations,
+)
+res, mAP = tube_evaluator.evaluate(thr=0.5)
+```
+
+The same table can be passed to `evaluate(..., frame_durations=...)` or to
+`TubeEvaluator._tube_pairwise_iou(..., frame_durations=...)`. Missing boxes are
+treated as zero-area intervals and are not interpolated; if an explicit table
+omits a frame present in a tube, evaluation raises `FrameScheduleError` (also a
+`KeyError` and `ValueError`) instead of silently falling back to equal weights.
+
 ## Contributing
 
 We appreciate all contributions. If you are planning to contribute with this repository, please do so without any further discussion.
