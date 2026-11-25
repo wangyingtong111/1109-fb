@@ -65,18 +65,7 @@ module Eps
 
       data = Eps::DataFrame.new(data)
 
-      @evaluator.features.each do |k, type|
-        values = data.columns[k]
-        raise ArgumentError, "Missing column: #{k}" if !values
-        column_type = Utils.column_type(values.compact, k) if values
-
-        if !column_type.nil?
-          if (type == "numeric" && column_type != "numeric") || (type != "numeric" && column_type != "categorical")
-            raise ArgumentError, "Bad type for column #{k}: Expected #{type} but got #{column_type}"
-          end
-        end
-        # TODO check for unknown values for categorical features
-      end
+      check_column_types(@evaluator.features, data)
 
       predictions = @evaluator.predict(data, probabilities: probabilities)
 
@@ -116,9 +105,25 @@ module Eps
         end
       end
 
-      # determine feature types
+      if split && !validation_set
+        @train_set = data[train_idx]
+        validation_set = data[validation_idx]
+      else
+        @train_set = data.dup
+        if validation_set
+          raise "Target required for validation set" unless target
+          raise "Weight required for validation set" if data.weight && !weight
+          validation_set, _ = prep_data(validation_set, nil, @target, weight)
+        end
+      end
+
+      raise "No data in training set" if @train_set.empty?
+      raise "No data in validation set" if validation_set && validation_set.empty?
+
+      # determine feature types from training data
+      # (do not use validation data, since it may contain bad values)
       @features = {}
-      data.columns.each do |k, v|
+      @train_set.columns.each do |k, v|
         @features[k] = Utils.column_type(v.compact, k)
       end
 
@@ -129,7 +134,7 @@ module Eps
         @features.each do |k, type|
           next if type != "categorical"
 
-          values = data.columns[k].compact
+          values = @train_set.columns[k].compact
 
           next unless values.first.is_a?(String) # not boolean
 
@@ -159,20 +164,7 @@ module Eps
         }.merge(v || {})
       end
 
-      if split && !validation_set
-        @train_set = data[train_idx]
-        validation_set = data[validation_idx]
-      else
-        @train_set = data.dup
-        if validation_set
-          raise "Target required for validation set" unless target
-          raise "Weight required for validation set" if data.weight && !weight
-          validation_set, _ = prep_data(validation_set, nil, @target, weight)
-        end
-      end
-
-      raise "No data in training set" if @train_set.empty?
-      raise "No data in validation set" if validation_set && validation_set.empty?
+      check_column_types(@features, validation_set) if validation_set
 
       @validation_set = validation_set
       @evaluator = _train(**options)
@@ -251,6 +243,22 @@ module Eps
       raise "No data" if data.empty?
       raise "Number of data points differs from target" if data.size != data.label.size
       raise "Number of data points differs from weight" if data.weight && data.size != data.weight.size
+    end
+
+    def check_column_types(features, data)
+      features.each do |k, type|
+        values = data.columns[k]
+        raise ArgumentError, "Missing column: #{k}" if !values
+
+        column_type = Utils.column_type(values.compact, k)
+
+        if !column_type.nil?
+          if (type == "numeric" && column_type != "numeric") || (type != "numeric" && column_type != "categorical")
+            raise ArgumentError, "Bad type for column #{k}: Expected #{type} but got #{column_type}"
+          end
+        end
+        # TODO check for unknown values for categorical features
+      end
     end
 
     def check_missing(c, name)

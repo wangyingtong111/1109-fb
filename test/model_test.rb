@@ -91,6 +91,80 @@ class ModelTest < Minitest::Test
     assert_equal "No data in validation set", error.message
   end
 
+  def test_split_bad_validation_type
+    data = 4.times.map { |i| {x: i + 1, y: 3 + (i + 1) * 5} }
+    data += 2.times.map { |i| {x: "bad", y: 10 + i} }
+
+    error = assert_raises(ArgumentError) do
+      Eps::LinearRegression.new(data, target: :y, split: {shuffle: false, validation_size: 1.0 / 3})
+    end
+    assert_equal "Bad type for column x: Expected numeric but got categorical", error.message
+  end
+
+  def test_split_column_bad_validation_type
+    data = 4.times.map { |i| {x: i + 1, y: 3 + (i + 1) * 5, listed_at: Date.new(2020, 1, i + 1)} }
+    data += 2.times.map { |i| {x: "bad", y: 10 + i, listed_at: Date.new(2020, 2, i + 1)} }
+
+    error = assert_raises(ArgumentError) do
+      Eps::LinearRegression.new(data, target: :y, split: {column: :listed_at, value: Date.new(2020, 2, 1)})
+    end
+    assert_equal "Bad type for column x: Expected numeric but got categorical", error.message
+  end
+
+  def test_validation_set_bad_type
+    data = 4.times.map { |i| {x: i + 1, y: 3 + (i + 1) * 5} }
+    validation_set = 2.times.map { |i| {x: "bad", y: 10 + i} }
+
+    error = assert_raises(ArgumentError) do
+      Eps::LinearRegression.new(data, target: :y, validation_set: validation_set)
+    end
+    assert_equal "Bad type for column x: Expected numeric but got categorical", error.message
+  end
+
+  def test_valid_validation_types
+    train = 4.times.map { |i| {x: i + 1, y: 3 + (i + 1) * 5} }
+    validation = 2.times.map { |i| {x: i + 5, y: 13 + i * 2} }
+
+    # position split
+    Eps::LinearRegression.new(train + validation, target: :y, split: {shuffle: false, validation_size: 1.0 / 3})
+
+    # time split
+    data = 4.times.map { |i| {x: i + 1, y: 3 + (i + 1) * 5, listed_at: Date.new(2020, 1, i + 1)} }
+    data += 2.times.map { |i| {x: i + 5, y: 13 + i * 2, listed_at: Date.new(2020, 2, i + 1)} }
+    Eps::LinearRegression.new(data, target: :y, split: {column: :listed_at})
+
+    # explicit validation set
+    Eps::LinearRegression.new(train, target: :y, validation_set: validation)
+  end
+
+  def test_split_column_not_feature
+    data = 8.times.map do |i|
+      {x: i + 1, target_col: 3 + (i + 1) * 5, weight_col: 1, listed_at: Date.new(2020, 1, i + 1)}
+    end
+
+    model = Eps::LinearRegression.new(data, target: :target_col, weight: :weight_col, split: {column: :listed_at})
+    assert_equal [:_intercept, :x], model.coefficients.keys
+
+    data = 8.times.map { |i| {x: i + 1, target_col: 3 + (i + 1) * 5, weight_col: 1} }
+    model = Eps::LinearRegression.new(data, target: :target_col, weight: :weight_col, split: false)
+    assert_equal [:_intercept, :x], model.coefficients.keys
+  end
+
+  def test_auto_text_features_from_training_set
+    # text-like values are only in the validation set,
+    # so automatic text features should not include the column
+    data = [
+      {x: "alpha beta", y: 3},
+      {x: "alpha beta", y: 3},
+      {x: "gamma delta", y: 5},
+      {x: "gamma delta", y: 5}
+    ]
+    data += 6.times.map { |i| {x: "one two three four #{i}", y: 7 + i} }
+
+    model = Eps::LinearRegression.new(data, target: :y, split: {shuffle: false, validation_size: 0.6})
+    assert_equal [:_intercept, :"xgamma delta"], model.coefficients.keys
+  end
+
   def test_regression_comparison
     _lr = Eps::LinearRegression.new(mpg_data, target: :hwy)
     _lgb = Eps::LightGBM.new(mpg_data, target: :hwy)
