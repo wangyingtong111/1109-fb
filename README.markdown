@@ -103,6 +103,21 @@ Stop words are NOT removed when checking `:must_match_at_least_one_word` and whe
 * `must_match_at_least_one_word`: don't return a match unless the needle shares at least one word with the match. Note that "Foo's" is treated like one word (so that it won't match "'s") and "Bolivia," is treated as just "bolivia"
 * `gather_last_result`: enable `last_result`
 
+## Refreshing one record
+
+If one entered record changes, refresh only its projection instead of rebuilding the whole matcher. Records with `id`, `:id`, or an `id` method are recognized automatically; other primary keys can be declared with `:primary_key` (or `:id_key`).
+
+    people = [{ :id => 1, :name => "oak" }, { :id => 2, :name => "oak" }]
+    matcher = FuzzyMatch.new(people, :primary_key => :id, :read => lambda { |person| person[:name] })
+
+    people[1][:name] = "maple"
+    matcher.refresh(2) # re-reads the entered record
+
+    # Or supply the new source record explicitly:
+    # matcher.refresh(2, { :id => 2, :name => "maple" })
+
+`refresh` returns `true` after atomically replacing the record. If the read callback raises, it returns that exception and leaves the previous whole text, cleaned text, word list, identity/grouping projection, and scores in service. `refresh!` raises the same exception. Other records are not re-read.
+
 ## Case sensitivity
 
 String similarity is case-insensitive. Everything is downcased before scoring. This is a change from previous versions.

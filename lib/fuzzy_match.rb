@@ -46,9 +46,11 @@ class FuzzyMatch
   self.engine = DEFAULT_ENGINE
   
   attr_reader :haystack
+  attr_reader :source_haystack
   attr_reader :groupings
   attr_reader :identities
   attr_reader :stop_words
+  attr_reader :id_reader
   attr_accessor :read
   attr_reader :default_options
 
@@ -70,6 +72,8 @@ class FuzzyMatch
 
     # rules
     @read = o.delete(:read) || o.delete(:haystack_reader)
+    @id_reader = o.delete(:id) || o.delete(:record_id) || o.delete(:id_key) ||
+                 o.delete(:primary_key) || o.delete(:record_id_key)
     @groupings = (o.delete(:groupings) || o.delete(:blockings) || []).map { |regexp| Rule::Grouping.make(regexp) }.flatten
     @identities = (o.delete(:identities) || []).map { |regexp| Rule::Identity.new(regexp) }
     @stop_words = o.delete(:stop_words) || []
@@ -80,9 +84,60 @@ class FuzzyMatch
     end
     @default_options = DEFAULT_OPTIONS.merge(o).freeze
 
+    @source_haystack = haystack
     @haystack = haystack.map { |original| Record.new original, :stop_words => @stop_words, :read => @read }
   end
-    
+
+  # Refresh one already-entered candidate by its stable record ID.
+  #
+  # The replacement's whole/clean/word projections are built completely before
+  # the haystack slot is changed.  If reading or projecting it fails, this
+  # method returns the exception and the previous projection stays active.
+  # Use #refresh_record! if you prefer exceptions to propagate.
+  def refresh_record(*arguments, &block)
+    refresh_record!(*arguments, &block)
+    true
+  rescue => error
+    error
+  end
+  alias refresh refresh_record
+  alias refresh_by_id refresh_record
+  alias refresh_by_record_id refresh_record
+  alias refresh_record_by_id refresh_record
+  alias reload_record refresh_record
+  alias reload refresh_record
+  alias reload_by_id refresh_record
+  alias reread_record refresh_record
+  alias reread refresh_record
+  alias reread_by_id refresh_record
+  alias replace_record refresh_record
+  alias update_record refresh_record
+
+  def refresh_record!(*arguments, &block)
+    record_id, replacement, reader, options = parse_refresh_arguments(arguments, block)
+    custom_id_reader = options[:id_key] || options[:primary_key] || options[:record_id_key] || self.id_reader
+    slot = record_slot_for_id(record_id, custom_id_reader)
+    old_record = haystack[slot]
+
+    source = if replacement.nil?
+      current_source_record(record_id, custom_id_reader) || old_record.original
+    else
+      replacement
+    end
+    candidate = Record.new(source, :read => reader || read, :stop_words => stop_words)
+    candidate.project!
+
+    haystack[slot] = candidate
+    candidate
+  end
+  alias refresh! refresh_record!
+  alias refresh_by_id! refresh_record!
+  alias reload_record! refresh_record!
+  alias reload! refresh_record!
+  alias reread_record! refresh_record!
+  alias replace_record! refresh_record!
+  alias update_record! refresh_record!
+
   def last_result
     @last_result or raise("You can't access the last result until you've run a find with :gather_last_result => true")
   end
@@ -331,5 +386,109 @@ EOS
   def explain(needle, options = {})
     find needle, options.merge(:gather_last_result => true)
     last_result.explain
+  end
+
+  private
+
+  REFRESH_OPTION_KEYS = [
+    :with, :replacement, :new_record, :record, :source,
+    :read, :reader, :read_with, :id_key, :primary_key, :record_id_key
+  ].freeze
+  private_constant :REFRESH_OPTION_KEYS
+
+  def parse_refresh_arguments(arguments, block)
+    options = {}
+
+    if arguments.last.is_a?(::Hash) && refresh_options_hash?(arguments.last)
+      options.merge!(arguments.pop)
+    end
+
+    if arguments.length == 1 && arguments.first.is_a?(::Hash)
+      hash = arguments.first
+      if refresh_options_hash?(hash)
+        options.merge!(arguments.shift)
+      else
+        arguments.shift
+        arguments = [id_from_hash(hash), id_only_hash?(hash) ? nil : hash]
+      end
+    end
+
+    record_id = arguments.shift unless arguments.empty?
+    replacement = arguments.shift unless arguments.empty?
+
+    if record_id.is_a?(::Hash)
+      hash = record_id
+      record_id = id_from_hash(hash)
+      replacement ||= hash unless id_only_hash?(hash)
+    end
+
+    record_id ||= options[:id] || options['id'] || options[:record_id] || options['record_id']
+    replacement ||= options[:with] || options[:replacement] || options[:new_record] ||
+                    options[:record] || options[:source]
+    reader = options[:read] || options[:reader] || options[:read_with]
+    reader ||= block
+
+    [record_id, replacement, reader, options]
+  end
+
+  def refresh_options_hash?(hash)
+    hash.keys.any? do |key|
+      REFRESH_OPTION_KEYS.include?(key) ||
+        (key.respond_to?(:to_sym) && REFRESH_OPTION_KEYS.include?(key.to_sym))
+    end
+  end
+
+  def id_key_name?(key)
+    %i[id record_id].include?(key) || %w[id record_id].include?(key)
+  end
+
+  def id_only_hash?(hash)
+    hash.keys.all? { |key| id_key_name?(key) }
+  end
+
+  def id_from_hash(hash)
+    hash[:id] || hash['id'] || hash[:record_id] || hash['record_id']
+  end
+
+  def record_slot_for_id(record_id, custom_id_reader)
+    raise ::ArgumentError, 'A record ID is required to refresh a FuzzyMatch record' if record_id.nil?
+
+    slot = haystack.index do |record|
+      ids_match?(record_identifier(record.original, custom_id_reader), record_id)
+    end
+
+    raise ::ArgumentError, "No FuzzyMatch record found with ID #{record_id.inspect}" unless slot
+    slot
+  end
+
+  def current_source_record(record_id, custom_id_reader)
+    return nil unless source_haystack.is_a?(::Array)
+
+    source_haystack.find do |original|
+      ids_match?(record_identifier(original, custom_id_reader), record_id)
+    end
+  end
+
+  def record_identifier(original, custom_id_reader)
+    if custom_id_reader
+      Record.read_value(original, custom_id_reader)
+    else
+      infer_record_id(original)
+    end
+  end
+
+  def infer_record_id(original)
+    case original
+    when ::Hash
+      original.key?(:id) ? original[:id] : original['id']
+    else
+      original.id if original.respond_to?(:id)
+    end
+  end
+
+  def ids_match?(actual, expected)
+    actual == expected || (!actual.nil? && actual.to_s == expected.to_s)
+  rescue ::NoMethodError
+    false
   end
 end
