@@ -1,6 +1,17 @@
 v.2.11.2
 ========
 
+* Feat: ``HashingEncoder`` (issue#7) gained an optional signed sparse output. With
+  ``sparse_output=True`` ``transform`` returns a signed ``scipy.sparse.csr_matrix``
+  instead of the dense unsigned count matrix: every value maps to one bucket and
+  contributes ``+1``/``-1``, so colliding features cancel instead of accumulating.
+  Buckets that cancel to zero are dropped from the CSR storage, and no
+  ``n_samples * n_components`` dense array is allocated, not even during ``fit``.
+  The bucket/sign mapping is pinned by ``random_state`` (fixed by default), so
+  output is reproducible across calls and processes and does not depend on row
+  order or process chunking. ``hash_chunk(..., signed=True)`` /
+  ``hash_chunk_signed`` expose the same computation for a single chunk. The
+  historical dense unsigned path is unchanged.
 * Fix: ``composite_cols`` no longer raises the "separator occurs in the data"
   ``ValueError`` for column groups containing missing values on pandas >= 3,
   where ``astype(str)`` keeps missing values as NaN. The separator-collision
