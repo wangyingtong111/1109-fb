@@ -2,7 +2,7 @@
 
 from opt_einsum import blas, helpers, path_random, paths
 from opt_einsum._version import __version__
-from opt_einsum.contract import contract, contract_expression, contract_path
+from opt_einsum.contract import ContractExpression, ShapeContract, contract, contract_expression, contract_path
 from opt_einsum.parser import get_symbol
 from opt_einsum.path_random import RandomGreedy
 from opt_einsum.paths import BranchBound, DynamicProgramming
@@ -17,6 +17,8 @@ __all__ = [
     "contract",
     "contract_expression",
     "contract_path",
+    "ContractExpression",
+    "ShapeContract",
     "get_symbol",
     "RandomGreedy",
     "BranchBound",

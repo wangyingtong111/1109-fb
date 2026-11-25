@@ -1,8 +1,9 @@
 """Contains the primary optimization and contraction routines."""
 
-from collections.abc import Collection, Iterable, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from decimal import Decimal
 from functools import lru_cache
+from numbers import Integral
 from typing import Any, Literal, overload
 
 from opt_einsum import backends, blas, helpers, parser, paths, sharing
@@ -22,12 +23,17 @@ __all__ = [
     "contract",
     "format_const_einsum_str",
     "ContractExpression",
+    "ShapeContract",
     "shape_only",
 ]
 
 ## Common types
 
 _MemoryLimit = None | int | Decimal | Literal["max_input"]
+_DynamicAxes = None | bool | str | Collection[Any] | Mapping[Any, Any]
+_ShapeContractOption = bool | str | Collection[Any] | Mapping[str, Any] | None
+
+_SCALAR_TYPES = (bool, int, float, complex, str, bytes)
 
 
 class PathInfo:
@@ -140,6 +146,399 @@ def _filter_einsum_defaults(kwargs: dict[_EinsumDefaultKeys, Any]) -> dict[_Eins
 
     ret.update(kwargs)
     return ret
+
+
+def _interleaved_subscript_lists(operands: Sequence[Any]) -> list[list[Any]]:
+    """Return the subscript lists of an 'interleaved' einsum input."""
+    tmp_operands = list(operands)
+    subscript_lists: list[list[Any]] = []
+    for _ in range(len(tmp_operands) // 2):
+        tmp_operands.pop(0)  # the operand itself
+        subscript_lists.append(tmp_operands.pop(0))
+    return subscript_lists
+
+
+def _normalize_dims(dims: Iterable[Any]) -> tuple[int | None, ...]:
+    """Convert dimensions to ints, keeping symbolic/unknown ones as ``None``.
+
+    Some backends expose symbolic sizes (for example TensorFlow's ``None`` for a
+    dynamic axis); those are left alone so the contract can skip their precise
+    check rather than wrongly rejecting the call.
+    """
+    normalized: list[int | None] = []
+    for dim in dims:
+        if dim is None:
+            normalized.append(None)
+            continue
+        try:
+            normalized.append(int(dim))
+        except (TypeError, ValueError):
+            normalized.append(None)
+    return tuple(normalized)
+
+
+def _build_shape(shape: Any) -> tuple[int | None, ...]:
+    """Normalize a *build-time* shape (a tuple of ints, or an actual array)."""
+    if hasattr(shape, "shape"):
+        return _normalize_dims(shape.shape)
+
+    if isinstance(shape, _SCALAR_TYPES):
+        return ()
+
+    if isinstance(shape, Sequence):
+        return _normalize_dims(shape)
+
+    return _normalize_dims(parser.get_shape(shape))
+
+
+def _call_shape(array: Any) -> tuple[int | None, ...] | None:
+    """Normalize an operand supplied to a compiled expression to a shape tuple.
+
+    Follows the repository's data semantics: ``shape`` is used when present,
+    otherwise nested sequences are data (their lengths are the dimensions). An
+    empty sequence is treated as a scalar-like object, mirroring ``get_shape``.
+    Returns ``None`` if the shape simply cannot be inspected (for example a
+    symbolic framework shape), so the contract can skip that operand.
+    """
+    try:
+        if hasattr(array, "shape"):
+            return _normalize_dims(array.shape)
+
+        if isinstance(array, _SCALAR_TYPES):
+            return ()
+
+        if isinstance(array, Sequence) and len(array) == 0:
+            return ()
+
+        return _normalize_dims(parser.get_shape(array))
+    except TypeError:
+        return None
+
+
+def _coerce_dims(item: Any) -> tuple[int | None, ...] | None:
+    """Normalize an entry of :meth:`ShapeContract.check` to a shape tuple.
+
+    Explicit shape tuples (and flat lists of integers) are taken as shapes, while
+    arrays and nested data use the ordinary call-time shape semantics.
+    """
+    is_dimension_sequence = (
+        isinstance(item, Sequence)
+        and not isinstance(item, (str, bytes))
+        and all(dim is None or isinstance(dim, Integral) for dim in item)
+    )
+    if is_dimension_sequence:
+        return _normalize_dims(item)
+
+    return _call_shape(item)
+
+
+def _infer_variable_labels(
+    input_subscripts: str,
+    output_subscript: str,
+    ellipsis_labels: Collection[str] = (),
+) -> frozenset[str]:
+    """Infer the labels that naturally vary between calls.
+
+    These are the ellipsis broadcast batch labels and, for matmul-like equations,
+    the label shared by *every* operand and the output (such as ``b`` in
+    ``bij,bjk->bik``).
+    """
+    labels = set(ellipsis_labels)
+
+    terms = input_subscripts.split(",")
+    if len(terms) >= 2:
+        shared = set(terms[0])
+        for term in terms[1:]:
+            shared.intersection_update(term)
+        shared.intersection_update(output_subscript)
+        labels.update(shared)
+
+    return frozenset(labels)
+
+
+def _resolve_variable_labels(
+    dynamic_axes: _DynamicAxes,
+    input_subscripts: str,
+    output_subscript: str,
+    ellipsis_labels: Collection[str],
+    symbol_map: Mapping[Any, str] | None = None,
+    has_ellipsis: bool = True,
+) -> frozenset[str]:
+    """Resolve the user's ``dynamic_axes`` declaration into subscript labels."""
+    if dynamic_axes is None or dynamic_axes is True or (isinstance(dynamic_axes, str) and dynamic_axes == "auto"):
+        return _infer_variable_labels(input_subscripts, output_subscript, ellipsis_labels)
+
+    if dynamic_axes is False:
+        return frozenset()
+
+    if isinstance(dynamic_axes, str):
+        if dynamic_axes == "...":
+            dynamic_axes = [Ellipsis]
+        else:
+            dynamic_axes = list(dynamic_axes)
+
+    if isinstance(dynamic_axes, Mapping):
+        keys = list(dynamic_axes)
+        if keys and all(isinstance(key, str) and len(key) == 1 for key in keys):
+            entries: Collection[Any] = keys
+        else:
+            # Also accept the ``{operand_index: axis_index_or_indexes}`` form.
+            terms = input_subscripts.split(",")
+            positional: set[str] = set()
+            for operand_index, axes in dynamic_axes.items():
+                if not isinstance(operand_index, int) or not 0 <= operand_index < len(terms):
+                    raise ValueError(f"`dynamic_axes` operand index {operand_index!r} is out of range.")
+                if isinstance(axes, Mapping):
+                    axis_indices = list(axes)
+                elif isinstance(axes, int):
+                    axis_indices = [axes]
+                else:
+                    axis_indices = list(axes)
+                for axis_index in axis_indices:
+                    if not isinstance(axis_index, int):
+                        raise ValueError("Positional `dynamic_axes` entries must be integer axis indexes.")
+                    positional.add(terms[operand_index][axis_index])
+            return frozenset(positional)
+    elif isinstance(dynamic_axes, int):
+        raise ValueError(
+            "`dynamic_axes` must name subscript label(s), not a single axis index; use a one-element sequence."
+        )
+    else:
+        entries = dynamic_axes
+
+    labels: set[str] = set()
+    wants_ellipsis = False
+    for entry in entries:
+        if entry is Ellipsis or (isinstance(entry, str) and entry == "..."):
+            wants_ellipsis = True
+            continue
+
+        if symbol_map is not None:
+            if entry not in symbol_map:
+                raise ValueError(
+                    f"`dynamic_axes` contains the label {entry!r} which does not appear in the expression."
+                )
+            labels.add(symbol_map[entry])
+            continue
+
+        if not isinstance(entry, str) or len(entry) != 1:
+            raise ValueError(
+                f"`dynamic_axes` entries must be single subscript characters or `Ellipsis`, got {entry!r}."
+            )
+        labels.add(entry)
+
+    if wants_ellipsis:
+        if not has_ellipsis:
+            raise ValueError(
+                "`dynamic_axes` requested the ellipsis batch dimensions but the subscripts contain no ellipsis."
+            )
+        labels.update(ellipsis_labels)
+
+    available = set(input_subscripts.replace(",", "").replace("->", "")) | set(ellipsis_labels)
+    unknown = labels - available
+    if unknown:
+        raise ValueError(
+            f"`dynamic_axes` contains {sorted(unknown)!r} which do not appear in the expression's subscripts."
+        )
+
+    return frozenset(labels)
+
+
+class ShapeContract:
+    """A compiled expression's shape contract: locked labels and variable labels.
+
+    The contract is built once from the expression's subscripts and build shapes.
+    Every label is *locked* to the size it had in the corresponding operand
+    (contraction and channel dimensions, for example), unless it was declared
+    variable via ``dynamic_axes``. Only variable labels - typically the
+    broadcast batch dimensions - may change size between calls, and then only in
+    a broadcast compatible way: every operand that shares the label must agree,
+    with size ``1`` broadcasting against any other size.
+
+    Both checks are performed purely from the call-time shapes. That means a
+    violation is always reported *before* the backend is entered and before a
+    caller supplied ``out`` buffer can be written to.
+
+    Examples:
+        ```python
+        contract = ShapeContract.from_expression("...ij,...jk->...ik", [(1, 2, 3), (1, 3, 4)])
+        contract.dynamic
+        #> frozenset({'c'})
+
+        contract.check([(5, 2, 3), (1, 3, 4)])
+        contract.check([(5, 2, 6), (1, 6, 4)])
+        #> ValueError: ... static label 'j' ...
+        ```
+    """
+
+    __slots__ = ("input_subscripts", "output_subscript", "locked", "dynamic", "strict")
+
+    def __init__(
+        self,
+        input_subscripts: str,
+        output_subscript: str,
+        locked: list[tuple[int | None, ...]],
+        dynamic: Collection[str],
+        strict: bool = True,
+    ) -> None:
+        self.input_subscripts = input_subscripts
+        self.output_subscript = output_subscript
+        #: ``locked[i][axis]`` is the build-time size for operand ``i``, or ``None``
+        #: if the corresponding label was declared variable.
+        self.locked = locked
+        self.dynamic = frozenset(dynamic)
+        #: Whether the contract is enforced on *every* call (or only when ``out``
+        #: is supplied, which keeps plain calls of legacy expressions permissive).
+        self.strict = strict
+
+    @classmethod
+    def from_expression(
+        cls,
+        subscripts: str,
+        shapes: Sequence[Any],
+        dynamic_axes: _DynamicAxes = None,
+        strict: bool = True,
+        symbol_map: Mapping[Any, str] | None = None,
+    ) -> "ShapeContract":
+        """Build a :class:`ShapeContract` for ``subscripts`` and ``shapes``."""
+        normalized = [_build_shape(shape) for shape in shapes]
+        input_subscripts, output_subscript, _ = parser.parse_einsum_input([subscripts] + list(normalized), shapes=True)
+
+        ellipsis_labels = parser.find_ellipsis_labels(subscripts, normalized)
+        dynamic = _resolve_variable_labels(
+            dynamic_axes,
+            input_subscripts,
+            output_subscript,
+            ellipsis_labels,
+            symbol_map=symbol_map,
+            has_ellipsis="..." in subscripts,
+        )
+
+        locked = [
+            tuple(None if label in dynamic else dim for label, dim in zip(term, shape))
+            for term, shape in zip(input_subscripts.split(","), normalized)
+        ]
+
+        return cls(input_subscripts, output_subscript, locked, dynamic, strict=strict)
+
+    def check(self, shapes: Sequence[Any], ranks_are_fatal: bool = True) -> bool:
+        """Validate call-time ``shapes`` against this contract.
+
+        Each entry may be an array (its ``shape`` is used) or an explicit shape
+        tuple. Raises ``ValueError`` naming the offending operand and subscript
+        label, and does so before any contraction or array write can happen.
+
+        If ``ranks_are_fatal`` is ``False`` then a rank mismatch simply returns
+        ``False`` instead of raising, leaving the call to the backend's own error
+        handling - used by the implicit contract to keep legacy behaviour intact.
+        """
+        terms = self.input_subscripts.split(",")
+        if len(shapes) != len(terms):
+            raise ValueError(
+                "Shape contract check failed before backend dispatch or writing `out`: this expression was built "
+                f"for {len(terms)} operands but received {len(shapes)}."
+            )
+
+        dims_by_operand = [_coerce_dims(shape) for shape in shapes]
+        # operands whose shape can not be inspected are left to the backend
+        checkable = [dims is not None for dims in dims_by_operand]
+        rank_problems = [
+            f"Operand {i} has rank {len(dims)} (shape {dims}), but this expression's shape contract "
+            f"expects rank {len(term)} (subscript {term!r})."
+            for i, (term, dims) in enumerate(zip(terms, dims_by_operand))
+            if dims is not None and len(dims) != len(term)
+        ]
+        if rank_problems:
+            if not ranks_are_fatal:
+                return False
+            raise ValueError(
+                "Shape contract check failed before backend dispatch or writing `out`: " + " ".join(rank_problems)
+            )
+
+        problems: list[str] = []
+        observed: dict[str, list[tuple[int, int]]] = {label: [] for label in self.dynamic}
+
+        for i, (term, locked_term, dims, check) in enumerate(zip(terms, self.locked, dims_by_operand, checkable)):
+            if not check:
+                continue
+            for axis, (label, dim, expected) in enumerate(zip(term, dims, locked_term)):
+                if dim is None:
+                    # a symbolic / unknown call-time dimension can not be checked
+                    continue
+                if label in self.dynamic:
+                    observed[label].append((i, dim))
+                elif expected is not None and dim != expected:
+                    problems.append(
+                        f"Operand {i} has size {dim} for static label {label!r} at axis {axis} of subscript "
+                        f"{term!r}, but this expression was built with size {expected} for that position. "
+                        "Static labels are locked by the expression's shape contract."
+                    )
+
+        for label in sorted(self.dynamic):
+            sizes = observed[label]
+            non_unit = [(i, dim) for i, dim in sizes if dim != 1]
+            if len(non_unit) < 2:
+                continue
+            first_index, first_dim = non_unit[0]
+            for other_index, other_dim in non_unit[1:]:
+                if other_dim != first_dim:
+                    problems.append(
+                        f"Dynamic label {label!r} is {first_dim} in operand {first_index} but {other_dim} in "
+                        f"operand {other_index}. Variable labels may change together, but every operand must "
+                        "remain broadcast compatible (equal sizes, or 1 on all but one operand)."
+                    )
+
+        if problems:
+            raise ValueError(
+                "Shape contract check failed before backend dispatch or writing `out`: " + " ".join(problems)
+            )
+
+        return True
+
+    def __repr__(self) -> str:
+        dynamic = "".join(sorted(self.dynamic)) or "-"
+        return f"<ShapeContract('{self.input_subscripts}->{self.output_subscript}', dynamic={dynamic!r})>"
+
+
+def _resolve_shape_contract(
+    shape_contract: _ShapeContractOption,
+    dynamic_axes: _DynamicAxes,
+) -> tuple[bool | None, _DynamicAxes]:
+    """Normalize the ``shape_contract`` / ``dynamic_axes`` options.
+
+    Returns whether the contract is enforced on every call (``True``), only when
+    a caller supplied ``out`` is written to (``None``), or not at all (``False``),
+    together with the (possibly inferred) variable-axis declaration.
+    """
+    if shape_contract is None:
+        # No explicit request: keep legacy permissive calls, but still guard
+        # writes into a caller supplied ``out`` buffer.
+        return (True if dynamic_axes is not None else None), dynamic_axes
+
+    if shape_contract is False:
+        return False, dynamic_axes
+
+    if isinstance(shape_contract, Mapping):
+        options = dict(shape_contract)
+        enabled = options.pop("enabled", True)
+        strict = options.pop("strict", True)
+        if "dynamic_axes" in options:
+            if dynamic_axes is None:
+                dynamic_axes = options.pop("dynamic_axes")
+        if options:
+            raise TypeError(f"Did not understand the following `shape_contract` options: {options.keys()}")
+        if not enabled:
+            return False, dynamic_axes
+        # ``strict=False`` keeps the legacy permissive plain calls, while still
+        # validating before a caller supplied ``out`` buffer is written.
+        return (True if strict else None), dynamic_axes
+
+    if dynamic_axes is None:
+        # ``shape_contract=True`` enables the contract; a label or collection of
+        # labels passed as ``shape_contract`` doubles as the declaration.
+        dynamic_axes = True if shape_contract is True else shape_contract
+
+    return True, dynamic_axes
 
 
 # Overlaod for contract(einsum_string, *operands)
@@ -589,6 +988,7 @@ def contract(
     # Grab non-einsum kwargs
     gen_expression = kwargs.pop("_gen_expression", False)
     constants_dict = kwargs.pop("_constants_dict", {})
+    shape_contract = kwargs.pop("_shape_contract", None)
 
     if gen_expression:
         full_str = operands_list[0]
@@ -601,7 +1001,9 @@ def contract(
 
     # check if performing contraction or just building expression
     if gen_expression:
-        return ContractExpression(full_str, contraction_list, constants_dict, **kwargs)
+        return ContractExpression(
+            full_str, contraction_list, constants_dict, _shape_contract=shape_contract, **kwargs
+        )
 
     return _core_contract(operands, contraction_list, backend=backend, out=out, **kwargs)
 
@@ -752,6 +1154,9 @@ class ContractExpression:
         constants_dict: dict[int, ArrayType],
         **kwargs: Any,
     ):
+        # the compiled shape contract is kept separate from the backend kwargs
+        self._shape_contract: ShapeContract | None = kwargs.pop("_shape_contract", None)
+
         self.contraction = format_const_einsum_str(contraction, constants_dict.keys())
         self.contraction_list = contraction_list
         self.kwargs = kwargs
@@ -766,6 +1171,40 @@ class ContractExpression:
         self._constants_dict = constants_dict
         self._evaluated_constants: dict[str, Any] = {}
         self._backend_expressions: dict[str, Any] = {}
+
+    @property
+    def shape_contract(self) -> ShapeContract | None:
+        """The compiled :class:`ShapeContract`, if one is attached to the expression."""
+        return self._shape_contract
+
+    def _call_shapes(self, arrays: Sequence[ArrayType]) -> list[TensorShapeType]:
+        """Build the full per-operand shape list for a call.
+
+        Constant operands are substituted with their build-time shapes so the shape
+        contract can be checked for every operand without evaluating any constants
+        or touching the backend.
+        """
+        var_shapes = iter(_call_shape(array) for array in arrays)
+        return [
+            _build_shape(self._constants_dict[i]) if i in self._constants_dict else next(var_shapes)
+            for i in range(self._full_num_args)
+        ]
+
+    def _validate_shapes(self, arrays: Sequence[ArrayType], out: ArrayType | None) -> None:
+        """Run the shape contract, if it applies to this call.
+
+        A contract that was explicitly requested is enforced on every call. The
+        implicit contract attached to every expression is only enforced when a
+        caller supplied ``out`` buffer is about to be written, which keeps plain
+        legacy calls permissive.
+        """
+        contract = self._shape_contract
+        if contract is None:
+            return
+        if not (contract.strict or out is not None):
+            return
+
+        contract.check(self._call_shapes(arrays), ranks_are_fatal=contract.strict)
 
     def evaluate_constants(self, backend: str | None = "auto") -> None:
         """Convert any constant operands to the correct backend form, and
@@ -872,14 +1311,19 @@ class ContractExpression:
         Returns:
             The contracted result.
         """
-        backend = parse_backend(arrays, backend)
-
         correct_num_args = self._full_num_args if evaluate_constants else self.num_args
 
         if len(arrays) != correct_num_args:
             raise ValueError(
                 f"This `ContractExpression` takes exactly {self.num_args} array arguments but received {len(arrays)}."
             )
+
+        if not evaluate_constants:
+            # Validate before backend inference/dispatch, constant evaluation, or
+            # any possible write into a caller supplied ``out`` buffer.
+            self._validate_shapes(arrays, out)
+
+        backend = parse_backend(arrays, backend)
 
         if self._constants_dict and not evaluate_constants:
             # fill in the missing non-constant terms with newly supplied arrays
@@ -938,6 +1382,8 @@ def contract_expression(
     use_blas: bool = ...,
     optimize: OptimizeKind = ...,
     memory_limit: _MemoryLimit = ...,
+    dynamic_axes: _DynamicAxes = ...,
+    shape_contract: _ShapeContractOption = ...,
     **kwargs: Any,
 ) -> ContractExpression: ...
 
@@ -951,6 +1397,8 @@ def contract_expression(
     use_blas: bool = ...,
     optimize: OptimizeKind = ...,
     memory_limit: _MemoryLimit = ...,
+    dynamic_axes: _DynamicAxes = ...,
+    shape_contract: _ShapeContractOption = ...,
     **kwargs: Any,
 ) -> ContractExpression: ...
 
@@ -962,6 +1410,8 @@ def contract_expression(
     use_blas: bool = True,
     optimize: OptimizeKind = True,
     memory_limit: _MemoryLimit = None,
+    dynamic_axes: _DynamicAxes = None,
+    shape_contract: _ShapeContractOption = None,
     **kwargs: Any,
 ) -> ContractExpression:
     """Generate a reusable expression for a given contraction with
@@ -977,6 +1427,37 @@ def contract_expression(
             between calls will be reused. Additionally, if a GPU-enabled backend is
             used for example, then the constant tensors will be kept on the GPU,
             minimizing transfers.
+        dynamic_axes: Declare which subscript labels are allowed to change size
+            between calls - typically the broadcast batch dimensions. Every other
+            label is *locked* to the size it had in `shapes`, so a call that
+            changes a contraction or channel dimension is rejected. Supplying this
+            argument enables the expression's shape contract on every call.
+            Accepts:
+
+            - ``None`` (the default): no explicit declaration. Plain calls keep
+              the legacy permissive behaviour, but shapes are still validated
+              before a caller supplied ``out`` buffer is written.
+            - ``True`` or ``"auto"``: infer the variable labels - the ellipsis
+              broadcast batch labels and, for matmul-like equations, the label
+              shared by every input and the output (e.g. ``b`` in
+              ``bij,bjk->bik``).
+            - ``False``: lock every label.
+            - a subscript character or iterable of characters: only those labels
+              may change size. ``Ellipsis`` or ``"..."`` additionally marks the
+              ellipsis batch dimensions as variable.
+            - ``{operand_index: axis_index_or_indexes}``: declare labels by the
+              axis positions they occupy in the expression.
+
+            Whatever the declaration, every operand that shares a variable label
+            must remain broadcast compatible (equal sizes, or ``1`` on all but one
+            operand). Both the locked-label and the broadcast checks run *before*
+            the backend is entered or ``out`` is written to, and a rejected call
+            leaves a constant cache untouched.
+        shape_contract: Enable the shape contract without declaring anything
+            explicit; ``True`` behaves like ``dynamic_axes="auto"``. A label or
+            collection of labels may also be passed here as a shorthand for
+            ``dynamic_axes``. ``False`` disables the contract entirely, restoring
+            completely unchecked calls.
         kwargs: Passed on to `contract_path` or `einsum`. See `contract`.
 
     Returns:
@@ -988,9 +1469,12 @@ def contract_expression(
         The `backend` keyword argument should also be supplied to the generated
         expression. If numpy arrays are supplied, if possible they will be
         converted to and back from the correct backend array type.
-        The generated expression will work with any arrays which have
-        the same rank (number of dimensions) as the original shapes, however, if
-        the actual sizes are different, the expression may no longer be optimal.
+        Without an explicitly enabled shape contract the generated expression will
+        work with any arrays which have the same rank (number of dimensions) as
+        the original shapes, however, if the actual sizes are different, the
+        expression may no longer be optimal. With a contract, the locked labels
+        and the broadcast compatibility of the variable labels are validated
+        first.
         Constant operations will be computed upon the first call with a particular
         backend, then subsequently reused.
 
@@ -1017,6 +1501,24 @@ def contract_expression(
     #> True
     ```
 
+    A batched matmul with a variable batch dimension, but locked contraction and
+    channel dimensions:
+
+    ```python
+    expr = contract_expression(
+        "...ij,...jk->...ik", (1, 2, 3), (1, 3, 4), dynamic_axes=["..."]
+    )
+
+    expr(np.ones((5, 2, 3)), np.ones((1, 3, 4))).shape
+    #> (5, 2, 4)
+
+    # the contraction and channel labels stay locked - even though the backend
+    # could multiply the new sizes, this raises before any work is done:
+    expr(np.ones((5, 2, 6)), np.ones((1, 6, 4)))
+    #> ValueError: Operand 0 has size 6 for static label 'j' ...
+    ```
+
+    Without ``dynamic_axes`` or ``shape_contract`` plain calls remain permissive.
     """
     if not optimize:
         raise ValueError("Can only generate expressions for optimized contractions.")
@@ -1028,7 +1530,13 @@ def contract_expression(
             )
 
     if not isinstance(subscripts, str):
-        subscripts, shapes = parser.convert_interleaved_input((subscripts,) + shapes)
+        interleaved = (subscripts,) + shapes
+        symbol_map: dict[Any, str] | None = parser.build_symbol_map(_interleaved_subscript_lists(interleaved))
+        subscripts, shapes = parser.convert_interleaved_input(interleaved)
+    else:
+        symbol_map = None
+
+    enable_contract, dynamic_axes = _resolve_shape_contract(shape_contract, dynamic_axes)
 
     kwargs["_gen_expression"] = True
 
@@ -1036,6 +1544,21 @@ def contract_expression(
     constants = constants or ()
     constants_dict = {i: shapes[i] for i in constants}
     kwargs["_constants_dict"] = constants_dict
+
+    # Compile the shape contract. Every expression carries the implicit contract
+    # (used to guard writes into a caller supplied ``out``); an explicitly
+    # requested contract is enforced on every call as well, while
+    # ``shape_contract=False`` disables it entirely.
+    if enable_contract is False:
+        kwargs["_shape_contract"] = None
+    else:
+        kwargs["_shape_contract"] = ShapeContract.from_expression(
+            subscripts,
+            shapes,
+            dynamic_axes=dynamic_axes,
+            strict=bool(enable_contract),
+            symbol_map=symbol_map,
+        )
 
     # apart from constant arguments, make dummy arrays
     dummy_arrays = [s if i in constants else shape_only(s) for i, s in enumerate(shapes)]  # type: ignore

@@ -28,6 +28,62 @@ my_expr(x, y, z)
 Note that few checks are performed when calling the expression, and while it will work for a set of arrays with the same ranks as the original shapes but differing sizes, it might no longer be optimal.
 
 
+## Shape Contracts and Dynamic Batch Axes
+
+A batched matrix multiply is usually reused with a *varying* batch size, while
+the contraction and channel dimensions stay fixed. Passing `dynamic_axes` to
+[`opt_einsum.contract_expression`](../api_reference.md#opt_einsumcontract_expression)
+compiles that intent into a shape contract:
+
+```python
+expr = oe.contract_expression(
+    "...ij,...jk->...ik", (1, 2, 3), (1, 3, 4), dynamic_axes=["..."]
+)
+
+expr(np.ones((5, 2, 3)), np.ones((1, 3, 4))).shape
+#> (5, 2, 4)
+```
+
+The explicit labels (`i`, `j`, `k` here) are locked to the sizes they had in the
+build shapes, while the broadcast batch label that `...` expands to may change
+freely. This is checked from the shapes alone, so an invalid call is rejected
+*before* the backend is entered and before an `out` buffer is written:
+
+```python
+expr(np.ones((5, 2, 6)), np.ones((1, 6, 4)))
+#> ValueError: ... Operand 0 has size 6 for static label 'j' ...
+```
+
+The batch label is the one that `...` expands to, so it may sit at different axis
+positions in different operands: in `"i...j,...jk->i...k"` it is axis 1 of the
+first operand but axis 0 of the second, and only the sizes of the *same* label
+are compared. Two variable batch sizes that are both non-1 and differ are
+likewise rejected up front:
+
+```python
+expr = oe.contract_expression("...ij,...jk->...ik", (1, 2, 3), (1, 3, 4), dynamic_axes=True)
+expr(np.ones((5, 2, 3)), np.ones((3, 3, 4)))
+#> ValueError: ... Dynamic label 'c' is 5 in operand 0 but 3 in operand 1 ...
+```
+
+`dynamic_axes` accepts:
+
+- `True` or `"auto"` to infer the variable labels (ellipsis batch labels, plus
+  the label shared by every input and the output for matmul-like equations such
+  as `b` in `"bij,bjk->bik"`),
+- `False` to lock every label,
+- a label or an iterable of labels (optionally including `Ellipsis`/`"..."`) to
+  declare exactly which labels may vary,
+- `{operand_index: axis_index}` to declare labels by axis position.
+
+`shape_contract=True` is a shortcut for the inferred declaration, and
+`shape_contract=False` turns the contract off completely. A declared contract is
+enforced on every call; without a declaration plain calls stay permissive (as
+before) but are still validated before an `out` buffer is written. Constant
+tensors keep working: a constant whose batch size is `1` is evaluated once and
+its cache is reused across different legal batch sizes.
+
+
 ## Specifying Constants
 
 Often one generates contraction expressions where some of the tensor arguments

@@ -26,6 +26,12 @@ toc_depth: 1
     <!-- :docstring:
     :members: -->
 
+### `opt_einsum.contract.ShapeContract`
+
+::: opt_einsum.contract.ShapeContract
+    <!-- :docstring:
+    :members: -->
+
 ### `opt_einsum.contract.PathInfo`
 
 ::: opt_einsum.contract.PathInfo

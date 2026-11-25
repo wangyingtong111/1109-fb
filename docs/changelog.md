@@ -1,6 +1,20 @@
 Changelog
 =========
 
+## Unreleased
+
+**New Features**
+
+- `contract_expression` accepts `dynamic_axes=` (and the `shape_contract=` shortcut) to
+  compile a shape contract for compiled expressions. Labels that are not declared
+  variable - for example the contraction and channel dimensions of a batched matrix
+  multiply - are locked to their build-time sizes, while declared broadcast batch
+  labels may change between calls as long as every operand stays broadcast compatible.
+  Violations raise `ValueError` naming the offending operand and subscript label
+  before the backend is entered or an `out` buffer is written, and constant caches
+  are reused across different legal batch sizes. Expressions built without a
+  declaration keep their previous permissive calling behaviour.
+
 ## 3.4.0 / 2024-09-26
 
 NumPy has been removed from `opt_einsum` as a dependency allowing for more flexible installs.

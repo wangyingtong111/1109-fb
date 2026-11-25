@@ -13,6 +13,9 @@ __all__ = [
     "get_shape",
     "gen_unused_symbols",
     "convert_to_valid_einsum_chars",
+    "convert_interleaved_input",
+    "build_symbol_map",
+    "find_ellipsis_labels",
     "alpha_canonicalize",
     "find_output_str",
     "find_output_shape",
@@ -254,6 +257,85 @@ def convert_subscripts(old_sub: list[Any], symbol_map: dict[Any, Any]) -> str:
     return new_sub
 
 
+def build_symbol_map(subscript_lists: Sequence[Sequence[Any]]) -> dict[Any, str]:
+    """Build the map from user subscripts to the single character labels used by
+    :func:`convert_interleaved_input`.
+
+    The mapping retains the intrinsic order of the user symbols, mirroring the
+    behaviour of ``convert_interleaved_input``.
+
+    Examples:
+    --------
+    >>> oe.parser.build_symbol_map([[0, 1], [1, 2]])
+    {0: 'a', 1: 'b', 2: 'c'}
+    """
+    try:
+        # collect all user symbols
+        symbol_set = set(itertools.chain.from_iterable(subscript_lists))
+
+        # remove Ellipsis because it can not be compared with other objects
+        symbol_set.discard(Ellipsis)
+
+        # build the map based on sorted user symbols, retaining the order we lost in the `set`
+        return {symbol: get_symbol(idx) for idx, symbol in enumerate(sorted(symbol_set))}
+
+    except TypeError:  # unhashable or uncomparable object
+        raise TypeError(
+            "For this input type lists must contain either Ellipsis or hashable and comparable object (e.g. int, str)."
+        )
+
+
+def find_ellipsis_labels(subscripts: str, shapes: Sequence[TensorShapeType]) -> tuple[str, ...]:
+    """Find the labels that ``...`` expands to for the given ``shapes``.
+
+    The expansion is identical to :func:`parse_einsum_input`: unused symbols are
+    generated and assigned right aligned to each ellipsis, so that broadcasting
+    happens on the *leading* axes and the same batch label can sit at different
+    axis positions in different operands.
+
+    Examples:
+    --------
+    >>> oe.parser.find_ellipsis_labels("...ij,...jk->...ik", [(1, 2, 3), (1, 3, 4)])
+    ('c',)
+
+    >>> oe.parser.find_ellipsis_labels("i...j,...jk->i...k", [(2, 1, 3), (1, 3, 4)])
+    ('c',)
+
+    >>> oe.parser.find_ellipsis_labels("ij,jk->ik", [(2, 3), (3, 4)])
+    ()
+    """
+    subscripts = subscripts.replace(" ", "")
+    if "." not in subscripts:
+        return ()
+
+    used = subscripts.replace(".", "").replace(",", "").replace("->", "")
+    input_subscripts = subscripts.split("->")[0]
+    ellipse_inds = "".join(gen_unused_symbols(used, max((len(shape) for shape in shapes), default=0)))
+
+    longest = 0
+    for sub, shape in zip(input_subscripts.split(","), shapes):
+        if "." not in sub:
+            continue
+
+        if (sub.count(".") != 3) or (sub.count("...") != 1):
+            raise ValueError("Invalid Ellipses.")
+
+        if len(shape) == 0:
+            ellipse_count = 0
+        else:
+            ellipse_count = max(len(shape), 1) - (len(sub) - 3)
+
+        if ellipse_count < 0:
+            raise ValueError("Ellipses lengths do not match.")
+
+        longest = max(longest, ellipse_count)
+
+    if longest == 0:
+        return ()
+
+    return tuple(ellipse_inds[-longest:])
+
+
 def convert_interleaved_input(operands: Sequence[Any]) -> tuple[str, tuple[Any, ...]]:
     """Convert 'interleaved' input to standard einsum input."""
     tmp_operands = list(operands)
@@ -266,21 +348,7 @@ def convert_interleaved_input(operands: Sequence[Any]) -> tuple[str, tuple[Any, 
     output_list = tmp_operands[-1] if len(tmp_operands) else None
 
     # build a map from user symbols to single-character symbols based on `get_symbol`
-    # The map retains the intrinsic order of user symbols
-    try:
-        # collect all user symbols
-        symbol_set = set(itertools.chain.from_iterable(subscript_list))
-
-        # remove Ellipsis because it can not be compared with other objects
-        symbol_set.discard(Ellipsis)
-
-        # build the map based on sorted user symbols, retaining the order we lost in the `set`
-        symbol_map = {symbol: get_symbol(idx) for idx, symbol in enumerate(sorted(symbol_set))}
-
-    except TypeError:  # unhashable or uncomparable object
-        raise TypeError(
-            "For this input type lists must contain either Ellipsis or hashable and comparable object (e.g. int, str)."
-        )
+    symbol_map = build_symbol_map(subscript_list)
 
     subscripts = ",".join(convert_subscripts(sub, symbol_map) for sub in subscript_list)
     if output_list is not None:
