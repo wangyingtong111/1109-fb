@@ -10,6 +10,7 @@ from libcpp cimport bool
 from libcpp.utility cimport move
 from libcpp.vector cimport vector
 
+from rapidfuzz._common_py import compose_editops
 from rapidfuzz cimport RF_String
 
 
@@ -493,6 +494,55 @@ cdef class Editops:
         """
         cdef Editops x = Editops.__new__(Editops)
         x.editops = self.editops.remove_subsequence(subsequence.editops)
+        return x
+
+    def compose(self, Editops other):
+        """
+        Compose this Editops with another Editops, so it describes how to
+        transform the source string of this Editops into the destination
+        string of the other Editops.
+
+        This is the edit script equivalent of applying this Editops and the
+        other Editops one after another. The resulting Editops keeps the
+        identity of the characters of the source string, so it is not simply
+        derived from comparing the first source string with the second
+        destination string.
+
+        Parameters
+        ----------
+        other : Editops
+            Editops to apply after this Editops. Its `src_len` has to be equal
+            to the `dest_len` of this Editops.
+
+        Returns
+        -------
+        editops : Editops
+            composed Editops, with the `src_len` of this Editops and the
+            `dest_len` of the other Editops
+
+        Examples
+        -------------
+        >>> from rapidfuzz.distance import Levenshtein
+        >>> Levenshtein.editops('aaa', 'aXa').compose(Levenshtein.editops('aXa', 'aa'))
+        Editops([Editop(tag='delete', src_pos=1, dest_pos=1)], src_len=3, dest_len=2)
+
+        >>> Levenshtein.editops('aXbc', 'abcd').compose(Levenshtein.editops('abcd', 'aBc'))
+        Editops([Editop(tag='delete', src_pos=1, dest_pos=1),
+                 Editop(tag='replace', src_pos=2, dest_pos=1)], src_len=4, dest_len=3)
+        """
+        cdef Editops x = Editops.__new__(Editops)
+        x.editops = list_to_editops(
+            compose_editops(
+                editops_to_list(self.editops),
+                self.editops.get_src_len(),
+                self.editops.get_dest_len(),
+                editops_to_list(other.editops),
+                other.editops.get_src_len(),
+                other.editops.get_dest_len(),
+            ),
+            self.editops.get_src_len(),
+            other.editops.get_dest_len(),
+        )
         return x
 
     @property

@@ -2,6 +2,8 @@
 # Copyright (C) 2022 Max Bachmann
 from __future__ import annotations
 
+from rapidfuzz._common_py import compose_editops
+
 
 def _list_to_editops(
     ops,
@@ -376,6 +378,61 @@ class Editops:
         x._src_len = self.dest_len
         x._dest_len = self.src_len
         x._editops = blocks
+        return x
+
+    def compose(self, other):
+        """
+        Compose this Editops with another Editops, so it describes how to
+        transform the source string of this Editops into the destination
+        string of the other Editops.
+
+        This is the edit script equivalent of applying this Editops and the
+        other Editops one after another. The resulting Editops keeps the
+        identity of the characters of the source string, so it is not simply
+        derived from comparing the first source string with the second
+        destination string.
+
+        Parameters
+        ----------
+        other : Editops
+            Editops to apply after this Editops. Its `src_len` has to be equal
+            to the `dest_len` of this Editops.
+
+        Returns
+        -------
+        editops : Editops
+            composed Editops, with the `src_len` of this Editops and the
+            `dest_len` of the other Editops
+
+        Examples
+        -------------
+        >>> from rapidfuzz.distance import Levenshtein
+        >>> Levenshtein.editops('aaa', 'aXa').compose(Levenshtein.editops('aXa', 'aa'))
+        Editops([Editop(tag='delete', src_pos=1, dest_pos=1)], src_len=3, dest_len=2)
+
+        >>> Levenshtein.editops('aXbc', 'abcd').compose(Levenshtein.editops('abcd', 'aBc'))
+        Editops([Editop(tag='delete', src_pos=1, dest_pos=1),
+                 Editop(tag='replace', src_pos=2, dest_pos=1)], src_len=4, dest_len=3)
+        """
+        if not isinstance(other, Editops):
+            msg = "Expected Editops"
+            raise TypeError(msg)
+
+        x = Editops.__new__(Editops)
+        x._src_len = self.src_len
+        x._dest_len = other.dest_len
+        x._editops = _list_to_editops(
+            compose_editops(
+                self.as_list(),
+                self.src_len,
+                self.dest_len,
+                other.as_list(),
+                other.src_len,
+                other.dest_len,
+            ),
+            x._src_len,
+            x._dest_len,
+        )
         return x
 
     def remove_subsequence(self, subsequence):
