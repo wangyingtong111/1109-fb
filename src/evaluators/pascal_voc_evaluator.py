@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 from src.bounding_box import BoundingBox
 from src.utils.enumerators import (BBFormat, CoordinatesType,
-                                   MethodAveragePrecision)
+                                   DetectionOutcome, MethodAveragePrecision)
 
 
 def calculate_ap_every_point(rec, prec):
@@ -79,11 +79,67 @@ def calculate_ap_11_point_interp(rec, prec, recall_vals=11):
     return [ap, rhoInterp, recallValues, None]
 
 
+def _make_detail_record(det, outcome, iou=None, matched_gt=None, duplicate_of=None,
+                        wrong_class_gt=None):
+    """Build a single per-detection detail record.
+
+    The record always carries the detection itself together with the outcome reason assigned
+    in the current matching run. Optional references point to the boxes that explain the reason.
+
+    Parameters
+    ----------
+    det : BoundingBox
+        Detection the record refers to.
+    outcome : DetectionOutcome
+        Reason assigned to the detection (TP, DUPLICATE, LOCALIZATION, WRONG_CLASS or IGNORED).
+    iou : float (optional)
+        IoU between the detection and its best same-class ground truth.
+    matched_gt : BoundingBox (optional)
+        Ground truth actually hit by the detection (for TP records).
+    duplicate_of : BoundingBox (optional)
+        Higher-confidence detection that already occupies the same ground truth (for DUPLICATE).
+    wrong_class_gt : BoundingBox (optional)
+        Ground truth of another class overlapped by the detection (for WRONG_CLASS).
+    """
+    record = {
+        'detection': det,
+        'outcome': outcome,
+        'image': det.get_image_name(),
+        'class': det.get_class_id(),
+        'confidence': det.get_confidence(),
+        'iou': iou,
+        'matched_gt': matched_gt,
+        'duplicate_of': duplicate_of,
+        'wrong_class_gt': wrong_class_gt,
+    }
+    return record
+
+
+def _find_wrong_class_gt(det, image_gts, iou_threshold):
+    """Find a ground truth of a different class that overlaps the detection.
+
+    Used only for the per-detection details. It returns the highest-IoU ground truth whose class
+    differs from the detection class and whose IoU is at least the threshold, or None when no such
+    ground truth exists.
+    """
+    best_gt = None
+    best_iou = sys.float_info.min
+    for g in image_gts:
+        if g.get_class_id() == det.get_class_id():
+            continue
+        iou = BoundingBox.iou(det, g)
+        if iou >= iou_threshold and iou > best_iou:
+            best_iou = iou
+            best_gt = g
+    return best_gt
+
+
 def get_pascalvoc_metrics(gt_boxes,
                           det_boxes,
                           iou_threshold=0.5,
                           method=MethodAveragePrecision.EVERY_POINT_INTERPOLATION,
-                          generate_table=False):
+                          generate_table=False,
+                          generate_detail=False):
     """Get the metrics used by the VOC Pascal 2012 challenge.
     Args:
         boundingboxes: Object of the class BoundingBoxes representing ground truth and detected
@@ -100,7 +156,17 @@ def get_pascalvoc_metrics(gt_boxes,
         dict['interpolated recall']: interpolated recall values;
         dict['total positives']: total number of ground truth positives;
         dict['total TP']: total number of True Positive detections;
-        dict['total FP']: total number of False Positive detections;"""
+        dict['total FP']: total number of False Positive detections;
+        generate_table: if True, a pandas DataFrame with the per-detection TP/FP accumulation
+        is returned inside each class result;
+        generate_detail: if True, an additional 'details' entry is returned containing the
+        reason of every detection in the current matching run. The reasons are grouped by
+        DetectionOutcome: TP, DUPLICATE (points to the higher-confidence detection that already
+        occupies the same ground truth), LOCALIZATION (best same-class IoU below the threshold),
+        WRONG_CLASS (overlaps a ground truth of another class) and IGNORED (listed separately,
+        never counted as TP or FP). The details follow this run's matching results, while the
+        per-class AP values keep their original computation. When False, the function behaves
+        exactly as before."""
     ret = {}
     # Get classes of all bounding boxes separating them by classes
     gt_classes_only = []
@@ -111,10 +177,24 @@ def get_pascalvoc_metrics(gt_boxes,
         classes_bbs.setdefault(c, {'gt': [], 'det': []})
         classes_bbs[c]['gt'].append(bb)
     gt_classes_only = list(set(gt_classes_only))
+    # Ignored detections are listed separately and never count as TP or FP. They are removed
+    # from the per-class matching only when the details are requested, so the legacy behaviour
+    # (and AP values) is preserved byte-for-byte otherwise.
+    ignored_dets = []
     for bb in det_boxes:
+        if generate_detail and bb.get_is_ignore():
+            ignored_dets.append(bb)
+            continue
         c = bb.get_class_id()
         classes_bbs.setdefault(c, {'gt': [], 'det': []})
         classes_bbs[c]['det'].append(bb)
+
+    # Index of every ground truth by image, used to explain wrong-class overlaps in the details.
+    gt_by_image = {}
+    if generate_detail:
+        for g in gt_boxes:
+            gt_by_image.setdefault(g.get_image_name(), []).append(g)
+        detail_groups = {outcome: [] for outcome in DetectionOutcome}
 
     # Precision x Recall is obtained individually by each class
     for c, v in classes_bbs.items():
@@ -130,6 +210,9 @@ def get_pascalvoc_metrics(gt_boxes,
         detected_gt_per_image = Counter([bb.get_image_name() for bb in gt_boxes])
         for key, val in detected_gt_per_image.items():
             detected_gt_per_image[key] = np.zeros(val)
+        # For the details only: maps an occupied ground truth to the detection that matched it,
+        # so a duplicate can point to the detection that "owns" the same ground truth.
+        gt_owner = {} if generate_detail else None
         # print(f'Evaluating class: {c}')
         dict_table = {
             'image': [],
@@ -153,12 +236,13 @@ def get_pascalvoc_metrics(gt_boxes,
             gt = [gt for gt in classes_bbs[c]['gt'] if gt.get_image_name() == img_det]
             # Get the maximum iou among all detectins in the image
             iouMax = sys.float_info.min
+            id_match_gt = None
             # Given the detection det, find ground-truth with the highest iou
             for j, g in enumerate(gt):
                 # print('Ground truth gt => %s' %
                 #       str(g.get_absolute_bounding_box(format=BBFormat.XYX2Y2)))
                 iou = BoundingBox.iou(det, g)
-                if iou > iouMax:
+                if j == 0 or iou > iouMax:
                     iouMax = iou
                     id_match_gt = j
             # Assign detection as TP or FP
@@ -168,12 +252,28 @@ def get_pascalvoc_metrics(gt_boxes,
                     TP[idx_det] = 1  # detection is set as true positive
                     detected_gt_per_image[img_det][
                         id_match_gt] = 1  # set flag to identify gt as already 'matched'
+                    if generate_detail:
+                        # remember which detection occupies this ground truth
+                        gt_owner[(img_det, id(gt[id_match_gt]))] = det
+                        detail_groups[DetectionOutcome.TP].append(
+                            _make_detail_record(det,
+                                                DetectionOutcome.TP,
+                                                iou=iouMax,
+                                                matched_gt=gt[id_match_gt]))
                     # print("TP")
                     if generate_table:
                         dict_table['TP'].append(1)
                         dict_table['FP'].append(0)
                 else:
                     FP[idx_det] = 1  # detection is set as false positive
+                    if generate_detail:
+                        owner = gt_owner.get((img_det, id(gt[id_match_gt])))
+                        detail_groups[DetectionOutcome.DUPLICATE].append(
+                            _make_detail_record(det,
+                                                DetectionOutcome.DUPLICATE,
+                                                iou=iouMax,
+                                                matched_gt=gt[id_match_gt],
+                                                duplicate_of=owner))
                     if generate_table:
                         dict_table['FP'].append(1)
                         dict_table['TP'].append(0)
@@ -181,6 +281,24 @@ def get_pascalvoc_metrics(gt_boxes,
             # - A detected "cat" is overlaped with a GT "cat" with IOU >= iou_threshold.
             else:
                 FP[idx_det] = 1  # detection is set as false positive
+                if generate_detail:
+                    # Check first for a cross-class overlap before blaming the localization
+                    wrong_class_gt = _find_wrong_class_gt(det, gt_by_image.get(img_det, []),
+                                                          iou_threshold)
+                    if wrong_class_gt is not None:
+                        cross_iou = BoundingBox.iou(det, wrong_class_gt)
+                        detail_groups[DetectionOutcome.WRONG_CLASS].append(
+                            _make_detail_record(det,
+                                                DetectionOutcome.WRONG_CLASS,
+                                                iou=cross_iou,
+                                                wrong_class_gt=wrong_class_gt))
+                    else:
+                        best_same_class_gt = gt[id_match_gt] if id_match_gt is not None else None
+                        detail_groups[DetectionOutcome.LOCALIZATION].append(
+                            _make_detail_record(det,
+                                                DetectionOutcome.LOCALIZATION,
+                                                iou=(iouMax if gt else 0.0),
+                                                matched_gt=best_same_class_gt))
                 if generate_table:
                     dict_table['FP'].append(1)
                     dict_table['TP'].append(0)
@@ -221,7 +339,14 @@ def get_pascalvoc_metrics(gt_boxes,
         }
     # For mAP, only the classes in the gt set should be considered
     mAP = sum([v['AP'] for k, v in ret.items() if k in gt_classes_only]) / len(gt_classes_only)
-    return {'per_class': ret, 'mAP': mAP}
+    results = {'per_class': ret, 'mAP': mAP}
+    if generate_detail:
+        # Ignored detections are reported in their own group and never participate in TP/FP.
+        for det in ignored_dets:
+            detail_groups[DetectionOutcome.IGNORED].append(
+                _make_detail_record(det, DetectionOutcome.IGNORED))
+        results['details'] = detail_groups
+    return results
 
 
 def plot_precision_recall_curve(results,

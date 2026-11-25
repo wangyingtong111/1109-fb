@@ -53,3 +53,28 @@ class FileFormat(Enum):
     OPENIMAGE = 7
     IMAGENET = 8
     UNKNOWN = 9
+
+
+class DetectionOutcome(Enum):
+    """
+    Class representing the reason assigned to a detection when the per-detection
+    details are requested in the PASCAL VOC evaluator.
+
+        TP: the detection matched a not-yet-matched ground truth of the same class
+            with IoU >= threshold.
+        DUPLICATE: the detection overlaps (IoU >= threshold) a same-class ground
+            truth that was already matched by another detection with higher
+            confidence. It points to that other detection.
+        LOCALIZATION: the highest IoU of the detection with a same-class ground
+            truth is below the threshold (poor localization).
+        WRONG_CLASS: the detection does not qualify as TP/duplicate/localization
+            for its own class, but overlaps a ground truth of another class with
+            IoU >= threshold.
+        IGNORED: the detection is marked as ignored (or matches an ignored ground
+            truth) and must not count as TP or FP.
+    """
+    TP = 'tp'
+    DUPLICATE = 'duplicate'
+    LOCALIZATION = 'localization'
+    WRONG_CLASS = 'wrong_class'
+    IGNORED = 'ignored'

@@ -16,7 +16,8 @@ class BoundingBox:
                  img_size=None,
                  bb_type=BBType.GROUND_TRUTH,
                  confidence=None,
-                 format=BBFormat.XYWH):
+                 format=BBFormat.XYWH,
+                 is_ignore=False):
         """ Constructor.
 
         Parameters
@@ -49,6 +50,10 @@ class BoundingBox:
                 BBFormat.XYWH: <left> <top> <width> <height>
                 BBFomat.XYX2Y2: <left> <top> <right> <bottom>.
                 BBFomat.YOLO: <x_center> <y_center> <width> <height>. (relative)
+            is_ignore : bool (optional)
+                Flag identifying if the bounding box must be ignored in the evaluation. Ignored
+                boxes do not count as TP or FP and are reported separately in the per-detection
+                details. Default: False.
         """
 
         self._image_name = image_name
@@ -56,6 +61,7 @@ class BoundingBox:
         self._confidence = confidence
         self._class_id = class_id
         self._format = format
+        self._is_ignore = bool(is_ignore)
         if bb_type == BBType.DETECTED and confidence is None:
             raise IOError(
                 'For bb_type=\'Detected\', it is necessary to inform the confidence value.')
@@ -263,6 +269,26 @@ class BoundingBox:
             Enum representing the type of the bounding box (BBType.GROUND_TRUTH or BBType.DETECTED)
         """
         return self._bb_type
+
+    def set_is_ignore(self, is_ignore):
+        """ Set whether the bounding box must be ignored during the evaluation.
+
+        Parameters
+        ----------
+        is_ignore : bool
+            True if the bounding box must be ignored, False otherwise.
+        """
+        self._is_ignore = bool(is_ignore)
+
+    def get_is_ignore(self):
+        """ Get whether the bounding box is marked to be ignored during the evaluation.
+
+        Returns
+        -------
+        bool
+            True if the bounding box must be ignored, False otherwise.
+        """
+        return self._is_ignore
 
     def __str__(self):
         abs_bb_xywh = self.get_absolute_bounding_box(format=BBFormat.XYWH)
