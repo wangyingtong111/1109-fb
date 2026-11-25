@@ -242,6 +242,14 @@ recommender.top_items
 
 This uses [Wilson score](https://www.evanmiller.org/how-not-to-sort-by-average-rating.html) for explicit feedback and item frequency for implicit feedback.
 
+To limit recommendations to a shelf of items, pass `item_ids`:
+
+```ruby
+recommender.user_recs(new_user_id, item_ids: [1, 2, 3])
+```
+
+Only the listed items that exist in the catalog are scored, and each score matches the one it has in `top_items`. An empty list (or a list with only unknown ids) returns an empty array.
+
 ## Data
 
 Data can be an array of hashes

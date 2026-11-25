@@ -168,7 +168,7 @@ module Disco
         end
         result
       elsif @top_items
-        top_items(count: count)
+        top_items(count: count, item_ids: item_ids)
       else
         []
       end
@@ -185,34 +185,33 @@ module Disco
       similar(user_id, :user_id, @user_map, @user_factors, user_norms, count, @similar_users_index)
     end
 
-    def top_items(count: 5)
+    def top_items(count: 5, item_ids: nil)
       check_fit
       raise "top_items not computed" unless @top_items
 
-      if @implicit
-        scores = Numo::UInt64.cast(@item_count)
-      else
-        min_rating = @min_rating
-
-        # TODO remove temp fix
-        min_rating -= 1 if @min_rating == @max_rating
-
-        # wilson score with continuity correction
-        # https://en.wikipedia.org/wiki/Binomial_proportion_confidence_interval#Wilson_score_interval_with_continuity_correction
-        z = 1.96 # 95% confidence
-        range = @max_rating - min_rating
-        n = Numo::DFloat.cast(@item_count)
-        phat = (Numo::DFloat.cast(@item_sum) - (min_rating * n)) / range / n
-        phat = (phat - (1 / (2 * n))).clip(0, nil) # continuity correction
-        scores = (phat + z**2 / (2 * n) - z * Numo::DFloat::Math.sqrt((phat * (1 - phat) + z**2 / (4 * n)) / n)) / (1 + z**2 / n)
-        scores = scores * range + min_rating
-      end
-
-      scores, indexes = top_k(scores, count)
-
       keys = @item_map.keys
-      indexes.size.times.map do |i|
-        {item_id: keys[indexes[i]], score: scores[i]}
+
+      if item_ids
+        # only score the candidates that exist in the catalog
+        # dedupe and order by catalog position so ties are deterministic
+        indexes = item_ids.filter_map { |i| @item_map[i] }.uniq.sort
+        return [] if indexes.empty?
+
+        scores = item_scores(@item_count.values_at(*indexes), @item_sum.values_at(*indexes))
+        values = scores.to_a
+
+        # descending score, ties in saved catalog order
+        order = (0...values.size).sort_by { |j| [-values[j], j] }
+        order = order.first(count) if count
+
+        order.map { |j| {item_id: keys[indexes[j]], score: scores[j]} }
+      else
+        scores = item_scores(@item_count, @item_sum)
+        scores, indexes = top_k(scores, count)
+
+        indexes.size.times.map do |i|
+          {item_id: keys[indexes[i]], score: scores[i]}
+        end
       end
     end
 
@@ -391,6 +390,27 @@ module Disco
         result
       else
         []
+      end
+    end
+
+    def item_scores(item_count, item_sum)
+      if @implicit
+        Numo::UInt64.cast(item_count)
+      else
+        min_rating = @min_rating
+
+        # TODO remove temp fix
+        min_rating -= 1 if @min_rating == @max_rating
+
+        # wilson score with continuity correction
+        # https://en.wikipedia.org/wiki/Binomial_proportion_confidence_interval#Wilson_score_interval_with_continuity_correction
+        z = 1.96 # 95% confidence
+        range = @max_rating - min_rating
+        n = Numo::DFloat.cast(item_count)
+        phat = (Numo::DFloat.cast(item_sum) - (min_rating * n)) / range / n
+        phat = (phat - (1 / (2 * n))).clip(0, nil) # continuity correction
+        scores = (phat + z**2 / (2 * n) - z * Numo::DFloat::Math.sqrt((phat * (1 - phat) + z**2 / (4 * n)) / n)) / (1 + z**2 / n)
+        scores * range + min_rating
       end
     end
 

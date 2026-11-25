@@ -1,3 +1,7 @@
+## Unreleased
+
+- Added `item_ids` option to `user_recs` for new users with `top_items` to restrict recommendations to a set of candidates
+
 ## 1.0.0 (2026-04-17)
 
 - Switched to `numo-narray-alt`

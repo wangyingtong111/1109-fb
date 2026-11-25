@@ -131,6 +131,122 @@ class RecommenderTest < Minitest::Test
     assert_equal top_items, recommender.user_recs("unknown")
   end
 
+  def test_top_items_item_ids_unknown_user
+    data = [
+      {user_id: 1, item_id: "tea", rating: 5},
+      {user_id: 2, item_id: "tea", rating: 5},
+      {user_id: 3, item_id: "tea", rating: 5},
+      {user_id: 4, item_id: "tofu", rating: 5},
+      {user_id: 5, item_id: "rice", rating: 5}
+    ]
+    recommender = Disco::Recommender.new(factors: 5, top_items: true)
+    recommender.fit(data)
+
+    global = recommender.top_items(count: nil)
+    assert_equal "tea", global.first[:item_id]
+
+    # a later item from the global list is still returned when it is the only candidate
+    recs = recommender.user_recs("unknown", count: 1, item_ids: ["rice"])
+    assert_equal ["rice"], recs.map { |r| r[:item_id] }
+
+    # scores match the full list exactly
+    global.each do |r|
+      subset = recommender.user_recs("unknown", count: nil, item_ids: [r[:item_id]])
+      assert_equal r[:score], subset.first[:score]
+    end
+
+    # explicit feedback keeps the training rating range
+    assert_operator recs.first[:score], :<=, 5
+    assert_operator recs.first[:score], :>=, 0
+  end
+
+  def test_top_items_item_ids_empty
+    data = [
+      {user_id: 1, item_id: "tea", rating: 5},
+      {user_id: 2, item_id: "rice", rating: 4}
+    ]
+    recommender = Disco::Recommender.new(factors: 5, top_items: true)
+    recommender.fit(data)
+
+    assert_empty recommender.user_recs("unknown", item_ids: [])
+    assert_empty recommender.user_recs("unknown", item_ids: ["unknown"])
+    assert_empty recommender.user_recs("unknown", item_ids: ["unknown", "missing"])
+  end
+
+  def test_top_items_item_ids_order_and_duplicates_after_load
+    data = [
+      {user_id: 1, item_id: "tea", rating: 5},
+      {user_id: 2, item_id: "tea", rating: 5},
+      {user_id: 3, item_id: "tea", rating: 5},
+      {user_id: 4, item_id: "tofu", rating: 5},
+      {user_id: 5, item_id: "rice", rating: 5}
+    ]
+    recommender = Disco::Recommender.new(factors: 5, top_items: true)
+    recommender.fit(data)
+    recommender = Disco::Recommender.load_json(recommender.to_json)
+
+    global = recommender.top_items(count: nil)
+    catalog_order = recommender.item_ids
+
+    forward = recommender.user_recs("unknown", count: 5, item_ids: ["tofu", "rice", "tofu"])
+    reverse = recommender.user_recs("unknown", count: 5, item_ids: ["rice", "tofu"])
+
+    # both input orders give the same result, and duplicates do not take a second slot
+    assert_equal forward, reverse
+    assert_equal 2, forward.size
+    assert_equal ["tofu", "rice"], forward.map { |r| r[:item_id] }
+
+    # ties follow the saved catalog order
+    assert_equal catalog_order.index("tofu") < catalog_order.index("rice"), forward.first[:item_id] == "tofu"
+
+    # each candidate score is the same as its entry in the full list
+    forward.each do |rec|
+      assert_equal global.find { |r| r[:item_id] == rec[:item_id] }[:score], rec[:score]
+    end
+  end
+
+  def test_top_items_item_ids_only_scores_candidates
+    data = 100.times.map { |i| {user_id: i, item_id: "item#{i}", rating: 5} }
+    data << {user_id: 100, item_id: "item42", rating: 5}
+    data << {user_id: 101, item_id: "item42", rating: 5}
+    recommender = Disco::Recommender.new(factors: 5, top_items: true)
+    recommender.fit(data)
+
+    sizes = []
+    original = recommender.method(:item_scores)
+    recommender.define_singleton_method(:item_scores) do |count, sum|
+      sizes << count.size
+      original.call(count, sum)
+    end
+
+    recs = recommender.user_recs("unknown", count: 1, item_ids: ["item7", "item42", "item42", "missing"])
+
+    assert_equal ["item42"], recs.map { |r| r[:item_id] }
+    assert_equal [2], sizes
+  end
+
+  def test_top_items_implicit_item_ids_unknown_user
+    data = [
+      {user_id: 1, item_id: "tea"},
+      {user_id: 2, item_id: "tea"},
+      {user_id: 3, item_id: "tea"},
+      {user_id: 1, item_id: "rice"},
+      {user_id: 1, item_id: "tofu"}
+    ]
+    recommender = Disco::Recommender.new(factors: 5, top_items: true)
+    recommender.fit(data)
+
+    global = recommender.top_items(count: nil)
+    assert_equal "tea", global.first[:item_id]
+
+    recs = recommender.user_recs("unknown", count: 1, item_ids: ["rice"])
+    assert_equal ["rice"], recs.map { |r| r[:item_id] }
+    assert_equal global.find { |r| r[:item_id] == "rice" }[:score], recs.first[:score]
+
+    assert_empty recommender.user_recs("unknown", item_ids: [])
+    assert_empty recommender.user_recs("unknown", item_ids: ["missing"])
+  end
+
   def test_top_items_not_computed
     data = Disco.load_movielens
     recommender = Disco::Recommender.new(factors: 20)
