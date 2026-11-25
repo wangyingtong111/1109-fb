@@ -151,37 +151,81 @@ class LabelMatcher:
         return counts, details
 
 
+def hungarian_mapping(
+    cooccurrence: np.ndarray,
+    a_labels: list["Label"],
+    b_labels: list["Label"],
+) -> dict["Label", "Label"]:
+    """Hungarian one-to-one mapping from a cooccurrence matrix
+
+    Parameters
+    ----------
+    cooccurrence : np.ndarray
+        Cooccurrence matrix of shape ``(len(a_labels), len(b_labels))``.
+    a_labels, b_labels : list of Label
+        Labels associated, respectively, with the rows and the columns of
+        ``cooccurrence``.
+
+    Returns
+    -------
+    mapping : dict
+        Optimal one-to-one mapping between labels of ``a_labels`` (keys) and
+        labels of ``b_labels`` (values). Pairs with zero cooccurrence are not
+        included in the returned mapping.
+    """
+    mapping = {}
+    for a, b in zip(*linear_sum_assignment(-cooccurrence)):
+        if cooccurrence[a, b] > 0:
+            mapping[a_labels[a]] = b_labels[b]
+    return mapping
+
+
+def greedy_mapping(
+    cooccurrence: np.ndarray,
+    a_labels: list["Label"],
+    b_labels: list["Label"],
+) -> dict["Label", "Label"]:
+    """Greedy one-to-one mapping from a cooccurrence matrix
+
+    Parameters
+    ----------
+    cooccurrence : np.ndarray
+        Cooccurrence matrix of shape ``(len(a_labels), len(b_labels))``.
+        It is modified in place: rows and columns of selected pairs are
+        zeroed out.
+    a_labels, b_labels : list of Label
+        Labels associated, respectively, with the rows and the columns of
+        ``cooccurrence``.
+
+    Returns
+    -------
+    mapping : dict
+        Greedy one-to-one mapping between labels of ``a_labels`` (keys) and
+        labels of ``b_labels`` (values). Pairs with zero cooccurrence are not
+        included in the returned mapping.
+    """
+    mapping = {}
+    Na, Nb = cooccurrence.shape
+    for _ in range(min(Na, Nb)):
+        a, b = np.unravel_index(np.argmax(cooccurrence), (Na, Nb))
+        if cooccurrence[a, b] > 0:
+            mapping[a_labels[a]] = b_labels[b]
+            cooccurrence[a, :] = 0.0
+            cooccurrence[:, b] = 0.0
+            continue
+        break
+    return mapping
+
+
 class HungarianMapper:
     def __call__(self, A: Annotation, B: Annotation) -> dict["Label", "Label"]:
-        mapping = {}
-
         cooccurrence = A * B
         a_labels, b_labels = A.labels(), B.labels()
-
-        for a, b in zip(*linear_sum_assignment(-cooccurrence)):
-            if cooccurrence[a, b] > 0:
-                mapping[a_labels[a]] = b_labels[b]
-
-        return mapping
+        return hungarian_mapping(cooccurrence, a_labels, b_labels)
 
 
 class GreedyMapper:
     def __call__(self, A: Annotation, B: Annotation) -> dict["Label", "Label"]:
-        mapping = {}
-
         cooccurrence = A * B
-        Na, Nb = cooccurrence.shape
         a_labels, b_labels = A.labels(), B.labels()
-
-        for i in range(min(Na, Nb)):
-            a, b = np.unravel_index(np.argmax(cooccurrence), (Na, Nb))
-
-            if cooccurrence[a, b] > 0:
-                mapping[a_labels[a]] = b_labels[b]
-                cooccurrence[a, :] = 0.0
-                cooccurrence[:, b] = 0.0
-                continue
-
-            break
-
-        return mapping
+        return greedy_mapping(cooccurrence, a_labels, b_labels)

@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- feat: add `MappedDiarizationErrorRate.optimal_mapping_group` and
+  `evaluate_group` to evaluate several files of one conversation (e.g. a
+  continuous recording split into multiple files) with a single global
+  speaker label mapping; per-file evaluation maps, collars and scoring stay
+  independent. A shared `mapping` can also be passed to each metric call.
+  Supported by `DiarizationErrorRate`, `GreedyDiarizationErrorRate` and
+  `JaccardErrorRate`.
+
 ## Version 4.2.0 (2026-10-16)
 
 - BREAKING: require Python 3.11 or newer; Python 3.10 is no longer supported

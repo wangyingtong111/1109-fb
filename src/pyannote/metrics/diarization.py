@@ -25,18 +25,27 @@
 
 """Metrics for diarization"""
 
+from collections.abc import Iterable
+
 import numpy as np
 from pyannote.core import Annotation, Timeline
 from pyannote.core.utils.types import Label
 
 from .base import BaseMetric
 from .identification import IdentificationErrorRate
-from .matcher import GreedyMapper, HungarianMapper
+from .matcher import GreedyMapper, HungarianMapper, greedy_mapping, hungarian_mapping
 from .types import Details, MetricComponents
 from .utils import UEMSupportMixin
 
 # TODO: can't we put these as class attributes?
 DER_NAME = "diarization error rate"
+
+# one file of a conversation: (reference, hypothesis[, uem[, uri]])
+GroupFile = (
+    tuple[Annotation, Annotation]
+    | tuple[Annotation, Annotation, Timeline]
+    | tuple[Annotation, Annotation, Timeline, str]
+)
 
 
 class DiarizationSpeakerCountAccuracy(UEMSupportMixin, BaseMetric):
@@ -131,13 +140,20 @@ class DiarizationSpeakerCountError(UEMSupportMixin, BaseMetric):
         return report
 
 
-class DiarizationErrorRate(IdentificationErrorRate):
-    """Diarization error rate
+class MappedDiarizationErrorRate(IdentificationErrorRate):
+    """Base class for diarization error rates based on a label mapping
 
-    First, the optimal mapping between reference and hypothesis labels
-    is obtained using the Hungarian algorithm. Then, the actual diarization
-    error rate is computed as the identification error rate with each hypothesis
-    label translated into the corresponding reference label.
+    Concrete subclasses provide a one-to-one mapping between hypothesis and
+    reference labels (e.g. the optimal mapping from the Hungarian algorithm
+    or a greedy mapping). The actual diarization error rate is then computed
+    as the identification error rate with each hypothesis label translated
+    into the corresponding reference label.
+
+    This class also supports evaluating several files that belong to the same
+    conversation (e.g. a continuous recording split into multiple files) with
+    a single global label mapping: see :meth:`optimal_mapping_group` and
+    :meth:`evaluate_group`. Each file is still scored independently, with its
+    own evaluation map (``uem``) and collar.
 
     Parameters
     ----------
@@ -165,6 +181,22 @@ class DiarizationErrorRate(IdentificationErrorRate):
         >>> global_value = abs(metric)            # doctest: +SKIP
         >>> mean, (lower, upper) = metric.confidence_interval() # doctest: +SKIP
 
+    * Evaluate several files known to belong to the same conversation
+      (e.g. a continuous recording split into multiple files) with a single
+      global label mapping shared by every file. Each file is still scored
+      independently -- with its own evaluation map and collar -- and the
+      components keep accumulating in the metric instance. This prevents a
+      label swap between files from being hidden by a per-file remapping:
+
+        >>> files = [                             # doctest: +SKIP
+        ...     (reference_1, hypothesis_1, uem_1),
+        ...     (reference_2, hypothesis_2, uem_2),
+        ... ]
+        >>> mapping = metric.optimal_mapping_group(files)  # doctest: +SKIP
+        >>> for reference, hypothesis, uem in files:       # doctest: +SKIP
+        ...     metric(reference, hypothesis, uem=uem, mapping=mapping)
+        >>> global_value = abs(metric)            # doctest: +SKIP
+
     * Get diarization error rate detailed components
 
         >>> components = metric(reference, hypothesis, detailed=True) #doctest +SKIP
@@ -188,6 +220,55 @@ class DiarizationErrorRate(IdentificationErrorRate):
     def __init__(self, collar: float = 0.0, skip_overlap: bool = False, **kwargs):
         super().__init__(collar=collar, skip_overlap=skip_overlap, **kwargs)
         self.mapper_ = HungarianMapper()
+
+    @staticmethod
+    def _unpack_file(
+        file: tuple[Annotation, Annotation]
+        | tuple[Annotation, Annotation, Timeline]
+        | tuple[Annotation, Annotation, Timeline, str],
+    ) -> tuple[Annotation, Annotation, Timeline | None, str | None]:
+        """Split a ``(reference, hypothesis[, uem[, uri]])`` file tuple"""
+        if len(file) == 2:
+            reference, hypothesis = file
+            return reference, hypothesis, None, None
+        if len(file) == 3:
+            reference, hypothesis, uem = file
+            return reference, hypothesis, uem, None
+        reference, hypothesis, uem, uri = file
+        return reference, hypothesis, uem, uri
+
+    @staticmethod
+    def _apply_mapping(
+        hypothesis: Annotation, mapping: dict[Label, Label]
+    ) -> Annotation:
+        """Rename hypothesis labels with `mapping`, isolating unmapped labels.
+
+        Unmapped labels are renamed to unique tuple labels so that they can
+        never be mistaken for a reference label when the identification error
+        rate is computed. This mirrors the per-file behavior where hypothesis
+        labels are systematically renamed to integers and therefore cannot
+        match any (string) reference label.
+        """
+        full_mapping = dict(mapping)
+        for index, label in enumerate(hypothesis.labels()):
+            if label not in full_mapping:
+                full_mapping[label] = ("__unmapped_hypothesis_label__", index)
+        return hypothesis.rename_labels(mapping=full_mapping)
+
+    def _solve_mapping(
+        self,
+        cooccurrence: np.ndarray,
+        hypothesis_labels: list[Label],
+        reference_labels: list[Label],
+    ) -> dict[Label, Label]:
+        """Solve the one-to-one label assignment from a cooccurrence matrix"""
+        return hungarian_mapping(cooccurrence, hypothesis_labels, reference_labels)
+
+    def _per_file_mapping(
+        self, reference: Annotation, hypothesis: Annotation
+    ) -> dict[Label, Label]:
+        """Compute the optimal mapping for a single file"""
+        return self.optimal_mapping(reference, hypothesis)
 
     def optimal_mapping(
         self,
@@ -220,13 +301,134 @@ class DiarizationErrorRate(IdentificationErrorRate):
         # call hungarian mapper
         return self.mapper_(hypothesis, reference)
 
-    def compute_components(
+    def optimal_mapping_group(
+        self,
+        files: Iterable[GroupFile],
+    ) -> dict[Label, Label]:
+        """Optimal label mapping shared by every file of one conversation
+
+        When a continuous recording is split into several files, business
+        speaker identities are expected to stay consistent across files. This
+        method accumulates the reference/hypothesis cooccurrence durations of
+        every file and solves the label assignment once, globally, instead of
+        allowing each file to pick its own permutation of the labels.
+
+        Each file is preprocessed independently: its own evaluation map
+        (``uem``), collar and overlap settings are applied before its
+        cooccurrence matrix is accumulated. Labels themselves are left
+        untouched, so the same hypothesis label found in several files is
+        treated as the same speaker.
+
+        Parameters
+        ----------
+        files : iterable of tuple
+            One ``(reference, hypothesis)``, ``(reference, hypothesis, uem)``
+            or ``(reference, hypothesis, uem, uri)`` tuple per file of the
+            conversation. All files are expected to use the same reference and
+            hypothesis label namespaces.
+
+        Returns
+        -------
+        mapping : dict
+            Mapping between hypothesis (key) and reference (value) labels,
+            valid for every file of the group. Pass it to subsequent calls of
+            the metric through the ``mapping`` keyword argument.
+        """
+
+        # accumulate cooccurrence durations in nested dictionaries keyed by
+        # raw hypothesis and reference labels
+        cooccurrence: dict[Label, dict[Label, float]] = {}
+
+        for file in files:
+            reference, hypothesis, uem, _ = self._unpack_file(file)
+
+            # crop each file independently to its own evaluated regions,
+            # removing its own collars / overlap regions
+            reference, hypothesis = self.uemify(
+                reference,
+                hypothesis,
+                uem=uem,
+                collar=self.collar,
+                skip_overlap=self.skip_overlap,
+            )
+
+            matrix = hypothesis * reference
+            h_labels = hypothesis.labels()
+            r_labels = reference.labels()
+            for i, h_label in enumerate(h_labels):
+                row = cooccurrence.setdefault(h_label, {})
+                for j, r_label in enumerate(r_labels):
+                    row[r_label] = row.get(r_label, 0.0) + matrix[i, j]
+
+        hypothesis_labels = sorted(cooccurrence, key=str)
+        reference_labels = sorted(
+            {r_label for row in cooccurrence.values() for r_label in row},
+            key=str,
+        )
+        matrix = np.zeros((len(hypothesis_labels), len(reference_labels)))
+        for i, h_label in enumerate(hypothesis_labels):
+            for j, r_label in enumerate(reference_labels):
+                matrix[i, j] = cooccurrence[h_label].get(r_label, 0.0)
+
+        return self._solve_mapping(matrix, hypothesis_labels, reference_labels)
+
+    def evaluate_group(
+        self,
+        files: Iterable[GroupFile],
+        detailed: bool = False,
+    ) -> tuple[dict[Label, Label], list]:
+        """Evaluate several files of one conversation with one global mapping
+
+        This first computes a single global label mapping with
+        :meth:`optimal_mapping_group`, then scores every file independently
+        -- each file keeps its own evaluation map and collar -- and
+        accumulates their components into this metric instance, as if the
+        files had been evaluated one by one.
+
+        Parameters
+        ----------
+        files : iterable of tuple
+            One ``(reference, hypothesis)``, ``(reference, hypothesis, uem)``
+            or ``(reference, hypothesis, uem, uri)`` tuple per file of the
+            conversation. The optional ``uri`` is used to label per-file rows
+            of the evaluation report.
+        detailed : bool, optional
+            By default (False), each per-file result is the metric value only.
+            Set to True to return the per-file component dictionaries.
+
+        Returns
+        -------
+        mapping : dict
+            The global hypothesis-to-reference mapping used for every file.
+        results : list
+            Per-file metric values (or component dictionaries when
+            ``detailed`` is True), in the same order as ``files``.
+        """
+        files = list(files)
+        mapping = self.optimal_mapping_group(files)
+        results = []
+        for file in files:
+            reference, hypothesis, uem, uri = self._unpack_file(file)
+            results.append(
+                self(
+                    reference,
+                    hypothesis,
+                    detailed=detailed,
+                    uem=uem,
+                    uri=uri,
+                    mapping=mapping,
+                )
+            )
+        return mapping, results
+
+    def _prepare_and_map(
         self,
         reference: Annotation,
         hypothesis: Annotation,
-        uem: Timeline | None = None,
-        **kwargs,
-    ) -> Details:
+        uem: Timeline | None,
+        mapping: dict[Label, Label] | None,
+    ) -> tuple[Annotation, Annotation, Timeline, dict[Label, Label]]:
+        """Apply per-file preprocessing and label mapping"""
         # crop reference and hypothesis to evaluated regions (uem)
         # remove collars around reference segment boundaries
         # remove overlap regions (if requested)
@@ -241,25 +443,111 @@ class DiarizationErrorRate(IdentificationErrorRate):
         # NOTE that this 'uemification' must be done here because it
         # might have an impact on the search for the optimal mapping.
 
-        # make sure reference only contains string labels ('A', 'B', ...)
-        reference = reference.rename_labels(generator="string")
+        if mapping is None:
+            # make sure reference only contains string labels ('A', 'B', ...)
+            reference = reference.rename_labels(generator="string")
 
-        # make sure hypothesis only contains integer labels (1, 2, ...)
-        hypothesis = hypothesis.rename_labels(generator="int")
+            # make sure hypothesis only contains integer labels (1, 2, ...)
+            hypothesis = hypothesis.rename_labels(generator="int")
 
-        # optimal (int --> str) mapping
-        mapping = self.optimal_mapping(reference, hypothesis)
+            # per-file optimal (int --> str) mapping
+            mapping = self._per_file_mapping(reference, hypothesis)
+
+        # when a group-level mapping is provided, labels are not renamed: the
+        # very same mapping must apply consistently to every file of the group.
 
         # compute identification error rate based on mapped hypothesis
         # NOTE that collar is set to 0.0 because 'uemify' has already
         # been applied (same reason for setting skip_overlap to False)
-        mapped = hypothesis.rename_labels(mapping=mapping)
+        mapped = self._apply_mapping(hypothesis, mapping)
+        return reference, mapped, uem, mapping
+
+    def compute_components(
+        self,
+        reference: Annotation,
+        hypothesis: Annotation,
+        uem: Timeline | None = None,
+        mapping: dict[Label, Label] | None = None,
+        **kwargs,
+    ) -> Details:
+        reference, mapped, uem, _ = self._prepare_and_map(
+            reference, hypothesis, uem, mapping
+        )
         return super().compute_components(
             reference, mapped, uem=uem, collar=0.0, skip_overlap=False, **kwargs
         )
 
 
-class GreedyDiarizationErrorRate(IdentificationErrorRate):
+class DiarizationErrorRate(MappedDiarizationErrorRate):
+    """Diarization error rate
+
+    First, the optimal mapping between reference and hypothesis labels
+    is obtained using the Hungarian algorithm. Then, the actual diarization
+    error rate is computed as the identification error rate with each hypothesis
+    label translated into the corresponding reference label.
+
+    When several files belong to the same conversation, a single global
+    mapping can be shared across files through
+    :meth:`MappedDiarizationErrorRate.optimal_mapping_group` and
+    :meth:`MappedDiarizationErrorRate.evaluate_group`.
+
+    Parameters
+    ----------
+    collar : float, optional
+        Duration (in seconds) of collars removed from evaluation around
+        boundaries of reference segments.
+    skip_overlap : bool, optional
+        Set to True to not evaluate overlap regions.
+        Defaults to False (i.e. keep overlap regions).
+    """
+
+    def _solve_mapping(
+        self,
+        cooccurrence: np.ndarray,
+        hypothesis_labels: list[Label],
+        reference_labels: list[Label],
+    ) -> dict[Label, Label]:
+        return hungarian_mapping(cooccurrence, hypothesis_labels, reference_labels)
+
+    def _per_file_mapping(
+        self, reference: Annotation, hypothesis: Annotation
+    ) -> dict[Label, Label]:
+        """Compute the optimal mapping for a single file"""
+        return self.optimal_mapping(reference, hypothesis)
+
+    def optimal_mapping(
+        self,
+        reference: Annotation,
+        hypothesis: Annotation,
+        uem: Timeline | None = None,
+    ) -> dict[Label, Label]:
+        """Optimal label mapping
+
+        Parameters
+        ----------
+        reference : Annotation
+        hypothesis : Annotation
+            Reference and hypothesis diarization
+        uem : Timeline
+            Evaluation map
+
+        Returns
+        -------
+        mapping : dict
+            Mapping between hypothesis (key) and reference (value) labels
+        """
+
+        # NOTE that this 'uemification' will not be called when
+        # 'optimal_mapping' is called from 'compute_components' as it
+        # has already been done in 'compute_components'
+        if uem:
+            reference, hypothesis = self.uemify(reference, hypothesis, uem=uem)
+
+        # call hungarian mapper
+        return self.mapper_(hypothesis, reference)
+
+
+class GreedyDiarizationErrorRate(MappedDiarizationErrorRate):
     """Greedy diarization error rate
 
     First, the greedy mapping between reference and hypothesis labels is
@@ -308,13 +596,24 @@ class GreedyDiarizationErrorRate(IdentificationErrorRate):
 
     """
 
-    @classmethod
-    def metric_name(cls):
-        return DER_NAME
-
     def __init__(self, collar: float = 0.0, skip_overlap: bool = False, **kwargs):
         super().__init__(collar=collar, skip_overlap=skip_overlap, **kwargs)
         self.mapper_ = GreedyMapper()
+
+    def _solve_mapping(
+        self,
+        cooccurrence: np.ndarray,
+        hypothesis_labels: list[Label],
+        reference_labels: list[Label],
+    ) -> dict[Label, Label]:
+        # the greedy mapper modifies the cooccurrence matrix in place
+        return greedy_mapping(cooccurrence, hypothesis_labels, reference_labels)
+
+    def _per_file_mapping(
+        self, reference: Annotation, hypothesis: Annotation
+    ) -> dict[Label, Label]:
+        """Compute the greedy mapping for a single file"""
+        return self.greedy_mapping(reference, hypothesis)
 
     def greedy_mapping(
         self,
@@ -340,44 +639,6 @@ class GreedyDiarizationErrorRate(IdentificationErrorRate):
         if uem:
             reference, hypothesis = self.uemify(reference, hypothesis, uem=uem)
         return self.mapper_(hypothesis, reference)
-
-    def compute_components(
-        self,
-        reference: Annotation,
-        hypothesis: Annotation,
-        uem: Timeline | None = None,
-        **kwargs,
-    ) -> Details:
-        # crop reference and hypothesis to evaluated regions (uem)
-        # remove collars around reference segment boundaries
-        # remove overlap regions (if requested)
-        reference, hypothesis, uem = self.uemify(
-            reference,
-            hypothesis,
-            uem=uem,
-            collar=self.collar,
-            skip_overlap=self.skip_overlap,
-            returns_uem=True,
-        )
-        # NOTE that this 'uemification' must be done here because it
-        # might have an impact on the search for the greedy mapping.
-
-        # make sure reference only contains string labels ('A', 'B', ...)
-        reference = reference.rename_labels(generator="string")
-
-        # make sure hypothesis only contains integer labels (1, 2, ...)
-        hypothesis = hypothesis.rename_labels(generator="int")
-
-        # greedy (int --> str) mapping
-        mapping = self.greedy_mapping(reference, hypothesis)
-
-        # compute identification error rate based on mapped hypothesis
-        # NOTE that collar is set to 0.0 because 'uemify' has already
-        # been applied (same reason for setting skip_overlap to False)
-        mapped = hypothesis.rename_labels(mapping=mapping)
-        return super().compute_components(
-            reference, mapped, uem=uem, collar=0.0, skip_overlap=False, **kwargs
-        )
 
 
 JER_NAME = "jaccard error rate"
@@ -471,35 +732,26 @@ class JaccardErrorRate(DiarizationErrorRate):
         reference: Annotation,
         hypothesis: Annotation,
         uem: Timeline | None = None,
+        mapping: dict[Label, Label] | None = None,
         **kwargs,
     ) -> Details:
-        # crop reference and hypothesis to evaluated regions (uem)
-        # remove collars around reference segment boundaries
-        # remove overlap regions (if requested)
-        reference, hypothesis, uem = self.uemify(
-            reference,
-            hypothesis,
-            uem=uem,
-            collar=self.collar,
-            skip_overlap=self.skip_overlap,
-            returns_uem=True,
+        # crop reference and hypothesis to evaluated regions (uem), remove
+        # collars / overlap regions, and translate hypothesis labels into
+        # reference labels. When `mapping` is None, a per-file optimal mapping
+        # is used; otherwise the shared group-level mapping is enforced.
+        reference, hypothesis, _, _ = self._prepare_and_map(
+            reference, hypothesis, uem, mapping
         )
-        # NOTE that this 'uemification' must be done here because it
-        # might have an impact on the search for the optimal mapping.
 
-        # make sure reference only contains string labels ('A', 'B', ...)
-        reference = reference.rename_labels(generator="string")
-
-        # make sure hypothesis only contains integer labels (1, 2, ...)
-        hypothesis = hypothesis.rename_labels(generator="int")
-
-        # optimal (str --> int) mapping
-        mapping = self.optimal_mapping(hypothesis, reference)
+        # after renaming, every paired hypothesis speaker carries the label of
+        # its reference speaker; unmapped hypothesis speakers carry unique
+        # tuple labels and therefore cannot match any reference speaker.
+        hypothesis_labels = set(hypothesis.labels())
 
         detail = self.init_components()
 
         for ref_speaker in reference.labels():
-            hyp_speaker = mapping.get(ref_speaker, None)
+            hyp_speaker = ref_speaker if ref_speaker in hypothesis_labels else None
 
             if hyp_speaker is None:
                 # if the reference speaker was not paired with a system speaker
