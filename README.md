@@ -52,6 +52,7 @@ options = {
   clean:               true, # remove some special characters
   classic_filter:      true, # removes dots from acronyms and 's from the end of tokens
   downcase:            false, # do not downcase tokens
+  canonical:           true, # match stop words through a language dependent canonical key (the output tokens keep their original glyph and casing)
   minimum_length:      3, # remove any tokens less than 3 characters
   long_word_split:     10 # split tokens longer than 10 characters at hypens or underscores
 }
@@ -89,6 +90,16 @@ options = {
   Removes all stop words.
 - `false`   
   Does not remove stop words.
+
+<hr>
+
+##### `canonical`
+  **default** = `false`
+- Only applies while `remove_stop_words` is `true`. Use together with `downcase: false` when you want to keep the original glyph and casing of the output tokens.
+- `true`  
+  Matches tokens against the stop words through a language dependent canonical key. The key applies the language specific case folding (for example the Turkish dotted/dotless `i` mapping) and Unicode canonical normalization, so composed and decomposed glyphs such as `é` and `e` + combining accent compare equal. Distinct letters are still distinct (`café` does not match `cafe`), and the output tokens are never altered by the comparison. With the French stop word `café`, input `café cafe Érable` only removes the first token, keeping `cafe` and `Érable` untouched. With the Turkish stop word `i`, input `İ I ı i` removes `İ` and `i` while keeping `I` and `ı`.
+- `false`   
+  Keeps the current literal matching: stop words are compared with the plain downcased token, and composed vs decomposed glyphs stay distinct.
 
 <hr>
 

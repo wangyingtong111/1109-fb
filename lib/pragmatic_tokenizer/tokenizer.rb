@@ -47,6 +47,7 @@ module PragmaticTokenizer
     # @option opts [String] :mentions - :remove (will completely remove it), :keep_and_clean (will prefix) and :keep_original (don't alter the token at all). - can be a String or symbol (i.e. :keep_and_clean or 'keep_and_clean')
     # @option opts [String] :hashtags - :remove (will completely remove it), :keep_and_clean (will prefix) and :keep_original (don't alter the token at all). - can be a String or symbol (i.e. :keep_and_clean or 'keep_and_clean')
     # @option opts [Boolean] :downcase - (default: true)
+    # @option opts [Boolean] :canonical - (default: false) when removing stop words, match tokens against the stop words through a language dependent canonical key (language specific case folding plus Unicode canonical normalization). The output tokens keep their original glyph and casing; only the comparison uses the canonical key. When false, stop words keep using the current literal, inverse-cased matching (composed and decomposed glyphs are not folded together).
     # @option opts [Boolean] :clean - (default: false)
     # @option opts [Boolean] :classic_filter - removes dots from acronyms and 's from the end of tokens - (default: false)
     # @option opts [Boolean] :remove_emoji - (default: false)
@@ -66,6 +67,7 @@ module PragmaticTokenizer
       @mentions            = opts[:mentions] ? opts[:mentions].to_sym : :keep_original
       @hashtags            = opts[:hashtags] ? opts[:hashtags].to_sym : :keep_original
       @downcase            = opts[:downcase].nil? ? true : opts[:downcase]
+      @canonical           = opts[:canonical].nil? ? opts[:canonical_comparison] : opts[:canonical]
       @clean               = opts[:clean]
       @classic_filter      = opts[:classic_filter]
       @remove_emoji        = opts[:remove_emoji]
@@ -87,6 +89,11 @@ module PragmaticTokenizer
         @abbreviations += language::ABBREVIATIONS
         @stop_words    += language::STOP_WORDS
       end
+
+      # Canonical keys are derived once from the merged stop words with the
+      # language specific rules. The stop words themselves stay untouched, so
+      # switching canonical matching off restores the plain, literal equivalence.
+      @canonical_stop_words = Set.new(@stop_words.map { |word| Unicode.canonicalize(word, @language_module) }) if @canonical
 
       raise "Punctuation argument can be only be nil, :all, :semi, :none, or :only" unless PUNCTUATION_OPTIONS.include?(@punctuation)
       raise "Numbers argument can be only be nil, :all, :semi, :none, or :only" unless NUMBERS_OPTIONS.include?(@numbers)
@@ -208,7 +215,11 @@ module PragmaticTokenizer
       end
 
       def remove_stop_words!
-        @tokens.delete_if { |token| @stop_words.include?(inverse_case(token)) }
+        if @canonical
+          @tokens.delete_if { |token| @canonical_stop_words.include?(Unicode.canonicalize(token, @language_module)) }
+        else
+          @tokens.delete_if { |token| @stop_words.include?(inverse_case(token)) }
+        end
       end
 
       def mentions!
