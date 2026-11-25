@@ -1,5 +1,9 @@
 ## HEAD
 
+### Minor Enhancements
+
+  * Add a projection mode to LSI text search (`search(..., projection: true)`) that measures external queries in the index's truncated SVD space without adding terms or retraining the index.
+
 ### Documentation
 
   * Update macOS instructions in Numo docs (#199)

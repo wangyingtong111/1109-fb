@@ -55,6 +55,11 @@ module ClassifierReborn
       @items = {}
       @version = 0
       @built_at_version = -1
+      # The term-space basis retained by the truncated SVD. It is only used
+      # to project external queries into the index's reduced space without
+      # adding new terms or retraining the index. It stays +nil+ until the
+      # index is built.
+      @projection_basis = nil
       @language = options[:language] || 'en'
       @token_filters = [
         TokenFilter::Stopword,
@@ -154,7 +159,7 @@ module ClassifierReborn
 
       if $SVD == :numo
         tdm = Numo::NArray.asarray(tda.map(&:to_a)).transpose
-        ntdm = numo_build_reduced_matrix(tdm, cutoff)
+        ntdm, @projection_basis = numo_build_reduced_matrix(tdm, cutoff)
 
         ntdm.each_over_axis(1).with_index do |col_vec, i|
           doc_list[i].lsi_vector = col_vec
@@ -162,7 +167,7 @@ module ClassifierReborn
         end
       elsif $SVD == :gsl
         tdm = GSL::Matrix.alloc(*tda).trans
-        ntdm = build_reduced_matrix(tdm, cutoff)
+        ntdm, @projection_basis = build_reduced_matrix(tdm, cutoff)
 
         ntdm.size[1].times do |col|
           vec = GSL::Vector.alloc(ntdm.column(col)).row
@@ -171,7 +176,7 @@ module ClassifierReborn
         end
       else
         tdm = Matrix.rows(tda).trans
-        ntdm = build_reduced_matrix(tdm, cutoff)
+        ntdm, @projection_basis = build_reduced_matrix(tdm, cutoff)
 
         ntdm.column_size.times do |col|
           doc_list[col].lsi_vector = ntdm.column(col) if doc_list[col]
@@ -272,10 +277,27 @@ module ClassifierReborn
     #
     # While this may seem backwards compared to the other functions that LSI supports,
     # it is actually the same algorithm, just applied on a smaller document.
-    def search(string, max_nearest = 3)
+    #
+    # By default (+projection: false+) the query keeps the historical lexical-first
+    # behavior: unseen terms are simply ignored and the query vector is compared in
+    # the full term space, never touching the truncated SVD space.
+    #
+    # Pass +projection: true+ to measure the query strictly inside the reduced space
+    # chosen when the index was built. The external text is first encoded with the
+    # index's existing word list (so it can never introduce new terms), then projected
+    # onto the singular directions retained by the truncation. Terms whose directions
+    # were discarded therefore contribute nothing, and the index is never retrained or
+    # modified. If nothing of the query survives the projection, an empty array is
+    # returned.
+    def search(string, max_nearest = 3, projection: false, &block)
       return [] if needs_rebuild?
 
-      carry = proximity_norms_for_content(string)
+      carry =
+        if projection
+          proximity_projection_for_content(string, &block)
+        else
+          proximity_norms_for_content(string, &block)
+        end
       unless carry.nil?
         result = carry.collect { |x| x[0] }
         result[0..max_nearest - 1]
@@ -357,7 +379,12 @@ module ClassifierReborn
         s[ord] = 0.0 if s[ord] < s_cutoff
       end
       # Reconstruct the term document matrix, only with reduced rank
-      u * ($SVD == :gsl ? GSL::Matrix : ::Matrix).diag(s) * v.trans
+      reduced = u * ($SVD == :gsl ? GSL::Matrix : ::Matrix).diag(s) * v.trans
+      # The term-space basis kept by the truncation (columns of +u+ whose
+      # singular value survived). External queries are projected onto these
+      # directions, which are the only ones still represented by the index.
+      basis = retained_term_basis(u, s)
+      [reduced, basis]
     end
 
     def numo_build_reduced_matrix(matrix, cutoff = 0.75)
@@ -370,7 +397,40 @@ module ClassifierReborn
       end
 
       # Reconstruct the term document matrix, only with reduced rank
-      u.dot(::Numo::DFloat.eye(s.size) * s).dot(vt)
+      reduced = u.dot(::Numo::DFloat.eye(s.size) * s).dot(vt)
+      # Numo's SVD returns +u+ with singular vectors as columns, matching the
+      # orientation used by the GSL/Ruby backends.
+      basis = retained_term_basis(u, s)
+      [reduced, basis]
+    end
+
+    # Extracts the term-space directions that survived the singular value
+    # truncation. Both +matrix+ and the returned basis keep singular vectors as
+    # their columns, so a term vector projects via +basis * (basis.t * vec)+.
+    #
+    # A singular value that was zeroed by the cutoff can survive as a tiny
+    # floating-point residual in pure-Ruby builds, so values are compared
+    # against a relative tolerance rather than tested for exact zero.
+    def retained_term_basis(u, singular_values)
+      largest = singular_values.map(&:abs).max || 0.0
+      tolerance = basis_tolerance * largest
+      retained = singular_values.each_index.reject { |ord| singular_values[ord].abs <= tolerance }
+      retained = singular_values.each_index.to_a if retained.empty? && largest.zero?
+      if $SVD == :numo
+        u[true, retained].dup
+      elsif $SVD == :gsl
+        GSL::Matrix.alloc(*retained.map { |ord| u.column(ord) }).trans
+      else
+        ::Matrix.columns(retained.map { |ord| u.column(ord) })
+      end
+    end
+
+    # Relative tolerance separating values intentionally kept by the
+    # truncation from zeroed values that survive only as floating-point noise
+    # (notably from the pure-Ruby Jacobi SVD). The same tolerance also decides
+    # when a projected query has no usable component in the retained space.
+    def basis_tolerance
+      1.0e-10
     end
 
     def node_for_content(item, &block)
@@ -388,6 +448,102 @@ module ClassifierReborn
       end
 
       content_node
+    end
+
+    # Scoring primitive behind +search(..., projection: true)+. The query is
+    # encoded with the index's existing word list and projected into the
+    # truncated SVD space, so external text can neither add terms nor retrain
+    # the index. Each indexed document is scored by the cosine between its
+    # reduced-space vector and the projected query.
+    #
+    # Returns an empty array when none of the query's terms have a component in
+    # the directions kept by the index (for example, every term was removed by
+    # the truncation, or none of the terms are in the word list).
+    def proximity_projection_for_content(doc, &block)
+      return [] if needs_rebuild? || @projection_basis.nil?
+
+      content_node = projection_node_for_content(doc, &block)
+      return [] if content_node.nil?
+
+      raw_vector = content_node.raw_vector
+      return [] if raw_vector.nil? || near_zero_vector?(raw_vector)
+
+      projected = project_vector(raw_vector)
+      return [] if near_zero_vector?(projected)
+
+      projected_norm = normalize_vector(projected)
+
+      result =
+        @items.keys.collect do |item|
+          val = dot_vectors(projected_norm, @items[item].search_norm)
+          [item, val]
+        end
+      result.sort_by { |x| x[1] }.reverse
+    end
+
+    # Builds a query node for projection searches while guaranteeing it has a
+    # usable raw vector. Returns nil when the query shares no term with the
+    # index's word list, which also avoids the zero-vector normalization done by
+    # ContentNode#raw_vector_with on backends that raise on such vectors.
+    def projection_node_for_content(doc, &block)
+      return @items[doc] if @items[doc]
+
+      clean_word_hash = Hasher.word_hash((block ? yield(doc) : doc.to_s),
+                                         token_filters: @token_filters)
+      return nil unless clean_word_hash.keys.any? { |word| @word_list[word] }
+
+      ContentNode.new(clean_word_hash).tap { |node| node.raw_vector_with(@word_list) }
+    end
+
+    # Orthogonal projection of a term-space vector onto the retained singular
+    # directions: P * vec, where P = basis * basis^T is the projection matrix.
+    def project_vector(vector)
+      if $SVD == :numo
+        @projection_basis.dot(@projection_basis.transpose.dot(vector))
+      elsif $SVD == :gsl
+        @projection_basis * (@projection_basis.transpose * vector.col)
+      else
+        @projection_basis * (@projection_basis.transpose * vector)
+      end
+    end
+
+    def dot_vectors(left, right)
+      if $SVD == :numo
+        left.dot(right)
+      elsif $SVD == :gsl
+        left * right.col
+      else
+        left.inner_product(right)
+      end
+    end
+
+    def normalize_vector(vector)
+      if $SVD == :numo
+        vector / Numo::Linalg.norm(vector)
+      elsif $SVD == :gsl
+        vector.normalize
+      else
+        vector.normalize
+      end
+    end
+
+    def vector_norm(vector)
+      if $SVD == :numo
+        Numo::Linalg.norm(vector)
+      elsif $SVD == :gsl
+        vector.norm
+      else
+        vector.r
+      end
+    end
+
+    # A vector counts as zero when its magnitude is negligible relative to the
+    # largest reduced-document magnitude in the index. Using a relative
+    # threshold keeps the check stable across backends and corpora.
+    def near_zero_vector?(vector)
+      scale = @items.values.map { |node| vector_norm(node.lsi_vector) }.max || 1.0
+      scale = 1.0 if scale.zero?
+      vector_norm(vector) <= basis_tolerance * scale
     end
 
     def make_word_list
