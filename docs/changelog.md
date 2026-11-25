@@ -1,6 +1,12 @@
 Changelog
 =========
 
+## Unreleased
+
+**Enhancements**
+
+- `PathInfo` now reports the concrete shape and actual element count materialized at each contraction step via the `intermediate_shapes` and `actual_size_list` attributes and the `actual_sizes_report` method. These resolve size-1 broadcast and zero-length axes against the real operand shapes, unlike `size_list`, which uses the broadcast-promoted dimension dictionary. The existing cost model (`size_list`, `opt_cost`, `largest_intermediate` and the printed path representation) is unchanged.
+
 ## 3.4.0 / 2024-09-26
 
 NumPy has been removed from `opt_einsum` as a dependency allowing for more flexible installs.

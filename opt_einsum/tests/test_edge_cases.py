@@ -140,6 +140,96 @@ def test_pathinfo_for_empty_contraction() -> None:
     # some info is built lazily, so check repr
     assert repr(info)
     assert info.largest_intermediate == 1
+    # no contraction steps means no actual intermediates
+    assert info.intermediate_shapes == ()
+    assert info.actual_size_list == ()
+
+
+def test_pathinfo_actual_sizes_resolve_broadcasting() -> None:
+    # the first contraction produces ``ac`` with the size-1 ``a`` axis not yet
+    # broadcast against the ``ad`` operand: it really holds 3 elements, not 21
+    _, info = contract_path(
+        "ab,bc,ad->acd",
+        (1, 2),
+        (2, 3),
+        (7, 4),
+        shapes=True,
+        optimize=[(0, 1), (0, 1)],
+    )
+
+    # step 1: (1, 3) -> 3 elements; step 2: (7, 3, 4) -> 84 elements
+    assert info.actual_size_list == (3, 84)
+    assert tuple(info.intermediate_shapes[0]) == (3, 1)
+    assert tuple(info.intermediate_shapes[1]) == (7, 3, 4)
+
+    # the broadcast-inflated cost model is unchanged
+    assert tuple(info.size_list) == (21, 84)
+    assert int(info.largest_intermediate) == 84
+
+    # report string matches the concrete shapes
+    report = info.actual_sizes_report()
+    assert "elements=3" in report and "elements=84" in report
+
+    # and the real contraction produces the advertised element count
+    operands = np.ones((1, 2)), np.ones((2, 3)), np.ones((7, 4))
+    result = contract("ab,bc,ad->acd", *operands, optimize=[(0, 1), (0, 1)])
+    assert result.shape == (7, 3, 4)
+    assert result.size == info.actual_size_list[-1] == 84
+
+
+def test_pathinfo_actual_sizes_are_order_independent() -> None:
+    # swapping the operand order must leave the actual per-step element counts
+    # consistent with the concrete output shape
+    _, info = contract_path(
+        "ad,ab,bc->acd",
+        (7, 4),
+        (1, 2),
+        (2, 3),
+        shapes=True,
+        optimize=[(1, 2), (0, 1)],
+    )
+    assert info.actual_size_list == (3, 84)
+
+    operands = np.ones((7, 4)), np.ones((1, 2)), np.ones((2, 3))
+    result = contract("ad,ab,bc->acd", *operands, optimize=[(1, 2), (0, 1)])
+    assert result.shape == (7, 3, 4) and result.size == 84
+
+
+def test_pathinfo_actual_sizes_see_late_zero_length_axis() -> None:
+    # ``a`` has size 1 in the operands contracted first and only becomes
+    # zero-length in the third operand, which is met at the second step
+    _, info = contract_path(
+        "ab,bc,ad->acd",
+        (1, 2),
+        (2, 3),
+        (0, 4),
+        shapes=True,
+        optimize=[(0, 1), (0, 1)],
+    )
+
+    # first intermediate still physically contains 3 elements; final one is empty
+    assert info.actual_size_list == (3, 0)
+    assert tuple(info.intermediate_shapes[0]) == (3, 1)
+    assert tuple(info.intermediate_shapes[1]) == (0, 3, 4)
+
+    # the dict-based cost model cannot distinguish these and stays untouched
+    assert tuple(info.size_list) == (0, 0)
+
+    operands = np.ones((1, 2)), np.ones((2, 3)), np.ones((0, 4))
+    result = contract("ab,bc,ad->acd", *operands, optimize=[(0, 1), (0, 1)])
+    assert result.shape == (0, 3, 4) and result.size == 0
+
+
+def test_pathinfo_actual_sizes_match_model_without_broadcasting() -> None:
+    # with no size-1 / zero-length axes the actual report must agree exactly
+    # with the existing cost-model sizes
+    _, info = contract_path("ij,jk,kl->il", (2, 2), (2, 5), (5, 2), shapes=True)
+    assert info.actual_size_list == tuple(info.size_list)
+
+    # scalar intermediates contain a single element
+    _, scalar_info = contract_path("ab,ab->", (2, 3), (2, 3), shapes=True)
+    assert tuple(scalar_info.intermediate_shapes[0]) == ()
+    assert scalar_info.actual_size_list == (1,)
 
 
 @pytest.mark.parametrize(

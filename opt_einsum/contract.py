@@ -1,5 +1,7 @@
 """Contains the primary optimization and contraction routines."""
 
+import functools
+import operator
 from collections.abc import Collection, Iterable, Sequence
 from decimal import Decimal
 from functools import lru_cache
@@ -45,6 +47,7 @@ class PathInfo:
         opt_cost: int,
         size_list: Sequence[int],
         size_dict: dict[str, int],
+        intermediate_shapes: Sequence[TensorShapeType] = (),
     ):
         self.contraction_list = contraction_list
         self.input_subscripts = input_subscripts
@@ -61,6 +64,33 @@ class PathInfo:
         self.shapes = [tuple(size_dict[k] for k in ks) for ks in input_subscripts.split(",")]
         self.eq = f"{input_subscripts}->{output_subscript}"
         self.largest_intermediate = Decimal(max(size_list, default=1))
+
+        # Actual shape formed at each contraction step, with broadcasting (size 1)
+        # and zero-length axes resolved against the concrete operand shapes rather
+        # than the broadcast-promoted ``size_dict`` used by the cost model.
+        self.intermediate_shapes = tuple(intermediate_shapes)
+        # The actual number of elements materialized by each intermediate tensor;
+        # a scalar (empty shape) contains a single element.
+        self.actual_size_list = tuple(functools.reduce(operator.mul, shape, 1) for shape in self.intermediate_shapes)
+
+    def actual_sizes_report(self) -> str:
+        """A step-by-step report of the *actual* intermediate sizes.
+
+        Unlike :attr:`size_list`, which sizes each intermediate with the
+        broadcast-promoted :attr:`size_dict` and can therefore over-count axes
+        that have not yet been broadcast away (or under-count when a
+        zero-length axis only appears in a later operand), these figures are
+        derived from the concrete shape materialized at every step, so they
+        always match the number of elements actually allocated.
+
+        The cost model (:attr:`size_list`, :attr:`opt_cost`,
+        :attr:`largest_intermediate`) is left untouched.
+        """
+        lines = [f"Actual intermediate sizes for contraction:  {self.eq}"]
+        for n, (shape, num_elements) in enumerate(zip(self.intermediate_shapes, self.actual_size_list)):
+            einsum_str = self.contraction_list[n][2]
+            lines.append(f"  step {n + 1}:  {einsum_str}  shape={tuple(shape)}  elements={num_elements}")
+        return "\n".join(lines)
 
     def __repr__(self) -> str:
         # Return the path along with a nice string representation
@@ -361,6 +391,9 @@ def contract_path(
     scale_list = []
     size_list = []
     contraction_list = []
+    # Concrete shape produced at each contraction step, with broadcasting and
+    # zero-length axes resolved. Kept separate from the cost-model ``size_list``.
+    intermediate_shapes: list[TensorShapeType] = []
 
     # Build contraction tuple (positions, gemm, einsum_str, remaining)
     for cnum, contract_inds in enumerate(path_tuple):
@@ -396,6 +429,7 @@ def contract_path(
 
         input_list.append(idx_result)
         input_shapes.append(shp_result)
+        intermediate_shapes.append(shp_result)
 
         einsum_str = ",".join(tmp_inputs) + "->" + idx_result
 
@@ -425,6 +459,7 @@ def contract_path(
         opt_cost,
         size_list,
         size_dict,
+        intermediate_shapes,
     )
 
     return path_tuple, path_print
