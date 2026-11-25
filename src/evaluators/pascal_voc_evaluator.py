@@ -83,12 +83,19 @@ def get_pascalvoc_metrics(gt_boxes,
                           det_boxes,
                           iou_threshold=0.5,
                           method=MethodAveragePrecision.EVERY_POINT_INTERPOLATION,
-                          generate_table=False):
+                          generate_table=False,
+                          continuous=False,
+                          clip=False):
     """Get the metrics used by the VOC Pascal 2012 challenge.
     Args:
         boundingboxes: Object of the class BoundingBoxes representing ground truth and detected
         bounding boxes;
         iou_threshold: IOU threshold indicating which detections will be considered TP or FP
+        continuous: if True, IoU uses the continuous float borders of the boxes so that
+        sub-pixel geometry is kept all the way into the matching step. If False (default), the
+        historical inclusive whole-pixel rule is used unchanged.
+        clip: if True, each pair of boxes is matched on its clipped (visible) view. The clipping
+        is a view only, so the unclipped relative values of the boxes are never modified.
         (dget_pascalvoc_metricsns:
         A dictioanry contains information and metrics of each class.
         The key represents the class and the values are:
@@ -157,7 +164,7 @@ def get_pascalvoc_metrics(gt_boxes,
             for j, g in enumerate(gt):
                 # print('Ground truth gt => %s' %
                 #       str(g.get_absolute_bounding_box(format=BBFormat.XYX2Y2)))
-                iou = BoundingBox.iou(det, g)
+                iou = BoundingBox.iou(det, g, continuous=continuous, clip=clip)
                 if iou > iouMax:
                     iouMax = iou
                     id_match_gt = j

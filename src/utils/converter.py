@@ -2,12 +2,13 @@ import base64
 import json
 import os
 import xml.etree.ElementTree as ET
+from math import isfinite
 
 import pandas as pd
 import src.utils.general_utils as general_utils
 import src.utils.validations as validations
 from src.bounding_box import BoundingBox
-from src.utils.enumerators import BBFormat, BBType, CoordinatesType
+from src.utils.enumerators import (BBFormat, BBType, CoordinatesPrecision, CoordinatesType)
 
 
 def _get_annotation_files(file_path):
@@ -237,7 +238,8 @@ def text2bb(annotations_path,
             bb_type=BBType.GROUND_TRUTH,
             bb_format=BBFormat.XYWH,
             type_coordinates=CoordinatesType.ABSOLUTE,
-            img_dir=None):
+            img_dir=None,
+            precision=CoordinatesPrecision.QUANTIZED):
     ret = []
 
     # Get annotation files in the path
@@ -298,17 +300,30 @@ def text2bb(annotations_path,
                                  confidence=confidence,
                                  type_coordinates=type_coordinates,
                                  bb_type=bb_type,
-                                 format=bb_format)
+                                 format=bb_format,
+                                 precision=precision)
                 # If the format is correct, x,y,w,h,x2,y2 must be positive
                 x, y, w, h = bb.get_absolute_bounding_box(format=BBFormat.XYWH)
                 _, _, x2, y2 = bb.get_absolute_bounding_box(format=BBFormat.XYX2Y2)
-                if x < 0 or y < 0 or w < 0 or h < 0 or x2 < 0 or y2 < 0:
+                if precision == CoordinatesPrecision.EXACT:
+                    # A sub-pixel box may legitimately overflow the image (e.g. a box on the left
+                    # border has a negative x1). Such boxes are kept, since the clipped view is
+                    # selected explicitly when scoring/drawing. Only genuinely malformed boxes
+                    # (negative width/height or non-finite values) are rejected.
+                    values = (x, y, w, h, x2, y2)
+                    if any(not isfinite(v) for v in values) or w < 0 or h < 0 or x2 < x or y2 < y:
+                        continue
+                elif x < 0 or y < 0 or w < 0 or h < 0 or x2 < 0 or y2 < 0:
                     continue
                 ret.append(bb)
     return ret
 
 
-def yolo2bb(annotations_path, images_dir, file_obj_names, bb_type=BBType.GROUND_TRUTH):
+def yolo2bb(annotations_path,
+            images_dir,
+            file_obj_names,
+            bb_type=BBType.GROUND_TRUTH,
+            precision=CoordinatesPrecision.QUANTIZED):
     ret = []
     if not os.path.isfile(file_obj_names):
         print(f'Warning: File with names of classes {file_obj_names} not found.')
@@ -366,7 +381,8 @@ def yolo2bb(annotations_path, images_dir, file_obj_names, bb_type=BBType.GROUND_
                                  confidence=confidence,
                                  type_coordinates=CoordinatesType.RELATIVE,
                                  bb_type=bb_type,
-                                 format=BBFormat.YOLO)
+                                 format=BBFormat.YOLO,
+                                 precision=precision)
                 ret.append(bb)
     return ret
 

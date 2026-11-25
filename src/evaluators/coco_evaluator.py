@@ -22,10 +22,10 @@
 from collections import defaultdict
 
 import numpy as np
-from src.bounding_box import BBFormat
+from src.bounding_box import BBFormat, BoundingBox
 
 
-def get_coco_summary(groundtruth_bbs, detected_bbs):
+def get_coco_summary(groundtruth_bbs, detected_bbs, continuous=False, clip=False):
     """Calculate the 12 standard metrics used in COCOEval,
         AP, AP50, AP75,
         AR1, AR10, AR100,
@@ -42,6 +42,15 @@ def get_coco_summary(groundtruth_bbs, detected_bbs):
                 A list containing objects of type BoundingBox representing the ground-truth bounding boxes.
             detected_bbs : list
                 A list containing objects of type BoundingBox representing the detected bounding boxes.
+            continuous : bool
+                If True, IoU and the area-range filtering use the continuous float borders of the
+                boxes, so sub-pixel geometry is kept all the way into the matching step. Boxes that
+                only touch at an edge then share no area, and the input boxes are never modified.
+                If False (default), the historical COCO open-ended calculation is used unchanged.
+            clip : bool
+                If True, each box takes part in the matching with its clipped (visible) view. The
+                clipping is a view only, so the unclipped relative values of the boxes are never
+                modified. If False (default), the stored geometry is used.
     Returns:
             A dictionary with one entry for each metric.
     """
@@ -50,7 +59,10 @@ def get_coco_summary(groundtruth_bbs, detected_bbs):
     _bbs = _group_detections(detected_bbs, groundtruth_bbs)
 
     # pairwise ious
-    _ious = {k: _compute_ious(**v) for k, v in _bbs.items()}
+    _ious = {
+        k: _compute_ious(**v, continuous=continuous, clip=clip)
+        for k, v in _bbs.items()
+    }
 
     def _evaluate(iou_threshold, max_dets, area_range):
         # accumulate evaluations on a per-class basis
@@ -63,6 +75,8 @@ def get_coco_summary(groundtruth_bbs, detected_bbs):
                 iou_threshold,
                 max_dets,
                 area_range,
+                continuous=continuous,
+                clip=clip,
             )
             acc = _evals[class_id]
             acc["scores"].append(ev["scores"])
@@ -174,6 +188,8 @@ def get_coco_metrics(
         iou_threshold=0.5,
         area_range=(0, np.inf),
         max_dets=100,
+        continuous=False,
+        clip=False,
 ):
     """ Calculate the Average Precision and Recall metrics as in COCO's official implementation
         given an IOU threshold, area range and maximum number of detections.
@@ -189,6 +205,15 @@ def get_coco_metrics(
                 Lower and upper bounds on annotation areas that should be considered.
             max_dets : int
                 Upper bound on the number of detections to be considered for each class in an image.
+            continuous : bool
+                If True, IoU and the area-range filtering use the continuous float borders of the
+                boxes, so sub-pixel geometry is kept all the way into the matching step. Boxes that
+                only touch at an edge then share no area, and the input boxes are never modified.
+                If False (default), the historical COCO open-ended calculation is used unchanged.
+            clip : bool
+                If True, each box takes part in the matching with its clipped (visible) view. The
+                clipping is a view only, so the unclipped relative values of the boxes are never
+                modified. If False (default), the stored geometry is used.
 
     Returns:
             A list of dictionaries. One dictionary for each class.
@@ -211,7 +236,10 @@ def get_coco_metrics(
     _bbs = _group_detections(detected_bbs, groundtruth_bbs)
 
     # pairwise ious
-    _ious = {k: _compute_ious(**v) for k, v in _bbs.items()}
+    _ious = {
+        k: _compute_ious(**v, continuous=continuous, clip=clip)
+        for k, v in _bbs.items()
+    }
 
     # accumulate evaluations on a per-class basis
     _evals = defaultdict(lambda: {"scores": [], "matched": [], "NP": []})
@@ -224,6 +252,8 @@ def get_coco_metrics(
             iou_threshold,
             max_dets,
             area_range,
+            continuous=continuous,
+            clip=clip,
         )
         acc = _evals[class_id]
         acc["scores"].append(ev["scores"])
@@ -262,13 +292,25 @@ def _group_detections(dt, gt):
     return bb_info
 
 
-def _get_area(a):
-    """ COCO does not consider the outer edge as included in the bbox """
+def _get_area(a, continuous=False, clip=False):
+    """ COCO does not consider the outer edge as included in the bbox.
+
+    When continuous is True, the area is computed from the continuous float
+    borders so that sub-pixel boxes keep a non-zero area. When clip is True the
+    area of the clipped (visible) box is used. The received box is never
+    modified in either case.
+    """
+    if clip:
+        return a.get_area(continuous=continuous, clip=True)
+    if continuous:
+        return a.get_area(continuous=True)
     x, y, x2, y2 = a.get_absolute_bounding_box(format=BBFormat.XYX2Y2)
     return (x2 - x) * (y2 - y)
 
 
-def _jaccard(a, b):
+def _jaccard(a, b, continuous=False, clip=False):
+    if continuous or clip:
+        return BoundingBox.iou(a, b, continuous=continuous, clip=clip)
     xa, ya, x2a, y2a = a.get_absolute_bounding_box(format=BBFormat.XYX2Y2)
     xb, yb, x2b, y2b = b.get_absolute_bounding_box(format=BBFormat.XYX2Y2)
 
@@ -287,17 +329,24 @@ def _jaccard(a, b):
     return Ai / (Aa + Ab - Ai)
 
 
-def _compute_ious(dt, gt):
+def _compute_ious(dt, gt, continuous=False, clip=False):
     """ compute pairwise ious """
 
     ious = np.zeros((len(dt), len(gt)))
     for g_idx, g in enumerate(gt):
         for d_idx, d in enumerate(dt):
-            ious[d_idx, g_idx] = _jaccard(d, g)
+            ious[d_idx, g_idx] = _jaccard(d, g, continuous=continuous, clip=clip)
     return ious
 
 
-def _evaluate_image(dt, gt, ious, iou_threshold, max_dets=None, area_range=None):
+def _evaluate_image(dt,
+                    gt,
+                    ious,
+                    iou_threshold,
+                    max_dets=None,
+                    area_range=None,
+                    continuous=False,
+                    clip=False):
     """ use COCO's method to associate detections to ground truths """
     # sort dts by increasing confidence
     dt_sort = np.argsort([-d.get_confidence() for d in dt], kind="stable")
@@ -310,7 +359,8 @@ def _evaluate_image(dt, gt, ious, iou_threshold, max_dets=None, area_range=None)
     def _is_ignore(bb):
         if area_range is None:
             return False
-        return not (area_range[0] <= _get_area(bb) <= area_range[1])
+        return not (area_range[0] <= _get_area(
+            bb, continuous=continuous, clip=clip) <= area_range[1])
 
     gt_ignore = [_is_ignore(g) for g in gt]
 

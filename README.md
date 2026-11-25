@@ -50,6 +50,7 @@ Ideally, in order to have trustworthy benchmarking among different approaches, i
   - [Table of contents](#table-of-contents)
   - [Supported bounding box formats](#supported-bounding-box-formats)
   - [A practical example](#a-practical-example)
+  - [Sub-pixel normalized boxes and clipped views](#sub-pixel-normalized-boxes-and-clipped-views)
   - [Metrics](#metrics)
     - [AP with IOU Threshold *t=0.5*](#ap-with-iou-threshold-t05)
     - [mAP with IOU Threshold *t=0.5*](#map-with-iou-threshold-t05)
@@ -133,6 +134,66 @@ When an IOU threshold *t=0.5* was applied (plots of the first row in image above
 
 In both cases, the all-point interpolation approach considers larger areas above the curve into the summation and consequently obtains higher results.
 When a lower IOU threshold was considered, the AP was reduced drastically in both interpolation approaches. This is caused by the flexibility the threshold brings in considering TP detections.
+
+## Sub-pixel normalized boxes and clipped views
+
+Detection models usually output **normalized** values (`center x`, `center y`,
+`width`, `height`). By default `BoundingBox` keeps the historical behaviour and
+rounds the resulting borders to whole pixels. For small objects that rounding
+destroys the geometry, so an opt-in precision keeps the floats all the way into
+the matching/scoring step:
+
+```python
+from src.bounding_box import BoundingBox
+from src.utils.enumerators import BBFormat, CoordinatesPrecision, CoordinatesType
+
+# 100x50 image, center x=.5, relative width .005
+box = BoundingBox('image.jpg', 'car', (.5, .5, .005, .01),
+                  type_coordinates=CoordinatesType.RELATIVE,
+                  img_size=(100, 50),
+                  precision=CoordinatesPrecision.EXACT)
+
+box.get_absolute_bounding_box(BBFormat.XYX2Y2)  # (49.75, 24.75, 50.25, 25.25)
+box.get_relative_bounding_box()[2]              # .005  (round-trips unchanged)
+```
+
+`CoordinatesPrecision.QUANTIZED` is the default and reproduces the legacy pixel
+rounding exactly, so existing code is unaffected:
+
+```python
+legacy = BoundingBox('image.jpg', 'car', (.5, .5, .005, .01),
+                     type_coordinates=CoordinatesType.RELATIVE,
+                     img_size=(100, 50))
+legacy.get_absolute_bounding_box(BBFormat.XYX2Y2)  # (50.0, 25.0, 50.0, 25.0)
+```
+
+### Clipped views
+
+A box may extend past the image borders. Reading the *clipped* view never
+modifies the box, so the unclipped normalized value (`.01` below) survives no
+matter whether the clipped view is read before or after scoring:
+
+```python
+# center x=0, relative width .01 -> borders -0.5 .. 0.5
+border_box = BoundingBox('image.jpg', 'car', (0.0, .5, .01, .01),
+                         type_coordinates=CoordinatesType.RELATIVE,
+                         img_size=(100, 50),
+                         precision=CoordinatesPrecision.EXACT)
+
+border_box.get_relative_bounding_box(clip=True)[2]  # .005 (visible width)
+border_box.get_relative_bounding_box()[2]           # .01  (unclipped width)
+
+# score the clipped views; the boxes themselves are not modified
+BoundingBox.iou(border_box, visible_box, clip=True)
+```
+
+The same `continuous`/`clip` switches are available on
+`get_pascalvoc_metrics(...)` and on `get_coco_metrics(...)` /
+`get_coco_summary(...)`. `continuous=True` compares the float borders as
+half-open intervals instead of the legacy inclusive whole-pixel rule.
+
+Drawing still works in whole pixels; the quantization happens only at the
+display step and is never written back to the box.
 
 ## Metrics
 

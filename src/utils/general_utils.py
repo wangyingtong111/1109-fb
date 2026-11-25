@@ -5,7 +5,7 @@ import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 from PyQt5 import QtCore, QtGui
-from src.utils.enumerators import BBFormat
+from src.utils.enumerators import BBFormat, CoordinatesPrecision
 
 
 def get_classes_from_txt_file(filepath_classes_det):
@@ -72,7 +72,9 @@ def convert_to_relative_values(size, box):
 
 # size => (width, height) of the image
 # box => (centerX, centerY, w, h) of the bounding box relative to the image
-def convert_to_absolute_values(size, box):
+# precision => CoordinatesPrecision.EXACT keeps the sub-pixel float borders,
+#              CoordinatesPrecision.QUANTIZED rounds them to whole pixels.
+def convert_to_absolute_values(size, box, precision=CoordinatesPrecision.QUANTIZED):
     w_box = size[0] * box[2]
     h_box = size[1] * box[3]
 
@@ -80,7 +82,29 @@ def convert_to_absolute_values(size, box):
     y1 = (float(box[1]) * float(size[1])) - (h_box / 2)
     x2 = x1 + w_box
     y2 = y1 + h_box
+    if precision == CoordinatesPrecision.EXACT:
+        # Keep the continuous borders, e.g. a 100x50 image with center x=.5 and
+        # relative width .005 yields the x borders 49.75 and 50.25.
+        return (float(x1), float(y1), float(x2), float(y2))
+    # Legacy behaviour: quantize the borders to whole pixels.
     return (round(x1), round(y1), round(x2), round(y2))
+
+
+# size => (width, height) of the image
+# coordinates => (x1, y1, x2, y2) of the bounding box, in pixels
+# Returns the same box limited to the visible area of the image. The received
+# coordinates are never modified; a new tuple is returned.
+def clip_to_image_size(coordinates, size):
+    x1, y1, x2, y2 = coordinates
+    width, height = float(size[0]), float(size[1])
+    # Keep the corners ordered so that the clipped view is never inverted.
+    x1, x2 = min(float(x1), float(x2)), max(float(x1), float(x2))
+    y1, y2 = min(float(y1), float(y2)), max(float(y1), float(y2))
+    x1 = min(max(x1, 0.0), width)
+    x2 = min(max(x2, 0.0), width)
+    y1 = min(max(y1, 0.0), height)
+    y2 = min(max(y2, 0.0), height)
+    return (x1, y1, x2, y2)
 
 
 def add_bb_into_image(image, bb, color=(255, 0, 0), thickness=2, label=None):
@@ -92,11 +116,13 @@ def add_bb_into_image(image, bb, color=(255, 0, 0), thickness=2, label=None):
     fontScale = 0.5
     fontThickness = 1
 
+    # Drawing works in whole pixels: the continuous float geometry is only
+    # quantized here, at the display step, and never written back to the box.
     x1, y1, x2, y2 = bb.get_absolute_bounding_box(BBFormat.XYX2Y2)
-    x1 = int(x1)
-    y1 = int(y1)
-    x2 = int(x2)
-    y2 = int(y2)
+    x1 = int(round(x1))
+    y1 = int(round(y1))
+    x2 = int(round(x2))
+    y2 = int(round(y2))
     cv2.rectangle(image, (x1, y1), (x2, y2), (b, g, r), thickness)
     # Add label
     if label is not None:

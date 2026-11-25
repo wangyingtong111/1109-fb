@@ -1,9 +1,9 @@
 from math import isclose
 
-from src.utils.general_utils import (convert_to_absolute_values,
+from src.utils.general_utils import (clip_to_image_size, convert_to_absolute_values,
                                      convert_to_relative_values)
 
-from .utils.enumerators import BBFormat, BBType, CoordinatesType
+from .utils.enumerators import BBFormat, BBType, CoordinatesPrecision, CoordinatesType
 
 
 class BoundingBox:
@@ -16,7 +16,8 @@ class BoundingBox:
                  img_size=None,
                  bb_type=BBType.GROUND_TRUTH,
                  confidence=None,
-                 format=BBFormat.XYWH):
+                 format=BBFormat.XYWH,
+                 precision=CoordinatesPrecision.QUANTIZED):
         """ Constructor.
 
         Parameters
@@ -49,6 +50,14 @@ class BoundingBox:
                 BBFormat.XYWH: <left> <top> <width> <height>
                 BBFomat.XYX2Y2: <left> <top> <right> <bottom>.
                 BBFomat.YOLO: <x_center> <y_center> <width> <height>. (relative)
+            precision : Enum (optional)
+                Enum (CoordinatesPrecision.EXACT or CoordinatesPrecision.QUANTIZED) indicating how
+                the relative coordinates are converted to absolute values.
+                CoordinatesPrecision.EXACT keeps the sub-pixel float borders, so the value informed
+                in relative coordinates round-trips back to the same relative value. On a 100x50
+                image, center x=.5 and relative width .005 give the x borders 49.75 and 50.25.
+                CoordinatesPrecision.QUANTIZED keeps the legacy behaviour, rounding the borders to
+                whole pixels. Default: CoordinatesPrecision.QUANTIZED.
         """
 
         self._image_name = image_name
@@ -56,6 +65,7 @@ class BoundingBox:
         self._confidence = confidence
         self._class_id = class_id
         self._format = format
+        self.set_precision(precision)
         if bb_type == BBType.DETECTED and confidence is None:
             raise IOError(
                 'For bb_type=\'Detected\', it is necessary to inform the confidence value.')
@@ -78,8 +88,41 @@ class BoundingBox:
                              img_size=img_size,
                              type_coordinates=self._type_coordinates)
 
+    def set_precision(self, precision):
+        """ Set how relative coordinates are converted into absolute ones.
+
+        Parameters
+        ----------
+        precision : Enum
+            CoordinatesPrecision.EXACT keeps the sub-pixel float borders of relative boxes,
+            CoordinatesPrecision.QUANTIZED keeps the legacy whole-pixel rounding. The precision
+            never changes boxes that were informed in absolute coordinates.
+        """
+        if precision is None:
+            # boxes created without an explicit precision behave as the legacy ones
+            precision = CoordinatesPrecision.QUANTIZED
+        if not isinstance(precision, CoordinatesPrecision):
+            raise IOError(
+                "Parameter 'precision' must be a member of the CoordinatesPrecision enumerator "
+                "(CoordinatesPrecision.EXACT or CoordinatesPrecision.QUANTIZED).")
+        self._precision = precision
+
+    def get_precision(self):
+        """ Get how relative coordinates are converted into absolute ones.
+
+        Returns
+        -------
+        Enum
+            CoordinatesPrecision.EXACT or CoordinatesPrecision.QUANTIZED.
+        """
+        return self._precision
+
     def set_coordinates(self, coordinates, type_coordinates, img_size=None):
         self._type_coordinates = type_coordinates
+        # Normalized values informed by the caller, kept so that the relative view round-trips
+        # without any loss. It is only used when the coordinates were informed as relative and
+        # the exact precision is selected.
+        self._relative_coordinates = None
         if type_coordinates == CoordinatesType.RELATIVE and img_size is None:
             raise IOError(
                 'Parameter \'img_size\' is required. It is necessary to inform the image size.')
@@ -90,19 +133,34 @@ class BoundingBox:
             self._width_img = img_size[0]
             self._height_img = img_size[1]
             if self._format == BBFormat.XYWH:
-                (self._x, self._y, self._w,
-                 self._h) = convert_to_absolute_values(img_size, coordinates)
-                self._x2 = self._w
-                self._y2 = self._h
+                (self._x, self._y, self._x2,
+                 self._y2) = convert_to_absolute_values(img_size,
+                                                       coordinates,
+                                                       precision=self._precision)
                 self._w = self._x2 - self._x
                 self._h = self._y2 - self._y
+                if self._precision == CoordinatesPrecision.EXACT:
+                    self._relative_coordinates = (float(coordinates[0]), float(coordinates[1]),
+                                                  float(coordinates[2]), float(coordinates[3]))
             elif self._format == BBFormat.XYX2Y2:
                 x1, y1, x2, y2 = coordinates
                 # Converting to absolute values
-                self._x = round(x1 * self._width_img)
-                self._x2 = round(x2 * self._width_img)
-                self._y = round(y1 * self._height_img)
-                self._y2 = round(y2 * self._height_img)
+                if self._precision == CoordinatesPrecision.EXACT:
+                    self._x = float(x1) * self._width_img
+                    self._x2 = float(x2) * self._width_img
+                    self._y = float(y1) * self._height_img
+                    self._y2 = float(y2) * self._height_img
+                    self._relative_coordinates = (
+                        (float(x1) + float(x2)) / 2.0,
+                        (float(y1) + float(y2)) / 2.0,
+                        float(x2) - float(x1),
+                        float(y2) - float(y1),
+                    )
+                else:
+                    self._x = round(x1 * self._width_img)
+                    self._x2 = round(x2 * self._width_img)
+                    self._y = round(y1 * self._height_img)
+                    self._y2 = round(y2 * self._height_img)
                 self._w = self._x2 - self._x
                 self._h = self._y2 - self._y
             else:
@@ -130,13 +188,74 @@ class BoundingBox:
         self._x2 = float(self._x2)
         self._y2 = float(self._y2)
 
-    def get_absolute_bounding_box(self, format=BBFormat.XYWH):
+    def _get_image_size_or_raise(self, img_size=None):
+        """ Resolve the image size to be used by the clipped views.
+
+        Parameters
+        ----------
+        img_size : tuple (optional)
+            Image size (width, height). If None, the size informed when the box was created is
+            used.
+
+        Returns
+        -------
+        tuple
+            Image size (width, height). The size informed when the box was created is returned
+            unchanged so that the clipped view keeps the original type.
+        """
+        if img_size is not None:
+            return (img_size[0], img_size[1])
+        if self._width_img is None or self._height_img is None:
+            raise IOError(
+                'Parameter \'img_size\' is required. It is necessary to inform the image size.')
+        return (self._width_img, self._height_img)
+
+    def get_clipped_bounding_box(self, img_size=None):
+        """ Get a new bounding box limited to the visible area of the image.
+
+        The clipping is a *view*: the current box is never modified, so its
+        (unclipped) absolute and relative coordinates stay untouched no matter
+        how many times a clipped view is read.
+
+        Parameters
+        ----------
+        img_size : tuple (optional)
+            Image size in the format (width, height)=>(int, int). If None, the size informed when
+            the box was created is used.
+
+        Returns
+        -------
+        BoundingBox
+            A new box whose coordinates are limited to [0, width] x [0, height]. It keeps the
+            image name, class, confidence, format, type and precision of the current box.
+            Its relative view describes the visible geometry, e.g. a box with center x=0 and
+            relative width .01 on a 100 pixel wide image has a clipped width of .005.
+        """
+        size = self._get_image_size_or_raise(img_size)
+        x1, y1, x2, y2 = clip_to_image_size((self._x, self._y, self._x2, self._y2), size)
+        return BoundingBox(image_name=self._image_name,
+                           class_id=self._class_id,
+                           coordinates=(x1, y1, x2, y2),
+                           type_coordinates=CoordinatesType.ABSOLUTE,
+                           img_size=size,
+                           bb_type=self._bb_type,
+                           confidence=self._confidence,
+                           format=BBFormat.XYX2Y2,
+                           precision=self._precision)
+
+    def get_absolute_bounding_box(self, format=BBFormat.XYWH, clip=False, img_size=None):
         """ Get bounding box in its absolute format.
 
         Parameters
         ----------
         format : Enum
             Format of the bounding box (BBFormat.XYWH or BBFormat.XYX2Y2) to be retreived.
+        clip : bool (optional)
+            If True, the returned coordinates are limited to the visible area of the image. The
+            box itself is not modified. Default: False.
+        img_size : tuple (optional)
+            Image size (width, height) used when clip is True. If None, the size informed when the
+            box was created is used.
 
         Returns
         -------
@@ -147,18 +266,23 @@ class BoundingBox:
             If format is BBFormat.XYX2Y2, the coordinates are (upper-left-X, upper-left-Y,
             bottom-right-X, bottom-right-Y).
         """
+        if clip:
+            return self.get_clipped_bounding_box(img_size).get_absolute_bounding_box(format)
         if format == BBFormat.XYWH:
             return (self._x, self._y, self._w, self._h)
         elif format == BBFormat.XYX2Y2:
             return (self._x, self._y, self._x2, self._y2)
 
-    def get_relative_bounding_box(self, img_size=None):
+    def get_relative_bounding_box(self, img_size=None, clip=False):
         """ Get bounding box in its relative format.
 
         Parameters
         ----------
         img_size : tuple
             Image size in the format (width, height)=>(int, int)
+        clip : bool (optional)
+            If True, the relative values describe the clipped (visible) geometry instead of the
+            stored geometry. The box itself is not modified. Default: False.
 
         Returns
         -------
@@ -168,15 +292,20 @@ class BoundingBox:
                 w   : bounding_box_width/width_of_the_image
                 h   : bounding_box_height/height_of_the_image
         """
+        if clip:
+            return self.get_clipped_bounding_box(img_size).get_relative_bounding_box()
         if img_size is None and self._width_img is None and self._height_img is None:
             raise IOError(
                 'Parameter \'img_size\' is required. It is necessary to inform the image size.')
         if img_size is not None:
             return convert_to_relative_values((img_size[0], img_size[1]),
                                               (self._x, self._x2, self._y, self._y2))
-        else:
-            return convert_to_relative_values((self._width_img, self._height_img),
-                                              (self._x, self._x2, self._y, self._y2))
+        # For relative boxes converted with exact precision, the informed normalized values are
+        # returned as they are, so the round trip cannot lose sub-pixel information.
+        if self._relative_coordinates is not None:
+            return self._relative_coordinates
+        return convert_to_relative_values((self._width_img, self._height_img),
+                                          (self._x, self._x2, self._y, self._y2))
 
     def get_image_name(self):
         """ Get the string that represents the image.
@@ -237,7 +366,31 @@ class BoundingBox:
         """
         return (self._width_img, self._height_img)
 
-    def get_area(self):
+    def get_area(self, continuous=False, clip=False, img_size=None):
+        """ Get the area of the bounding box.
+
+        Parameters
+        ----------
+        continuous : bool (optional)
+            If True, the area is computed from the continuous float borders
+            (width x height) instead of the legacy inclusive whole-pixel rule. Use it together
+            with the sub-pixel coordinates so that small boxes keep a non-zero area.
+            Default: False (legacy inclusive rule).
+        clip : bool (optional)
+            If True, the area of the clipped (visible) box is returned. The box is not modified.
+            Default: False.
+        img_size : tuple (optional)
+            Image size (width, height) used when clip is True.
+
+        Returns
+        -------
+        float
+            Area of the bounding box.
+        """
+        if clip:
+            return self.get_clipped_bounding_box(img_size).get_area(continuous=continuous)
+        if continuous:
+            return max(self._x2 - self._x, 0.0) * max(self._y2 - self._y, 0.0)
         assert isclose(self._w * self._h, (self._x2 - self._x) * (self._y2 - self._y))
         assert (self._x2 >= self._x)
         assert (self._y2 >= self._y)
@@ -293,10 +446,10 @@ class BoundingBox:
         bool
             True if both bounding boxes have the same coordinates, otherwise False.
         """
-        det1BB = det1.getAbsoluteBoundingBox()
-        det1img_size = det1.getImageSize()
-        det2BB = det2.getAbsoluteBoundingBox()
-        det2img_size = det2.getImageSize()
+        det1BB = det1.get_absolute_bounding_box()
+        det1img_size = det1.get_image_size()
+        det2BB = det2.get_absolute_bounding_box()
+        det2img_size = det2.get_image_size()
 
         if det1.get_class_id() == det2.get_class_id() and \
            det1.get_confidence() == det2.get_confidence() and \
@@ -327,21 +480,60 @@ class BoundingBox:
         # return (self._x,self._y,self._x2,self._y2)
         new_bounding_box = BoundingBox(bounding_box.get_image_name(),
                                        bounding_box.get_class_id(),
-                                       absBB[0],
-                                       absBB[1],
-                                       absBB[2],
-                                       absBB[3],
-                                       type_coordinates=bounding_box.getCoordinatesType(),
-                                       img_size=bounding_box.getImageSize(),
-                                       bb_type=bounding_box.getbb_type(),
-                                       confidence=bounding_box.getConfidence(),
-                                       format=BBFormat.XYWH)
+                                       coordinates=absBB,
+                                       type_coordinates=bounding_box.get_coordinates_type(),
+                                       img_size=bounding_box.get_image_size(),
+                                       bb_type=bounding_box.get_bb_type(),
+                                       confidence=bounding_box.get_confidence(),
+                                       format=BBFormat.XYWH,
+                                       precision=bounding_box.get_precision())
         return new_bounding_box
 
     @staticmethod
-    def iou(boxA, boxB):
+    def iou(boxA, boxB, continuous=False, clip=False, img_size=None):
+        """ Intersection over union of two bounding boxes.
+
+        Parameters
+        ----------
+        boxA, boxB : BoundingBox
+            Boxes to be compared.
+        continuous : bool (optional)
+            If True, the comparison uses the continuous float borders (half-open intervals) so
+            that sub-pixel boxes keep their exact geometry and boxes that only touch at an edge
+            share no area. If False (default), the legacy inclusive whole-pixel rule is used.
+        clip : bool (optional)
+            If True, both boxes are first limited to the visible area of the image. This is a
+            view: the received boxes (and their unclipped relative values) are never modified.
+            Default: False.
+        img_size : tuple (optional)
+            Image size (width, height) used when clip is True. If None, the size informed when
+            each box was created is used.
+
+        Returns
+        -------
+        float
+            Intersection over union in the interval [0, 1].
+        """
+        if clip:
+            boxA = boxA.get_clipped_bounding_box(img_size)
+            boxB = boxB.get_clipped_bounding_box(img_size)
         coords_A = boxA.get_absolute_bounding_box(format=BBFormat.XYX2Y2)
         coords_B = boxB.get_absolute_bounding_box(format=BBFormat.XYX2Y2)
+        if continuous:
+            # Half-open intervals: only an edge contact (zero width/height) is not an overlap.
+            if coords_A[0] >= coords_B[2] or coords_B[0] >= coords_A[2]:
+                return 0.0
+            if coords_A[3] <= coords_B[1] or coords_B[3] <= coords_A[1]:
+                return 0.0
+            interArea = BoundingBox.get_intersection_area(coords_A,
+                                                          coords_B,
+                                                          continuous=True)
+            area_A = boxA.get_area(continuous=True)
+            area_B = boxB.get_area(continuous=True)
+            union = area_A + area_B - interArea
+            if union <= 0:
+                return 0.0
+            return interArea / union
         # if boxes do not intersect
         if BoundingBox.have_intersection(coords_A, coords_B) is False:
             return 0
@@ -371,7 +563,7 @@ class BoundingBox:
         return True
 
     @staticmethod
-    def get_intersection_area(boxA, boxB):
+    def get_intersection_area(boxA, boxB, continuous=False):
         if isinstance(boxA, BoundingBox):
             boxA = boxA.get_absolute_bounding_box(BBFormat.XYX2Y2)
         if isinstance(boxB, BoundingBox):
@@ -380,15 +572,18 @@ class BoundingBox:
         yA = max(boxA[1], boxB[1])
         xB = min(boxA[2], boxB[2])
         yB = min(boxA[3], boxB[3])
+        if continuous:
+            # Half-open intervals: a mere edge contact has zero width/height.
+            return max(xB - xA, 0.0) * max(yB - yA, 0.0)
         # intersection area
         return (xB - xA + 1) * (yB - yA + 1)
 
     @staticmethod
-    def get_union_areas(boxA, boxB, interArea=None):
-        area_A = boxA.get_area()
-        area_B = boxB.get_area()
+    def get_union_areas(boxA, boxB, interArea=None, continuous=False):
+        area_A = boxA.get_area(continuous=continuous)
+        area_B = boxB.get_area(continuous=continuous)
         if interArea is None:
-            interArea = BoundingBox.get_intersection_area(boxA, boxB)
+            interArea = BoundingBox.get_intersection_area(boxA, boxB, continuous=continuous)
         return float(area_A + area_B - interArea)
 
     @staticmethod
@@ -416,6 +611,6 @@ class BoundingBox:
         return len(list(set([bb.get_image_name() for bb in bounding_boxes])))
 
     @staticmethod
-    def get_average_area(bounding_boxes):
-        areas = [bb.get_area() for bb in bounding_boxes]
+    def get_average_area(bounding_boxes, continuous=False):
+        areas = [bb.get_area(continuous=continuous) for bb in bounding_boxes]
         return sum(areas) / len(areas)

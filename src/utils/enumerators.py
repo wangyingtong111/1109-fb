@@ -25,6 +25,30 @@ class CoordinatesType(Enum):
     ABSOLUTE = 2
 
 
+class CoordinatesPrecision(Enum):
+    """
+    Class representing how relative (normalized) coordinates are converted into
+    absolute ones.
+
+    This only affects boxes informed in relative coordinates (e.g. the
+    (x_center, y_center, width, height) output of a detection model). Boxes
+    already informed in absolute coordinates are always stored as they are.
+
+    EXACT
+        The normalized values are converted without rounding, so sub-pixel
+        geometry is kept all the way to the matching/scoring step. On a
+        100x50 image, a box with center x=.5 and relative width .005 has the
+        x borders 49.75 and 50.25, and its relative width round-trips back to
+        .005.
+    QUANTIZED
+        Legacy behaviour: the absolute corners are rounded to the nearest
+        integer pixel, as the original BoundingBox pixel conversion did.
+        Small boxes may then collapse onto integer corners.
+    """
+    EXACT = 1
+    QUANTIZED = 2
+
+
 class BBType(Enum):
     """
     Class representing if the bounding box is groundtruth or not.
