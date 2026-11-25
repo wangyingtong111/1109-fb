@@ -24,6 +24,120 @@ class LinearRegressionTest < Minitest::Test
     assert_elements_in_delta expected, predictions
   end
 
+  def test_predict_intervals
+    data = [1, 2, 3, 4, 5, 6].map { |xi| {x: xi, y: 3 + xi * 5 + (xi.even? ? 1 : -1)} }
+    model = Eps::LinearRegression.new(data, target: :y, split: false)
+
+    new_data = [{x: 7}, {x: 20}]
+    predictions = model.predict(new_data)
+    mean_intervals = model.predict_mean_intervals(new_data)
+    prediction_intervals = model.predict_intervals(new_data)
+
+    assert_equal 2, mean_intervals.size
+    assert_equal 2, prediction_intervals.size
+
+    2.times do |i|
+      # point prediction within both intervals
+      assert_operator mean_intervals[i][0], :<, predictions[i]
+      assert_operator mean_intervals[i][1], :>, predictions[i]
+      assert_operator prediction_intervals[i][0], :<, predictions[i]
+      assert_operator prediction_intervals[i][1], :>, predictions[i]
+
+      # mean interval narrower than prediction interval
+      mean_width = mean_intervals[i][1] - mean_intervals[i][0]
+      prediction_width = prediction_intervals[i][1] - prediction_intervals[i][0]
+      assert_operator mean_width, :<, prediction_width
+    end
+
+    # mean interval wider for high-leverage point
+    near_width = mean_intervals[0][1] - mean_intervals[0][0]
+    far_width = mean_intervals[1][1] - mean_intervals[1][0]
+    assert_operator far_width, :>, near_width
+  end
+
+  def test_predict_intervals_singular
+    data = [1, 2, 3, 4, 5, 6].map { |xi| {x: xi, y: 3 + xi * 5 + (xi.even? ? 1 : -1)} }
+    model = Eps::LinearRegression.new(data, target: :y, split: false)
+
+    lower, upper = model.predict_intervals({x: 7})
+    assert_kind_of Float, lower
+    assert_operator lower, :<, upper
+
+    lower, upper = model.predict_mean_intervals({x: 7})
+    assert_kind_of Float, lower
+    assert_operator lower, :<, upper
+  end
+
+  def test_predict_intervals_confidence
+    data = [1, 2, 3, 4, 5, 6].map { |xi| {x: xi, y: 3 + xi * 5 + (xi.even? ? 1 : -1)} }
+    model = Eps::LinearRegression.new(data, target: :y, split: false)
+
+    i90 = model.predict_intervals([{x: 7}], confidence: 0.90).first
+    i99 = model.predict_intervals([{x: 7}], confidence: 0.99).first
+    assert_operator i99[1] - i99[0], :>, i90[1] - i90[0]
+
+    error = assert_raises(ArgumentError) do
+      model.predict_intervals([{x: 7}], confidence: 1.5)
+    end
+    assert_equal "confidence must be between 0 and 1", error.message
+  end
+
+  def test_predict_intervals_weight_all_one
+    data = [1, 2, 3, 4, 5, 6].map { |xi| {x: xi, y: 3 + xi * 5 + (xi.even? ? 1 : -1)} }
+    unweighted = Eps::LinearRegression.new(data, target: :y, split: false)
+    weighted = Eps::LinearRegression.new(data.map { |d| d.merge(w: 1) }, target: :y, weight: :w, split: false)
+
+    new_data = [{x: 7}, {x: 20}]
+    assert_elements_in_delta unweighted.predict(new_data), weighted.predict(new_data)
+
+    unweighted.predict_intervals(new_data).zip(weighted.predict_intervals(new_data)).each do |u, w|
+      assert_elements_in_delta u, w
+    end
+    unweighted.predict_mean_intervals(new_data).zip(weighted.predict_mean_intervals(new_data)).each do |u, w|
+      assert_elements_in_delta u, w
+    end
+  end
+
+  def test_predict_intervals_weight_counts
+    base = [
+      {x: 1, y: 4},
+      {x: 2, y: 8},
+      {x: 3, y: 13},
+      {x: 4, y: 17}
+    ]
+    # weights represent occurrence counts
+    # zero-weight rows are extreme values that should not affect the fit
+    weighted_data = base.each_with_index.map { |d, i| d.merge(w: [2, 1, 1, 1][i]) }
+    weighted_data += [{x: 100, y: 1000, w: 0}, {x: -100, y: -1000, w: 0}]
+    weighted = Eps::LinearRegression.new(weighted_data, target: :y, weight: :w, split: false)
+
+    # same as duplicating the first row and dropping zero-weight rows
+    unweighted = Eps::LinearRegression.new([base[0]] + base, target: :y, split: false)
+
+    # coefficients and predictions match
+    assert_in_delta unweighted.coefficients[:_intercept], weighted.coefficients[:_intercept]
+    assert_in_delta unweighted.coefficients[:x], weighted.coefficients[:x]
+
+    new_data = [{x: 5}, {x: 20}]
+    assert_elements_in_delta unweighted.predict(new_data), weighted.predict(new_data)
+
+    # intervals match
+    unweighted.predict_intervals(new_data).zip(weighted.predict_intervals(new_data)).each do |u, w|
+      assert_elements_in_delta u, w
+    end
+    unweighted_mean = unweighted.predict_mean_intervals(new_data)
+    weighted_mean = weighted.predict_mean_intervals(new_data)
+    unweighted_mean.zip(weighted_mean).each do |u, w|
+      assert_elements_in_delta u, w
+    end
+
+    # mean interval wider for high-leverage point
+    near_width = weighted_mean[0][1] - weighted_mean[0][0]
+    far_width = weighted_mean[1][1] - weighted_mean[1][0]
+    assert_operator far_width, :>, near_width
+  end
+
+
   # this option behaves the same as Python and R when all columns are numeric
   # R generates the same number of coefficients when "+ 0" added to formula
   # it replaces the intercept with a single categorical value that was previously excluded

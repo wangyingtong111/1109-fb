@@ -69,5 +69,27 @@ module Eps
       a = n == 0 ? a / Math.sqrt(b) : (Math.atan(y) + a / b) * (2.0 / Math::PI)
       start + sign * (z - a) / 2.0
     end
+
+    # inverse of students_t_cdf
+    # uses bisection, which is slow but robust
+    def self.students_t_ppf(p, n)
+      raise ArgumentError, "p must be between 0 and 1" if p <= 0.0 || p >= 1.0
+      return -students_t_ppf(1.0 - p, n) if p < 0.5
+      return 0.0 if p == 0.5
+
+      lo = 0.0
+      hi = 1.0
+      hi *= 2.0 while students_t_cdf(hi, n) < p
+
+      100.times do
+        mid = (lo + hi) / 2.0
+        if students_t_cdf(mid, n) < p
+          lo = mid
+        else
+          hi = mid
+        end
+      end
+      (lo + hi) / 2.0
+    end
   end
 end

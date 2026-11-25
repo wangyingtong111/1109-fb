@@ -372,6 +372,20 @@ By default, an intercept is included. Disable this with:
 Eps::Model.new(data, intercept: false)
 ```
 
+Get prediction intervals for individual observations with:
+
+```ruby
+model.predict_intervals(data, confidence: 0.95)
+```
+
+Get confidence intervals for the mean response with:
+
+```ruby
+model.predict_mean_intervals(data, confidence: 0.95)
+```
+
+Both return `[lower, upper]` pairs for each data point. When weights are used for training, they are treated as occurrence counts, so a weight of 2 is equivalent to the data point appearing twice (and zero-weight rows do not affect the fit or intervals).
+
 To speed up training on large datasets with linear regression, [install GSL](https://github.com/ankane/gslr#gsl-installation). With Homebrew, you can use:
 
 ```sh

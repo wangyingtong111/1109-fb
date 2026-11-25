@@ -12,6 +12,16 @@ module Eps
       @adjusted_r2 ||= (mst - mse) / mst
     end
 
+    # prediction intervals for individual observations
+    def predict_intervals(data, confidence: 0.95)
+      _predict_intervals(data, confidence, :prediction)
+    end
+
+    # confidence intervals for the mean response
+    def predict_mean_intervals(data, confidence: 0.95)
+      _predict_intervals(data, confidence, :mean)
+    end
+
     private
 
     # https://people.richland.edu/james/ictcm/2004/multiple.html
@@ -51,6 +61,9 @@ module Eps
       x = data.map_rows(&:to_a)
 
       gsl = defined?(GSLR) if gsl.nil?
+
+      @intercept = intercept
+      @gsl = gsl
 
       if intercept && !gsl
         data.size.times do |i|
@@ -169,6 +182,96 @@ module Eps
       arr.all? { |x| x == arr[0] }
     end
 
+    def _predict_intervals(data, confidence, type)
+      raise "Intervals not available for loaded models" unless @trained
+      raise ArgumentError, "confidence must be between 0 and 1" if confidence <= 0.0 || confidence >= 1.0
+      raise "Not enough degrees of freedom for intervals" if degrees_of_freedom <= 0
+
+      singular = data.is_a?(Hash)
+      data = [data] if singular
+
+      y_hat = predict(data)
+      rows = design_rows(Eps::DataFrame.new(data))
+
+      t = Eps::Statistics.students_t_ppf((1.0 + confidence) / 2.0, degrees_of_freedom)
+
+      intervals = rows.zip(y_hat).map do |xi, yh|
+        h = leverage(xi)
+        # mean interval estimates the mean response
+        # prediction interval adds the variance of a single observation
+        v = mse * (type == :prediction ? 1.0 + h : h)
+        half_width = t * Math.sqrt(v)
+        [yh - half_width, yh + half_width]
+      end
+
+      singular ? intervals.first : intervals
+    end
+
+    # design matrix rows for new data
+    # aligned with the coefficient names from training
+    def design_rows(data)
+      text_counts = {}
+      @text_features.each do |k, v|
+        encoder = TextEncoder.new(**v)
+        text_counts[k] = encoder.transform(data.columns[k])
+      end
+
+      rows = Array.new(data.size) { [] }
+      @coefficient_names.each do |name|
+        col =
+          if name == "_intercept"
+            Array.new(data.size, 1.0)
+          elsif name.is_a?(Array)
+            k, label = name
+            if @features[k] == "text"
+              counts = text_counts[k]
+              data.size.times.map { |i| counts[i][label] ? 1.0 : 0.0 }
+            else
+              data.columns[k].map { |v| v == label ? 1.0 : 0.0 }
+            end
+          else
+            data.columns[name].map(&:to_f)
+          end
+        col.each_with_index { |v, i| rows[i] << v }
+      end
+
+      # drop columns removed during training (multicollinearity)
+      if @removed && !@removed.empty?
+        removed = @removed.sort.reverse
+        rows.each do |row|
+          removed.each { |i| row.delete_at(i) }
+        end
+      end
+
+      rows
+    end
+
+    # leverage of a new observation
+    # h = x' (X' W X)^-1 x
+    def leverage(xi)
+      m = xtxi_rows
+      n = xi.size
+      h = 0.0
+      n.times do |i|
+        s = 0.0
+        mi = m[i]
+        n.times { |j| s += mi[j] * xi[j] }
+        h += xi[i] * s
+      end
+      h
+    end
+
+    def xtxi_rows
+      @xtxi_rows ||= begin
+        if @xtxi
+          @xtxi.to_a
+        else
+          # GSL only exposes the covariance matrix
+          @covariance.to_a.map { |row| row.map { |v| v / mse } }
+        end
+      end
+    end
+
     # add epsilon for perfect fits
     # consistent with GSL
     def t_value
@@ -212,7 +315,13 @@ module Eps
     end
 
     def y_bar
-      @y_bar ||= mean(@train_set.label)
+      @y_bar ||= begin
+        if (w = @train_set.weight)
+          @train_set.label.zip(w).sum { |y, wi| y * wi } / w.sum.to_f
+        else
+          mean(@train_set.label)
+        end
+      end
     end
 
     def y_hat
@@ -221,25 +330,43 @@ module Eps
 
     # total sum of squares
     def sst
-      @sst ||= @train_set.label.sum { |y| (y - y_bar)**2 }
+      @sst ||= begin
+        if (w = @train_set.weight)
+          @train_set.label.zip(w).sum { |y, wi| wi * (y - y_bar)**2 }
+        else
+          @train_set.label.sum { |y| (y - y_bar)**2 }
+        end
+      end
     end
 
     # sum of squared errors of prediction
     # not to be confused with "explained sum of squares"
     def sse
-      @sse ||= @train_set.label.zip(y_hat).sum { |y, yh| (y - yh)**2 }
+      @sse ||= begin
+        if (w = @train_set.weight)
+          @train_set.label.zip(y_hat, w).sum { |y, yh, wi| wi * (y - yh)**2 }
+        else
+          @train_set.label.zip(y_hat).sum { |y, yh| (y - yh)**2 }
+        end
+      end
     end
 
     def mst
-      @mst ||= sst / (@train_set.size - 1)
+      @mst ||= sst / (weight_sum - 1)
     end
 
     def mse
       @mse ||= sse / degrees_of_freedom
     end
 
+    # weights are treated as occurrence counts
+    # so zero-weight rows do not count toward degrees of freedom
     def degrees_of_freedom
-      @train_set.size - @coefficients.size
+      weight_sum - @coefficients.size
+    end
+
+    def weight_sum
+      @weight_sum ||= @train_set.weight ? @train_set.weight.sum.to_f : @train_set.size.to_f
     end
 
     def mean(arr)

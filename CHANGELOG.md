@@ -1,3 +1,8 @@
+## 0.7.1 (unreleased)
+
+- Added `predict_intervals` and `predict_mean_intervals` methods for linear regression
+- Weights for linear regression are now treated as occurrence counts for residuals and degrees of freedom
+
 ## 0.7.0 (2026-04-14)
 
 - Dropped support for Daru
