@@ -2,13 +2,14 @@ module Disco
   class Recommender
     attr_reader :global_mean
 
-    def initialize(factors: 8, epochs: 20, verbose: nil, top_items: false)
+    def initialize(factors: 8, epochs: 20, verbose: nil, top_items: false, valid_only: false)
       @factors = factors
       @epochs = epochs
       @verbose = verbose
       @user_map = {}
       @item_map = {}
       @top_items = top_items
+      @valid_only = valid_only
     end
 
     def fit(train_set, validation_set: nil)
@@ -109,6 +110,7 @@ module Disco
 
       @user_norms = nil
       @item_norms = nil
+      @zero_norm_indexes = {}
 
       @user_recs_index = nil
       @similar_users_index = nil
@@ -174,15 +176,15 @@ module Disco
       end
     end
 
-    def similar_items(item_id, count: 5)
+    def similar_items(item_id, count: 5, valid_only: nil)
       check_fit
-      similar(item_id, :item_id, @item_map, @item_factors, item_norms, count, @similar_items_index)
+      similar(item_id, :item_id, @item_map, @item_factors, item_norms, count, @similar_items_index, valid_only)
     end
     alias_method :item_recs, :similar_items
 
-    def similar_users(user_id, count: 5)
+    def similar_users(user_id, count: 5, valid_only: nil)
       check_fit
-      similar(user_id, :user_id, @user_map, @user_factors, user_norms, count, @similar_users_index)
+      similar(user_id, :user_id, @user_map, @user_factors, user_norms, count, @similar_users_index, valid_only)
     end
 
     def top_items(count: 5)
@@ -249,13 +251,13 @@ module Disco
 
     def optimize_similar_items(library: nil)
       check_fit
-      @similar_items_index = create_index(@item_factors / item_norms.expand_dims(1), library: library)
+      @similar_items_index = create_similar_index(@item_factors, item_norms, library)
     end
     alias_method :optimize_item_recs, :optimize_similar_items
 
     def optimize_similar_users(library: nil)
       check_fit
-      @similar_users_index = create_index(@user_factors / user_norms.expand_dims(1), library: library)
+      @similar_users_index = create_similar_index(@user_factors, user_norms, library)
     end
 
     def inspect
@@ -275,7 +277,8 @@ module Disco
         item_factors: [@item_factors.to_binary].pack("m0"),
         factors: @factors,
         epochs: @epochs,
-        verbose: @verbose
+        verbose: @verbose,
+        valid_only: @valid_only
       }
 
       unless @implicit
@@ -302,6 +305,18 @@ module Disco
     end
 
     private
+
+    # builds a nearest-neighbor index for similar users/items
+    # the index keeps every factor row (including zero-norm ones) so the
+    # default behavior is unchanged; valid-only mode filters the results
+    # the wrapper maps positions inside the index back to factor rows
+    def create_similar_index(factors, norms, library)
+      {
+        index: create_index(factors / norms.expand_dims(1), library: library),
+        # nil means the index position matches the factor row directly
+        row_map: nil
+      }
+    end
 
     # factors should already be normalized for similar users/items
     def create_index(factors, library:)
@@ -356,42 +371,152 @@ module Disco
       norms
     end
 
-    def similar(id, key, map, factors, norms, count, index)
+    # original row indexes whose factor vectors are not all zeros
+    def nonzero_norm_indexes(factors)
+      @zero_norm_indexes[factors.object_id] ||=
+        Numo::SFloat::Math.sqrt((factors * factors).sum(axis: 1)).ne(0).where.to_a
+    end
+
+    def similar(id, key, map, factors, norms, count, index_wrapper, valid_only)
       i = map[id]
+      valid_only = @valid_only if valid_only.nil?
 
       if i && factors.shape[0] > 1
-        if index && count
-          norm_factors = factors[i, true] / norms[i]
-          if defined?(Faiss) && index.is_a?(Faiss::Index)
-            predictions, ids = index.search(norm_factors.expand_dims(0), count + 1).map { |v| v.to_a[0] }
-          else
-            result = index.search(norm_factors, size: count + 1)
-            # ids from batch_insert start at 1 instead of 0
-            ids = result.map { |v| v[:id] - 1 }
-            # convert cosine distance to cosine similarity
-            predictions = result.map { |v| 1 - v[:distance] }
-          end
+        if valid_only
+          similar_valid(key, map, factors, norms, count, index_wrapper, i)
         else
-          predictions = factors.inner(factors[i, true]) / (norms * norms[i])
-          predictions, indexes = top_k(predictions, count ? count + 1 : nil)
-          ids = indexes
+          similar_all(key, map, factors, norms, count, index_wrapper, i)
         end
-
-        keys = map.keys
-
-        result = []
-        # items can have the same score
-        # so original item may not be at index 0
-        ids.each_with_index do |id, j|
-          next if id == i
-
-          result << {key => keys[id], score: predictions[j]}
-          break if result.size == count
-        end
-        result
       else
         []
       end
+    end
+
+    # original behavior: every factor row is a candidate, including zero-norm ones
+    def similar_all(key, map, factors, norms, count, index_wrapper, i)
+      if index_wrapper && count
+        index = index_wrapper[:index]
+        norm_factors = factors[i, true] / norms[i]
+        if defined?(Faiss) && index.is_a?(Faiss::Index)
+          predictions, ids = index.search(norm_factors.expand_dims(0), count + 1).map { |v| v.to_a[0] }
+        else
+          result = index.search(norm_factors, size: count + 1)
+          # ids from batch_insert start at 1 instead of 0
+          ids = result.map { |v| v[:id] - 1 }
+          # convert cosine distance to cosine similarity
+          predictions = result.map { |v| 1 - v[:distance] }
+        end
+        # index may only hold nonzero rows, translate positions back to factor rows
+        row_map = index_wrapper[:row_map]
+        ids = ids.map { |id| row_map[id] } if row_map
+      else
+        predictions = factors.inner(factors[i, true]) / (norms * norms[i])
+        predictions, indexes = top_k(predictions, count ? count + 1 : nil)
+        ids = indexes
+      end
+
+      build_similar_result(key, map, ids, predictions, count, i)
+    end
+
+    # valid-only mode: zero-norm rows never take a slot
+    # self, duplicate ids, and unused index positions are skipped and backfilled
+    def similar_valid(key, map, factors, norms, count, index_wrapper, i)
+      valid_indexes = nonzero_norm_indexes(factors)
+      valid_set = valid_indexes.to_set
+      # the queried row must itself have a nonzero norm
+      return [] unless valid_set.include?(i)
+
+      total = valid_indexes.size - 1
+      return [] if total <= 0
+
+      count = total if count.nil? || count > total
+      return [] if count <= 0
+
+      predictions = factors.inner(factors[i, true]) / (norms * norms[i])
+
+      if index_wrapper
+        index = index_wrapper[:index]
+        row_map = index_wrapper[:row_map]
+        index_size = row_map ? row_map.size : factors.shape[0]
+        norm_factors = factors[i, true] / norms[i]
+
+        # fetch every index row so self, duplicate ids, zero-norm rows, and
+        # unused positions can always be backfilled with usable candidates
+        if defined?(Faiss) && index.is_a?(Faiss::Index)
+          _, positions = index.search(norm_factors.expand_dims(0), index_size).map { |v| v.to_a[0] }
+        else
+          result = index.search(norm_factors, size: index_size)
+          # ids from batch_insert start at 1 instead of 0
+          positions = result.map { |v| v[:id] - 1 }
+        end
+
+        ids = []
+        positions.each do |position|
+          # unused index positions come back as -1
+          next if position.nil? || position < 0
+
+          row = row_map ? row_map[position] : position
+          next if row.nil? || row >= factors.shape[0]
+          # zero-norm rows, self, and duplicates do not take a slot
+          next unless valid_set.include?(row)
+          next if row == i || ids.include?(row)
+
+          ids << row
+          break if ids.size == count
+        end
+
+        # backfill any remaining slots from exact cosine similarities
+        backfill_similar(key, map, predictions, valid_set, count, i, ids)
+      else
+        sorted_indexes = predictions.sort_index.reverse.to_a
+        ids = []
+        sorted_indexes.each do |row|
+          next if row == i
+          # zero-norm rows score 0 and must not take a slot
+          next unless valid_set.include?(row)
+
+          ids << row
+          break if ids.size == count
+        end
+
+        build_result_from_rows(key, map, ids, ids.map { |row| predictions[row] })
+      end
+    end
+
+    # exact backfill used when an index cannot supply enough usable candidates
+    # scores always come from exact cosine similarities for consistency
+    def backfill_similar(key, map, predictions, valid_set, count, self_id, ids)
+      sorted_indexes = predictions.sort_index.reverse.to_a
+
+      sorted_indexes.each do |row|
+        break if ids.size == count
+        next if row == self_id || ids.include?(row)
+        next unless valid_set.include?(row)
+
+        ids << row
+      end
+
+      build_result_from_rows(key, map, ids, ids.map { |row| predictions[row] })
+    end
+
+    def build_similar_result(key, map, ids, predictions, count, self_id)
+      keys = map.keys
+
+      result = []
+      # items can have the same score
+      # so original item may not be at index 0
+      ids.each_with_index do |id, j|
+        next if id == self_id
+
+        result << {key => keys[id], score: predictions[j]}
+        break if count && result.size == count
+      end
+      result
+    end
+
+    def build_result_from_rows(key, map, ids, scores)
+      keys = map.keys
+      ids.each_with_index.map { |id, j| {key => keys[id], score: scores[j]} }
     end
 
     def top_k(values, count)
@@ -437,6 +562,11 @@ module Disco
       @item_factors = Numo::SFloat.from_binary(obj["item_factors"].unpack1("m0"), [@item_map.size, @factors])
       @epochs = obj["epochs"].to_i
       @verbose = obj["verbose"]
+      @valid_only = obj.fetch("valid_only", false)
+      @zero_norm_indexes = {}
+      @user_recs_index = nil
+      @similar_users_index = nil
+      @similar_items_index = nil
 
       unless @implicit
         @min_rating = obj["min_rating"]

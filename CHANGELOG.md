@@ -1,3 +1,9 @@
+## 1.1.0 (unreleased)
+
+- Added `valid_only` option to `similar_items` and `similar_users` to exclude zero-norm factor vectors and backfill usable neighbors
+- Added `valid_only` option to the initializer, persisted by `to_json`/`load_json`
+- Applied the option to both exact calculations and pre-built indexes
+
 ## 1.0.0 (2026-04-17)
 
 - Switched to `numo-narray-alt`

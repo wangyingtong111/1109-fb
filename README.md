@@ -76,6 +76,24 @@ Get similar users
 recommender.similar_users(user_id)
 ```
 
+### Zero-Norm Vectors
+
+Archived items can end up with all-zero factor vectors. By default, they’re still returned by `similar_items` and `similar_users` (with a cosine similarity of 0), so models serialized by earlier versions keep working unchanged.
+
+Pass `valid_only: true` to only consider items and users whose factor vectors have a nonzero norm. Zero-norm rows never take a slot, and the results are backfilled with usable neighbors.
+
+```ruby
+recommender.similar_items(item_id, valid_only: true)
+```
+
+You can also enable it for every similar-items/similar-users call when creating the recommender:
+
+```ruby
+recommender = Disco::Recommender.new(valid_only: true)
+```
+
+The setting is included when the recommender is serialized with `to_json`, and snapshots written by earlier versions (without the setting) keep the original behavior. It applies to both exact calculations and pre-built indexes from `optimize_item_recs` and `optimize_similar_users` — self, duplicate ids, and unused index positions are skipped and backfilled, and when there aren’t enough valid neighbors, only the actual number is returned.
+
 ## Examples
 
 ### MovieLens

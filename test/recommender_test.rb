@@ -97,6 +97,156 @@ class RecommenderTest < Minitest::Test
     assert_equal ["B", "C"], recommender.item_recs("A").map { |r| r[:item_id] }
   end
 
+  # A has a nonzero vector, B is all zeros (archived), C is positively
+  # correlated, and D is negatively correlated
+  def recommender_with_known_factors(valid_only: false)
+    recommender = Disco::Recommender.new(factors: 2, epochs: 1, valid_only: valid_only)
+    recommender.fit([
+      {user_id: 1, item_id: "A", rating: 5},
+      {user_id: 2, item_id: "B", rating: 3},
+      {user_id: 3, item_id: "C", rating: 4},
+      {user_id: 4, item_id: "D", rating: 2}
+    ])
+
+    obj = JSON.parse(recommender.to_json)
+    rows = [
+      [1.0, 0.0], # A
+      [0.0, 0.0], # B (zero norm)
+      [1.0, 0.0], # C (positive correlation)
+      [-1.0, 0.0] # D (negative correlation)
+    ]
+    obj["item_factors"] = [Numo::SFloat.cast(rows).to_binary].pack("m0")
+    obj["valid_only"] = valid_only
+    Disco::Recommender.load_json(JSON.generate(obj))
+  end
+
+  def test_similar_items_default_keeps_zero_norm
+    recommender = recommender_with_known_factors
+    assert_equal ["B", "C"], recommender.similar_items("A", count: 2).map { |r| r[:item_id] }.sort
+  end
+
+  def test_similar_items_valid_only_exact
+    recommender = recommender_with_known_factors(valid_only: true)
+
+    recs = recommender.similar_items("A", count: 2)
+    assert_equal ["C", "D"], recs.map { |r| r[:item_id] }.sort
+    refute_includes recs.map { |r| r[:item_id] }, "B"
+
+    scores = recs.to_h { |r| [r[:item_id], r[:score]] }
+    assert_in_delta 1.0, scores["C"]
+    assert_in_delta(-1.0, scores["D"])
+  end
+
+  def test_similar_items_valid_only_per_call
+    recommender = recommender_with_known_factors
+
+    recs = recommender.similar_items("A", count: 2, valid_only: true)
+    assert_equal ["C", "D"], recs.map { |r| r[:item_id] }.sort
+
+    # can also turn the initializer mode back off per call
+    recommender = recommender_with_known_factors(valid_only: true)
+    recs = recommender.similar_items("A", count: 2, valid_only: false)
+    assert_equal ["B", "C"], recs.map { |r| r[:item_id] }.sort
+  end
+
+  def test_similar_items_valid_only_count
+    recommender = recommender_with_known_factors(valid_only: true)
+
+    # not enough valid neighbors: only return the actual number
+    assert_equal ["C", "D"], recommender.similar_items("A", count: 10).map { |r| r[:item_id] }.sort
+    assert_equal ["C", "D"], recommender.similar_items("A", count: nil).map { |r| r[:item_id] }.sort
+  end
+
+  def test_similar_items_valid_only_zero_query
+    recommender = recommender_with_known_factors(valid_only: true)
+    assert_empty recommender.similar_items("B", count: 2)
+  end
+
+  def test_similar_items_valid_only_insufficient
+    recommender = Disco::Recommender.new(factors: 2, epochs: 1, valid_only: true)
+    recommender.fit([
+      {user_id: 1, item_id: "A", rating: 5},
+      {user_id: 2, item_id: "B", rating: 3},
+      {user_id: 3, item_id: "C", rating: 4}
+    ])
+
+    obj = JSON.parse(recommender.to_json)
+    rows = [[1.0, 0.0], [0.0, 0.0], [1.0, 0.0]]
+    obj["item_factors"] = [Numo::SFloat.cast(rows).to_binary].pack("m0")
+    recommender = Disco::Recommender.load_json(JSON.generate(obj))
+
+    assert_equal ["C"], recommender.similar_items("A", count: 5).map { |r| r[:item_id] }
+  end
+
+  def test_similar_users_valid_only
+    recommender = Disco::Recommender.new(factors: 2, epochs: 1)
+    recommender.fit([
+      {user_id: 1, item_id: 1, rating: 5},
+      {user_id: 2, item_id: 2, rating: 3},
+      {user_id: 3, item_id: 3, rating: 4},
+      {user_id: 4, item_id: 4, rating: 2}
+    ])
+
+    obj = JSON.parse(recommender.to_json)
+    rows = [
+      [1.0, 0.0],
+      [0.0, 0.0],
+      [1.0, 0.0],
+      [-1.0, 0.0]
+    ]
+    obj["user_factors"] = [Numo::SFloat.cast(rows).to_binary].pack("m0")
+    obj["valid_only"] = true
+    recommender = Disco::Recommender.load_json(JSON.generate(obj))
+
+    assert_equal [3, 4], recommender.similar_users(1, count: 2).map { |r| r[:user_id] }.sort
+  end
+
+  # emulates an index returning self, duplicate ids, zero-norm rows, and
+  # unused positions; valid-only mode must backfill usable results
+  def test_similar_items_valid_only_index
+    recommender = recommender_with_known_factors(valid_only: true)
+
+    index = Object.new
+    # the index only returns three rows even though four are requested, and
+    # every returned position is unusable, so exact backfill must supply both
+    def index.search(_vector, size:)
+      [
+        {id: 1, distance: 0.0}, # self A
+        {id: 1, distance: 0.0}, # duplicate self
+        {id: 2, distance: 1.0}  # zero-norm B
+      ].first(size)
+    end
+    recommender.instance_variable_set(:@similar_items_index, {index: index, row_map: nil})
+
+    recs = recommender.similar_items("A", count: 2)
+    assert_equal ["C", "D"], recs.map { |r| r[:item_id] }.sort
+  end
+
+  def test_similar_items_valid_only_index_self_only
+    recommender = recommender_with_known_factors(valid_only: true)
+
+    index = Object.new
+    def index.search(_vector, size:)
+      Array.new(size) { {id: 1, distance: 0.0} }
+    end
+    recommender.instance_variable_set(:@similar_items_index, {index: index, row_map: nil})
+
+    recs = recommender.similar_items("A", count: 2)
+    assert_equal ["C", "D"], recs.map { |r| r[:item_id] }.sort
+  end
+
+  def test_similar_items_valid_only_json_round_trip
+    recommender = recommender_with_known_factors(valid_only: true)
+    loaded = Disco::Recommender.load_json(recommender.to_json)
+    assert_equal ["C", "D"], loaded.similar_items("A", count: 2).map { |r| r[:item_id] }.sort
+
+    # snapshots written by older versions keep the original behavior
+    legacy = JSON.parse(recommender.to_json)
+    legacy.delete("valid_only")
+    loaded = Disco::Recommender.load_json(JSON.generate(legacy))
+    assert_equal ["B", "C"], loaded.similar_items("A", count: 2).map { |r| r[:item_id] }.sort
+  end
+
   def test_similar_users
     data = Disco.load_movielens
     recommender = Disco::Recommender.new(factors: 20)
