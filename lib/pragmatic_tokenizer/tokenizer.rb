@@ -42,6 +42,10 @@ module PragmaticTokenizer
       # Numbers 'semi': Removes tokens that include only digits
       # Numbers 'none': Removes all tokens that include a number from the result (including Roman numerals)
       # Numbers 'only': Removes everything except tokens that include a number
+    # @option opts [Boolean, Symbol] :german_numbers - (default: false) classify numbers with strict
+      # German locale syntax (optional U+2212/ASCII sign, "." thousands groups, "," decimal) so that
+      # only legal numerals drive `numbers: :only` / `:none`; also enabled by `language: 'de'` or
+      # `number_locale: :de`. When unset, an unambiguous German-formatted input opts itself in.
     # @option opts [Integer] :minimum_length - minimum length of the token in characters
     # @option opts [Integer] :long_word_split - the specified length to split long words at any hyphen or underscore.
     # @option opts [String] :mentions - :remove (will completely remove it), :keep_and_clean (will prefix) and :keep_original (don't alter the token at all). - can be a String or symbol (i.e. :keep_and_clean or 'keep_and_clean')
@@ -61,6 +65,7 @@ module PragmaticTokenizer
       @remove_stop_words   = opts[:remove_stop_words]
       @punctuation         = opts[:punctuation] ? opts[:punctuation].to_sym : :all
       @numbers             = opts[:numbers] ? opts[:numbers].to_sym : :all
+      @german_number_mode  = german_number_mode_option(opts)
       @minimum_length      = opts[:minimum_length] || 0
       @long_word_split     = opts[:long_word_split]
       @mentions            = opts[:mentions] ? opts[:mentions].to_sym : :keep_original
@@ -182,6 +187,11 @@ module PragmaticTokenizer
       end
 
       def process_numbers!
+        if german_number_classification?
+          process_german_numbers!
+          return
+        end
+
         case @numbers
         when :semi
           @tokens.delete_if { |token| token =~ Regex::ONLY_DECIMALS }
@@ -190,6 +200,51 @@ module PragmaticTokenizer
         when :only
           @tokens.delete_if { |token| token =~ Regex::NO_DECIMALS }
         end
+      end
+
+      # The strict German classifier drives both projections so that "only" and "none"
+      # stay exact complements: a token is either a legal German numeral or it is not.
+      def process_german_numbers!
+        case @numbers
+        when :only
+          @tokens.keep_if   { |token| german_number?(token) }
+        when :none
+          @tokens.delete_if { |token| german_number?(token) }
+        when :semi
+          @tokens.delete_if { |token| token =~ Regex::ONLY_DECIMALS }
+        end
+      end
+
+      def german_number?(token)
+        token =~ Regex::ONLY_GERMAN_NUMBER
+      end
+
+      # Explicit options and `language: 'de'` enable the mode deterministically.
+      # When nothing is specified, an unambiguous German formatting signal (the U+2212
+      # minus or a "1.234," grouped decimal) opts that input in, while ordinary ASCII
+      # input keeps the legacy `numbers` behaviour. An explicit false disables even that.
+      def german_number_classification?
+        return @german_number_mode unless @german_number_mode.nil?
+        @tokens.any? { |token| token =~ Regex::GERMAN_NUMBER_SIGNAL }
+      end
+
+      def german_number_mode_option(opts)
+        if opts.key?(:german_numbers)
+          value = opts[:german_numbers]
+          return value ? true : false
+        end
+
+        locale = opts[:number_locale] || opts[:numbers_locale] || opts[:locale] || opts[:region]
+        return german_locale_value?(locale) unless locale.nil?
+
+        return true if opts[:language] && german_locale_value?(opts[:language])
+
+        nil
+      end
+
+      def german_locale_value?(value)
+        normalized = value.to_s.tr('-', '_').downcase
+        normalized.start_with?('de') || normalized == 'german'
       end
 
       def remove_short_tokens!

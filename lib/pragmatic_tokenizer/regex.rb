@@ -57,8 +57,12 @@ module PragmaticTokenizer
     ALSO_DECIMALS                 = /(?:[[:alpha:]]*+[[:digit:]]+)/
     ACUTE_ACCENT_S                = /(?:\s\u0301(?=s))/
 
+    # A U+2212 minus directly followed by digits is a number sign (e.g. the German "−1.234,50")
+    # and must not be swept up by the unusual-character range and split from its number.
+    ATTACHED_NUMERIC_MINUS        = /−[0-9]/
+
     # Regular expressions used to capture items
-    CAPTURE_UNUSUAL_AND_EMOJI     = /(#{RANGE_UNUSUAL_AND_EMOJI.source})/
+    CAPTURE_UNUSUAL_AND_EMOJI     = /((?!#{ATTACHED_NUMERIC_MINUS.source})#{RANGE_UNUSUAL_AND_EMOJI.source})/
     QUESTION_MARK_NOT_URL         = /#{NOT_URL.source}(\?)/
     # Should we change specs and also capture "/", just like we capture ":" and "?"
     SLASH_NOT_URL                 = /#{NOT_URL.source}\//
@@ -96,6 +100,14 @@ module PragmaticTokenizer
 
     ONLY_DECIMALS                 = /(?:^[[:digit:]]+$)/
     NO_DECIMALS                   = /(?:^\D+$)/
+
+    # Strict, whole-token German numeral:
+    # optional sign (ASCII "-" or U+2212 "−"), either a grouped integer ("1.234" / "1.234.567")
+    # or plain digits, and an optional decimal comma (",50"). Grouping must be legal triples,
+    # so "12.34,50" and versions such as "v1.2" do not match.
+    ONLY_GERMAN_NUMBER            = /\A[−\-]?(?:[0-9]{1,3}(?:\.[0-9]{3})+|[0-9]+)(?:,[0-9]+)?\z/
+    # Unambiguous signal that German-style formatting is in use (U+2212 sign or "1.234," grouping).
+    GERMAN_NUMBER_SIGNAL          = /(?:−|[0-9]{1,3}\.[0-9]{3},)/
     ONLY_PUNCTUATION              = /^[[[:punct:]]^|+]+$/
     ONLY_ROMAN_NUMERALS           = /^(?=[MDCLXVI])M*(C[MD]|D?C*)(X[CL]|L?X*)(I[XV]|V?I*)$/i
     ONLY_EMAIL                    = /^#{EMAIL}$/
