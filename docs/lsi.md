@@ -33,6 +33,37 @@ lsi.classify "This text is also about dogs!"
 #=> :dog
 ```
 
+### Multi-label documents and quota voting
+
+A document may carry more than one label by passing several categories to
+`#add_item`. When classifying, every selected neighbor normally casts one full
+vote per label entry, so listing the same label repeatedly on a document
+inflates that label's score:
+
+```ruby
+lsi = ClassifierReborn::LSI.new
+lsi.add_item "A document about dogs and cats", :dog, :cat, :cat
+```
+
+Enable quota voting to give every selected neighbor a single vote, worth its
+similarity score, that is split equally across its **unique** labels.
+Repeating a label on the same document then never increases its share.
+Neighbors without labels cast no vote, and neighbors outside the nearest
+neighbor cutoff are never backfilled:
+
+```ruby
+lsi = ClassifierReborn::LSI.new(quota_voting: true)
+# ...or per call, without changing the instance default:
+lsi.scored_categories("some text", 0.30, true)
+# the :quota keyword is accepted as well:
+lsi.scored_categories("some text", 0.30, quota: true)
+```
+
+With two selected neighbors scored `0.8` and `0.5` carrying `[:a, :b, :b]` and
+`[:b]` respectively, the full view scores `:a` at `0.4` (`0.8 / 2`) and `:b`
+at `0.9` (`0.8 / 2 + 0.5`). Looking only at `:b` at the same cutoff still
+yields `0.9`; the hidden `:a` share is not reallocated to `:b`.
+
 Please see the [ClassifierReborn::LSI documentation](http://www.rubydoc.info/gems/classifier-reborn/ClassifierReborn/LSI) for more information.
 It is possible to index, search and classify with more than just simple strings.
 

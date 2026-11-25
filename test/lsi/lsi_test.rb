@@ -222,4 +222,137 @@ class LSITest < Minitest::Test
     lsi.add_item @str3, 'Cat'
     refute lsi.items.empty?
   end
+
+  # Build an index where the proximity array is fully controlled by the test,
+  # so the voting math can be asserted with exact similarity scores. Since the
+  # proximity array is stubbed, no semantic index needs to be built.
+  def build_stubbed_lsi(labels)
+    lsi = ClassifierReborn::LSI.new(auto_rebuild: false)
+    labels.each_with_index do |node_labels, i|
+      lsi.add_item "document number #{i} with unique wording #{i}", *node_labels
+    end
+    lsi
+  end
+
+  def stub_proximities(lsi, proximities)
+    lsi.define_singleton_method(:proximity_array_for_content) do |_doc, &_block|
+      proximities
+    end
+    lsi
+  end
+
+  def test_quota_voting_splits_a_single_vote_across_unique_categories
+    labels = [['A', 'B', 'B'], ['B'], [], ['B'], ['A']]
+    lsi = build_stubbed_lsi(labels)
+    proximities = lsi.items.each_with_index.map { |item, i| [item, [0.8, 0.5, 0.4, 0.3, 0.2][i]] }
+    stub_proximities(lsi, proximities)
+
+    # Two neighbors are selected by the cutoff: 0.8 with [A,B,B] and 0.5 with
+    # [B]. In quota mode the first neighbor splits its vote between A and B
+    # once each, so the duplicated B does not buy a larger share.
+    scores = lsi.scored_categories('query', 0.4, true).to_h
+    assert_in_delta 0.4, scores['A'], 1e-9
+    assert_in_delta 0.9, scores['B'], 1e-9
+  end
+
+  def test_quota_voting_does_not_transfer_hidden_shares_between_categories
+    labels = [['A', 'B', 'B'], ['B'], [], ['B'], ['A']]
+    lsi = build_stubbed_lsi(labels)
+    proximities = lsi.items.each_with_index.map { |item, i| [item, [0.8, 0.5, 0.4, 0.3, 0.2][i]] }
+    stub_proximities(lsi, proximities)
+
+    # Asking only about B must not reallocate the hidden A share, and B must
+    # still gather 0.4 (from the split neighbor) + 0.5 = 0.9.
+    b_score = lsi.scored_categories('query', 0.4, true).to_h['B']
+    assert_in_delta 0.9, b_score, 1e-9
+  end
+
+  def test_quota_voting_ignores_unlabeled_neighbors_without_backfilling
+    labels = [['A', 'B', 'B'], ['B'], [], ['B'], ['A']]
+    lsi = build_stubbed_lsi(labels)
+    proximities = lsi.items.each_with_index.map { |item, i| [item, [0.8, 0.5, 0.4, 0.3, 0.2][i]] }
+    stub_proximities(lsi, proximities)
+
+    # The unlabeled neighbor (0.4) still occupies a cutoff slot without voting,
+    # and the B neighbor outside the cutoff (0.3) is not pulled in to replace
+    # it: B remains 0.9 rather than gaining the backfilled 0.3 share.
+    scores = lsi.scored_categories('query', 0.4, true).to_h
+    assert_equal %w[A B], scores.keys.sort
+    assert_in_delta 0.9, scores['B'], 1e-9
+  end
+
+  def test_full_voting_remains_the_default_and_counts_duplicate_categories
+    labels = [['A', 'B', 'B'], ['B'], [], ['B'], ['A']]
+    lsi = build_stubbed_lsi(labels)
+    proximities = lsi.items.each_with_index.map { |item, i| [item, [0.8, 0.5, 0.4, 0.3, 0.2][i]] }
+    stub_proximities(lsi, proximities)
+
+    refute lsi.quota_voting
+    scores = lsi.scored_categories('query', 0.4).to_h
+    # Legacy whole-vote behavior: B appears twice on the 0.8 neighbor and once
+    # on the 0.5 neighbor, so it collects 0.8 + 0.8 + 0.5 = 2.1.
+    assert_in_delta 0.8, scores['A'], 1e-9
+    assert_in_delta 2.1, scores['B'], 1e-9
+  end
+
+  def test_quota_voting_can_be_enabled_on_construction
+    labels = [['A', 'B', 'B'], ['B'], [], ['B'], ['A']]
+    lsi = ClassifierReborn::LSI.new(auto_rebuild: false, quota_voting: true)
+    labels.each_with_index { |node_labels, i| lsi.add_item "document #{i}", *node_labels }
+    proximities = lsi.items.each_with_index.map { |item, i| [item, [0.8, 0.5, 0.4, 0.3, 0.2][i]] }
+    stub_proximities(lsi, proximities)
+
+    assert lsi.quota_voting
+    scores = lsi.scored_categories('query', 0.4).to_h
+    assert_in_delta 0.4, scores['A'], 1e-9
+    assert_in_delta 0.9, scores['B'], 1e-9
+  end
+
+  def test_quota_voting_can_be_overridden_per_call
+    labels = [['A', 'B', 'B'], ['B'], [], ['B'], ['A']]
+    lsi = ClassifierReborn::LSI.new(auto_rebuild: false, quota_voting: true)
+    labels.each_with_index { |node_labels, i| lsi.add_item "document #{i}", *node_labels }
+    proximities = lsi.items.each_with_index.map { |item, i| [item, [0.8, 0.5, 0.4, 0.3, 0.2][i]] }
+    stub_proximities(lsi, proximities)
+
+    # An instance configured for quota voting can still run a legacy full vote.
+    scores = lsi.scored_categories('query', 0.4, false).to_h
+    assert_in_delta 2.1, scores['B'], 1e-9
+    assert_in_delta 0.8, scores['A'], 1e-9
+  end
+
+  def test_quota_voting_accepts_positional_argument_and_quota_alias
+    labels = [['A', 'B', 'B'], ['B'], [], ['B'], ['A']]
+    lsi = build_stubbed_lsi(labels)
+    proximities = lsi.items.each_with_index.map { |item, i| [item, [0.8, 0.5, 0.4, 0.3, 0.2][i]] }
+    stub_proximities(lsi, proximities)
+
+    positional = lsi.scored_categories('query', 0.4, true).to_h
+    assert_in_delta 0.9, positional['B'], 1e-9
+    aliased = lsi.scored_categories('query', 0.4, quota: true).to_h
+    assert_in_delta 0.9, aliased['B'], 1e-9
+    assert_equal 'B', lsi.classify('query', 0.4, true)
+    assert_equal ['B', 0.9], lsi.classify_with_score('query', 0.4, true)
+  end
+
+  def test_scored_categories_keeps_passing_the_content_block
+    lsi = build_stubbed_lsi([['A', 'B', 'B'], ['B'], [], ['B'], ['A']])
+    proximities = lsi.items.each_with_index.map { |item, i| [item, [0.8, 0.5, 0.4, 0.3, 0.2][i]] }
+    received = nil
+    lsi.define_singleton_method(:proximity_array_for_content) do |doc, &block|
+      received = block.call(doc)
+      proximities
+    end
+
+    lsi.scored_categories('external item', 0.4, true) { |item| "resolved #{item}" }
+    assert_equal 'resolved external item', received
+  end
+
+  def test_quota_voting_survives_reset
+    lsi = ClassifierReborn::LSI.new(quota_voting: true)
+    lsi.add_item @str1, 'Dog'
+    lsi.reset
+    assert lsi.quota_voting
+  end
 end
+

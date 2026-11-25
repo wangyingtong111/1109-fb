@@ -40,7 +40,7 @@ module ClassifierReborn
   # data based on underlying semantic relations. For more information on the algorithms used,
   # please consult Wikipedia[http://en.wikipedia.org/wiki/Latent_Semantic_Indexing].
   class LSI
-    attr_reader :word_list, :cache_node_vectors
+    attr_reader :word_list, :cache_node_vectors, :quota_voting
     attr_accessor :auto_rebuild
 
     # Create a fresh index.
@@ -48,6 +48,9 @@ module ClassifierReborn
     #      ClassifierReborn::LSI.new :auto_rebuild => false
     # If you want to use ContentNodes with cached vector transpositions, use
     #      lsi = ClassifierReborn::LSI.new :cache_node_vectors => true
+    # If you want every neighbor to split its single vote equally across its
+    # unique categories instead of casting a full vote per category entry, use
+    #      lsi = ClassifierReborn::LSI.new :quota_voting => true
     #
     def initialize(options = {})
       @auto_rebuild = options[:auto_rebuild] != false
@@ -56,6 +59,7 @@ module ClassifierReborn
       @version = 0
       @built_at_version = -1
       @language = options[:language] || 'en'
+      @quota_voting = options[:quota_voting] == true || options[:quota] == true
       @token_filters = [
         TokenFilter::Stopword,
         TokenFilter::Symbol
@@ -299,13 +303,13 @@ module ClassifierReborn
     end
 
     # Return the most obvious category with the score
-    def classify_with_score(doc, cutoff = 0.30, &block)
-      scored_categories(doc, cutoff, &block).last
+    def classify_with_score(doc, cutoff = 0.30, quota_voting = nil, quota: quota_voting, &block)
+      scored_categories(doc, cutoff, quota_voting, quota: quota, &block).last
     end
 
     # Return the most obvious category without the score
-    def classify(doc, cutoff = 0.30, &block)
-      scored_categories(doc, cutoff, &block).last.first
+    def classify(doc, cutoff = 0.30, quota_voting = nil, quota: quota_voting, &block)
+      scored_categories(doc, cutoff, quota_voting, quota: quota, &block).last.first
     end
 
     # This function uses a voting system to categorize documents, based on
@@ -317,14 +321,28 @@ module ClassifierReborn
     # text. A cutoff of 1 means that every document in the index votes on
     # what category the document is in. This may not always make sense.
     #
-    def scored_categories(doc, cutoff = 0.30, &block)
+    # By default every selected neighbor casts one full vote per category
+    # entry, so a document carrying the same category more than once inflates
+    # that category's score. Pass true as the third argument (or construct the
+    # index with :quota_voting => true) to give each neighbor a single vote
+    # that is split equally across its unique categories. Repeating a category
+    # on a document then does not increase its share, documents without
+    # categories cast no votes, and neighbors beyond the cutoff are never
+    # backfilled. The flag may be supplied as a positional argument or as the
+    # :quota keyword; nil falls back to the instance default.
+    #
+    def scored_categories(doc, cutoff = 0.30, quota_voting = nil, quota: quota_voting, &block)
+      use_quota_voting = quota.nil? ? @quota_voting : quota
       icutoff = (@items.size * cutoff).round
       carry = proximity_array_for_content(doc, &block)
       carry = carry[0..icutoff - 1]
       votes = Hash.new(0.0)
       carry.each do |pair|
-        @items[pair[0]].categories.each do |category|
-          votes[category] += pair[1]
+        categories = @items[pair[0]].categories
+        if use_quota_voting
+          cast_quota_votes(votes, categories, pair[1])
+        else
+          cast_full_votes(votes, categories, pair[1])
         end
       end
 
@@ -343,10 +361,30 @@ module ClassifierReborn
     end
 
     def reset
-      initialize(auto_rebuild: @auto_rebuild, cache_node_vectors: @cache_node_vectors)
+      initialize(auto_rebuild: @auto_rebuild,
+                 cache_node_vectors: @cache_node_vectors,
+                 quota_voting: @quota_voting)
     end
 
     private
+
+    # Legacy whole-vote behavior: every category entry receives the neighbor's
+    # full similarity score, including repeated entries of the same category.
+    def cast_full_votes(votes, categories, score)
+      categories.each { |category| votes[category] += score }
+    end
+
+    # Quota voting: a neighbor owns a single vote worth its similarity score.
+    # It is split equally across its unique categories, so repeating a category
+    # on the same document never increases its share. Neighbors without any
+    # category contribute nothing and simply do not vote.
+    def cast_quota_votes(votes, categories, score)
+      unique_categories = categories.uniq
+      return if unique_categories.empty?
+
+      share = score.to_f / unique_categories.size
+      unique_categories.each { |category| votes[category] += share }
+    end
 
     def build_reduced_matrix(matrix, cutoff = 0.75)
       # TODO: Check that M>=N on these dimensions! Transpose helps assure this
