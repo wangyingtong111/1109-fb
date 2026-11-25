@@ -20,12 +20,14 @@ module Eps
         @text_features.each do |k, v|
           encoder = TextEncoder.new(**v)
           counts = encoder.transform(data.columns[k])
+          vocabulary = encoder.vocabulary
 
           counts.each_with_index do |xc, i|
             row = rows[i]
             row.delete(k)
             xc.each do |word, count|
-              row[[k, word]] = count
+              # no need to keep terms outside the vocabulary
+              row[[k, word]] = count if vocabulary.include?(word)
             end
           end
         end

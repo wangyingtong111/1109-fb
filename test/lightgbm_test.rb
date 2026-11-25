@@ -226,6 +226,26 @@ class LightGBMTest < Minitest::Test
     Eps::LightGBM.new(data, target: :tag)
   end
 
+  def test_text_features_pmml_partial_vocabulary
+    pmml = File.read("test/support/lightgbm_text.pmml")
+    assert_valid_pmml(pmml)
+    model = Eps::Model.load_pmml(pmml)
+
+    # tree only uses body(oak) and title(oak)
+    # body vocabulary also contains unused, which the tree does not use
+    # new terms and unused do not affect predictions
+    body = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor unused Oak oak"
+
+    # body oak twice (mixed case) enters right branch, title oak decides next level
+    assert_equal 3.0, model.predict(title: "oak", body: body)
+
+    # same body, but title oak missing counts as 0
+    assert_equal 2.0, model.predict(title: "maple", body: body)
+
+    # body oak once enters left branch regardless of title
+    assert_equal 1.0, model.predict(title: "oak", body: "unused oak")
+  end
+
   def test_learning_rate
     data = mpg_data
     model = Eps::LightGBM.new(data, target: :hwy, split: false, learning_rate: 1)

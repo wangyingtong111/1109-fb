@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<PMML version="4.4" xmlns="http://www.dmg.org/PMML-4_4">
+  <Header>
+    <Application name="Eps"/>
+  </Header>
+  <DataDictionary>
+    <DataField name="y" optype="continuous" dataType="double"/>
+    <DataField name="title" optype="categorical" dataType="string"/>
+    <DataField name="body" optype="categorical" dataType="string"/>
+  </DataDictionary>
+  <TransformationDictionary>
+    <DefineFunction name="titleTransform" optype="continuous">
+      <ParameterField name="text"/>
+      <ParameterField name="term"/>
+      <TextIndex textField="text" localTermWeights="termFrequency" wordSeparatorCharacterRE="\W+" isCaseSensitive="false">
+        <FieldRef field="term"/>
+      </TextIndex>
+    </DefineFunction>
+    <DefineFunction name="bodyTransform" optype="continuous">
+      <ParameterField name="text"/>
+      <ParameterField name="term"/>
+      <TextIndex textField="text" localTermWeights="termFrequency" wordSeparatorCharacterRE="\W+" isCaseSensitive="false">
+        <FieldRef field="term"/>
+      </TextIndex>
+    </DefineFunction>
+  </TransformationDictionary>
+  <MiningModel functionName="regression" algorithmName="LightGBM">
+    <MiningSchema>
+      <MiningField name="y" usageType="target"/>
+      <MiningField name="title"/>
+      <MiningField name="body"/>
+    </MiningSchema>
+    <LocalTransformations>
+      <DerivedField name="title(oak)" optype="continuous" dataType="integer">
+        <Apply function="titleTransform">
+          <FieldRef field="title"/>
+          <Constant>oak</Constant>
+        </Apply>
+      </DerivedField>
+      <DerivedField name="body(oak)" optype="continuous" dataType="integer">
+        <Apply function="bodyTransform">
+          <FieldRef field="body"/>
+          <Constant>oak</Constant>
+        </Apply>
+      </DerivedField>
+      <DerivedField name="body(unused)" optype="continuous" dataType="integer">
+        <Apply function="bodyTransform">
+          <FieldRef field="body"/>
+          <Constant>unused</Constant>
+        </Apply>
+      </DerivedField>
+    </LocalTransformations>
+    <Segmentation multipleModelMethod="sum">
+      <Segment id="1">
+        <True/>
+        <TreeModel functionName="regression" missingValueStrategy="none" noTrueChildStrategy="returnLastPrediction" splitCharacteristic="multiSplit">
+          <MiningSchema>
+            <MiningField name="body(oak)"/>
+            <MiningField name="title(oak)"/>
+          </MiningSchema>
+          <Node score="1.0">
+            <True/>
+            <Node score="1.0">
+              <SimplePredicate field="body(oak)" operator="lessOrEqual" value="1.5"/>
+            </Node>
+            <Node score="2.0">
+              <SimplePredicate field="body(oak)" operator="greaterThan" value="1.5"/>
+              <Node score="2.0">
+                <SimplePredicate field="title(oak)" operator="lessOrEqual" value="0.5"/>
+              </Node>
+              <Node score="3.0">
+                <SimplePredicate field="title(oak)" operator="greaterThan" value="0.5"/>
+              </Node>
+            </Node>
+          </Node>
+        </TreeModel>
+      </Segment>
+    </Segmentation>
+  </MiningModel>
+</PMML>
