@@ -54,6 +54,30 @@ ps.clean
 # => "This is a sentence cut off in the middle because pdf."
 ```
 
+### Streaming chunks
+
+Use `PragmaticSegmenter::Segmenter.stream` when text arrives in fragments.
+`push` returns newly confirmed sentences; the final current segment is held
+back because a chunk boundary can be in the middle of punctuation. Call
+`finish` once to flush that tail. Repeated calls to `finish` return `[]`.
+
+```ruby
+stream = PragmaticSegmenter::Segmenter.stream
+
+stream.push("Wait..")             # => []
+stream.push(". we're here.")      # => []
+stream.push(" Then go.")          # => ["Wait... we're here."]
+stream.finish                     # => ["Then go."]
+stream.finish                     # => []
+
+stream.sentences
+# => ["Wait... we're here.", "Then go."]
+```
+
+`feed`, `append_chunk`, and `push_chunk` are aliases for `push`; `flush`,
+`close`, and `complete` are aliases for `finish`. The original one-shot
+`PragmaticSegmenter::Segmenter.new(text: text).segment` API is unchanged.
+
 ## Live Demo
 
 Try out a [live demo](https://www.tm-town.com/natural-language-processing) of Pragmatic Segmenter in the browser.
