@@ -7,6 +7,7 @@ require "set"
 
 # modules
 require_relative "disco/data"
+require_relative "disco/exposure_comparison"
 require_relative "disco/metrics"
 require_relative "disco/recommender"
 require_relative "disco/version"

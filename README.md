@@ -242,6 +242,47 @@ recommender.top_items
 
 This uses [Wilson score](https://www.evanmiller.org/how-not-to-sort-by-average-rating.html) for explicit feedback and item frequency for implicit feedback.
 
+## Offline Exposure Comparison
+
+Compare the item exposure of two *already fitted* recommenders over the same
+batch of users, a de-duplicated candidate list, and one shared explicit
+"already seen" exclusion. Recommenders are only read (never re-fit) and joined
+by external `user_id`/`item_id`, so different internal index mappings between
+the models do not affect the result.
+
+```ruby
+result = Disco::ExposureComparison.compare(
+  model_a, model_b,
+  user_ids: ["u", "ua"],
+  item_ids: ["rice", "tofu", "corn"],
+  seen: {"u" => ["corn"]}, # optional, applied identically to both sides
+  k: 1
+)
+
+result.exposure_counts(:a) # {"rice"=>2, "tofu"=>0, "corn"=>0}
+result.exposure_counts(:b) # {"rice"=>0, "tofu"=>1, "corn"=>0}
+result.item_diffs          # per-item A/B counts and exposure delta
+```
+
+A zero exposure can have several distinct, separately auditable causes. They
+are never collapsed into a bare `0`:
+
+- **missing catalog item** - the item is absent from that side's catalog, so it
+  could never be recommended (`missing_catalog_user_ids`)
+- **missing user** - the user is unknown to that side. No cold-start/popularity
+  ranking is substituted for that user (`missing_user_ids`)
+- **unranked** - the item is in the catalog and the user is known, but it did
+  not make the top k (`unranked_user_ids`)
+- **excluded** - the item was removed by the shared explicit "already seen"
+  list for that user (`excluded_user_ids`)
+
+```ruby
+item = result.side(:b).item("rice")
+item.exposure             # 0
+item.missing_catalog?     # true
+item.missing_catalog_user_ids
+```
+
 ## Data
 
 Data can be an array of hashes
