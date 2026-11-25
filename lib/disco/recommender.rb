@@ -17,18 +17,20 @@ module Disco
 
       check_training_set(train_set)
 
+      # Build the new model entirely in local variables so a failed fit does
+      # not overwrite the state of a previously successful fit.
       # TODO option to set in initializer to avoid pass
       # could also just check first few values
       # but may be confusing if they are all missing and later ones aren't
-      @implicit = !train_set.any? { |v| v[:rating] }
+      implicit = !train_set.any? { |v| v[:rating] }
 
-      if @implicit && train_set.any? { |v| v[:value] }
+      if implicit && train_set.any? { |v| v[:value] }
         raise ArgumentError, "Passing `:value` with implicit feedback has no effect on recommendations and should be removed. Earlier versions of the library incorrectly stated this was used."
       end
 
       # TODO improve performance
       # (catch exception instead of checking ahead of time)
-      unless @implicit
+      unless implicit
         check_ratings(train_set)
 
         if validation_set
@@ -36,39 +38,41 @@ module Disco
         end
       end
 
-      @user_map = {}
-      @item_map = {}
-      @rated = []
+      user_map = {}
+      item_map = {}
+      rated = []
       input = []
       train_set.each do |v|
         # update maps and build matrix in single pass
-        u = (@user_map[v[:user_id]] ||= @user_map.size)
-        i = (@item_map[v[:item_id]] ||= @item_map.size)
-        (@rated[u] ||= Set.new) << i
+        u = (user_map[v[:user_id]] ||= user_map.size)
+        i = (item_map[v[:item_id]] ||= item_map.size)
+        (rated[u] ||= Set.new) << i
 
         # explicit will always have a value due to check_ratings
-        input << [u, i, @implicit ? 1 : v[:rating]]
+        input << [u, i, implicit ? 1 : v[:rating]]
       end
 
       # much more efficient than checking every value in another pass
-      raise ArgumentError, "Missing user_id" if @user_map.key?(nil)
-      raise ArgumentError, "Missing item_id" if @item_map.key?(nil)
+      raise ArgumentError, "Missing user_id" if user_map.key?(nil)
+      raise ArgumentError, "Missing item_id" if item_map.key?(nil)
 
       # TODO improve performance
-      unless @implicit
-        @min_rating, @max_rating = train_set.minmax_by { |o| o[:rating] }.map { |o| o[:rating] }
+      if implicit
+        min_rating = nil
+        max_rating = nil
       else
-        @min_rating = nil
-        @max_rating = nil
+        min_rating, max_rating = train_set.minmax_by { |o| o[:rating] }.map { |o| o[:rating] }
       end
 
+      item_count = nil
+      item_sum = nil
       if @top_items
-        @item_count = Array.new(@item_map.size, 0)
-        @item_sum = Array.new(@item_map.size, 0.0)
+        item_count = Array.new(item_map.size, 0)
+        item_sum = Array.new(item_map.size, 0.0)
         train_set.each do |v|
-          i = @item_map[v[:item_id]]
-          @item_count[i] += 1
-          @item_sum[i] += (@implicit ? 1 : v[:rating])
+          i = item_map[v[:item_id]]
+          item_count[i] += 1
+          item_sum[i] += (implicit ? 1 : v[:rating])
         end
       end
 
@@ -76,10 +80,10 @@ module Disco
       if validation_set&.any?
         eval_set = []
         validation_set.each do |v|
-          u = @user_map[v[:user_id]]
-          i = @item_map[v[:item_id]]
+          u = user_map[v[:user_id]]
+          i = item_map[v[:item_id]]
 
-          if @implicit
+          if implicit
             if u.nil?
               raise ArgumentError, "Validation set cannot have new users for implicit feedback"
             end
@@ -88,24 +92,36 @@ module Disco
               raise ArgumentError, "Validation set cannot have new items for implicit feedback"
             end
           else
-            u ||= @user_map.size
-            i ||= @item_map.size
+            u ||= user_map.size
+            i ||= item_map.size
           end
 
-          eval_set << [u, i, @implicit ? 1 : v[:rating]]
+          eval_set << [u, i, implicit ? 1 : v[:rating]]
         end
       end
 
-      loss = @implicit ? 12 : 0
+      loss = implicit ? 12 : 0
       verbose = @verbose
       verbose = true if verbose.nil? && eval_set
       model = Libmf::Model.new(loss: loss, factors: @factors, iterations: @epochs, quiet: !verbose)
       model.fit(input, eval_set: eval_set)
 
-      @global_mean = model.bias
+      global_mean = model.bias
+      user_factors = model.p_factors(format: :numo)
+      item_factors = model.q_factors(format: :numo)
 
-      @user_factors = model.p_factors(format: :numo)
-      @item_factors = model.q_factors(format: :numo)
+      # Commit only after training and factor extraction have succeeded.
+      @implicit = implicit
+      @user_map = user_map
+      @item_map = item_map
+      @rated = rated
+      @min_rating = min_rating
+      @max_rating = max_rating
+      @item_count = item_count
+      @item_sum = item_sum
+      @global_mean = global_mean
+      @user_factors = user_factors
+      @item_factors = item_factors
 
       @user_norms = nil
       @item_norms = nil
@@ -117,6 +133,7 @@ module Disco
 
     # generates a prediction even if a user has already rated the item
     def predict(data)
+      check_fit
       data = to_dataset(data)
 
       u = data.map { |v| @user_map[v[:user_id]] }
