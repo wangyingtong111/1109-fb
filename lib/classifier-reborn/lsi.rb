@@ -203,6 +203,57 @@ module ClassifierReborn
       avg_density.keys.sort_by { |x| avg_density[x] }.reverse[0..max_chunks - 1].map
     end
 
+    # Maximal Marginal Relevance style selection.
+    #
+    # Picks up to +max_chunks+ indexed items balancing their centrality (the
+    # same semantic rating used by #highest_relative_content) against their
+    # similarity to the items already selected. +redundancy_weight+ controls
+    # the trade-off:
+    #
+    # * a weight of +0+ (the default) ignores redundancy and reproduces the
+    #   plain centrality ranking of #highest_relative_content;
+    # * larger weights penalize candidates that are semantically close to an
+    #   item already chosen, reducing the number of repeated themes.
+    #
+    # The first item is always the most central one. Every subsequent pick
+    # maximizes
+    #
+    #   centrality(candidate) - redundancy_weight *
+    #                           max similarity(chosen, candidate)
+    #
+    # where the similarity is the cosine similarity between the normalized
+    # LSI vectors returned by #proximity_norms_for_content.
+    def highest_relative_content_with_mmr(max_chunks = 10,
+                                          redundancy_weight = 0.0)
+      return [] if needs_rebuild?
+
+      items = @items.keys
+      return [] if items.empty?
+
+      max_chunks = items.size if max_chunks > items.size
+      centrality = {}
+      items.each do |item|
+        centrality[item] = proximity_array_for_content(item).inject(0.0) { |x, y| x + y[1] }
+      end
+
+      selected = [items.max_by { |item| centrality[item] }]
+      return selected if max_chunks <= 1
+
+      similarity = {}
+      until selected.size == max_chunks
+        candidates = items - selected
+        break if candidates.empty?
+
+        chosen = candidates.max_by do |item|
+          similarity[item] ||= proximity_norms_for_content(item).to_h
+          nearest = selected.map { |picked| similarity[item][picked].to_f }.max
+          centrality[item] - redundancy_weight * nearest
+        end
+        selected << chosen
+      end
+      selected
+    end
+
     # This function is the primitive that find_related and classify
     # build upon. It returns an array of 2-element arrays. The first element
     # of this array is a document, and the second is its "score", defining
