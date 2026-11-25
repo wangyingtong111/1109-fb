@@ -52,6 +52,25 @@ text = "This is a sentence\ncut off in the middle because pdf."
 ps = PragmaticSegmenter::Cleaner.new(text: text, doc_type: 'pdf')
 ps.clean
 # => "This is a sentence cut off in the middle because pdf."
+
+# Unicode layout text mode
+# U+2029 always starts a new hard block. Each U+2028 can be classified by its
+# original character position as :intra_word, :inter_word, or :hard_line.
+text = "inter\u2028national travel\u2028Next fragment\u2029Beta"
+PragmaticSegmenter::Segmenter.new(
+  text: text,
+  layout_text: true,
+  line_breaks: { 5 => :intra_word, 21 => :hard_line }
+).segment
+# => ["international travel", "Next fragment", "Beta"]
+
+# U+2028 roles may also be supplied in source order; undeclared U+2028 marks
+# default to :hard_line. Passing layout: roles is an alias for layout_text:.
+PragmaticSegmenter::Segmenter.new(
+  text: text,
+  layout_text: [:intra_word, :hard_line]
+).segment
+# => ["international travel", "Next fragment", "Beta"]
 ```
 
 ## Live Demo
