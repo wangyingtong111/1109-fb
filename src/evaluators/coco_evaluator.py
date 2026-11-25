@@ -22,10 +22,22 @@
 from collections import defaultdict
 
 import numpy as np
-from src.bounding_box import BBFormat
+from src.bounding_box import BBFormat, BoundingBox
+from src.utils.rotated_geometry import geometry_iou
 
 
-def get_coco_summary(groundtruth_bbs, detected_bbs):
+def _is_rotated(bb):
+    return hasattr(bb, 'is_rotated') and bb.is_rotated()
+
+
+def _continuous_flag(continuous=False, rotated=None, **kwargs):
+    """Resolve common compatibility aliases for continuous polygon scoring."""
+    aliases = ('continuous_area', 'use_continuous_area', 'polygon', 'use_polygon',
+               'geometry', 'real_geometry')
+    return bool(continuous or rotated is True or any(kwargs.get(name) for name in aliases))
+
+
+def get_coco_summary(groundtruth_bbs, detected_bbs, rotated=None, continuous=False, **kwargs):
     """Calculate the 12 standard metrics used in COCOEval,
         AP, AP50, AP75,
         AR1, AR10, AR100,
@@ -49,8 +61,13 @@ def get_coco_summary(groundtruth_bbs, detected_bbs):
     # separate bbs per image X class
     _bbs = _group_detections(detected_bbs, groundtruth_bbs)
 
-    # pairwise ious
-    _ious = {k: _compute_ious(**v) for k, v in _bbs.items()}
+    # pairwise ious.  Rotated boxes are detected from their representation;
+    # the optional flags force continuous polygon geometry for all pairs.
+    use_continuous = _continuous_flag(continuous, rotated, **kwargs)
+    _ious = {
+        k: _compute_ious(**v, continuous=use_continuous)
+        for k, v in _bbs.items()
+    }
 
     def _evaluate(iou_threshold, max_dets, area_range):
         # accumulate evaluations on a per-class basis
@@ -174,6 +191,9 @@ def get_coco_metrics(
         iou_threshold=0.5,
         area_range=(0, np.inf),
         max_dets=100,
+        rotated=None,
+        continuous=False,
+        **kwargs,
 ):
     """ Calculate the Average Precision and Recall metrics as in COCO's official implementation
         given an IOU threshold, area range and maximum number of detections.
@@ -210,8 +230,13 @@ def get_coco_metrics(
     # separate bbs per image X class
     _bbs = _group_detections(detected_bbs, groundtruth_bbs)
 
-    # pairwise ious
-    _ious = {k: _compute_ious(**v) for k, v in _bbs.items()}
+    # pairwise ious.  Rotated boxes are detected from their representation;
+    # the optional flags force continuous polygon geometry for all pairs.
+    use_continuous = _continuous_flag(continuous, rotated, **kwargs)
+    _ious = {
+        k: _compute_ious(**v, continuous=use_continuous)
+        for k, v in _bbs.items()
+    }
 
     # accumulate evaluations on a per-class basis
     _evals = defaultdict(lambda: {"scores": [], "matched": [], "NP": []})
@@ -248,6 +273,45 @@ def get_coco_metrics(
     return res
 
 
+def _looks_detected(box):
+    confidence = getattr(box, 'get_confidence', lambda: None)()
+    return confidence is not None
+
+
+def evaluate_detections(groundtruth_bbs=None,
+                        detected_bbs=None,
+                        iou_threshold=0.5,
+                        predictions=None,
+                        references=None,
+                        **kwargs):
+    """Keyword-friendly alias of :func:`get_coco_metrics`.
+
+    The repository's historical argument order is ground truths first.  This
+    alias also accepts the prompt vocabulary ``predictions`` and ``references``
+    and tolerates ``evaluate(predictions, references)`` positional ordering by
+    checking which objects carry detection confidence.
+    """
+    if predictions is not None:
+        detected_bbs = predictions
+    if references is not None:
+        groundtruth_bbs = references
+    if groundtruth_bbs is None or detected_bbs is None:
+        raise ValueError('Both references/groundtruths and predictions/detections are required.')
+    if groundtruth_bbs and detected_bbs:
+        first_is_pred = all(_looks_detected(bb) for bb in groundtruth_bbs)
+        second_is_ref = all(not _looks_detected(bb) for bb in detected_bbs)
+        if first_is_pred and second_is_ref:
+            groundtruth_bbs, detected_bbs = detected_bbs, groundtruth_bbs
+    return get_coco_metrics(groundtruth_bbs,
+                           detected_bbs,
+                           iou_threshold=iou_threshold,
+                           **kwargs)
+
+
+# Concise public alias for callers looking for a generic evaluation entry.
+evaluate = evaluate_detections
+
+
 def _group_detections(dt, gt):
     """ simply group gts and dts on a imageXclass basis """
     bb_info = defaultdict(lambda: {"dt": [], "gt": []})
@@ -263,12 +327,22 @@ def _group_detections(dt, gt):
 
 
 def _get_area(a):
-    """ COCO does not consider the outer edge as included in the bbox """
+    """COCO does not consider the outer edge as included in the bbox."""
+    if _is_rotated(a):
+        return a.get_continuous_area()
     x, y, x2, y2 = a.get_absolute_bounding_box(format=BBFormat.XYX2Y2)
     return (x2 - x) * (y2 - y)
 
 
-def _jaccard(a, b):
+def _jaccard(a, b, continuous=False):
+    # Any pair involving an explicitly rotated representation is scored from
+    # the real polygons.  ``continuous=True`` also selects polygon/continuous
+    # geometry for ordinary boxes.  The default ordinary path below is the
+    # original COCO open-ended axis-aligned calculation.
+    if continuous or not hasattr(a, 'get_absolute_bounding_box') or not hasattr(
+            b, 'get_absolute_bounding_box') or _is_rotated(a) or _is_rotated(b):
+        return geometry_iou(a, b)
+
     xa, ya, x2a, y2a = a.get_absolute_bounding_box(format=BBFormat.XYX2Y2)
     xb, yb, x2b, y2b = b.get_absolute_bounding_box(format=BBFormat.XYX2Y2)
 
@@ -284,16 +358,21 @@ def _jaccard(a, b):
     Aa = max(x2a - xa, 0) * max(y2a - ya, 0)
     Ab = max(x2b - xb, 0) * max(y2b - yb, 0)
     Ai = max(x2i - xi, 0) * max(y2i - yi, 0)
-    return Ai / (Aa + Ab - Ai)
+    union = Aa + Ab - Ai
+    if union <= 0:
+        # Explicit degenerate boundary: zero-area boxes do not produce 0/0 or
+        # a match in mixed evaluation.
+        return 0.0
+    return Ai / union
 
 
-def _compute_ious(dt, gt):
+def _compute_ious(dt, gt, continuous=False):
     """ compute pairwise ious """
 
     ious = np.zeros((len(dt), len(gt)))
     for g_idx, g in enumerate(gt):
         for d_idx, d in enumerate(dt):
-            ious[d_idx, g_idx] = _jaccard(d, g)
+            ious[d_idx, g_idx] = _jaccard(d, g, continuous=continuous)
     return ious
 
 

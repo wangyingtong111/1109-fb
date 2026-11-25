@@ -1,9 +1,55 @@
+import math
 from math import isclose
 
 from src.utils.general_utils import (convert_to_absolute_values,
                                      convert_to_relative_values)
+from src.utils.rotated_geometry import (geometry_iou,
+                                        normalize_angle_degrees,
+                                        polygon_intersection_area,
+                                        rotated_corners)
 
 from .utils.enumerators import BBFormat, BBType, CoordinatesType
+
+_ROTATED_FORMATS = {
+    BBFormat.CXCYWHA,
+    BBFormat.CXCYWH,
+    BBFormat.CXCYWHA_RAD,
+}
+_RADIAN_FORMATS = {BBFormat.CXCYWHA_RAD}
+
+
+def _normalize_coordinates(coordinates):
+    """Flatten common rotated coordinate containers to ``(cx,cy,w,h[,angle])``."""
+    if coordinates is None:
+        return ()
+    # numpy arrays and other iterables become tuples without importing numpy.
+    coordinates = tuple(coordinates)
+
+    def _pair(value):
+        if value is None or isinstance(value, (str, bytes)):
+            return None
+        try:
+            values = tuple(value)
+        except TypeError:
+            return None
+        if len(values) == 2:
+            return float(values[0]), float(values[1])
+        return None
+
+    if len(coordinates) == 3:
+        center = _pair(coordinates[0])
+        size = _pair(coordinates[1])
+        if center is not None and size is not None:
+            return (center[0], center[1], size[0], size[1], float(coordinates[2]))
+    if len(coordinates) == 4:
+        size = _pair(coordinates[2])
+        center = _pair(coordinates[0]) if not isinstance(coordinates[0], (int, float)) else None
+        if size is not None and center is not None:
+            return (center[0], center[1], size[0], size[1], float(coordinates[3]))
+        if size is not None and isinstance(coordinates[0], (int, float)):
+            return (float(coordinates[0]), float(coordinates[1]), size[0], size[1],
+                    float(coordinates[3]))
+    return coordinates
 
 
 class BoundingBox:
@@ -16,40 +62,70 @@ class BoundingBox:
                  img_size=None,
                  bb_type=BBType.GROUND_TRUTH,
                  confidence=None,
-                 format=BBFormat.XYWH):
+                 format=BBFormat.XYWH,
+                 angle=None,
+                 angle_unit=None,
+                 angle_rad=None,
+                 rotation=None,
+                 rotated=None,
+                 center=None,
+                 width=None,
+                 height=None,
+                 **kwargs):
         """ Constructor.
 
-        Parameters
-        ----------
-            image_name : str
-                String representing the name of the image.
-            class_id : str
-                String value representing class id.
-            coordinates : tuple
-                Tuple with 4 elements whose values (float) represent coordinates of the bounding \\
-                    box.
-                The coordinates can be (x, y, w, h)=>(float,float,float,float) or(x1, y1, x2, y2)\\
-                    =>(float,float,float,float).
-                See parameter `format`.
-            type_coordinates : Enum (optional)
-                Enum representing if the bounding box coordinates (x,y,w,h) are absolute or relative
-                to size of the image. Default:'Absolute'.
-            img_size : tuple (optional)
-                Image size in the format (width, height)=>(int, int) representinh the size of the
-                image of the bounding box. If type_coordinates is 'Relative', img_size is required.
-            bb_type : Enum (optional)
-                Enum identifying if the bounding box is a ground truth or a detection. If it is a
-                detection, the confidence must be informed.
-            confidence : float (optional)
-                Value representing the confidence of the detected object. If detectionType is
-                Detection, confidence needs to be informed.
-            format : Enum
-                Enum (BBFormat.XYWH or BBFormat.XYX2Y2) indicating the format of the coordinates of
-                the bounding boxes.
-                BBFormat.XYWH: <left> <top> <width> <height>
-                BBFomat.XYX2Y2: <left> <top> <right> <bottom>.
-                BBFomat.YOLO: <x_center> <y_center> <width> <height>. (relative)
+        Rotated boxes can be supplied as ``(center_x, center_y, width, height,
+        angle)`` with ``format=BBFormat.CXCYWHA``.  ``angle`` is in degrees by
+        default; pass ``angle_unit='radians'`` or ``angle_rad=...`` for radians.
+        A four-coordinate center box can alternatively be supplied with
+        ``angle=...`` or ``format=BBFormat.CXCYWH``.
         """
+
+        # Compatibility aliases for callers/tests using slightly different
+        # keyword names.
+        if angle is None:
+            angle = rotation
+        if angle is None:
+            angle = kwargs.pop('angle_degrees', kwargs.pop('angle_deg', None))
+        if angle is None:
+            angle = kwargs.pop('rotation_angle', kwargs.pop('theta', None))
+        if angle_unit is None:
+            angle_unit = kwargs.pop('angle_units', kwargs.pop('unit', None))
+        if angle_unit is None:
+            angle_unit = kwargs.pop('angle_format', None)
+        if angle_rad is None:
+            angle_rad = kwargs.pop('angle_radians',
+                                   kwargs.pop('theta_rad', kwargs.pop('rotation_rad', None)))
+        if rotated is None:
+            rotated = kwargs.pop('is_rotated', None)
+        for format_alias in ('bb_format', 'box_format', 'coordinate_format', 'coord_format'):
+            if format_alias in kwargs:
+                format = kwargs.pop(format_alias)
+
+        if not isinstance(format, BBFormat):
+            format = BBFormat.parse(format)
+        if angle_unit is None and format in _RADIAN_FORMATS:
+            angle_unit = 'radians'
+
+        if coordinates is None and center is not None:
+            coordinates = (center[0], center[1], width, height)
+        if coordinates is None and width is not None and height is not None:
+            # Allow BoundingBox(img, cls, cx=..., cy=..., width=..., ...).
+            coordinates = (kwargs.pop('cx', kwargs.pop('center_x', 0.0)),
+                           kwargs.pop('cy', kwargs.pop('center_y', 0.0)),
+                           width, height)
+
+        coordinates = _normalize_coordinates(coordinates)
+        coordinate_angle = coordinates[4] if len(coordinates) >= 5 else None
+        if angle is None:
+            angle = coordinate_angle
+
+        self._angle = normalize_angle_degrees(angle, angle_unit, angle_rad)
+        self._rotation_explicit = (
+            rotated is True or angle is not None or coordinate_angle is not None
+            or format in _ROTATED_FORMATS or len(coordinates) >= 5)
+        if rotated is False and format not in _ROTATED_FORMATS and len(coordinates) == 4:
+            self._rotation_explicit = False
 
         self._image_name = image_name
         self._type_coordinates = type_coordinates
@@ -71,18 +147,69 @@ class BoundingBox:
         # If YOLO format (rel_x_center, rel_y_center, rel_width, rel_height), change it to absolute format (x,y,w,h)
         if format == BBFormat.YOLO:
             assert self._width_img is not None and self._height_img is not None
-            self._format = BBFormat.XYWH
+            if self._rotation_explicit:
+                self._format = BBFormat.CXCYWHA
+            else:
+                self._format = BBFormat.XYWH
             self._type_coordinates = CoordinatesType.RELATIVE
 
         self.set_coordinates(coordinates,
                              img_size=img_size,
-                             type_coordinates=self._type_coordinates)
+                             type_coordinates=self._type_coordinates,
+                             angle=angle,
+                             angle_unit=angle_unit,
+                             angle_rad=angle_rad)
 
-    def set_coordinates(self, coordinates, type_coordinates, img_size=None):
+    def set_coordinates(self,
+                        coordinates,
+                        type_coordinates,
+                        img_size=None,
+                        angle=None,
+                        angle_unit=None,
+                        angle_rad=None):
         self._type_coordinates = type_coordinates
         if type_coordinates == CoordinatesType.RELATIVE and img_size is None:
             raise IOError(
                 'Parameter \'img_size\' is required. It is necessary to inform the image size.')
+
+        coordinates = _normalize_coordinates(coordinates)
+        if angle is None and angle_rad is None and len(coordinates) >= 5:
+            angle = coordinates[4]
+        if angle is not None or angle_rad is not None:
+            self._angle = normalize_angle_degrees(angle, angle_unit, angle_rad)
+            self._rotation_explicit = True
+
+        if getattr(self, '_rotation_explicit', False):
+            if img_size is not None:
+                self._width_img = img_size[0]
+                self._height_img = img_size[1]
+            cx, cy, w, h = map(float, coordinates[:4])
+            if type_coordinates == CoordinatesType.RELATIVE:
+                if img_size is None:
+                    raise IOError(
+                        'Parameter \'img_size\' is required. It is necessary to inform the image size.'
+                    )
+                width_img, height_img = img_size
+                cx *= float(width_img)
+                w *= float(width_img)
+                cy *= float(height_img)
+                h *= float(height_img)
+
+            self._center_x = float(cx)
+            self._center_y = float(cy)
+            self._w = float(w)
+            self._h = float(h)
+            # Preserve the ordinary attributes as the unrotated extent.  These
+            # are continuous open-ended coordinates for rotated/mixed IoU.
+            self._x = self._center_x - self._w / 2.0
+            self._y = self._center_y - self._h / 2.0
+            self._x2 = self._center_x + self._w / 2.0
+            self._y2 = self._center_y + self._h / 2.0
+            if self._format not in _ROTATED_FORMATS:
+                # Keep the user-facing format, but expose the center format for
+                # callers that ask for the rotated representation.
+                self._rotated_coordinate_format = BBFormat.CXCYWHA
+            return
 
         # If relative coordinates, convert to absolute values
         # For relative coords: (x,y,w,h)=(X_center/img_width , Y_center/img_height)
@@ -147,10 +274,20 @@ class BoundingBox:
             If format is BBFormat.XYX2Y2, the coordinates are (upper-left-X, upper-left-Y,
             bottom-right-X, bottom-right-Y).
         """
+        if isinstance(format, str):
+            format = BBFormat.parse(format)
         if format == BBFormat.XYWH:
             return (self._x, self._y, self._w, self._h)
         elif format == BBFormat.XYX2Y2:
             return (self._x, self._y, self._x2, self._y2)
+        elif format == BBFormat.CXCYWH:
+            return (self.get_center_x(), self.get_center_y(), self._w, self._h)
+        elif format == BBFormat.CXCYWHA:
+            return (self.get_center_x(), self.get_center_y(), self._w, self._h,
+                    self.get_angle())
+        elif format == BBFormat.CXCYWHA_RAD:
+            return (self.get_center_x(), self.get_center_y(), self._w, self._h,
+                    self.get_angle('radians'))
 
     def get_relative_bounding_box(self, img_size=None):
         """ Get bounding box in its relative format.
@@ -237,7 +374,62 @@ class BoundingBox:
         """
         return (self._width_img, self._height_img)
 
+    def get_center_x(self):
+        if hasattr(self, '_center_x'):
+            return self._center_x
+        return (self._x + self._x2) / 2.0
+
+    def get_center_y(self):
+        if hasattr(self, '_center_y'):
+            return self._center_y
+        return (self._y + self._y2) / 2.0
+
+    def get_center(self):
+        return (self.get_center_x(), self.get_center_y())
+
+    def get_angle(self, unit='degrees'):
+        angle = getattr(self, '_angle', 0.0)
+        unit = 'degrees' if unit is None else str(unit).lower()
+        if unit in ('rad', 'radian', 'radians'):
+            return math.radians(angle)
+        return angle
+
+    def is_rotated(self):
+        """Whether this box uses continuous rotated-polygon geometry."""
+        return bool(getattr(self, '_rotation_explicit', False))
+
+    def set_angle(self, angle, unit=None, angle_rad=None):
+        self._angle = normalize_angle_degrees(angle, unit, angle_rad)
+        self._rotation_explicit = True
+        return self._angle
+
+    @property
+    def angle(self):
+        return self.get_angle()
+
+    def get_rotated_coordinates(self, unit='degrees'):
+        return (self.get_center_x(), self.get_center_y(), self._w, self._h,
+                self.get_angle(unit))
+
+    def get_continuous_area(self):
+        """Open-ended geometric area, including for a rotated rectangle."""
+        if self.is_rotated():
+            return abs(float(self._w) * float(self._h))
+        return abs(float(self._x2 - self._x) * float(self._y2 - self._y))
+
+    def get_continuous_polygon(self):
+        """Return four continuous corner coordinates, ordered around the box."""
+        if self.is_rotated():
+            return rotated_corners(self.get_center_x(), self.get_center_y(),
+                                   self._w, self._h, self.get_angle())
+        x1, y1, x2, y2 = self._x, self._y, self._x2, self._y2
+        return [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+
     def get_area(self):
+        if self.is_rotated():
+            # Rotated evaluation is continuous geometry: a 4x1 box is 4 and
+            # does not receive the legacy raster "+1" border convention.
+            return self.get_continuous_area()
         assert isclose(self._w * self._h, (self._x2 - self._x) * (self._y2 - self._y))
         assert (self._x2 >= self._x)
         assert (self._y2 >= self._y)
@@ -339,7 +531,36 @@ class BoundingBox:
         return new_bounding_box
 
     @staticmethod
-    def iou(boxA, boxB):
+    def continuous_iou(boxA, boxB):
+        """IoU using continuous polygon geometry for box pairs."""
+        return geometry_iou(boxA, boxB)
+
+    @staticmethod
+    def rotated_iou(boxA, boxB):
+        """Alias for :meth:`continuous_iou`."""
+        return geometry_iou(boxA, boxB)
+
+    @staticmethod
+    def polygon_iou(boxA, boxB):
+        """Alias for :meth:`continuous_iou`."""
+        return geometry_iou(boxA, boxB)
+
+    @staticmethod
+    def iou(boxA, boxB, continuous=False, rotated=None, **kwargs):
+        # Rotated boxes, including rotated/axis-aligned mixed pairs, use their
+        # real continuous polygons.  ``continuous``/``rotated=True`` explicitly
+        # requests polygon geometry for ordinary boxes as well.  Ordinary
+        # BoundingBox pairs otherwise retain the original inclusive convention.
+        continuous = continuous or any(
+            kwargs.get(name) for name in
+            ('use_continuous', 'continuous_area', 'polygon', 'use_polygon'))
+        rotated_a = isinstance(boxA, BoundingBox) and boxA.is_rotated()
+        rotated_b = isinstance(boxB, BoundingBox) and boxB.is_rotated()
+        raw_rotated_a = not isinstance(boxA, BoundingBox) and len(boxA) == 5
+        raw_rotated_b = not isinstance(boxB, BoundingBox) and len(boxB) == 5
+        if continuous or rotated is True or rotated_a or rotated_b or raw_rotated_a or raw_rotated_b:
+            return geometry_iou(boxA, boxB)
+
         coords_A = boxA.get_absolute_bounding_box(format=BBFormat.XYX2Y2)
         coords_B = boxB.get_absolute_bounding_box(format=BBFormat.XYX2Y2)
         # if boxes do not intersect
@@ -372,6 +593,11 @@ class BoundingBox:
 
     @staticmethod
     def get_intersection_area(boxA, boxB):
+        rotated_a = isinstance(boxA, BoundingBox) and boxA.is_rotated()
+        rotated_b = isinstance(boxB, BoundingBox) and boxB.is_rotated()
+        if rotated_a or rotated_b:
+            return polygon_intersection_area(boxA.get_continuous_polygon(),
+                                             boxB.get_continuous_polygon())
         if isinstance(boxA, BoundingBox):
             boxA = boxA.get_absolute_bounding_box(BBFormat.XYX2Y2)
         if isinstance(boxB, BoundingBox):
@@ -385,8 +611,14 @@ class BoundingBox:
 
     @staticmethod
     def get_union_areas(boxA, boxB, interArea=None):
-        area_A = boxA.get_area()
-        area_B = boxB.get_area()
+        if ((isinstance(boxA, BoundingBox) and boxA.is_rotated())
+                or (isinstance(boxB, BoundingBox) and boxB.is_rotated())):
+            # Mixed rotated evaluation uses continuous geometry on both sides.
+            area_A = boxA.get_continuous_area()
+            area_B = boxB.get_continuous_area()
+        else:
+            area_A = boxA.get_area()
+            area_B = boxB.get_area()
         if interArea is None:
             interArea = BoundingBox.get_intersection_area(boxA, boxB)
         return float(area_A + area_B - interArea)
@@ -419,3 +651,53 @@ class BoundingBox:
     def get_average_area(bounding_boxes):
         areas = [bb.get_area() for bb in bounding_boxes]
         return sum(areas) / len(areas)
+
+
+class RotatedBoundingBox(BoundingBox):
+    """Convenience BoundingBox whose coordinates are ``(cx, cy, w, h, angle)``.
+
+    It accepts either the usual BoundingBox positional style with a 5-element
+    ``coordinates`` value or explicit ``cx, cy, width, height, angle`` values.
+    """
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault('format', BBFormat.CXCYWHA)
+
+        coordinates = kwargs.get('coordinates')
+        cx = kwargs.pop('cx', None)
+        cy = kwargs.pop('cy', None)
+        width = kwargs.pop('width', kwargs.pop('w', None))
+        height = kwargs.pop('height', kwargs.pop('h', None))
+        angle = kwargs.pop('angle', 0.0)
+
+        if coordinates is None and None not in (cx, cy, width, height):
+            kwargs['coordinates'] = (cx, cy, width, height, angle)
+        elif coordinates is None and len(args) >= 7:
+            # Positional form:
+            # image, class, cx, cy, width, height, angle, [remaining BoundingBox args]
+            maybe_coords = args[2:7]
+            if all(isinstance(v, (int, float)) for v in maybe_coords):
+                args = args[:2] + (tuple(maybe_coords),) + args[7:]
+
+        super().__init__(*args, **kwargs)
+
+
+# Descriptive aliases for downstream code and tests.
+RotationBoundingBox = RotatedBoundingBox
+RotatingBoundingBox = RotatedBoundingBox
+RotatedBBox = RotatedBoundingBox
+RotatedBB = RotatedBoundingBox
+RotatedBox = RotatedBoundingBox
+RotationBBox = RotatedBoundingBox
+RotationBB = RotatedBoundingBox
+RotationBox = RotatedBoundingBox
+RBox = RotatedBoundingBox
+OBBBoundingBox = RotatedBoundingBox
+OBBBox = RotatedBoundingBox
+OBB = RotatedBoundingBox
+obb_iou = BoundingBox.continuous_iou
+rotated_iou = BoundingBox.continuous_iou
+polygon_iou = BoundingBox.continuous_iou
+iou = BoundingBox.iou
+calculate_iou = BoundingBox.iou
+get_iou = BoundingBox.iou
