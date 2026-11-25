@@ -7,6 +7,23 @@ from opt_einsum.parser import get_symbol
 from opt_einsum.path_random import RandomGreedy
 from opt_einsum.paths import BranchBound, DynamicProgramming
 from opt_einsum.sharing import shared_intermediates
+from opt_einsum.symbolic import (
+    Broadcast,
+    Dimension,
+    DimensionConflictError,
+    Symbol,
+    SymbolicDimension,
+    SymbolicExpression,
+    SymbolicInt,
+    SymbolicPlanningError,
+    SymbolicSize,
+    UnresolvedSymbolError,
+    UnresolvedSymbolicDimensionError,
+    bind_plan,
+    broadcast_dimensions,
+    symbol,
+    symbols,
+)
 
 __all__ = [
     "__version__",
@@ -22,6 +39,21 @@ __all__ = [
     "BranchBound",
     "DynamicProgramming",
     "shared_intermediates",
+    "Symbol",
+    "Dimension",
+    "SymbolicDimension",
+    "SymbolicExpression",
+    "SymbolicInt",
+    "SymbolicSize",
+    "Broadcast",
+    "symbol",
+    "symbols",
+    "bind_plan",
+    "broadcast_dimensions",
+    "SymbolicPlanningError",
+    "UnresolvedSymbolError",
+    "UnresolvedSymbolicDimensionError",
+    "DimensionConflictError",
 ]
 
 

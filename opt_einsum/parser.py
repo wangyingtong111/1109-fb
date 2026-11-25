@@ -4,6 +4,14 @@ import itertools
 from collections.abc import Iterator, Sequence
 from typing import Any
 
+from opt_einsum.symbolic import (
+    Broadcast,
+    Symbol,
+    SymbolicDimension,
+    SymbolicExpression,
+    SymbolicSize,
+    broadcast_dimensions,
+)
 from opt_einsum.typing import ArrayType, TensorShapeType
 
 __all__ = [
@@ -18,6 +26,12 @@ __all__ = [
     "find_output_shape",
     "possibly_convert_to_numpy",
     "parse_einsum_input",
+    "Symbol",
+    "SymbolicDimension",
+    "SymbolicExpression",
+    "SymbolicSize",
+    "Broadcast",
+    "broadcast_dimensions",
 ]
 
 _einsum_symbols_base = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -170,8 +184,25 @@ def find_output_shape(inputs: list[str], shapes: list[TensorShapeType], output: 
     output_shape = []
     for c in output:
         dimensions = [shape[term.find(c)] for term, shape in zip(inputs, shapes) if c in term]
-        output_shape.append(next((dimension for dimension in dimensions if dimension != 1), 1))
+        has_symbolic_dimension = any(
+            isinstance(dimension, SymbolicExpression)
+            or (isinstance(dimension, str) and not _is_integer_string(dimension))
+            for dimension in dimensions
+        )
+        if has_symbolic_dimension:
+            output_shape.append(broadcast_dimensions(dimensions, label=c))
+        else:
+            output_shape.append(next((dimension for dimension in dimensions if dimension != 1), 1))
     return tuple(output_shape)
+
+
+def _is_integer_string(value: str) -> bool:
+    """Return whether ``value`` is parseable as an integer."""
+    try:
+        int(value.strip())
+    except ValueError:
+        return False
+    return True
 
 
 _BaseTypes = (bool, int, float, complex, str, bytes)

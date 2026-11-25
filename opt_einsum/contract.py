@@ -1,11 +1,23 @@
 """Contains the primary optimization and contraction routines."""
 
-from collections.abc import Collection, Iterable, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from decimal import Decimal
 from functools import lru_cache
 from typing import Any, Literal, overload
 
 from opt_einsum import backends, blas, helpers, parser, paths, sharing
+from opt_einsum.symbolic import (
+    Broadcast,
+    Symbol,
+    SymbolicDimension,
+    SymbolicExpression,
+    SymbolicSize,
+    UnresolvedSymbolError,
+    broadcast_dimensions,
+    coerce_dimension,
+    normalize_bindings,
+    symbolic_max,
+)
 from opt_einsum.typing import (
     ArrayIndexType,
     ArrayShaped,
@@ -23,6 +35,10 @@ __all__ = [
     "format_const_einsum_str",
     "ContractExpression",
     "shape_only",
+    "Symbol",
+    "SymbolicDimension",
+    "SymbolicSize",
+    "Broadcast",
 ]
 
 ## Common types
@@ -41,10 +57,10 @@ class PathInfo:
         indices: ArrayIndexType,
         path: PathType,
         scale_list: Sequence[int],
-        naive_cost: int,
-        opt_cost: int,
-        size_list: Sequence[int],
-        size_dict: dict[str, int],
+        naive_cost: Any,
+        opt_cost: Any,
+        size_list: Sequence[Any],
+        size_dict: dict[str, Any],
     ):
         self.contraction_list = contraction_list
         self.input_subscripts = input_subscripts
@@ -52,15 +68,31 @@ class PathInfo:
         self.path = path
         self.indices = indices
         self.scale_list = scale_list
-        self.naive_cost = Decimal(naive_cost)
-        self.opt_cost = Decimal(opt_cost)
-        self.speedup = self.naive_cost / max(self.opt_cost, Decimal(1))
-        self.size_list = size_list
         self.size_dict = size_dict
+
+        self.is_symbolic = any(
+            isinstance(value, SymbolicExpression)
+            for value in [*size_list, naive_cost, opt_cost, *size_dict.values()]
+        )
+        self.size_list = list(size_list) if self.is_symbolic else size_list
+
+        if self.is_symbolic:
+            # Keep the expressions readable and explicitly unresolved.  Turning
+            # these into Decimals/ints here would either fail or falsely choose
+            # one possible concrete value for an unbound dimension.
+            self.naive_cost = naive_cost
+            self.opt_cost = opt_cost
+            self.speedup = naive_cost / opt_cost if opt_cost != 0 else naive_cost
+            self.largest_intermediate = symbolic_max(*self.size_list) if self.size_list else 1
+        else:
+            self.naive_cost = Decimal(naive_cost)
+            self.opt_cost = Decimal(opt_cost)
+            self.speedup = self.naive_cost / max(self.opt_cost, Decimal(1))
+            self.largest_intermediate = Decimal(max(self.size_list, default=1))
 
         self.shapes = [tuple(size_dict[k] for k in ks) for ks in input_subscripts.split(",")]
         self.eq = f"{input_subscripts}->{output_subscript}"
-        self.largest_intermediate = Decimal(max(size_list, default=1))
+        self._rebind = None
 
     def __repr__(self) -> str:
         # Return the path along with a nice string representation
@@ -99,8 +131,65 @@ class PathInfo:
 
         return "".join(path_print)
 
+    def bind(self, bindings: Mapping[str, Any] | Any = None, value: Any = None, **kwargs: Any) -> "PathInfo":
+        """Return a concrete :class:`PathInfo` after binding symbolic sizes.
 
-def _choose_memory_arg(memory_limit: _MemoryLimit, size_list: list[int]) -> int | None:
+        If the plan was created by :func:`contract_path`, the bound plan is
+        recomputed through the normal integer path.  Consequently, incompatible
+        bindings raise before any numeric path/cost comparison is trusted.
+        """
+        raw_bindings: dict[Any, Any] = {}
+        if isinstance(bindings, Mapping):
+            raw_bindings.update(bindings)
+        elif bindings is not None and value is not None:
+            raw_bindings[bindings] = value
+        elif bindings is not None:
+            raw_bindings.update(dict(bindings))
+        raw_bindings.update(kwargs)
+        values = normalize_bindings(raw_bindings)
+        if self._rebind is not None:
+            return self._rebind(values)
+
+        bound_size_list = [
+            value.bind(values) if isinstance(value, SymbolicExpression) else value
+            for value in self.size_list
+        ]
+        bound_size_dict = {
+            key: value.bind(values) if isinstance(value, SymbolicExpression) else value
+            for key, value in self.size_dict.items()
+        }
+        naive_cost = (
+            self.naive_cost.bind(values)
+            if isinstance(self.naive_cost, SymbolicExpression)
+            else self.naive_cost
+        )
+        opt_cost = (
+            self.opt_cost.bind(values)
+            if isinstance(self.opt_cost, SymbolicExpression)
+            else self.opt_cost
+        )
+        return PathInfo(
+            self.contraction_list,
+            self.input_subscripts,
+            self.output_subscript,
+            self.indices,
+            self.path,
+            self.scale_list,
+            naive_cost,
+            opt_cost,
+            bound_size_list,
+            bound_size_dict,
+        )
+
+    # Common symbolic-substitution aliases.
+    subs = bind
+    substitute = bind
+    resolve = bind
+    materialize = bind
+    evaluate = bind
+
+
+def _choose_memory_arg(memory_limit: _MemoryLimit, size_list: list[Any]) -> int | None:
     if memory_limit == "max_input":
         return max(size_list)
 
@@ -287,6 +376,15 @@ def contract_path(
 
     # Hidden option, only einsum should call this
     einsum_call_arg = kwargs.pop("einsum_call", False)
+
+    # Symbolic shape-plan bindings.  Several aliases make the deferred-binding
+    # workflow discoverable without changing the established positional API.
+    symbolic_bindings: dict[str, int] = {}
+    for binding_name in ("bindings", "binding", "bind"):
+        binding_value = kwargs.pop(binding_name, None)
+        if binding_value is not None:
+            symbolic_bindings.update(normalize_bindings(binding_value))
+
     if len(kwargs):
         raise TypeError(f"Did not understand the following kwargs: {kwargs.keys()}")
 
@@ -304,30 +402,65 @@ def contract_path(
     output_set = frozenset(output_subscript)
     indices = frozenset(input_subscripts.replace(",", ""))
 
-    # Get length of each unique dimension and ensure all dimensions are correct
-    size_dict: dict[str, int] = {}
-    for tnum, term in enumerate(input_list):
-        sh = input_shapes[tnum]
+    # Get length of each unique dimension and ensure all dimensions are correct.
+    # Pure integer shapes keep the original incremental validation path exactly;
+    # symbolic syntax instead retains every occurrence as a broadcast constraint
+    # so that distinct symbols under one label are not prematurely equated.
+    size_dict: dict[str, Any] = {}
+    has_symbolic_syntax = any(
+        isinstance(dim, SymbolicExpression)
+        or (isinstance(dim, str) and not parser._is_integer_string(dim))
+        for sh in input_shapes
+        for dim in sh
+    )
 
-        if len(sh) != len(term):
-            raise ValueError(
-                f"Einstein sum subscript '{input_list[tnum]}' does not contain the "
-                f"correct number of indices for operand {tnum}."
-            )
-        for cnum, char in enumerate(term):
-            dim = int(sh[cnum])
+    if has_symbolic_syntax:
+        coerced_shapes: list[tuple[Any, ...]] = []
+        label_dimensions: dict[str, list[Any]] = {}
 
-            if char in size_dict:
-                # For broadcasting cases we always want the largest dim size
-                if size_dict[char] == 1:
+        for tnum, term in enumerate(input_list):
+            sh = input_shapes[tnum]
+            if len(sh) != len(term):
+                raise ValueError(
+                    f"Einstein sum subscript '{input_list[tnum]}' does not contain the "
+                    f"correct number of indices for operand {tnum}."
+                )
+
+            dims = tuple(coerce_dimension(dim, symbolic_bindings) for dim in sh)
+            coerced_shapes.append(dims)
+            for cnum, char in enumerate(term):
+                label_dimensions.setdefault(char, []).append(dims[cnum])
+
+        input_shapes = coerced_shapes
+        size_dict = {
+            char: broadcast_dimensions(dims, label=char) for char, dims in label_dimensions.items()
+        }
+    else:
+        for tnum, term in enumerate(input_list):
+            sh = input_shapes[tnum]
+
+            if len(sh) != len(term):
+                raise ValueError(
+                    f"Einstein sum subscript '{input_list[tnum]}' does not contain the "
+                    f"correct number of indices for operand {tnum}."
+                )
+            for cnum, char in enumerate(term):
+                dim = int(sh[cnum])
+
+                if char in size_dict:
+                    # For broadcasting cases we always want the non-unit dim size.
+                    # This is not max(): 0 and 1 must resolve to 0.
+                    if size_dict[char] == 1:
+                        size_dict[char] = dim
+                    elif dim not in (1, size_dict[char]):
+                        raise ValueError(
+                            f"Size of label '{char}' for operand {tnum} ({size_dict[char]}) does not match previous "
+                            f"terms ({dim})."
+                        )
+                else:
                     size_dict[char] = dim
-                elif dim not in (1, size_dict[char]):
-                    raise ValueError(
-                        f"Size of label '{char}' for operand {tnum} ({size_dict[char]}) does not match previous "
-                        f"terms ({dim})."
-                    )
-            else:
-                size_dict[char] = dim
+
+    unresolved_symbolic = any(isinstance(value, SymbolicExpression) for value in size_dict.values())
 
     # Compute size of each input array plus the output array
     size_list = [helpers.compute_size_by_dict(term, size_dict) for term in input_list + [output_subscript]]
@@ -350,6 +483,11 @@ def contract_path(
     elif num_ops <= 2:
         # Nothing to be optimized
         path_tuple = [tuple(range(num_ops))]
+    elif unresolved_symbolic:
+        raise UnresolvedSymbolError(
+            "Automatic path optimization cannot compare symbolic costs or priorities while dimensions are unbound. "
+            "Supply an explicit fixed path via optimize=[...], or pass complete bindings=... to numericalize the plan."
+        )
     elif isinstance(optimize, paths.PathOptimizer):
         # Custom path optimizer supplied
         path_tuple = optimize(input_sets, output_set, size_dict, memory_arg)
@@ -426,6 +564,29 @@ def contract_path(
         size_list,
         size_dict,
     )
+
+    def _rebind_path(more_bindings: Mapping[str, Any]) -> PathInfo:
+        return contract_path(
+            *operands_,
+            use_blas=use_blas,
+            optimize=path_tuple,
+            memory_limit=memory_limit,
+            shapes=shapes,
+            bindings={**symbolic_bindings, **dict(more_bindings)},
+        )[1]
+
+    class _BindingMap(dict):
+        """Mapping of initial bindings that can also bind the owning plan."""
+
+        def __call__(self, more: Mapping[str, Any] | None = None, **kwargs: Any) -> PathInfo:
+            merged = dict(self)
+            if more is not None:
+                merged.update(more)
+            merged.update(kwargs)
+            return path_print.bind(merged)
+
+    path_print._rebind = _rebind_path
+    path_print.bindings = _BindingMap(symbolic_bindings)
 
     return path_tuple, path_print
 
