@@ -107,7 +107,11 @@ module Eps
           end
 
           # detect bad form in Eps < 0.3
-          bad_format = n.css("PairCounts").map { |n2| n2.attribute("value").value } == prior.keys
+          pair_counts = n.css("PairCounts")
+          outer_values = pair_counts.map { |n2| n2.attribute("value").value }
+          inner_values = pair_counts.css("TargetValueCount").map { |n3| n3.attribute("value").value }
+          inner_values_match_targets = inner_values.any? && inner_values.all? { |value| prior.key?(value) }
+          bad_format = !inner_values_match_targets && outer_values == prior.keys
 
           # categorical
           n.css("PairCounts").each do |n2|

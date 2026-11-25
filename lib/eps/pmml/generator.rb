@@ -223,7 +223,7 @@ module Eps
                     xml.TargetValueStats do
                       v.sort_by { |k2, _| k2.to_s }.each do |k2, v2|
                         xml.TargetValueStat(value: k2) do
-                          xml.GaussianDistribution(mean: v2[:mean], variance: v2[:stdev]**2)
+                          xml.GaussianDistribution(mean: v2[:mean], variance: v2[:stdev] ? v2[:stdev]**2 : 0.0)
                         end
                       end
                     end
