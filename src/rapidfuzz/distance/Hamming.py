@@ -9,6 +9,8 @@ import os
 from rapidfuzz._feature_detector import AVX2, SSE2, supports
 
 __all__ = [
+    "comparable_count",
+    "comparable_positions",
     "distance",
     "editops",
     "normalized_distance",
@@ -114,3 +116,35 @@ else:
             hamming_opcodes as opcodes,
             hamming_similarity as similarity,
         )
+
+# The coverage reporters of the masked mode are pure Python helpers and are shared
+# between both implementations of the scorer functions above.
+from rapidfuzz.distance import metrics_py as _metrics_py
+from rapidfuzz.distance.metrics_py import (
+    hamming_comparable_count as comparable_count,
+    hamming_comparable_positions as comparable_positions,
+)
+
+# The compiled implementations do not know the optional masked Hamming mode, so the
+# dispatcher falls back to the pure Python implementation as soon as a wildcard is
+# used. Without a wildcard the resolved implementation and its behaviour are kept.
+if distance is not _metrics_py.hamming_distance:
+
+    def _dispatch(func, py_func):
+        def wrapper(s1, s2, **kwargs):
+            if kwargs.get("wildcard") is not None:
+                return py_func(s1, s2, **kwargs)
+            return func(s1, s2, **kwargs)
+
+        wrapper.__name__ = func.__name__
+        wrapper.__doc__ = py_func.__doc__
+        wrapper.__module__ = func.__module__
+        wrapper._RF_ScorerPy = py_func._RF_ScorerPy
+        wrapper._RF_OriginalScorer = wrapper
+        wrapper._RF_Coverage = comparable_count
+        return wrapper
+
+    distance = _dispatch(distance, _metrics_py.hamming_distance)
+    similarity = _dispatch(similarity, _metrics_py.hamming_similarity)
+    normalized_distance = _dispatch(normalized_distance, _metrics_py.hamming_normalized_distance)
+    normalized_similarity = _dispatch(normalized_similarity, _metrics_py.hamming_normalized_similarity)

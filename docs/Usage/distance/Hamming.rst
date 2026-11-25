@@ -4,6 +4,14 @@ Hamming
 Functions
 ^^^^^^^^^
 
+comparable_count
+~~~~~~~~~~~~~~~~
+.. autofunction:: rapidfuzz.distance.Hamming.comparable_count
+
+comparable_positions
+~~~~~~~~~~~~~~~~~~~~
+.. autofunction:: rapidfuzz.distance.Hamming.comparable_positions
+
 distance
 ~~~~~~~~
 .. autofunction:: rapidfuzz.distance.Hamming.distance

@@ -2,6 +2,15 @@ Changelog
 ---------
 [Unreleased]
 ^^^^^^^^^^^^
+Added
+~~~~~
+* ``Hamming`` gained an optional masked mode (``wildcard=``): only positions where both
+  sequences carry a real value are compared, a pair without any comparable position is
+  not reported as a perfect match and the amount of comparable positions is available
+  via ``Hamming.comparable_count``/``Hamming.comparable_positions``. ``process.extract``
+  drops candidates below ``min_comparable`` and orders equal scores by the amount of
+  comparable positions, keeping the input order and the original key for full ties.
+
 Fixed
 ~~~~~
 * keep the ``score_cutoff`` of normalized scorers in double precision: a score equal to the

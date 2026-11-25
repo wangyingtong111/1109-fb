@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import heapq
+from math import ceil
 
 from rapidfuzz._utils import ScorerFlag, is_none, setupPandas
 from rapidfuzz.fuzz import WRatio, ratio
@@ -16,6 +17,114 @@ def _get_scorer_flags_py(scorer, scorer_kwargs):
         flags = params["get_scorer_flags"](**scorer_kwargs)
         return (flags["worst_score"], flags["optimal_score"])
     return (0, 100)
+
+
+# Settings of the masked Hamming mode that steer the search and must never be
+# forwarded to the scorer itself. ``wildcard`` is not listed, since it is a regular
+# keyword argument of the Hamming scorers.
+_COVERAGE_FLOOR_KEYS = ("min_comparable", "min_coverage", "min_valid", "min_overlap")
+
+
+def _prepare_scorer_kwargs(scorer_kwargs):
+    """Return the scorer arguments with ``wildcard=True`` mapped to the default ``"?"``."""
+    kwargs = dict(scorer_kwargs or {})
+    if kwargs.get("wildcard") is True:
+        kwargs["wildcard"] = "?"
+    return kwargs
+
+
+def _strip_coverage_kwargs(scorer_kwargs):
+    """Remove the coverage settings of the masked mode from the scorer arguments."""
+    kwargs = dict(scorer_kwargs or {})
+    for key in _COVERAGE_FLOOR_KEYS:
+        kwargs.pop(key, None)
+    return kwargs
+
+
+def _masked_coverage(scorer, scorer_kwargs):
+    """
+    Resolve the optional masked Hamming mode of the search.
+
+    The mode is only active when the scorer exposes a coverage reporter and it was
+    explicitly requested through a ``wildcard`` sentinel. Without that request every
+    scorer keeps its previous behaviour, including padding and a literal ``"?"``, and
+    unknown keywords are left alone so they still reach the scorer untouched.
+
+    Returns the coverage reporter, the sentinel, the coverage floor and the scorer
+    arguments with the coverage settings removed.
+    """
+    coverage = getattr(scorer, "_RF_Coverage", None)
+    if coverage is None:
+        return None, None, None, scorer_kwargs
+
+    wildcard = scorer_kwargs.get("wildcard")
+    if wildcard is None:
+        wildcard = scorer_kwargs.get("mask")
+    if wildcard is None:
+        return None, None, None, scorer_kwargs
+
+    kwargs = dict(scorer_kwargs)
+    floor = None
+    for key in _COVERAGE_FLOOR_KEYS:
+        value = kwargs.pop(key, None)
+        if value is not None and floor is None:
+            floor = value
+
+    return coverage, wildcard, floor, kwargs
+
+
+def _coverage_floor(floor, query, coverage, wildcard):
+    """
+    Turn the configured floor into an absolute amount of comparable positions.
+
+    An integer is used as an absolute count, a float as the fraction of the positions
+    that could be comparable at all, i.e. the real values inside the query. ``None``
+    disables the floor.
+    """
+    if floor is None:
+        return None
+    if isinstance(floor, float) and not isinstance(floor, bool):
+        return ceil(floor * _potential_coverage(query, coverage, wildcard))
+    return int(floor)
+
+
+def _potential_coverage(query, coverage, wildcard):
+    """
+    Maximum amount of comparable positions any candidate could reach for this query.
+
+    The reporter converts both sides into the same element domain as the scorer, so
+    this stays consistent with the per-candidate coverage of a list of custom tokens.
+    """
+    return coverage(query, query, wildcard=wildcard)
+
+
+def _is_better(score, comparable, best_score, best_comparable, lowest_score_worst):
+    """
+    Order two hits by score and, for equal scores, by the amount of comparable bits.
+
+    Only a strict improvement replaces the current result, so equal scores with equal
+    coverage keep the input order and the original candidate key.
+    """
+    if best_score is None:
+        return True
+    if score != best_score:
+        return score > best_score if lowest_score_worst else score < best_score
+    if comparable is None or best_comparable is None:
+        return False
+    return comparable > best_comparable
+
+
+def _sort_key(entry, lowest_score_worst):
+    _, score, _, comparable = entry
+    coverage = 0 if comparable is None else comparable
+    if lowest_score_worst:
+        return (score, coverage)
+    return (score, -coverage)
+
+
+def _has_best_coverage(comparable, potential):
+    """Whether no later candidate can report more comparable positions any more."""
+    return comparable is None or comparable >= potential
 
 
 def extract_iter(
@@ -60,6 +169,11 @@ def extract_iter(
         any other named parameters are passed to the scorer. This can be used to pass
         e.g. weights to `Levenshtein.distance`
 
+        For the masked Hamming mode (see the ``wildcard`` argument of the Hamming
+        scorers) the coverage floor is passed here as well. ``min_comparable`` is an
+        absolute amount of comparable positions, ``min_coverage`` is the fraction of
+        the real values of the query. Choices below the floor are ignored.
+
     Yields
     -------
     tuple[Sequence[Hashable], Any, Any]
@@ -86,7 +200,33 @@ def extract_iter(
 
     """
     _ = score_hint
-    scorer_kwargs = scorer_kwargs or {}
+    for choice, score, key, _ in _extract_iter(
+        query,
+        choices,
+        scorer=scorer,
+        processor=processor,
+        score_cutoff=score_cutoff,
+        scorer_kwargs=scorer_kwargs,
+    ):
+        yield (choice, score, key)
+
+
+def _extract_iter(
+    query,
+    choices,
+    *,
+    scorer,
+    processor,
+    score_cutoff,
+    scorer_kwargs,
+):
+    """
+    Shared search loop returning the amount of comparable positions as fourth value.
+
+    The coverage is ``None`` unless the optional masked mode is enabled, so every
+    caller keeps its previous ranking contract by default.
+    """
+    scorer_kwargs = _prepare_scorer_kwargs(scorer_kwargs)
     worst_score, optimal_score = _get_scorer_flags_py(scorer, scorer_kwargs)
     lowest_score_worst = optimal_score > worst_score
 
@@ -102,27 +242,30 @@ def extract_iter(
     if processor is not None:
         query = processor(query)
 
+    coverage, wildcard, floor, scorer_kwargs = _masked_coverage(scorer, scorer_kwargs)
+    if coverage is not None:
+        floor = _coverage_floor(floor, query, coverage, wildcard)
+
     choices_iter = choices.items() if hasattr(choices, "items") else enumerate(choices)
     for key, choice in choices_iter:
         if is_none(choice):
             continue
 
-        if processor is None:
-            score = scorer(query, choice, score_cutoff=score_cutoff, **scorer_kwargs)
-        else:
-            score = scorer(
-                query,
-                processor(choice),
-                score_cutoff=score_cutoff,
-                **scorer_kwargs,
-            )
+        proc_choice = choice if processor is None else processor(choice)
+        score = scorer(query, proc_choice, score_cutoff=score_cutoff, **scorer_kwargs)
+
+        comparable = None
+        if coverage is not None:
+            comparable = coverage(query, proc_choice, wildcard=wildcard)
+            if floor is not None and comparable < floor:
+                continue
 
         if lowest_score_worst:
             if score >= score_cutoff:
-                yield (choice, score, key)
+                yield (choice, score, key, comparable)
         else:
             if score <= score_cutoff:
-                yield (choice, score, key)
+                yield (choice, score, key, comparable)
 
 
 def extractOne(
@@ -167,6 +310,11 @@ def extractOne(
     scorer_kwargs : dict[str, Any], optional
         any other named parameters are passed to the scorer. This can be used to pass
         e.g. weights to `Levenshtein.distance`
+
+        For the masked Hamming mode (see the ``wildcard`` argument of the Hamming
+        scorers) the coverage floor is passed here as well. ``min_comparable`` is an
+        absolute amount of comparable positions, ``min_coverage`` is the fraction of
+        the real values of the query. Choices below the floor are ignored.
 
     Returns
     -------
@@ -252,7 +400,7 @@ def extractOne(
 
     """
     _ = score_hint
-    scorer_kwargs = scorer_kwargs or {}
+    scorer_kwargs = _prepare_scorer_kwargs(scorer_kwargs)
     worst_score, optimal_score = _get_scorer_flags_py(scorer, scorer_kwargs)
     lowest_score_worst = optimal_score > worst_score
 
@@ -268,33 +416,42 @@ def extractOne(
     if processor is not None:
         query = processor(query)
 
+    coverage, wildcard, floor, scorer_kwargs = _masked_coverage(scorer, scorer_kwargs)
+    potential = None
+    if coverage is not None:
+        potential = _potential_coverage(query, coverage, wildcard)
+        floor = _coverage_floor(floor, query, coverage, wildcard)
+
     result = None
+    best_comparable = None
 
     choices_iter = choices.items() if hasattr(choices, "items") else enumerate(choices)
     for key, choice in choices_iter:
         if is_none(choice):
             continue
 
-        if processor is None:
-            score = scorer(query, choice, score_cutoff=score_cutoff, **scorer_kwargs)
-        else:
-            score = scorer(
-                query,
-                processor(choice),
-                score_cutoff=score_cutoff,
-                **scorer_kwargs,
-            )
+        proc_choice = choice if processor is None else processor(choice)
+        score = scorer(query, proc_choice, score_cutoff=score_cutoff, **scorer_kwargs)
 
-        if lowest_score_worst:
-            if score >= score_cutoff and (result is None or score > result[1]):
-                score_cutoff = score
-                result = (choice, score, key)
-        else:
-            if score <= score_cutoff and (result is None or score < result[1]):
-                score_cutoff = score
-                result = (choice, score, key)
+        comparable = None
+        if coverage is not None:
+            comparable = coverage(query, proc_choice, wildcard=wildcard)
+            if floor is not None and comparable < floor:
+                continue
 
-        if score == optimal_score:
+        accepted = score >= score_cutoff if lowest_score_worst else score <= score_cutoff
+        if accepted and (
+            result is None
+            or _is_better(score, comparable, result[1], best_comparable, lowest_score_worst)
+        ):
+            score_cutoff = score
+            result = (choice, score, key)
+            best_comparable = comparable
+
+        # A perfect match can no longer be improved, except by a candidate that covers
+        # more real values at the same score. In the masked mode the shortcut is only
+        # taken once the coverage is maximal as well.
+        if score == optimal_score and _has_best_coverage(best_comparable, potential):
             break
 
     return result
@@ -374,9 +531,13 @@ def extract(
         The list is sorted by similarity or distance depending on the scorer used. The first element in the list
         has the `highest similarity`/`smallest distance`.
 
+        When the masked Hamming mode is enabled through ``scorer_kwargs`` (``wildcard``), choices with an equal
+        score are ordered by the amount of comparable positions, so a hit covering more real values comes first.
+        Choices below ``min_comparable`` are dropped before ranking. When the score and the coverage are both
+        equal the input order and the original candidate key are kept.
+
     """
-    scorer_kwargs = scorer_kwargs or {}
-    worst_score, optimal_score = _get_scorer_flags_py(scorer, scorer_kwargs)
+    worst_score, optimal_score = _get_scorer_flags_py(scorer, _strip_coverage_kwargs(scorer_kwargs))
     lowest_score_worst = optimal_score > worst_score
 
     if limit == 1:
@@ -393,22 +554,23 @@ def extract(
             return []
         return [res]
 
-    result_iter = extract_iter(
+    result_iter = _extract_iter(
         query,
         choices,
         processor=processor,
         scorer=scorer,
         score_cutoff=score_cutoff,
-        score_hint=score_hint,
         scorer_kwargs=scorer_kwargs,
     )
 
     if limit is None:
-        return sorted(result_iter, key=lambda i: i[1], reverse=lowest_score_worst)
+        ranked = sorted(result_iter, key=lambda i: _sort_key(i, lowest_score_worst), reverse=lowest_score_worst)
+    elif lowest_score_worst:
+        ranked = heapq.nlargest(limit, result_iter, key=lambda i: _sort_key(i, lowest_score_worst))
+    else:
+        ranked = heapq.nsmallest(limit, result_iter, key=lambda i: _sort_key(i, lowest_score_worst))
 
-    if lowest_score_worst:
-        return heapq.nlargest(limit, result_iter, key=lambda i: i[1])
-    return heapq.nsmallest(limit, result_iter, key=lambda i: i[1])
+    return [(choice, score, key) for choice, score, key, _ in ranked]
 
 
 def _dtype_to_type_num(
@@ -515,7 +677,10 @@ def cdist(
     import numpy as np
 
     _ = workers, score_hint
-    scorer_kwargs = scorer_kwargs or {}
+    # The matrix only stores the score, so the coverage settings of the masked mode
+    # are removed before they reach the scorer. `wildcard` stays, because it changes
+    # the score itself.
+    scorer_kwargs = _strip_coverage_kwargs(_prepare_scorer_kwargs(scorer_kwargs))
     if processor is False:
         processor = None
     dtype = _dtype_to_type_num(dtype, scorer, scorer_kwargs)
@@ -652,7 +817,10 @@ def cpdist(
         raise ValueError(error_message)
 
     _ = workers, score_hint
-    scorer_kwargs = scorer_kwargs or {}
+    # The matrix only stores the score, so the coverage settings of the masked mode
+    # are removed before they reach the scorer. `wildcard` stays, because it changes
+    # the score itself.
+    scorer_kwargs = _strip_coverage_kwargs(_prepare_scorer_kwargs(scorer_kwargs))
     if processor is False:
         processor = None
     dtype = _dtype_to_type_num(dtype, scorer, scorer_kwargs)

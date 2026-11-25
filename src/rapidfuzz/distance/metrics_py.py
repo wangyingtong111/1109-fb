@@ -24,6 +24,8 @@ from rapidfuzz.distance.DamerauLevenshtein_py import (
 
 # Hamming
 from rapidfuzz.distance.Hamming_py import (
+    comparable_count as hamming_comparable_count,
+    comparable_positions as hamming_comparable_positions,
     distance as hamming_distance,
     editops as hamming_editops,
     normalized_distance as hamming_normalized_distance,
@@ -290,6 +292,8 @@ add_scorer_attrs(hamming_normalized_distance, norm_dist_attr)
 add_scorer_attrs(hamming_normalized_similarity, norm_sim_attr)
 
 __all__ += [
+    "hamming_comparable_count",
+    "hamming_comparable_positions",
     "hamming_distance",
     "hamming_editops",
     "hamming_normalized_distance",

@@ -837,3 +837,46 @@ def test_pairwise_processor_compatibility(module, method, processor, custom_scor
 
     result = getattr(module, method)(["A"], ["a"], processor=processor, scorer=scorer if custom_scorer else fuzz.ratio)
     assert result.item() == (100 if processor is str.lower else 0)
+
+
+@pytest.mark.parametrize("module", [process_py, process_cpp])
+def test_extract_masked_hamming(module):
+    from rapidfuzz.distance import Hamming
+
+    kwargs = {"wildcard": "?"}
+
+    hits = module.extract("a?b", ["axb", "bxa"], scorer=Hamming.normalized_similarity, scorer_kwargs=kwargs)
+    assert [(score, key) for _, score, key in hits] == [(1.0, 0), (0.0, 1)]
+
+    # a candidate with too few comparable positions is dropped, equal scores are
+    # ordered by the amount of comparable positions and full ties keep the input order
+    ranked = module.extract(
+        "a?b?c",
+        ["a?bzc", "a????", "?ab?c", "a?b?c"],
+        scorer=Hamming.normalized_similarity,
+        scorer_kwargs={**kwargs, "min_comparable": 2},
+    )
+    assert [key for _, _, key in ranked] == [0, 3, 2]
+
+    # the perfect-match shortcut must not stop before a candidate with more coverage
+    assert module.extractOne(
+        "a?b?c", ["a????", "a?b?c"], scorer=Hamming.normalized_similarity, scorer_kwargs=kwargs
+    ) == ("a?b?c", 1.0, 1)
+
+    # the distance direction keeps working and the original keys of a mapping survive
+    assert module.extractOne("a?b", ["bxa", "axb"], scorer=Hamming.distance, scorer_kwargs=kwargs) == ("axb", 0, 1)
+    mapped = module.extract(
+        "a?b", {"k1": "axb", "k2": "ayb"}, scorer=Hamming.normalized_similarity, scorer_kwargs=kwargs
+    )
+    assert [key for _, _, key in mapped] == ["k1", "k2"]
+
+
+@pytest.mark.parametrize("module", [process_py, process_cpp])
+def test_extract_masked_hamming_legacy_defaults(module):
+    from rapidfuzz.distance import Hamming
+
+    # without a wildcard the literal question mark and padding keep their old meaning
+    hits = module.extract("a?b", ["a?b", "axb"], scorer=Hamming.normalized_similarity)
+    assert [key for _, _, key in hits] == [0, 1]
+    assert [score for _, score, _ in hits] == pytest.approx([1.0, 2 / 3])
+    assert module.cdist(["a?b"], ["axb"], scorer=Hamming.normalized_similarity).item() == pytest.approx(2 / 3)
