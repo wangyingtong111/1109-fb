@@ -213,7 +213,54 @@ describe FuzzyMatch do
       d.find('George Clinton', :must_match_grouping => true).should be_nil
     end
   end
-  
+
+  describe "the :fallback_grouping option" do
+    let(:items) do
+      [
+        'cat green r8 sku2',
+        'cat blue r7 sku1',
+        'cat red r8 sku1'
+      ]
+    end
+    let(:rules) do
+      {
+        :groupings => [ /cat (green|blue)/, /r(\d+)/ ],
+        :identities => [ /(sku\d+)/ ],
+        :must_match_grouping => true,
+        :must_match_at_least_one_word => true
+      }
+    end
+
+    it %{falls back only to the next grouping with word- and identity-qualified candidates} do
+      d = FuzzyMatch.new items, rules.merge(:fallback_grouping => true)
+      d.find_all('cat green r7 sku1').should == [ 'cat blue r7 sku1' ]
+      d.find('cat green r7 sku1').should == 'cat blue r7 sku1'
+    end
+
+    it %{keeps strict first-group behavior unless fallback is enabled} do
+      d = FuzzyMatch.new items, rules
+      d.find_all('cat green r7 sku1').should == []
+      d.find('cat green r7 sku1').should be_nil
+    end
+
+    it %{uses only the first grouping when the needle itself is in it} do
+      d = FuzzyMatch.new [ 'cat green r7 sku1', 'cat blue r7 sku1' ], rules.merge(:fallback_grouping => true)
+      d.find_all('cat green r7 sku1').should == [ 'cat green r7 sku1' ]
+    end
+
+    it %{uses only the first grouping when it has a word- and identity-qualified candidate} do
+      items << 'cat green r9 sku1'
+      d = FuzzyMatch.new items, rules.merge(:fallback_grouping => true)
+      d.find_all('cat green r7 sku1').should == [ 'cat green r9 sku1' ]
+    end
+
+    it %{does not turn into an ungrouped search when no grouping qualifies} do
+      d = FuzzyMatch.new [ 'cat green r8 sku2', 'dog blue r9 sku2' ], rules.merge(:fallback_grouping => true)
+      d.find_all('cat green r7 sku1').should == []
+      d.find('cat green r7 sku1').should be_nil
+    end
+  end
+
   describe "the :read option" do
     it %{interpret a Numeric as an array index} do
       ab = ['a', 'b']

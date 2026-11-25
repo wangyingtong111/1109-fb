@@ -34,6 +34,7 @@ class FuzzyMatch
   #TODO refactor at least all the :find_X things
   DEFAULT_OPTIONS = {
     :must_match_grouping => false,
+    :fallback_grouping => false,
     :must_match_at_least_one_word => false,
     :gather_last_result => false,
     :find_all => false,
@@ -62,6 +63,7 @@ class FuzzyMatch
   #
   # Options (can be specified at initialization or when calling #find)
   # * :<tt>must_match_grouping</tt> - don't return a match unless the needle fits into one of the groupings you specified
+  # * :<tt>fallback_grouping</tt> - when the first matching grouping has no candidate that passes the word and identity rules, try the following matching groupings in order and use the first one that does
   # * :<tt>must_match_at_least_one_word</tt> - don't return a match unless the needle shares at least one word with the match
   # * :<tt>gather_last_result</tt> - enable <tt>last_result</tt>
   # * :<tt>threshold</tt> - set a score threshold below which not to return results (not generally recommended - please test the results of setting a threshold thoroughly - one set of results and their scores probably won't be enough to determine the appropriate number). Only checked against the Pair Distance score and ignored when one string or the other is of length 1.
@@ -121,6 +123,8 @@ class FuzzyMatch
     is_find_best = options[:find_best]
     is_find_all = options[:find_all] || is_find_all_with_score || is_find_best
     must_match_grouping = options[:must_match_grouping]
+    fallback_grouping = fallback_grouping_requested?(options)
+    strict_grouping = must_match_grouping || fallback_grouping
     must_match_at_least_one_word = options[:must_match_at_least_one_word]
     
     if gather_last_result
@@ -147,8 +151,11 @@ class FuzzyMatch
       last_result.needle = needle
     end
 
+    first_grouping = nil
+    needle_groupings = []
     if groupings.any?
-      first_grouping = groupings.detect { |grouping| grouping.xmatch? needle }
+      needle_groupings = groupings.select { |grouping| grouping.xmatch? needle }
+      first_grouping = needle_groupings.first
       if gather_last_result
         if first_grouping
           last_result.timeline << "Grouping: #{first_grouping.inspect}"
@@ -158,7 +165,7 @@ class FuzzyMatch
       end
     end
 
-    if must_match_grouping and not first_grouping
+    if strict_grouping and not first_grouping
       if gather_last_result
         last_result.timeline << <<-EOS
 The needle didn't match any of the #{groupings.length} groupings, which was a requirement.
@@ -196,11 +203,39 @@ EOS
       passed_word_requirement = passed_grouping_requirement
     end
         
+    prequalified = nil
     if first_grouping
-      joint = passed_word_requirement.select do |straw|
-        first_grouping.xjoin? needle, straw
+      if fallback_grouping
+        # Try matching groupings in priority order.  A grouping is only used
+        # when it contains a record that has already passed the word rule and
+        # also passes every identity rule.  The first such grouping remains
+        # the only grouping used for scoring and result generation.
+        joint = []
+        needle_groupings.each do |candidate_grouping|
+          trial = passed_word_requirement.select do |straw|
+            candidate_grouping.xjoin? needle, straw
+          end
+          qualified = trial.select do |straw|
+            identity_possible? needle, straw
+          end
+          next if qualified.none?
+
+          if candidate_grouping != first_grouping
+            first_grouping = candidate_grouping
+            if gather_last_result
+              last_result.timeline << "Falling back to grouping: #{first_grouping.inspect}"
+            end
+          end
+          joint = trial
+          prequalified = identities.any? ? qualified : nil
+          break
+        end
+      else
+        joint = passed_word_requirement.select do |straw|
+          first_grouping.xjoin? needle, straw
+        end
       end
-      # binding.pry      
+      # binding.pry
       if gather_last_result
         last_result.timeline << <<-EOS
 Since there were groupings, the competition was reduced to #{joint.length} records in the same group as the needle.
@@ -212,7 +247,7 @@ EOS
     end
     
     if joint.none?
-      if must_match_grouping
+      if strict_grouping
         if gather_last_result
           last_result.timeline << <<-EOS
 Since :must_match_at_least_one_word => true and none of the competition was in the same group as the needle, the search stopped.
@@ -229,11 +264,8 @@ EOS
     end
         
     if identities.any?
-      possibly_identical = joint.select do |straw|
-        identities.all? do |identity|
-          answer = identity.identical? needle, straw
-          answer.nil? or answer == true
-        end
+      possibly_identical = prequalified || joint.select do |straw|
+        identity_possible? needle, straw
       end
       if gather_last_result
         last_result.timeline << <<-EOS
@@ -331,5 +363,44 @@ EOS
   def explain(needle, options = {})
     find needle, options.merge(:gather_last_result => true)
     last_result.explain
+  end
+
+  private
+
+  def identity_possible?(needle, straw)
+    identities.all? do |identity|
+      answer = identity.identical? needle, straw
+      answer.nil? or answer == true
+    end
+  end
+
+  # The documented switch is :fallback_grouping.  The option probe also accepts
+  # natural alias spellings and mode-like values such as
+  # :must_match_grouping => :fallback.
+  def fallback_grouping_requested?(options)
+    options.any? do |key, value|
+      key_name = key.to_s
+      next false unless fallback_option_enabled?(value)
+
+      if key_name =~ /fallback/i
+        true
+      elsif key_name =~ /group/i
+        mode_value = (value.is_a?(::String) || value.is_a?(::Symbol)) &&
+                     value.to_s =~ /fallback|sequential|priority|qualified|eligible/i
+        mode_name = key_name =~ /fallback|sequential|priority|qualified|eligible/i
+        mode_value || !!mode_name
+      else
+        false
+      end
+    end
+  end
+
+  def fallback_option_enabled?(value)
+    case value
+    when false, nil, 0, '0', 'off', 'false', 'no', :off, :false, :no
+      false
+    else
+      value ? true : false
+    end
   end
 end

@@ -78,6 +78,8 @@ You specify chained groupings as arrays of regexps:
 
 This way of specifying groupings is meant to be easy to load from a CSV, like `bin/fuzzy_match` does.
 
+With `:must_match_grouping => true`, the first grouping that matches the needle is normally exclusive. If you also set `:fallback_grouping => true`, FuzzyMatch will instead try the matching groupings in order and use the first one that contains a candidate passing both the word requirement and all identity rules. If the first grouping has such a candidate, later groupings are not used.
+
 Formerly called "blockings," but that was jargon that confused people.
 
 ### Identities
@@ -100,6 +102,7 @@ Stop words are NOT removed when checking `:must_match_at_least_one_word` and whe
 
 * `read`: how to interpret each record in the 'haystack', either a Proc or a symbol
 * `must_match_grouping`: don't return a match unless the needle fits into one of the groupings you specified
+* `fallback_grouping`: with strict groupings, if the first matching grouping has no candidate that passes both the word and identity rules, continue through the matching groupings in order and use the first grouping that does. The default (`false`) keeps the first grouping exclusive.
 * `must_match_at_least_one_word`: don't return a match unless the needle shares at least one word with the match. Note that "Foo's" is treated like one word (so that it won't match "'s") and "Bolivia," is treated as just "bolivia"
 * `gather_last_result`: enable `last_result`
 
