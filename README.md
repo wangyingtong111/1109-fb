@@ -219,6 +219,26 @@ Pass a validation set with:
 recommender.fit(data, validation_set: validation_set)
 ```
 
+For implicit feedback, the default validation path keeps its original behavior and rejects users or items that were not present in the training set.
+
+Use the holdout report when a newer catalog snapshot may contain items that are not in the fitted catalog:
+
+```ruby
+report = recommender.holdout_evaluation(validation_set, k: 5)
+# or Disco::Metrics.holdout_evaluation(recommender, validation_set)
+
+report[:ranking_score]          # hits / scoreable holdout rows
+report[:ranking_denominator]    # known users, known items, not seen in training
+report[:seen_count]             # in-catalog items the user already trained on
+report[:out_of_catalog_count]   # items absent from the fitted catalog
+report[:catalog_coverage]       # in-catalog rows / all validation rows
+report[:coverage]               # counts and denominator for the coverage receipt
+```
+
+For `a=tea`, `b=rice` training and `a=[tea, rice, tofu]` validation, this gives `total: 3`, `ranking_denominator: 1` (`rice`), `seen_count: 1` (`tea`), `out_of_catalog_count: 1` (`tofu`), and in-catalog coverage `2/3` without changing `item_ids` from `["tea", "rice"]`.
+
+Only known, training-unseen items participate in ranking. Already-seen and out-of-catalog rows remain in the coverage counts but are not added to the factor maps, seen sets, or sampler. The same report can be collected during fitting with `recommender.fit(data, validation_set: validation_set, holdout_evaluation: true)`.
+
 ## Cold Start
 
 Collaborative filtering suffers from the [cold start problem](https://en.wikipedia.org/wiki/Cold_start_(recommender_systems)). It’s unable to make good recommendations without data on a user or item, which is problematic for new users and items.
