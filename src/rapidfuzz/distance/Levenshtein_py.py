@@ -23,22 +23,111 @@ def _levenshtein_maximum(s1, s2, weights):
     return max_dist
 
 
-def _uniform_generic(s1, s2, weights):
+def _uniform_generic(s1, s2, weights, score_cutoff=None):
     len1 = len(s1)
+    len2 = len(s2)
     insert, delete, replace = weights
-    cache = [i * delete for i in range(len1 + 1)]
 
-    for ch2 in s2:
-        temp = cache[0]
-        cache[0] += insert
-        for i in range(len1):
-            x = temp
-            if s1[i] != ch2:
-                x = min(cache[i] + delete, cache[i + 1] + insert, temp + replace)
-            temp = cache[i + 1]
-            cache[i + 1] = x
+    if score_cutoff is None or score_cutoff == float("inf") or min(weights) < 0:
+        cache = [i * delete for i in range(len1 + 1)]
 
-    return cache[-1]
+        for ch2 in s2:
+            temp = cache[0]
+            cache[0] += insert
+            for i in range(len1):
+                x = temp
+                if s1[i] != ch2:
+                    x = min(cache[i] + delete, cache[i + 1] + insert, temp + replace)
+                temp = cache[i + 1]
+                cache[i + 1] = x
+
+        return cache[-1]
+
+    # A path through cell (i, j) has offset j - i. The length difference to
+    # the final cell forces the same number of unmatched characters on top of
+    # the global length difference. This gives a weight-dependent diagonal band
+    # containing every path which can stay within score_cutoff.
+    length_difference = len2 - len1
+    if length_difference >= 0:
+        length_lower_bound = length_difference * insert
+    else:
+        length_lower_bound = -length_difference * delete
+
+    if length_lower_bound > score_cutoff:
+        return score_cutoff + 1
+
+    indel_cost = insert + delete
+    if indel_cost == 0:
+        # All characters can be removed and inserted without cost.
+        return 0
+
+    extra_diagonals = int((score_cutoff - length_lower_bound) // indel_cost)
+    min_offset = min(0, length_difference) - extra_diagonals
+    max_offset = max(0, length_difference) + extra_diagonals
+
+    inf = float("inf")
+    cache = [inf] * (len1 + 1)
+
+    # Initialize only row zero states inside the diagonal band.
+    max_initial_index = min(len1, -min_offset)
+    for i in range(max_initial_index + 1):
+        cache[i] = i * delete
+
+    for j, ch2 in enumerate(s2, 1):
+        start = max(1, j - max_offset)
+        end = min(len1, j - min_offset)
+        row_has_possible_state = False
+
+        if start > end:
+            # This only occurs for an empty s1. Keeping cache[0] exact preserves
+            # the normal boundary initialization.
+            cache[0] += insert
+            row_has_possible_state = cache[0] <= score_cutoff
+        else:
+            if start == 1:
+                temp = cache[0]
+                if j <= max_offset:
+                    cache[0] = temp + insert
+                else:
+                    cache[0] = inf
+
+                if cache[0] <= score_cutoff:
+                    row_has_possible_state = True
+            else:
+                # cache[start - 1] has not been updated in this row yet, so it is
+                # the diagonal predecessor from the previous row.
+                temp = cache[start - 1]
+
+            i = start
+            above = cache[i]
+            if s1[i - 1] == ch2:
+                current = temp
+            else:
+                current = min(temp + replace, above + insert)
+                if start == 1 and j <= max_offset:
+                    current = min(current, cache[0] + delete)
+
+            temp = above
+            cache[i] = current
+            if current <= score_cutoff:
+                row_has_possible_state = True
+
+            for i in range(start + 1, end + 1):
+                above = cache[i]
+                if s1[i - 1] == ch2:
+                    current = temp
+                else:
+                    current = min(temp + replace, cache[i - 1] + delete, above + insert)
+
+                temp = above
+                cache[i] = current
+                if current <= score_cutoff:
+                    row_has_possible_state = True
+
+        if not row_has_possible_state:
+            return score_cutoff + 1
+
+    return cache[-1] if cache[-1] <= score_cutoff else score_cutoff + 1
 
 
 def _uniform_distance(s1, s2):
@@ -153,8 +242,10 @@ def distance(
         dist = _uniform_distance(s1, s2)
     elif weights == (1, 1, 2):
         dist = Indel.distance(s1, s2)
-    else:
+    elif score_cutoff is None:
         dist = _uniform_generic(s1, s2, weights)
+    else:
+        dist = _uniform_generic(s1, s2, weights, score_cutoff)
 
     return dist if (score_cutoff is None or dist <= score_cutoff) else score_cutoff + 1
 
