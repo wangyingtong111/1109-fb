@@ -39,6 +39,52 @@ RSpec.describe PragmaticSegmenter::Segmenter do
       expect(text).to eq("It was a cold \nnight in the city.")
     end
 
+    describe 'the optional ellipsis rule' do
+      def segment(text, **options)
+        PragmaticSegmenter::Segmenter.new(text: text, language: 'fr', **options).segment
+      end
+
+      it 'starts a new sentence at a capitalized accented word' do
+        expect(segment('Après... Émile revient.', ellipsis: true))
+          .to eq(['Après...', 'Émile revient.'])
+      end
+
+      it 'keeps a lowercase word in the same sentence' do
+        expect(segment('après... encore un mot.', ellipsis: true))
+          .to eq(['après... encore un mot.'])
+      end
+
+      it 'keeps the original precomposed glyph' do
+        text = 'Après... Émile revient.'
+        expect(segment(text, ellipsis: true).join(' ')).to eq(text)
+      end
+
+      it 'looks at the first word inside an opening quotation mark' do
+        expect(segment('Après... «Émile revient.»', ellipsis: true))
+          .to eq(['Après...', '«Émile revient.»'])
+      end
+
+      it 'keeps a lowercase word inside an opening quotation mark in the same sentence' do
+        expect(segment('après... «encore un mot.»', ellipsis: true))
+          .to eq(['après... «encore un mot.»'])
+      end
+
+      it 'treats a decomposed capital the same as a precomposed one' do
+        # "E" + U+0301 COMBINING ACUTE ACCENT, i.e. the decomposed spelling of É.
+        text = "Après... «Émile revient.»"
+        segments = segment(text, ellipsis: true)
+        expect(segments).to eq(["Après...", "«Émile revient.»"])
+        expect(segments.last.codepoints.first(3)).to eq([0x00AB, 0x0045, 0x0301])
+        expect(segments.last.length).to eq(text.length - 'Après... '.length)
+      end
+
+      it 'is off by default and keeps the original rule' do
+        expect(segment('Après... Marie revient.')).to eq(['Après...', 'Marie revient.'])
+        expect(segment('Après... Émile revient.')).to eq(['Après... Émile revient.'])
+        expect(segment('après... «Émile revient.»')).to eq(['après... «Émile revient.»'])
+      end
+    end
+
     describe '#clean' do
       it 'cleans the text #001' do
         ps = PragmaticSegmenter::Cleaner.new(text: "It was a cold \nnight in the city.", language: "en")

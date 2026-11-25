@@ -47,12 +47,42 @@ ps = PragmaticSegmenter::Segmenter.new(text: text, language: 'en', doc_type: 'pd
 ps.segment
 # => ["This is a sentence cut", "off in the middle because pdf."]
 
+# Segment on an ellipsis followed by a capitalized word
+# (off by default; see "Ellipsis pauses in interview transcripts" below)
+text = "Après... Émile revient."
+ps = PragmaticSegmenter::Segmenter.new(text: text, language: 'fr', ellipsis: true)
+ps.segment
+# => ["Après...", "Émile revient."]
+
 # Text cleaning and preprocessing only
 text = "This is a sentence\ncut off in the middle because pdf."
 ps = PragmaticSegmenter::Cleaner.new(text: text, doc_type: 'pdf')
 ps.clean
 # => "This is a sentence cut off in the middle because pdf."
 ```
+
+### Ellipsis pauses in interview transcripts
+
+By default an ellipsis only ends a sentence when the next word starts with an ASCII capital (Golden Rule #49). Interview transcripts often need a slightly wider rule: a pause followed by *any* capitalized word – including an accented one – starts a new sentence, while a pause followed by a lowercase word is the same speaker carrying on.
+
+Pass `ellipsis: true` to turn that rule on. It is off by default, so existing callers see exactly the same output as before.
+
+```ruby
+PragmaticSegmenter::Segmenter.new(text: 'Après... Émile revient.', language: 'fr', ellipsis: true).segment
+# => ["Après...", "Émile revient."]
+
+PragmaticSegmenter::Segmenter.new(text: 'après... encore un mot.', language: 'fr', ellipsis: true).segment
+# => ["après... encore un mot."]
+
+PragmaticSegmenter::Segmenter.new(text: 'Après... «Émile revient.»', language: 'fr', ellipsis: true).segment
+# => ["Après...", "«Émile revient.»"]
+```
+
+Notes:
+
+* Capitalization is decided from the first *letter* of the next word, so an opening quotation mark (`«`, `‹`, `“`, `"`, `„`, `‘`, `‚`, `「`, `『`) between the ellipsis and the word does not hide it.
+* The check reads the code points of the original text, so a precomposed `É` and a decomposed `E` + `U+0301` behave the same way, and the returned strings keep the exact glyphs and quotation marks they came in with.
+* The three periods are preserved verbatim; the rule only decides where the boundary falls.
 
 ## Live Demo
 
@@ -411,6 +441,24 @@ One further habit which was somewhat weakened . . . was that of combining words 
 ```
 Hello world.Today is Tuesday.Mr. Smith went to the store and bought 1,000.That is a lot.
 => ["Hello world.", "Today is Tuesday.", "Mr. Smith went to the store and bought 1,000.", "That is a lot."]
+```
+
+53.) **Ellipsis as a sentence boundary before a capitalized accented word** *(optional, `ellipsis: true`)*
+```
+Après... Émile revient.
+=> ["Après...", "Émile revient."]
+```
+
+54.) **Ellipsis as a non sentence boundary before a lowercase word** *(optional, `ellipsis: true`)*
+```
+après... encore un mot.
+=> ["après... encore un mot."]
+```
+
+55.) **Ellipsis inside an opening quotation mark** *(optional, `ellipsis: true`)*
+```
+Après... «Émile revient.»
+=> ["Après...", "«Émile revient.»"]
 ```
 
 #### Golden Rules (German)

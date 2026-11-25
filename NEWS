@@ -1,3 +1,7 @@
+Unreleased:
+
+* Improvement: Optional `ellipsis: true` rule that treats an ellipsis as a sentence boundary when the next word starts with any capitalized letter (including accented and decomposed letters) and keeps a lowercase word in the same sentence. Opening quotation marks are looked through, and the original glyphs are preserved. Off by default.
+
 0.3.24 (2024-08-12):
 
 * Bug Fix: Catastrophic backtracking in regular expression for numerical references

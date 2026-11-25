@@ -13,9 +13,10 @@ module PragmaticSegmenter
   # This class processing segmenting the text.
   class Processor
 
-    attr_reader :text
-    def initialize(language: Languages::Common)
+    attr_reader :text, :ellipsis
+    def initialize(language: Languages::Common, ellipsis: false)
       @language = language
+      @ellipsis = ellipsis
     end
 
     def process(text:)
@@ -34,12 +35,21 @@ module PragmaticSegmenter
 
     def split_into_segments
       check_for_parens_between_quotes(@text).split("\r")
-         .map! { |segment| Rule.apply(segment, @language::SingleNewLineRule, @language::EllipsisRules::All) }
+         .map! { |segment| Rule.apply(segment, @language::SingleNewLineRule, ellipsis_rules) }
          .map { |segment| check_for_punctuation(segment) }.flatten
          .map! { |segment| Rule.apply(segment, @language::SubSymbolsRules::All) }
          .map { |segment| post_process_segments(segment) }
          .flatten.compact.delete_if(&:empty?)
          .map! { |segment| Rule.apply(segment, @language::SubSingleQuoteRule) }
+    end
+
+    # The optional ellipsis rule has to look at the following word before the
+    # plain three-period rule turns the ellipsis into a non-boundary marker,
+    # so it is prepended when it is turned on. When it is off the rule list is
+    # exactly the one the segmenter has always used.
+    def ellipsis_rules
+      return @language::EllipsisRules::All unless ellipsis
+      [@language::EllipsisRules::CapitalizedWordRule, @language::EllipsisRules::All]
     end
 
     def post_process_segments(txt)
