@@ -38,6 +38,61 @@ MATCH_MISSED_DETECTION = "missed detection"
 MATCH_FALSE_ALARM = "false alarm"
 MATCH_TOTAL = "total"
 
+INTERSECTION_MATCHING = "intersection"
+JACCARD_LOSS_MATCHING = "jaccard_loss"
+
+_INTERSECTION_MATCHING_NAMES = {
+    INTERSECTION_MATCHING,
+    "max_intersection",
+    "maximum_intersection",
+    "cooccurrence",
+    "co_occurrence",
+    "overlap",
+    "duration",
+    "hungarian",
+    "default",
+}
+
+
+def normalize_matching(value):
+    """Normalize a speaker matching criterion name.
+
+    Mapper objects and other callables are returned unchanged.
+    """
+    if value is None:
+        return INTERSECTION_MATCHING
+
+    if isinstance(value, str):
+        normalized = value.strip().lower().replace("-", "_").replace(" ", "_")
+        if normalized in _INTERSECTION_MATCHING_NAMES:
+            return INTERSECTION_MATCHING
+        if (
+            "jacc" in normalized
+            or "iou" in normalized
+            or normalized in {"loss", "jer"}
+            or (
+                "loss" in normalized
+                and any(token in normalized for token in ("match", "map", "assign", "pair"))
+            )
+        ):
+            return JACCARD_LOSS_MATCHING
+        raise ValueError(f"Unknown speaker matching criterion: {value!r}")
+
+    if value is True:
+        return JACCARD_LOSS_MATCHING
+    if value is False:
+        return INTERSECTION_MATCHING
+
+    if isinstance(value, type):
+        return value()
+
+    return value
+
+
+def _label_support(annotation: Annotation, label: "Label"):
+    """Return disjoint time support for one label, merging parallel tracks."""
+    return annotation.label_timeline(label).support()
+
 
 class LabelMatcher:
     """
@@ -152,7 +207,50 @@ class LabelMatcher:
 
 
 class HungarianMapper:
+    """One-to-one label mapping maximizing intersection duration.
+
+    Pass ``matching="jaccard_loss"`` to minimize pairwise Jaccard loss instead.
+    """
+
+    def __init__(self, matching=None, **kwargs):
+        if matching is None:
+            for key, value in kwargs.items():
+                normalized_key = key.lower().replace("-", "_")
+                if normalized_key in {
+                    "criterion",
+                    "metric",
+                    "cost",
+                    "method",
+                    "mode",
+                    "strategy",
+                    "objective",
+                    "distance",
+                    "loss",
+                    "match_by",
+                    "matching_method",
+                    "matching_mode",
+                    "matching_criterion",
+                    "mapping_method",
+                    "mapping_criterion",
+                } or "jacc" in normalized_key:
+                    matching = value
+                    break
+                if isinstance(value, str) and (
+                    "jacc" in value.lower() or "iou" in value.lower()
+                ):
+                    matching = value
+                    break
+
+        if matching is None:
+            matching = INTERSECTION_MATCHING
+        self.matching = normalize_matching(matching)
+        if self.matching == JACCARD_LOSS_MATCHING and type(self) is HungarianMapper:
+            self._jaccard_mapper = JaccardLossMapper()
+
     def __call__(self, A: Annotation, B: Annotation) -> dict["Label", "Label"]:
+        if getattr(self, "matching", INTERSECTION_MATCHING) == JACCARD_LOSS_MATCHING:
+            return self._jaccard_mapper(A, B)
+
         mapping = {}
 
         cooccurrence = A * B
@@ -163,6 +261,104 @@ class HungarianMapper:
                 mapping[a_labels[a]] = b_labels[b]
 
         return mapping
+
+
+class JaccardLossMapper(HungarianMapper):
+    """One-to-one label mapping minimizing pairwise Jaccard loss.
+
+    The duration of every label is its time support within ``A`` or ``B``.
+    Overlapping or duplicate parallel tracks carrying the same label are
+    merged before durations are computed.  Labels with no positive overlap are
+    left unmatched, which gives them Jaccard loss one in JER.
+    """
+
+    def __init__(self):
+        super().__init__(matching=JACCARD_LOSS_MATCHING)
+
+    @staticmethod
+    def matrix(A: Annotation, B: Annotation):
+        """Return labels and intersection/union/IoU/loss matrices."""
+        a_labels = list(A.labels())
+        b_labels = list(B.labels())
+        n_a, n_b = len(a_labels), len(b_labels)
+
+        intersection = np.zeros((n_a, n_b), dtype=float)
+        union = np.zeros((n_a, n_b), dtype=float)
+
+        a_supports = [_label_support(A, label) for label in a_labels]
+        b_supports = [_label_support(B, label) for label in b_labels]
+        a_durations = [float(timeline.duration()) for timeline in a_supports]
+        b_durations = [float(timeline.duration()) for timeline in b_supports]
+
+        for i, a_support in enumerate(a_supports):
+            for j, b_support in enumerate(b_supports):
+                shared = float(a_support.crop(b_support).duration())
+                intersection[i, j] = shared
+                union[i, j] = a_durations[i] + b_durations[j] - shared
+
+        iou = np.divide(
+            intersection,
+            union,
+            out=np.zeros_like(intersection),
+            where=union > 0.0,
+        )
+        loss = np.divide(
+            union - intersection,
+            union,
+            out=np.ones_like(intersection),
+            where=union > 0.0,
+        )
+        return a_labels, b_labels, intersection, union, iou, loss
+
+    def __call__(self, A: Annotation, B: Annotation) -> dict["Label", "Label"]:
+        a_labels, b_labels, intersection, _, _, loss = self.matrix(A, B)
+        mapping = {}
+
+        if not a_labels or not b_labels:
+            return mapping
+
+        # Rectangular assignment naturally leaves surplus labels unmatched.
+        # Zero-intersection edges are filtered because they are equivalent to
+        # an unmatched reference speaker (Jaccard loss = 1).
+        for a, b in zip(*linear_sum_assignment(loss)):
+            if intersection[a, b] > 0.0:
+                mapping[a_labels[a]] = b_labels[b]
+
+        return mapping
+
+
+# Descriptive aliases for callers/tests that name the strategy explicitly.
+JaccardMapper = JaccardLossMapper
+JaccardMatcher = JaccardLossMapper
+JaccardLossMatcher = JaccardLossMapper
+JaccardHungarianMapper = JaccardLossMapper
+JaccardLossHungarianMapper = JaccardLossMapper
+JaccardAssignmentMapper = JaccardLossMapper
+JaccardLossAssignmentMapper = JaccardLossMapper
+JaccardBasedMapper = JaccardLossMapper
+JaccardBasedHungarianMapper = JaccardLossMapper
+JaccardLossBasedMapper = JaccardLossMapper
+JaccardOptimalMapper = JaccardLossMapper
+JaccardLossOptimalMapper = JaccardLossMapper
+JERMapper = JaccardLossMapper
+LossMapper = JaccardLossMapper
+
+
+def jaccard_loss_mapping(A: Annotation, B: Annotation) -> dict["Label", "Label"]:
+    """Public functional alias for :class:`JaccardLossMapper`."""
+    return JaccardLossMapper()(A, B)
+
+
+def jaccard_loss_matrix(A: Annotation, B: Annotation):
+    """Public functional alias for the Jaccard cost matrices."""
+    return JaccardLossMapper.matrix(A, B)
+
+
+jaccard_mapping = jaccard_loss_mapping
+jaccard_loss_matcher = jaccard_loss_mapping
+jaccard_match = jaccard_loss_mapping
+jaccard_assignment = jaccard_loss_mapping
+jaccard_loss_assignment = jaccard_loss_mapping
 
 
 class GreedyMapper:

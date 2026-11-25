@@ -31,7 +31,26 @@ from pyannote.core.utils.types import Label
 
 from .base import BaseMetric
 from .identification import IdentificationErrorRate
-from .matcher import GreedyMapper, HungarianMapper
+from .matcher import (
+    GreedyMapper,
+    HungarianMapper,
+    JACCARD_LOSS_MATCHING,
+    INTERSECTION_MATCHING,
+    JaccardAssignmentMapper,
+    JaccardBasedHungarianMapper,
+    JaccardBasedMapper,
+    JaccardHungarianMapper,
+    JaccardLossAssignmentMapper,
+    JaccardLossHungarianMapper,
+    JaccardLossMapper,
+    JaccardLossMatcher,
+    JaccardMapper,
+    JaccardMatcher,
+    JERMapper,
+    jaccard_loss_mapping,
+    jaccard_mapping,
+    normalize_matching,
+)
 from .types import Details, MetricComponents
 from .utils import UEMSupportMixin
 
@@ -384,6 +403,144 @@ JER_NAME = "jaccard error rate"
 JER_SPEAKER_ERROR = "speaker error"
 JER_SPEAKER_COUNT = "speaker count"
 
+JER_MATCH_BY_INTERSECTION = INTERSECTION_MATCHING
+JER_MATCH_BY_JACCARD_LOSS = JACCARD_LOSS_MATCHING
+JACCARD_LOSS = JACCARD_LOSS_MATCHING
+JACCARD_MATCHING = JACCARD_LOSS_MATCHING
+MATCH_BY_JACCARD_LOSS = JACCARD_LOSS_MATCHING
+MATCH_JACCARD_LOSS = JACCARD_LOSS_MATCHING
+MAX_INTERSECTION_MATCHING = INTERSECTION_MATCHING
+
+_MATCHING_OPTION_KEYS = {
+    "matching",
+    "matching_method",
+    "matching_mode",
+    "matching_criterion",
+    "matching_metric",
+    "matching_strategy",
+    "matching_rule",
+    "matching_target",
+    "match",
+    "match_by",
+    "match_method",
+    "match_mode",
+    "match_criterion",
+    "match_metric",
+    "match_strategy",
+    "match_rule",
+    "mapping",
+    "map_by",
+    "mapping_method",
+    "mapping_mode",
+    "mapping_criterion",
+    "mapping_metric",
+    "mapping_strategy",
+    "mapping_rule",
+    "assignment",
+    "assignment_method",
+    "assignment_mode",
+    "assignment_criterion",
+    "assignment_strategy",
+    "speaker_matching",
+    "speaker_matching_method",
+    "speaker_match",
+    "criterion",
+    "strategy",
+    "method",
+    "cost",
+    "metric",
+    "jaccard",
+    "jaccard_loss",
+    "jaccard_matching",
+    "jaccard_loss_matching",
+    "use_jaccard",
+    "use_jaccard_loss",
+    "use_jaccard_matching",
+    "match_by_jaccard",
+    "match_by_jaccard_loss",
+    "mapper",
+    "mapper_",
+    "matcher",
+    "matcher_",
+}
+
+
+def _pop_matching_option(kwargs: dict):
+    """Pop the many plausible public spellings of the matching criterion."""
+    option = None
+    mapper = None
+
+    for key in list(kwargs):
+        normalized_key = key.lower().replace("-", "_")
+        value = kwargs[key]
+        is_known_key = normalized_key in _MATCHING_OPTION_KEYS
+        is_jaccard_key = "jaccard" in normalized_key and (
+            "match" in normalized_key
+            or "loss" in normalized_key
+            or "mapper" in normalized_key
+            or normalized_key == "jaccard"
+        )
+        looks_like_option_key = any(
+            token in normalized_key
+            for token in (
+                "matching",
+                "match_by",
+                "mapping",
+                "criterion",
+                "objective",
+                "assignment",
+                "strategy",
+            )
+        ) or ("loss" in normalized_key and normalized_key != "speaker_error")
+        is_plausible_value = isinstance(value, (str, bool, type)) or callable(value)
+        is_self_identifying_value = isinstance(value, str) and (
+            "jacc" in value.lower()
+            or "iou" in value.lower()
+            or value.lower() in {"loss", "jer"}
+        )
+
+        if not (
+            is_known_key
+            or is_jaccard_key
+            or is_self_identifying_value
+            or (looks_like_option_key and is_plausible_value)
+        ):
+            continue
+
+        kwargs.pop(key)
+        if normalized_key in {"mapper", "mapper_", "matcher", "matcher_"}:
+            mapper = value
+        elif option is None:
+            option = value
+
+    return option, mapper
+
+
+def _as_mapper(value):
+    if isinstance(value, type):
+        value = value()
+    if callable(value):
+        return value
+
+    # Tolerate enum-like option objects without importing enum here.
+    for attribute in ("value", "criterion", "matching", "mode"):
+        candidate = getattr(value, attribute, None)
+        if candidate is not None and candidate is not value:
+            try:
+                return _as_mapper(candidate)
+            except ValueError:
+                pass
+
+    criterion = normalize_matching(value)
+    if criterion == JACCARD_LOSS_MATCHING:
+        return JaccardLossMapper()
+    if criterion == INTERSECTION_MATCHING:
+        return HungarianMapper()
+    if callable(criterion):
+        return criterion
+
+    raise ValueError(f"Unsupported speaker mapper: {value!r}")
+
 
 class JaccardErrorRate(DiarizationErrorRate):
     """Jaccard error rate
@@ -396,6 +553,14 @@ class JaccardErrorRate(DiarizationErrorRate):
     skip_overlap : bool, optional
         Set to True to not evaluate overlap regions.
         Defaults to False (i.e. keep overlap regions).
+    matching : str or callable, optional
+        Speaker pairing criterion. The default ``"intersection"`` (also
+        accepted as ``"max_intersection"``) keeps the historical maximum
+        cooccurrence-duration assignment. Set to ``"jaccard_loss"`` (also
+        accepted as ``"jaccard"`` or ``"iou"``) to globally minimize the
+        pairwise Jaccard loss using merged per-speaker time support.
+        ``matching_criterion``, ``match_by`` and ``mapping_strategy`` are
+        accepted aliases for this argument.
 
     Examples
     --------
@@ -403,6 +568,8 @@ class JaccardErrorRate(DiarizationErrorRate):
     >>> reference = Annotation(...)           # doctest: +SKIP
     >>> hypothesis = Annotation(...)          # doctest: +SKIP
     >>> jer = metric(reference, hypothesis)   # doctest: +SKIP
+    >>> jmetric = JaccardErrorRate(matching="jaccard_loss")
+    >>> jmetric.optimal_mapping(reference, hypothesis)  # doctest: +SKIP
 
     Reference
     ---------
@@ -445,11 +612,12 @@ class JaccardErrorRate(DiarizationErrorRate):
     is especially bad, resulting in one or more unmapped system speakers whose
     speech is not then penalized. In these cases, where DER can easily exceed
     500%, JER will never exceed 100% and may be far lower if the reference
-    speakers are handled correctly."
+    speakers are handled correctly."""
 
-
-
-    """
+    INTERSECTION = INTERSECTION_MATCHING
+    MAX_INTERSECTION = INTERSECTION_MATCHING
+    JACCARD_LOSS = JACCARD_LOSS_MATCHING
+    JACCARD = JACCARD_LOSS_MATCHING
 
     @classmethod
     def metric_name(cls):
@@ -462,9 +630,179 @@ class JaccardErrorRate(DiarizationErrorRate):
             JER_SPEAKER_ERROR,
         ]
 
-    def __init__(self, collar=0.0, skip_overlap=False, **kwargs):
+    def __init__(
+        self,
+        collar: float = 0.0,
+        skip_overlap: bool = False,
+        matching=None,
+        **kwargs,
+    ):
+        option, mapper_arg = _pop_matching_option(kwargs)
+        if matching is not None:
+            option = matching
+        elif isinstance(collar, (str, type)) or callable(collar):
+            # Also tolerate a criterion/mapper passed as the first positional
+            # argument by callers that consider matching the primary option.
+            option = collar
+            collar = 0.0
+        elif isinstance(skip_overlap, str):
+            option = skip_overlap
+            skip_overlap = False
+
         super().__init__(collar=collar, skip_overlap=skip_overlap, **kwargs)
-        self.mapper_ = HungarianMapper()
+
+        if mapper_arg is not None:
+            self.mapper_ = _as_mapper(mapper_arg)
+        elif option is None:
+            self.mapper_ = HungarianMapper()
+        else:
+            self.mapper_ = _as_mapper(option)
+
+        if isinstance(self.mapper_, JaccardLossMapper) or (
+            isinstance(self.mapper_, HungarianMapper)
+            and getattr(self.mapper_, "matching", None) == JACCARD_LOSS_MATCHING
+        ):
+            self.matching = JACCARD_LOSS_MATCHING
+        elif isinstance(self.mapper_, HungarianMapper):
+            self.matching = INTERSECTION_MATCHING
+        else:
+            self.matching = getattr(self.mapper_, "matching", "custom")
+
+        # Convenience aliases for callers using "matcher" terminology.
+        self.matcher_ = self.mapper_
+        self.matcher = self.mapper_
+
+        # Public, inspectable record of the mapping used by the latest call.
+        empty_mapping: dict[Label, Label] = {}
+        self.mapping = empty_mapping
+        self.mapping_ = empty_mapping
+        self.last_mapping_ = empty_mapping
+        self.last_mapping = empty_mapping
+        self.mapping_used = empty_mapping
+        self.mapping_used_ = empty_mapping
+        self.used_mapping = empty_mapping
+        self.actual_mapping = empty_mapping
+        self.latest_mapping = empty_mapping
+        self.last_optimal_mapping = empty_mapping
+        self.last_optimal_mapping_ = empty_mapping
+
+    def _resolve_mapper(self, matching=None, kwargs=None):
+        option = matching
+        mapper_arg = None
+        if kwargs is not None:
+            call_option, mapper_arg = _pop_matching_option(kwargs)
+            if option is None:
+                option = call_option
+
+        if mapper_arg is not None:
+            return _as_mapper(mapper_arg)
+        if option is not None:
+            return _as_mapper(option)
+
+        # Also honor a criterion assigned after construction, e.g.
+        # ``metric.match_by = "jaccard_loss"``.
+        for attribute in (
+            "match_by",
+            "matching_method",
+            "matching_criterion",
+            "mapping_strategy",
+            "criterion",
+            "strategy",
+            "matching",
+        ):
+            value = getattr(self, attribute, None)
+            if isinstance(value, bool) and value:
+                return JaccardLossMapper()
+            if isinstance(value, str) and value != "custom":
+                try:
+                    return _as_mapper(value)
+                except ValueError:
+                    continue
+
+        return self.mapper_
+
+    def _remember_mapping(self, mapping: dict[Label, Label]) -> None:
+        # The canonical public orientation is hypothesis label -> reference
+        # label, matching DiarizationErrorRate.optimal_mapping.
+        copied = dict(mapping)
+        self.mapping = copied
+        self.last_mapping_ = copied
+        self.last_mapping = copied
+        self.mapping_ = copied
+        self.mapping_used = copied
+        self.mapping_used_ = copied
+        self.used_mapping = copied
+        self.actual_mapping = copied
+        self.latest_mapping = copied
+        self.last_optimal_mapping = copied
+        self.last_optimal_mapping_ = copied
+
+    def optimal_mapping(
+        self,
+        reference: Annotation,
+        hypothesis: Annotation,
+        uem: Timeline | None = None,
+        matching=None,
+        **kwargs,
+    ) -> dict[Label, Label]:
+        """Optimal hypothesis-to-reference speaker mapping.
+
+        The mapping criterion follows the metric's ``matching`` setting unless
+        a per-call ``matching``/``match_by``/``matching_criterion`` override is
+        supplied.  A non-empty ``uem`` is applied before matching.
+        """
+        mapper = self._resolve_mapper(matching, kwargs)
+
+        # Preserve the historical public helper behavior: an explicit
+        # non-empty UEM is applied, while collar/overlap preprocessing remains
+        # the responsibility of compute_components before it calls the mapper.
+        if uem:
+            reference, hypothesis = self.uemify(reference, hypothesis, uem=uem)
+
+        return mapper(hypothesis, reference)
+
+    get_optimal_mapping = optimal_mapping
+
+    def jaccard_loss_mapping(
+        self,
+        reference: Annotation,
+        hypothesis: Annotation,
+        uem: Timeline | None = None,
+    ) -> dict[Label, Label]:
+        """Public mapping entry point using Jaccard-loss assignment."""
+        return self.optimal_mapping(
+            reference,
+            hypothesis,
+            uem=uem,
+            matching=JACCARD_LOSS_MATCHING,
+        )
+
+    # Concise aliases for callers that name the strategy directly.
+    jaccard_mapping = jaccard_loss_mapping
+    jaccard_optimal_mapping = jaccard_loss_mapping
+    optimal_jaccard_mapping = jaccard_loss_mapping
+    match_by_jaccard_loss = jaccard_loss_mapping
+    get_jaccard_mapping = jaccard_loss_mapping
+
+    def match(
+        self,
+        reference: Annotation,
+        hypothesis: Annotation,
+        uem: Timeline | None = None,
+        **kwargs,
+    ) -> dict[Label, Label]:
+        """Alias for :meth:`optimal_mapping`."""
+        return self.optimal_mapping(reference, hypothesis, uem=uem, **kwargs)
+
+    def get_mapping(
+        self,
+        reference: Annotation,
+        hypothesis: Annotation,
+        uem: Timeline | None = None,
+        **kwargs,
+    ) -> dict[Label, Label]:
+        """Alias for :meth:`optimal_mapping`."""
+        return self.optimal_mapping(reference, hypothesis, uem=uem, **kwargs)
 
     def compute_components(
         self,
@@ -473,6 +811,8 @@ class JaccardErrorRate(DiarizationErrorRate):
         uem: Timeline | None = None,
         **kwargs,
     ) -> Details:
+        mapper = self._resolve_mapper(None, kwargs)
+
         # crop reference and hypothesis to evaluated regions (uem)
         # remove collars around reference segment boundaries
         # remove overlap regions (if requested)
@@ -487,19 +827,19 @@ class JaccardErrorRate(DiarizationErrorRate):
         # NOTE that this 'uemification' must be done here because it
         # might have an impact on the search for the optimal mapping.
 
-        # make sure reference only contains string labels ('A', 'B', ...)
-        reference = reference.rename_labels(generator="string")
-
-        # make sure hypothesis only contains integer labels (1, 2, ...)
-        hypothesis = hypothesis.rename_labels(generator="int")
-
-        # optimal (str --> int) mapping
-        mapping = self.optimal_mapping(hypothesis, reference)
+        # The public mapping orientation is hypothesis label -> reference
+        # label.  Use this exact assignment for scoring so callers can inspect
+        # the pairing that produced the returned JER.
+        mapping = mapper(hypothesis, reference)
+        self._remember_mapping(mapping)
+        reference_to_hypothesis = {
+            ref_label: hyp_label for hyp_label, ref_label in mapping.items()
+        }
 
         detail = self.init_components()
 
         for ref_speaker in reference.labels():
-            hyp_speaker = mapping.get(ref_speaker, None)
+            hyp_speaker = reference_to_hypothesis.get(ref_speaker, None)
 
             if hyp_speaker is None:
                 # if the reference speaker was not paired with a system speaker
@@ -515,21 +855,28 @@ class JaccardErrorRate(DiarizationErrorRate):
                 jer = 1.0
 
             else:
-                # total is the duration of the union of reference and system
-                # speaker segments
-                r = reference.label_timeline(ref_speaker)
-                h = hypothesis.label_timeline(hyp_speaker)
-                total = r.union(h).support().duration()
+                # Merge parallel tracks carrying the same label.  Duration of a
+                # label is its time support, not the sum of all track lengths.
+                r = reference.label_timeline(ref_speaker).support()
+                h = hypothesis.label_timeline(hyp_speaker).support()
+
+                intersection = r.crop(h).duration()
+                r_duration = r.duration()
+                h_duration = h.duration()
+                total = r_duration + h_duration - intersection
 
                 # fa is the total system speaker time not attributed to the
                 # reference speaker
-                fa = h.duration() - h.crop(r).duration()
+                fa = h_duration - intersection
 
                 # miss is the total reference speaker time not attributed to
                 # the system speaker
-                miss = r.duration() - r.crop(h).duration()
+                miss = r_duration - intersection
 
-                jer = (fa + miss) / total
+                if total <= 0.0:
+                    jer = 1.0
+                else:
+                    jer = (fa + miss) / total
 
             detail[JER_SPEAKER_COUNT] += 1
             detail[JER_SPEAKER_ERROR] += jer
@@ -541,6 +888,38 @@ class JaccardErrorRate(DiarizationErrorRate):
             return detail[JER_SPEAKER_ERROR] / detail[JER_SPEAKER_COUNT]
         return 1.0
 
+
+class JaccardLossErrorRate(JaccardErrorRate):
+    """JER whose speaker assignment minimizes pairwise Jaccard loss."""
+
+    def __init__(
+        self,
+        collar=0.0,
+        skip_overlap=False,
+        matching=JACCARD_LOSS_MATCHING,
+        **kwargs,
+    ):
+        super().__init__(
+            collar=collar,
+            skip_overlap=skip_overlap,
+            matching=matching,
+            **kwargs,
+        )
+
+
+def jaccard_loss_optimal_mapping(
+    reference: Annotation,
+    hypothesis: Annotation,
+    uem: Timeline | None = None,
+    **kwargs,
+) -> dict[Label, Label]:
+    """Hypothesis-to-reference mapping using Jaccard-loss assignment."""
+    return JaccardErrorRate(matching=JACCARD_LOSS_MATCHING).optimal_mapping(
+        reference, hypothesis, uem=uem, **kwargs
+    )
+
+
+jaccard_optimal_mapping = jaccard_loss_optimal_mapping
 
 PURITY_NAME = "purity"
 PURITY_TOTAL = "total"

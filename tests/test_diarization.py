@@ -8,6 +8,7 @@ from pyannote.metrics.diarization import (
     DiarizationPurity,
     DiarizationSpeakerCountAccuracy,
     DiarizationSpeakerCountError,
+    JaccardErrorRate,
 )
 
 
@@ -206,3 +207,95 @@ def test_jaccard_error_rate_empty_reference():
     hypothesis[Segment(0, 10)] = "spk"
     # empty reference -> zero speaker count -> must not ZeroDivisionError
     assert JaccardErrorRate()(Annotation(), hypothesis) == 1.0
+
+
+def _jaccard_pairing_annotations(parallel_x_track=False):
+    reference = Annotation()
+    reference[Segment(0, 10)] = "A"
+
+    hypothesis = Annotation()
+    hypothesis[Segment(0, 8), "x-main"] = "X"
+    hypothesis[Segment(8, 100), "x-extra"] = "X"
+    hypothesis[Segment(0, 7), "y-main"] = "Y"
+    if parallel_x_track:
+        hypothesis[Segment(0, 8), "x-parallel"] = "X"
+
+    return reference, hypothesis, Timeline([Segment(0, 100)])
+
+
+def test_jaccard_loss_matching_selects_by_true_support():
+    reference, hypothesis, uem = _jaccard_pairing_annotations()
+    metric = JaccardErrorRate(matching="jaccard_loss")
+
+    assert metric.optimal_mapping(reference, hypothesis, uem=uem) == {"Y": "A"}
+    assert metric(reference, hypothesis, uem=uem) == pytest.approx(0.3)
+
+    detailed = metric(reference, hypothesis, uem=uem, detailed=True)
+    assert detailed["jaccard error rate"] == pytest.approx(0.3)
+    assert metric.last_mapping_ == {"Y": "A"}
+
+
+def test_jaccard_loss_matching_merges_parallel_same_label_tracks():
+    reference, hypothesis, uem = _jaccard_pairing_annotations(parallel_x_track=True)
+    metric = JaccardErrorRate(matching="jaccard_loss")
+
+    assert metric.optimal_mapping(reference, hypothesis, uem=uem) == {"Y": "A"}
+    assert metric(reference, hypothesis, uem=uem) == pytest.approx(0.3)
+    assert metric.last_mapping_ == {"Y": "A"}
+
+
+def test_default_jer_matching_still_uses_max_intersection():
+    reference, hypothesis, uem = _jaccard_pairing_annotations()
+    metric = JaccardErrorRate()
+
+    assert metric.optimal_mapping(reference, hypothesis, uem=uem) == {"X": "A"}
+    assert metric(reference, hypothesis, uem=uem) == pytest.approx(0.9)
+
+
+def test_jaccard_loss_matching_is_global_one_to_one_assignment():
+    reference = Annotation()
+    reference[Segment(0, 10)] = "A"
+    reference[Segment(10, 20)] = "B"
+    reference[Segment(20, 24)] = "C"
+
+    hypothesis = Annotation()
+    hypothesis[Segment(0, 8), "x-a"] = "X"
+    hypothesis[Segment(10, 16), "x-b"] = "X"
+    hypothesis[Segment(0, 4), "y-a"] = "Y"
+
+    uem = Timeline([Segment(0, 24)])
+    metric = JaccardErrorRate(matching="jaccard_loss")
+
+    assert metric.optimal_mapping(reference, hypothesis, uem=uem) == {
+        "Y": "A",
+        "X": "B",
+    }
+    # A-Y JER 0.6, B-X JER 2/3, unmatched C JER 1.
+    assert metric(reference, hypothesis, uem=uem) == pytest.approx(
+        (0.6 + 2.0 / 3.0 + 1.0) / 3.0
+    )
+    assert metric.last_mapping_ == {"Y": "A", "X": "B"}
+
+
+def test_jaccard_matching_option_aliases_and_mapper_entry_point():
+    from pyannote.metrics.matcher import JaccardLossMapper
+
+    reference, hypothesis, uem = _jaccard_pairing_annotations()
+
+    for kwargs in (
+        {"match_by": "jaccard"},
+        {"matching_criterion": "jaccard-loss"},
+        {"mapping_strategy": "IOU"},
+        {"jaccard_loss_matching": True},
+    ):
+        metric = JaccardErrorRate(**kwargs)
+        assert metric.optimal_mapping(reference, hypothesis, uem=uem) == {"Y": "A"}
+        assert metric(reference, hypothesis, uem=uem) == pytest.approx(0.3)
+
+    assert JaccardLossMapper()(hypothesis, reference) == {"Y": "A"}
+    assert JaccardErrorRate().jaccard_loss_mapping(
+        reference, hypothesis, uem=uem
+    ) == {"Y": "A"}
+    assert JaccardErrorRate()(
+        reference, hypothesis, uem=uem, matching="jaccard_loss"
+    ) == pytest.approx(0.3)
