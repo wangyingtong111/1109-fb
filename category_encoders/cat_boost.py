@@ -1,5 +1,7 @@
 """CatBoost coding."""
 
+import numbers
+
 import numpy as np
 import pandas as pd
 from sklearn.utils.random import check_random_state
@@ -7,6 +9,51 @@ from sklearn.utils.random import check_random_state
 import category_encoders.utils as util
 
 __author__ = 'Jan Motl'
+
+# Canonical identity of the missing class (NaN, None, pd.NA, ...) as a string key.
+# The control-character prefix cannot be produced by ``str()`` of an ordinary
+# value, so the missing class never collides with a literal text category
+# (not even with the literal string 'nan').
+_MISSING_KEY = '\x00missing'
+
+# Prefixes tagging non-string categories so that e.g. the text '1' stays a
+# category of its own, distinct from the integer 1.
+_NUM_PREFIX = '\x00num\x00'
+_BOOL_PREFIX = '\x00bool\x00'
+_OBJ_PREFIX = '\x00obj\x00'
+
+
+def _category_key(value):
+    """Return the canonical string identity of a category value.
+
+    The same value must yield the same key at fit time (when the category
+    mapping is built) and at transform time (when the running means are
+    accumulated or the mapping is applied), no matter how the value is
+    represented:
+
+    - text categories keep their literal string (the original behavior);
+    - numbers collapse to their value, so Python ``1`` and ``numpy.int64(1)``
+      share one category, while staying distinct from the text ``'1'``;
+    - booleans form their own categories, distinct from numbers and text;
+    - all missing values (NaN, None, pd.NA, ...) share one missing class,
+      which is distinct from the literal string ``'nan'``.
+    """
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return _MISSING_KEY
+    if isinstance(value, (bool, np.bool_)):
+        return _BOOL_PREFIX + str(bool(value))
+    if isinstance(value, numbers.Number):
+        if value != value:  # NaN of some float flavor
+            return _MISSING_KEY
+        return _NUM_PREFIX + str(value)
+    try:
+        if bool(pd.isna(value)):
+            return _MISSING_KEY
+    except (TypeError, ValueError):
+        pass
+    return _OBJ_PREFIX + str(value)
 
 
 class CatBoostEncoder(util.SupervisedTransformerMixin, util.BaseEncoder):
@@ -161,12 +208,14 @@ class CatBoostEncoder(util.SupervisedTransformerMixin, util.BaseEncoder):
             level_notunique = colmap['count'] > 1
 
             unique_train = colmap.index
-            unseen_values = pd.Series(
-                [x for x in X[col].unique() if x not in unique_train], dtype=unique_train.dtype
-            )
+
+            # Canonical string identity of each row's category. The same keys
+            # were used to build the mapping at fit time, so the accumulation
+            # below and the inference mapping see identical category identities.
+            keys = X[col].map(_category_key)
 
             is_nan = X[col].isna()
-            is_unknown_value = X[col].isin(unseen_values.dropna().astype(object))
+            is_unknown_value = ~keys.isin(unique_train) & ~is_nan
 
             if self.handle_unknown == 'error' and is_unknown_value.any():
                 raise ValueError('Columns to be encoded cannot contain new values')
@@ -177,7 +226,8 @@ class CatBoostEncoder(util.SupervisedTransformerMixin, util.BaseEncoder):
                 level_means = (
                     (colmap['sum'] + self._mean * self.a) / (colmap['count'] + self.a)
                 ).where(level_notunique, self._mean)
-                X[col] = X[col].map(level_means)
+                # Assign positionally: a duplicated index must not realign rows.
+                X[col] = keys.map(level_means).to_numpy()
             else:
                 # Simulation of CatBoost implementation, which calculates leave-one-out on the fly.
                 # The nice thing about this is that it helps to prevent overfitting. The bad thing
@@ -187,25 +237,25 @@ class CatBoostEncoder(util.SupervisedTransformerMixin, util.BaseEncoder):
                 # See:
                 #   https://tech.yandex.com/catboost/doc/dg/concepts/algorithm-main-stages_cat-to-numberic-docpage/
                 # Cumsum does not work nicely with None (while cumcount does).
-                # As a workaround, we cast the grouping column as string.
+                # As a workaround, we accumulate over the canonical string keys.
                 # See: issue #209
-                temp = y.groupby(X[col].astype(str).fillna('nan')).agg(['cumsum', 'cumcount'])
-                X[col] = (temp['cumsum'] - y + self._mean * self.a) / (temp['cumcount'] + self.a)
+                temp = y.groupby(keys.to_numpy()).agg(['cumsum', 'cumcount'])
+                # Assign positionally: a duplicated index must not realign rows.
+                X[col] = (
+                    temp['cumsum'].to_numpy() - y.to_numpy() + self._mean * self.a
+                ) / (temp['cumcount'].to_numpy() + self.a)
 
             if self.handle_unknown == 'value':
-                if X[col].dtype.name == 'category':
-                    X[col] = X[col].astype(float)
                 X.loc[is_unknown_value, col] = self._mean
             elif self.handle_unknown == 'return_nan':
                 X.loc[is_unknown_value, col] = np.nan
 
             if self.handle_missing == 'value':
-                # only set value if there are actually missing values.
-                # In case of pd.Categorical columns setting values that are not seen in
-                # pd.Categorical gives an error.
-                nan_cond = is_nan & unseen_values.isna().any()
-                if nan_cond.any():
-                    X.loc[nan_cond, col] = self._mean
+                # Only impute with the global mean if the missing class was not
+                # seen during training; otherwise the rows already carry the
+                # encoding of the missing class itself.
+                if _MISSING_KEY not in unique_train and is_nan.any():
+                    X.loc[is_nan, col] = self._mean
             elif self.handle_missing == 'return_nan':
                 X.loc[is_nan, col] = np.nan
 
@@ -221,15 +271,9 @@ class CatBoostEncoder(util.SupervisedTransformerMixin, util.BaseEncoder):
         return tags
 
     def _fit_column_map(self, series, y):
-        category = pd.Categorical(series)
-
-        categories = category.categories
-        codes = category.codes.copy()
-
-        codes[codes == -1] = len(categories)
-        categories = np.append(categories, np.nan)
-
-        return_map = pd.Series(dict(enumerate(categories)))
-
-        result = y.groupby(codes).agg(['sum', 'count'])
-        return result.rename(return_map)
+        # Group by the canonical string keys so that the category identities
+        # stored in the mapping match the keys used at transform time.
+        # The keys are passed positionally, so a duplicated index cannot
+        # realign the target.
+        keys = series.map(_category_key)
+        return y.groupby(keys.to_numpy()).agg(['sum', 'count'])
