@@ -14,6 +14,7 @@ from opt_einsum.typing import (
     ContractionListType,
     OptimizeKind,
     PathType,
+    PeakMemoryStep,
     TensorShapeType,
 )
 
@@ -45,6 +46,7 @@ class PathInfo:
         opt_cost: int,
         size_list: Sequence[int],
         size_dict: dict[str, int],
+        peak_memory_ledger: Sequence[PeakMemoryStep] | None = None,
     ):
         self.contraction_list = contraction_list
         self.input_subscripts = input_subscripts
@@ -61,6 +63,11 @@ class PathInfo:
         self.shapes = [tuple(size_dict[k] for k in ks) for ks in input_subscripts.split(",")]
         self.eq = f"{input_subscripts}->{output_subscript}"
         self.largest_intermediate = Decimal(max(size_list, default=1))
+
+        # Step-by-step peak (simultaneously live elements) budget accounting.
+        self.peak_memory_ledger = list(peak_memory_ledger) if peak_memory_ledger is not None else None
+        self.peak_memory_limit = self.peak_memory_ledger[0]["peak_memory_limit"] if self.peak_memory_ledger else None
+        self.peak_live = self.peak_memory_ledger[-1]["peak"] if self.peak_memory_ledger else None
 
     def __repr__(self) -> str:
         # Return the path along with a nice string representation
@@ -119,6 +126,28 @@ def _choose_memory_arg(memory_limit: _MemoryLimit, size_list: list[int]) -> int 
     return int(memory_limit)
 
 
+def _choose_peak_memory_arg(peak_memory_limit: int | Decimal | None) -> int | None:
+    """Normalize the peak simultaneously-live elements budget.
+
+    Unlike :func:`_choose_memory_arg` this budget counts every buffer live at
+    once, so ``'max_input'`` is not a meaningful shorthand and only integers
+    (plus ``None`` / ``-1`` for unlimited) are accepted.
+    """
+    if peak_memory_limit is None:
+        return None
+
+    if isinstance(peak_memory_limit, str):
+        raise ValueError("peak_memory_limit must be None or a positive integer (use -1 for no limit).")
+
+    if peak_memory_limit < 1:
+        if peak_memory_limit == -1:
+            return None
+        else:
+            raise ValueError("Peak memory limit must be larger than 0, or -1")
+
+    return int(peak_memory_limit)
+
+
 _EinsumDefaultKeys = Literal["order", "casting", "dtype", "out"]
 
 
@@ -150,6 +179,7 @@ def contract_path(
     use_blas: bool = True,
     optimize: OptimizeKind = True,
     memory_limit: _MemoryLimit = None,
+    peak_memory_limit: int | Decimal | None = None,
     shapes: bool = False,
     **kwargs: Any,
 ) -> tuple[PathType, PathInfo]: ...
@@ -163,6 +193,7 @@ def contract_path(
     use_blas: bool = True,
     optimize: OptimizeKind = True,
     memory_limit: _MemoryLimit = None,
+    peak_memory_limit: int | Decimal | None = None,
     shapes: bool = False,
     **kwargs: Any,
 ) -> tuple[PathType, PathInfo]: ...
@@ -174,6 +205,7 @@ def contract_path(
     use_blas: bool = True,
     optimize: OptimizeKind = True,
     memory_limit: _MemoryLimit = None,
+    peak_memory_limit: int | Decimal | None = None,
     shapes: bool = False,
     **kwargs: Any,
 ) -> tuple[PathType, PathInfo]:
@@ -216,6 +248,19 @@ def contract_path(
 
                 The default is None. Note that imposing a limit can make contractions
                 exponentially slower to perform.
+
+          peak_memory_limit: Give the upper bound on the peak number of *simultaneously live*
+                logical elements, as opposed to ``memory_limit`` which bounds a single
+                intermediate tensor. At every binary contraction the initial operands, every
+                other buffer still in play, and the step result (which occupies space before
+                the step operands are released) are all counted.
+                - None or -1 means there is no limit (the default) and path selection is unchanged
+                - a positive integer is taken as an explicit element budget
+
+                When given, a flop-optimal binary path fitting the budget is selected, even if
+                the otherwise preferred path would exceed it; a step-by-step accounting of the
+                budget is returned on the resulting ``PathInfo`` (``peak_memory_ledger``). If no
+                binary path fits, a ``RuntimeError`` is raised.
 
           shapes: Whether ``contract_path`` should assume arrays (the default) or array shapes have been supplied.
 
@@ -332,6 +377,7 @@ def contract_path(
     # Compute size of each input array plus the output array
     size_list = [helpers.compute_size_by_dict(term, size_dict) for term in input_list + [output_subscript]]
     memory_arg = _choose_memory_arg(memory_limit, size_list)
+    peak_memory_arg = _choose_peak_memory_arg(peak_memory_limit)
 
     num_ops = len(input_list)
 
@@ -356,6 +402,30 @@ def contract_path(
     else:
         path_optimizer = paths.get_path_fn(optimize)
         path_tuple = path_optimizer(input_sets, output_set, size_dict, memory_arg)
+
+    # The peak simultaneously-live budget only governs *binary* contraction
+    # paths: if the planned path is not binary or would breach the budget,
+    # search for the best binary path that fits rather than rejecting outright.
+    peak_memory_ledger: list[PeakMemoryStep] | None = None
+    if peak_memory_arg is not None:
+        if all(len(step) == 2 for step in path_tuple):
+            planned_ledger = paths.compute_peak_memory_ledger(
+                path_tuple, input_sets, output_set, size_dict, peak_memory_arg
+            )
+            if all(entry["live"] <= peak_memory_arg for entry in planned_ledger):
+                # keep the planner's preferred choice and reuse its accounting
+                peak_memory_ledger = planned_ledger
+
+        if peak_memory_ledger is None:
+            path_tuple = paths.find_peak_memory_feasible_path(
+                input_sets, output_set, size_dict, peak_memory_arg, candidate_path=path_tuple
+            )
+
+        # Step-by-step peak memory accounting for the path actually selected.
+        if peak_memory_ledger is None:
+            peak_memory_ledger = paths.compute_peak_memory_ledger(
+                path_tuple, input_sets, output_set, size_dict, peak_memory_arg
+            )
 
     cost_list = []
     scale_list = []
@@ -425,6 +495,7 @@ def contract_path(
         opt_cost,
         size_list,
         size_dict,
+        peak_memory_ledger=peak_memory_ledger,
     )
 
     return path_tuple, path_print
@@ -482,6 +553,7 @@ def contract(
     use_blas: bool = ...,
     optimize: OptimizeKind = ...,
     memory_limit: _MemoryLimit = ...,
+    peak_memory_limit: int | Decimal | None = ...,
     backend: BackendType = ...,
     **kwargs: Any,
 ) -> ArrayType: ...
@@ -495,6 +567,7 @@ def contract(
     use_blas: bool = ...,
     optimize: OptimizeKind = ...,
     memory_limit: _MemoryLimit = ...,
+    peak_memory_limit: int | Decimal | None = ...,
     backend: BackendType = ...,
     **kwargs: Any,
 ) -> ArrayType: ...
@@ -507,6 +580,7 @@ def contract(
     use_blas: bool = True,
     optimize: OptimizeKind = True,
     memory_limit: _MemoryLimit = None,
+    peak_memory_limit: int | Decimal | None = None,
     backend: BackendType = "auto",
     **kwargs: Any,
 ) -> ArrayType:
@@ -554,6 +628,9 @@ def contract(
             The default is None. Note that imposing a limit can make contractions
             exponentially slower to perform.
 
+        peak_memory_limit:- Give the upper bound on the peak number of simultaneously live logical
+            elements (see :func:`contract_path`). When omitted, path selection is unchanged.
+
         backend: Which library to use to perform the required ``tensordot``, ``transpose``
             and ``einsum`` calls. Should match the types of arrays supplied, See
             `contract_expression` for generating expressions which convert
@@ -596,7 +673,12 @@ def contract(
     # Build the contraction list and operand
     contraction_list: ContractionListType
     operands, contraction_list = contract_path(  # type: ignore
-        *operands_list, optimize=optimize, memory_limit=memory_limit, einsum_call=True, use_blas=use_blas
+        *operands_list,
+        optimize=optimize,
+        memory_limit=memory_limit,
+        peak_memory_limit=peak_memory_limit,
+        einsum_call=True,
+        use_blas=use_blas,
     )
 
     # check if performing contraction or just building expression
@@ -938,6 +1020,7 @@ def contract_expression(
     use_blas: bool = ...,
     optimize: OptimizeKind = ...,
     memory_limit: _MemoryLimit = ...,
+    peak_memory_limit: int | Decimal | None = ...,
     **kwargs: Any,
 ) -> ContractExpression: ...
 
@@ -951,6 +1034,7 @@ def contract_expression(
     use_blas: bool = ...,
     optimize: OptimizeKind = ...,
     memory_limit: _MemoryLimit = ...,
+    peak_memory_limit: int | Decimal | None = ...,
     **kwargs: Any,
 ) -> ContractExpression: ...
 
@@ -962,6 +1046,7 @@ def contract_expression(
     use_blas: bool = True,
     optimize: OptimizeKind = True,
     memory_limit: _MemoryLimit = None,
+    peak_memory_limit: int | Decimal | None = None,
     **kwargs: Any,
 ) -> ContractExpression:
     """Generate a reusable expression for a given contraction with
@@ -1041,5 +1126,11 @@ def contract_expression(
     dummy_arrays = [s if i in constants else shape_only(s) for i, s in enumerate(shapes)]  # type: ignore
 
     return contract(
-        subscripts, *dummy_arrays, use_blas=use_blas, optimize=optimize, memory_limit=memory_limit, **kwargs
+        subscripts,
+        *dummy_arrays,
+        use_blas=use_blas,
+        optimize=optimize,
+        memory_limit=memory_limit,
+        peak_memory_limit=peak_memory_limit,
+        **kwargs,
     )

@@ -600,3 +600,144 @@ def test_optimizer_registration() -> None:
 def test_path_with_assumed_shapes() -> None:
     path, _ = oe.contract_path("ab,bc,cd", [[5, 3]], [[2], [4]], [[3, 2]])
     assert path == [(0, 1), (0, 1)]
+
+
+def test_compute_peak_memory_ledger_counts_result_before_release() -> None:
+    # ab,bc,cd->ad with shapes (2,3),(3,2),(2,2): initial live = 6+6+4 = 16
+    eq = "ab,bc,cd->ad"
+    shapes = [(2, 3), (3, 2), (2, 2)]
+    inputs = [frozenset("ab"), frozenset("bc"), frozenset("cd")]
+    output = frozenset("ad")
+    size_dict = {"a": 2, "b": 3, "c": 2, "d": 2}
+
+    path = [(0, 1), (0, 1)]
+    ledger = oe.paths.compute_peak_memory_ledger(path, inputs, output, size_dict, peak_memory_limit=20)
+
+    # initial state entry plus one entry per contraction
+    assert [entry["step"] for entry in ledger] == [0, 1, 2]
+    assert ledger[0] == {
+        "step": 0,
+        "contraction": (),
+        "operands": 0,
+        "result": 0,
+        "live": 16,
+        "peak": 16,
+        "peak_memory_limit": 20,
+    }
+
+    # step 1: result (ac -> 4 elements) exists before the two operands
+    # (ab=6, bc=6) are released, so the peak is 16 + 4 = 20
+    assert ledger[1]["contraction"] == (0, 1)
+    assert ledger[1]["operands"] == 12
+    assert ledger[1]["result"] == 4
+    assert ledger[1]["live"] == 20
+    assert ledger[1]["peak"] == 20
+
+    # after step 1 the live buffers are cd=4 and ac=4; step 2 adds ad=4
+    assert ledger[2]["operands"] == 8
+    assert ledger[2]["result"] == 4
+    assert ledger[2]["live"] == 12
+    assert ledger[2]["peak"] == 20
+
+    # the limit is recorded on every entry and defaults to None when omitted
+    assert all(entry["peak_memory_limit"] == 20 for entry in ledger)
+    unlimited = oe.paths.compute_peak_memory_ledger(path, inputs, output, size_dict)
+    assert all(entry["peak_memory_limit"] is None for entry in unlimited)
+
+
+def test_find_peak_memory_feasible_path_initial_operands_exceed_budget() -> None:
+    inputs = [frozenset("ab"), frozenset("bc"), frozenset("cd")]
+    output = frozenset("ad")
+    size_dict = {"a": 2, "b": 3, "c": 2, "d": 2}
+
+    # the initial operands already require 16 elements, so a budget below that
+    # cannot even hold the inputs
+    with pytest.raises(RuntimeError, match="initial operands"):
+        oe.paths.find_peak_memory_feasible_path(inputs, output, size_dict, 15)
+
+    # a budget that exactly covers the inputs still leaves no room for any
+    # binary step result, so no pairwise path is feasible either
+    with pytest.raises(RuntimeError):
+        oe.paths.find_peak_memory_feasible_path(inputs, output, size_dict, 16)
+
+
+def test_find_peak_memory_feasible_path_picks_flop_optimal_binary_path() -> None:
+    eq = "ab,bc,cd,de->ae"
+    shapes = [(2, 2), (2, 4), (4, 5), (5, 3)]
+    inputs = [frozenset("ab"), frozenset("bc"), frozenset("cd"), frozenset("de")]
+    output = frozenset("ae")
+    size_dict = {"a": 2, "b": 2, "c": 4, "d": 5, "e": 3}
+
+    # the minimum-flop path contracts the middle of the chain first and
+    # reaches a peak of 57 elements, which breaches the budget of 55
+    preferred, info = oe.contract_path(eq, *shapes, shapes=True)
+    preferred_ledger = oe.paths.compute_peak_memory_ledger(preferred, inputs, output, size_dict, 55)
+    assert preferred_ledger[-1]["peak"] == 57
+
+    feasible_path = oe.paths.find_peak_memory_feasible_path(
+        inputs, output, size_dict, 55, candidate_path=preferred
+    )
+    feasible_ledger = oe.paths.compute_peak_memory_ledger(
+        feasible_path, inputs, output, size_dict, 55
+    )
+    assert feasible_ledger[-1]["peak"] <= 55
+
+    # the left-to-right path is the flop-optimal one fitting the budget
+    assert feasible_path == [(0, 1), (0, 2), (0, 1)]
+    assert feasible_ledger[1]["live"] == 55
+
+    # a feasible planner preference is kept rather than replaced
+    kept = oe.paths.find_peak_memory_feasible_path(
+        inputs, output, size_dict, 100, candidate_path=preferred
+    )
+    assert kept == [tuple(sorted(inds)) for inds in preferred]
+
+
+def test_contract_path_peak_memory_limit_reports_infeasible_and_feasible() -> None:
+    # budget equal to the initial 16 elements leaves no room for any result
+    eq1 = "ab,bc,cd->ad"
+    shapes1 = [(2, 3), (3, 2), (2, 2)]
+    with pytest.raises(RuntimeError):
+        oe.contract_path(eq1, *shapes1, shapes=True, peak_memory_limit=16)
+
+    # a slightly larger budget admits the binary path and returns a ledger
+    path1, info1 = oe.contract_path(eq1, *shapes1, shapes=True, peak_memory_limit=20)
+    assert all(len(step) == 2 for step in path1)
+    assert info1.peak_memory_limit == 20
+    assert info1.peak_live == 20
+    assert info1.peak_memory_ledger is not None
+    assert info1.peak_memory_ledger[-1]["peak"] == 20
+
+    # the four-term chain: preferred minimum-flop path breaches 55 but a
+    # binary path still exists and must be returned rather than refused
+    eq2 = "ab,bc,cd,de->ae"
+    shapes2 = [(2, 2), (2, 4), (4, 5), (5, 3)]
+    path2, info2 = oe.contract_path(eq2, *shapes2, shapes=True, peak_memory_limit=55)
+    assert path2 == [(0, 1), (0, 2), (0, 1)]
+    assert info2.peak_live == 55
+    assert all(entry["live"] <= 55 for entry in info2.peak_memory_ledger)
+
+
+@pytest.mark.parametrize("peak_memory_limit", [None, -1])
+def test_contract_path_without_peak_budget_unchanged(peak_memory_limit) -> None:
+    eq = "ab,bc,cd,de->ae"
+    shapes = [(2, 2), (2, 4), (4, 5), (5, 3)]
+
+    default_path, default_info = oe.contract_path(eq, *shapes, shapes=True)
+    path, info = oe.contract_path(
+        eq, *shapes, shapes=True, peak_memory_limit=peak_memory_limit
+    )
+
+    assert path == default_path
+    assert info.peak_memory_ledger is None
+    assert info.peak_memory_limit is None
+    assert info.peak_live is None
+    assert str(info) == str(default_info)
+
+
+@pytest.mark.parametrize("bad_limit", [0, -2, "max_input"])
+def test_contract_path_peak_memory_limit_validation(bad_limit) -> None:
+    eq = "ab,bc,cd->ad"
+    shapes = [(2, 3), (3, 2), (2, 2)]
+    with pytest.raises(ValueError):
+        oe.contract_path(eq, *shapes, shapes=True, peak_memory_limit=bad_limit)

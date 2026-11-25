@@ -277,3 +277,24 @@ def test_contract_path_supply_shapes() -> None:
     eq = "ab,bc,cd"
     shps = [(2, 3), (3, 4), (4, 5)]
     contract_path(eq, *shps, shapes=True)
+
+
+def test_peak_memory_limit_constrained_path_matches_reference() -> None:
+    # the minimum-flop path breaches the peak budget of 55 but a binary path exists
+    eq = "ab,bc,cd,de->ae"
+    shapes = [(2, 2), (2, 4), (4, 5), (5, 3)]
+    views = [np.random.rand(*shape) for shape in shapes]
+
+    reference = np.einsum(eq, *views)
+
+    path, info = contract_path(eq, *shapes, shapes=True, peak_memory_limit=55)
+    assert all(len(step) == 2 for step in path)
+    assert info.peak_live <= 55
+
+    result = contract(eq, *views, optimize=path, use_blas=False)
+    assert np.allclose(result, reference)
+
+    # the budget flows through contract() / contract_expression() as well
+    assert np.allclose(contract(eq, *views, peak_memory_limit=55), reference)
+    expression = contract_expression(eq, *shapes, peak_memory_limit=55)
+    assert np.allclose(expression(*views), reference)

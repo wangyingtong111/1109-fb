@@ -13,7 +13,7 @@ from collections.abc import Callable, Generator, Sequence
 from typing import Any
 
 from opt_einsum.helpers import compute_size_by_dict, flop_count
-from opt_einsum.typing import ArrayIndexType, PathSearchFunctionType, PathType, TensorShapeType
+from opt_einsum.typing import ArrayIndexType, PathSearchFunctionType, PathType, PeakMemoryStep, TensorShapeType
 
 __all__ = [
     "optimal",
@@ -25,6 +25,8 @@ __all__ = [
     "get_path_fn",
     "DynamicProgramming",
     "dynamic_programming",
+    "find_peak_memory_feasible_path",
+    "compute_peak_memory_ledger",
 ]
 
 _UNLIMITED_MEM = {-1, None, float("inf")}
@@ -282,6 +284,215 @@ def optimal(
     _optimal_iterate(path=(), inputs=inputs_set, remaining=set(range(len(inputs))), flops=0)
 
     return ssa_to_linear(best_ssa_path["ssa_path"])
+
+
+def compute_peak_memory_ledger(
+    path: PathType,
+    inputs: list[ArrayIndexType],
+    output: ArrayIndexType,
+    size_dict: dict[str, int],
+    peak_memory_limit: int | None = None,
+) -> list[PeakMemoryStep]:
+    """Replay a linear contraction path and account, at every step, how many
+    logical elements are simultaneously live.
+
+    The accounting treats each contraction as if the result were allocated
+    *before* its operands are released, so the peak reached during a step is::
+
+        live_peak = live_before + size(result)
+
+    where ``live_before`` still counts both step operands and every other
+    buffer in play. After the step the operands are released, leaving
+    ``live_after = live_peak - size(operands)`` for the next step. The initial
+    operands (and, at the final step, the overall output) are thus all
+    included. The first ledger entry (``step == 0``) describes the initial
+    state before any contraction.
+
+    Parameters:
+        path: A linear contraction path as returned by the path optimizers.
+        inputs: The indices of each input tensor.
+        output: The indices of the overall output tensor.
+        size_dict: Size mapping of all the indices.
+        peak_memory_limit: If given, recorded on every ledger entry.
+
+    Returns:
+        A step-by-step budget ledger that can be replayed against the path
+        actually selected.
+    """
+    input_sets = [frozenset(x) for x in inputs]
+    output_set = frozenset(output)
+    tensor_sizes = [compute_size_by_dict(k, size_dict) for k in input_sets]
+
+    live = sum(tensor_sizes)
+    peak = live
+    ledger: list[PeakMemoryStep] = [
+        {
+            "step": 0,
+            "contraction": (),
+            "operands": 0,
+            "result": 0,
+            "live": live,
+            "peak": peak,
+            "peak_memory_limit": peak_memory_limit,
+        }
+    ]
+
+    for step, raw_inds in enumerate(path, start=1):
+        contract_inds = tuple(sorted(raw_inds))
+        operands_size = sum(tensor_sizes[i] for i in contract_inds)
+
+        # determine the resulting indices, mirroring helpers.find_contraction
+        idx_contract: frozenset[str] = frozenset.union(*(input_sets[i] for i in contract_inds))
+        remaining_sets = [k for idx, k in enumerate(input_sets) if idx not in contract_inds]
+        idx_remain = output_set.union(*remaining_sets) if remaining_sets else output_set
+        out_inds = idx_remain & idx_contract
+        result_size = compute_size_by_dict(out_inds, size_dict)
+
+        # the new result occupies space before the step operands are released,
+        # so the peak counts both operands, every other buffer and the result
+        peak_live = live + result_size
+        peak = max(peak, peak_live)
+        # only once the step completes are its two operands dereferenced
+        live = peak_live - operands_size
+
+        ledger.append(
+            {
+                "step": step,
+                "contraction": contract_inds,
+                "operands": operands_size,
+                "result": result_size,
+                "live": peak_live,
+                "peak": peak,
+                "peak_memory_limit": peak_memory_limit,
+            }
+        )
+
+        # release the operands (right-to-left) and register the new tensor
+        for i in sorted(contract_inds, reverse=True):
+            input_sets.pop(i)
+            tensor_sizes.pop(i)
+        input_sets.append(out_inds)
+        tensor_sizes.append(result_size)
+
+    return ledger
+
+
+def find_peak_memory_feasible_path(
+    inputs: list[ArrayIndexType],
+    output: ArrayIndexType,
+    size_dict: dict[str, int],
+    peak_memory_limit: int,
+    candidate_path: PathType | None = None,
+) -> PathType:
+    """Find a flop-optimal *binary* contraction path whose peak number of
+    simultaneously live logical elements never exceeds ``peak_memory_limit``.
+
+    Unlike :func:`optimal`, the budget here is not the size of any single
+    intermediate: at every step the initial operands, every other buffer still
+    in play, and the step result (which exists before its two operands are
+    released) are all counted. Only pairwise contractions are considered.
+
+    Parameters:
+        inputs: The indices of each input tensor.
+        output: The indices of the overall output tensor.
+        size_dict: Size mapping of all the indices.
+        peak_memory_limit: The maximum number of simultaneously live elements.
+        candidate_path: An already planned path. If it is binary and already
+            fits the budget it is returned directly, so the planner's preferred
+            choice is not rejected when it happens to be feasible.
+
+    Returns:
+        A linear binary contraction path fitting the peak budget.
+
+    Raises:
+        RuntimeError: If no binary contraction path fits within the budget,
+            including when the initial operands alone exceed it.
+    """
+    input_sets = tuple(map(frozenset, inputs))
+    output_set = frozenset(output)
+
+    size_cache: dict[frozenset[str], int] = {}
+
+    def _size(indices: frozenset[str]) -> int:
+        try:
+            return size_cache[indices]
+        except KeyError:
+            size = size_cache[indices] = compute_size_by_dict(indices, size_dict)
+            return size
+
+    initial_live = sum(_size(k) for k in input_sets)
+
+    # the budget cannot even hold the initial operands: nothing binary is possible
+    if initial_live > peak_memory_limit:
+        raise RuntimeError(
+            f"No binary contraction path fits within the peak memory limit of "
+            f"{peak_memory_limit} elements: the initial operands already require "
+            f"{initial_live} elements."
+        )
+
+    # keep the planner's preferred path if it already fits the peak budget
+    if candidate_path is not None:
+        candidate_linear = [tuple(sorted(inds)) for inds in candidate_path]
+        if all(len(inds) == 2 for inds in candidate_linear):
+            candidate_ledger = compute_peak_memory_ledger(
+                candidate_linear, list(input_sets), output_set, size_dict, peak_memory_limit
+            )
+            if all(entry["live"] <= peak_memory_limit for entry in candidate_ledger):
+                return candidate_linear
+
+    best: dict[str, Any] = {"flops": float("inf"), "ssa_path": None}
+
+    def _search(
+        ssa_inputs: tuple[frozenset[str], ...],
+        remaining: frozenset[int],
+        live: int,
+        flops: int,
+        ssa_path: tuple[tuple[int, int], ...],
+    ) -> None:
+        if len(remaining) == 1:
+            if flops < best["flops"]:
+                best["flops"] = flops
+                best["ssa_path"] = ssa_path
+            return
+
+        for i, j in itertools.combinations(sorted(remaining), 2):
+            k1, k2 = ssa_inputs[i], ssa_inputs[j]
+            keep = frozenset.union(output_set, *(ssa_inputs[r] for r in remaining if r not in (i, j)))
+            k12 = (k1 | k2) & keep
+            size12 = _size(k12)
+
+            shared = k1 & k2
+            flops12 = flop_count(k1 | k2, bool(shared - keep), 2, size_dict)
+            new_flops = flops + flops12
+            if new_flops >= best["flops"]:
+                continue
+
+            # the result exists before the two operands are released, so the
+            # step peak counts every currently live buffer plus the new result
+            peak_live = live + size12
+            if peak_live > peak_memory_limit:
+                continue
+            # once the step completes its operands are dereferenced
+            new_live = peak_live - _size(k1) - _size(k2)
+
+            new_id = len(ssa_inputs)
+            _search(
+                ssa_inputs + (k12,),
+                (remaining - frozenset((i, j))) | frozenset((new_id,)),
+                new_live,
+                new_flops,
+                ssa_path + ((i, j),),
+            )
+
+    _search(input_sets, frozenset(range(len(input_sets))), initial_live, 0, ())
+
+    if best["ssa_path"] is None:
+        raise RuntimeError(
+            f"No binary contraction path fits within the peak memory limit of "
+            f"{peak_memory_limit} elements for this contraction."
+        )
+
+    return ssa_to_linear(best["ssa_path"])
 
 
 # functions for comparing which of two paths is 'better'
