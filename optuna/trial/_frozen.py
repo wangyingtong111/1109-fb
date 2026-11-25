@@ -259,7 +259,7 @@ class FrozenTrial(BaseTrial):
     ) -> CategoricalChoiceType:
         return self._suggest(name, CategoricalDistribution(choices=choices))
 
-    def report(self, value: float, step: int) -> None:
+    def report(self, value: float | Sequence[float], step: int) -> None:
         """Interface of report function.
 
         Since :class:`~optuna.trial.FrozenTrial` is not pruned,
@@ -270,7 +270,8 @@ class FrozenTrial(BaseTrial):
 
         Args:
             value:
-                A value returned from the objective function.
+                A value returned from the objective function. In a multi-objective study, a
+                sequence of values, one for each objective, can be reported instead.
             step:
                 Step of the trial (e.g., Epoch of neural network training). Note that pruners
                 assume that ``step`` starts at zero. For example,

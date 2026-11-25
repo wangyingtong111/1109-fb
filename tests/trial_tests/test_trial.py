@@ -680,6 +680,61 @@ def test_raise_error_for_report_with_multi_objectives() -> None:
     study.optimize(objective, n_trials=1)
 
 
+def test_report_vector_with_multi_objectives() -> None:
+    from optuna.trial._intermediate import get_intermediate_vectors
+
+    study = create_study(directions=["maximize", "minimize"])
+    trial = study.ask()
+
+    trial.report([0.5, 20.0], 2)
+    trial.report((0.8, 10.0), 3)
+    assert get_intermediate_vectors(trial._cached_frozen_trial) == {
+        2: [0.5, 20.0],
+        3: [0.8, 10.0],
+    }
+    # The scalar intermediate values must stay untouched on the vector path.
+    assert trial._cached_frozen_trial.intermediate_values == {}
+
+    # Warn if report is called multiple times at the same step; the first vector is kept.
+    with pytest.warns(UserWarning):
+        trial.report([9.0, 9.0], 3)
+    assert get_intermediate_vectors(trial._cached_frozen_trial)[3] == [0.8, 10.0]
+
+
+def test_report_vector_with_wrong_length() -> None:
+    study = create_study(directions=["maximize", "minimize"])
+    trial = study.ask()
+
+    with pytest.raises(ValueError):
+        trial.report([1.0], 0)
+
+    with pytest.raises(ValueError):
+        trial.report([1.0, 2.0, 3.0], 0)
+
+
+def test_report_vector_with_invalid_step() -> None:
+    study = create_study(directions=["maximize", "minimize"])
+    trial = study.ask()
+
+    with pytest.raises(TypeError):
+        trial.report([1.0, 2.0], None)  # type: ignore
+
+    with pytest.raises(ValueError):
+        trial.report([1.0, 2.0], -1)
+
+
+def test_report_vector_in_single_objective_study() -> None:
+    study = create_study()
+    trial = study.ask()
+
+    with pytest.raises(TypeError):
+        trial.report([1.0, 2.0], 0)  # type: ignore
+
+    # The scalar path keeps accepting string values that can be cast to float.
+    trial.report("1.23", 0)
+    assert trial._cached_frozen_trial.intermediate_values == {0: 1.23}
+
+
 def test_raise_error_for_should_prune_multi_objectives() -> None:
     study = create_study(directions=["maximize", "maximize"])
 
@@ -687,6 +742,21 @@ def test_raise_error_for_should_prune_multi_objectives() -> None:
         with pytest.raises(NotImplementedError):
             trial.should_prune()
         return 1.0, 1.0
+
+    study.optimize(objective, n_trials=1)
+
+
+def test_should_prune_with_multi_objectives_after_vector_report() -> None:
+    pruner = optuna.pruners.ParetoPruner()
+    study = create_study(directions=["maximize", "minimize"], pruner=pruner)
+    study.add_trial(
+        optuna.trial.create_trial(values=[0.8, 10.0], intermediate_values={3: (0.8, 10.0)})
+    )
+
+    def objective(trial: Trial) -> tuple[float, float]:
+        trial.report([0.7, 12.0], 3)
+        assert trial.should_prune()
+        return 0.7, 12.0
 
     study.optimize(objective, n_trials=1)
 

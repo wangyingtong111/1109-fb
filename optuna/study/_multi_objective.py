@@ -206,6 +206,41 @@ def _calculate_nondomination_rank(
     return ranks[order_inv.reshape(-1)]
 
 
+def _dominates_values(
+    values0: Sequence[float], values1: Sequence[float], directions: Sequence[StudyDirection]
+) -> bool:
+    """Judge whether ``values0`` strictly dominates ``values1``.
+
+    Objective values are normalized according to ``directions`` so that a smaller normalized value
+    is always better. ``values0`` dominates ``values1`` when it is no worse on every objective and
+    strictly better on at least one of them, i.e. identical vectors do not dominate each other.
+
+    Args:
+        values0:
+            Objective values of the candidate.
+        values1:
+            Objective values of the reference.
+        directions:
+            Directions of the study, one per objective.
+
+    Returns:
+        :obj:`True` if ``values0`` strictly dominates ``values1``.
+    """
+
+    if len(values0) != len(values1) or len(values0) != len(directions):
+        raise ValueError(
+            "The number of the values and the number of the objectives must be identical."
+        )
+
+    normalized_values0 = [_normalize_value(v, d) for v, d in zip(values0, directions)]
+    normalized_values1 = [_normalize_value(v, d) for v, d in zip(values1, directions)]
+
+    if normalized_values0 == normalized_values1:
+        return False
+
+    return all(v0 <= v1 for v0, v1 in zip(normalized_values0, normalized_values1))
+
+
 def _dominates(
     trial0: FrozenTrial, trial1: FrozenTrial, directions: Sequence[StudyDirection]
 ) -> bool:
@@ -229,13 +264,7 @@ def _dominates(
             "The number of the values and the number of the objectives are mismatched."
         )
 
-    normalized_values0 = [_normalize_value(v, d) for v, d in zip(values0, directions)]
-    normalized_values1 = [_normalize_value(v, d) for v, d in zip(values1, directions)]
-
-    if normalized_values0 == normalized_values1:
-        return False
-
-    return all(v0 <= v1 for v0, v1 in zip(normalized_values0, normalized_values1))
+    return _dominates_values(values0, values1, directions)
 
 
 def _normalize_value(value: float | None, direction: StudyDirection) -> float:

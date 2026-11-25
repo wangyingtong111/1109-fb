@@ -91,7 +91,16 @@ class Study:
         self._directions = storage.get_study_directions(study_id)
 
         self.sampler = sampler or samplers.TPESampler()
-        self.pruner = pruner or pruners.MedianPruner()
+        self.pruner: pruners.BasePruner
+        if pruner is not None:
+            self.pruner = pruner
+        elif len(self._directions) > 1:
+            # Scalar pruners cannot consume the objective vectors reported during a
+            # multi-objective trial, so the vector-aware pruner is the default there. It keeps the
+            # behavior of the scalar pruners intact for single-objective studies.
+            self.pruner = pruners.ParetoPruner()
+        else:
+            self.pruner = pruners.MedianPruner()
 
         self._thread_local = _ThreadLocalStudyAttribute()
         self._stop_flag = False
@@ -1211,8 +1220,9 @@ def create_study(
             as the default. See also :class:`~optuna.samplers`.
         pruner:
             A pruner object that decides early stopping of unpromising trials. If :obj:`None`
-            is specified, :class:`~optuna.pruners.MedianPruner` is used as the default. See
-            also :class:`~optuna.pruners`.
+            is specified, :class:`~optuna.pruners.MedianPruner` is used as the default for
+            single-objective optimization and :class:`~optuna.pruners.ParetoPruner` is used for
+            multi-objective optimization. See also :class:`~optuna.pruners`.
         study_name:
             Study's name. If this argument is set to None, a unique name is generated
             automatically.
@@ -1354,7 +1364,9 @@ def load_study(
         pruner:
             A pruner object that decides early stopping of unpromising trials.
             If :obj:`None` is specified, :class:`~optuna.pruners.MedianPruner` is used
-            as the default. See also :class:`~optuna.pruners`.
+            as the default for single-objective optimization and
+            :class:`~optuna.pruners.ParetoPruner` is used for multi-objective optimization.
+            See also :class:`~optuna.pruners`.
 
     Returns:
         A :class:`~optuna.study.Study` object.

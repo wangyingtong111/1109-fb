@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 from collections import UserDict
+from collections.abc import Iterable
+from collections.abc import Mapping
+from collections.abc import Sequence
 import copy
 import math
 from typing import Any
 from typing import overload
 from typing import TYPE_CHECKING
+from typing import TypeGuard
 
 import optuna
 from optuna import distributions
@@ -21,10 +25,11 @@ from optuna.distributions import IntDistribution
 from optuna.study._constrained_optimization import _CONSTRAINTS_KEY
 from optuna.study._constrained_optimization import _get_constraints_from_system_attrs
 from optuna.trial._base import BaseTrial
+from optuna.trial._intermediate import get_intermediate_vectors
+from optuna.trial._intermediate import set_intermediate_vector
 
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
     import datetime
 
     from optuna.study import Study
@@ -33,6 +38,20 @@ if TYPE_CHECKING:
 
 _logger = logging.get_logger(__name__)
 _suggest_deprecated_msg = "Use suggest_float{args} instead."
+
+
+def _is_vector_value(value: Any) -> TypeGuard[Iterable[float]]:
+    """Judge whether a reported value is an objective vector instead of a scalar.
+
+    Strings and bytes are treated as scalars even though they are sequences, so that the scalar
+    reporting path keeps accepting values such as ``"1.23"``. Mappings are excluded as well since
+    they are never a valid objective vector. Any other iterable (a list, a tuple, or a NumPy array)
+    is treated as a vector.
+    """
+
+    if isinstance(value, (str, bytes, bytearray)) or isinstance(value, Mapping):
+        return False
+    return isinstance(value, Iterable)
 
 
 class Trial(BaseTrial):
@@ -409,7 +428,13 @@ class Trial(BaseTrial):
 
         return self._suggest(name, CategoricalDistribution(choices=choices))
 
-    def report(self, value: float, step: int) -> None:
+    @overload
+    def report(self, value: float, step: int) -> None: ...
+
+    @overload
+    def report(self, value: Sequence[float], step: int) -> None: ...
+
+    def report(self, value: float | Sequence[float], step: int) -> None:
         """Report an objective function value for a given step.
 
         The reported values are used by the pruners to determine whether this trial should be
@@ -429,8 +454,13 @@ class Trial(BaseTrial):
             from the second time are ignored.
 
         .. note::
-            :func:`~optuna.trial.Trial.report` does not support multi-objective
-            optimization.
+            In a multi-objective study, a sequence of values can be reported instead, one value per
+            objective. These intermediate vectors are stored apart from the scalar
+            :attr:`~optuna.trial.FrozenTrial.intermediate_values` and are consumed by vector-aware
+            pruners such as :class:`~optuna.pruners.ParetoPruner`, which compares the complete
+            vectors of different trials at the same step according to the study directions. The
+            scalar reporting path (a single value) remains available and the existing scalar
+            pruners keep their behavior.
 
         Example:
 
@@ -468,7 +498,8 @@ class Trial(BaseTrial):
 
         Args:
             value:
-                A value returned from the objective function.
+                A value returned from the objective function. In a multi-objective study, a
+                sequence of values, one for each objective, can be reported instead.
             step:
                 Step of the trial (e.g., Epoch of neural network training). Note that pruners
                 assume that ``step`` starts at zero. For example,
@@ -478,9 +509,13 @@ class Trial(BaseTrial):
         """
 
         if len(self.study.directions) > 1:
-            raise NotImplementedError(
-                "Trial.report is not supported for multi-objective optimization."
-            )
+            if not _is_vector_value(value):
+                raise NotImplementedError(
+                    "Trial.report is not supported for multi-objective optimization with a single "
+                    "value. Report a sequence of values, one for each objective."
+                )
+            self._report_vector(value, step)
+            return
 
         try:
             # For convenience, we allow users to report a value that can be cast to `float`.
@@ -510,6 +545,42 @@ class Trial(BaseTrial):
         self.storage.set_trial_intermediate_value(self._trial_id, step, value)
         self._cached_frozen_trial.intermediate_values[step] = value
 
+    def _report_vector(self, values: Iterable[float], raw_step: Any) -> None:
+        directions = self.study.directions
+        try:
+            vector = [float(v) for v in values]
+        except (TypeError, ValueError):
+            message = f"Every element of `value` must be convertible to float, but got {values!r}."
+            raise TypeError(message) from None
+
+        try:
+            step = int(raw_step)
+        except (TypeError, ValueError):
+            message = (
+                f"The `step` argument is of type '{type(raw_step)}' but supposed to be an int."
+            )
+            raise TypeError(message) from None
+
+        if step < 0:
+            raise ValueError(f"`{step=}` must be non-negative.")
+
+        if len(vector) != len(directions):
+            raise ValueError(
+                f"The number of reported values ({len(vector)}) must match the number of study "
+                f"directions ({len(directions)})."
+            )
+
+        if step in get_intermediate_vectors(self._cached_frozen_trial):
+            # Do nothing if already reported.
+            optuna_warn(
+                f"The reported value is ignored because this `{step=}` is already reported."
+            )
+            return
+
+        set_intermediate_vector(
+            self._cached_frozen_trial, self.storage, self._trial_id, step, vector
+        )
+
     def should_prune(self) -> bool:
         """Suggest whether the trial should be pruned or not.
 
@@ -526,20 +597,28 @@ class Trial(BaseTrial):
             Please refer to the example code in :func:`optuna.trial.Trial.report`.
 
         .. note::
-            :func:`~optuna.trial.Trial.should_prune` does not support multi-objective
-            optimization.
+            In a multi-objective study, report objective vectors with
+            :func:`~optuna.trial.Trial.report` and use a vector-aware pruner such as
+            :class:`~optuna.pruners.ParetoPruner`; the pruning decision is then based on the
+            vectors reported so far. Until a vector is reported, multi-objective pruning remains
+            unsupported and :exc:`NotImplementedError` is raised, as the scalar pruners cannot
+            represent the trade-off between the objectives. The scalar pruners keep consuming the
+            scalar values reported in a single-objective study.
 
         Returns:
             A boolean value. If :obj:`True`, the trial should be pruned according to the
             configured pruning algorithm. Otherwise, the trial should continue.
         """
 
-        if len(self.study.directions) > 1:
+        trial = self._get_latest_trial()
+
+        if len(self.study.directions) > 1 and not get_intermediate_vectors(trial):
             raise NotImplementedError(
-                "Trial.should_prune is not supported for multi-objective optimization."
+                "Trial.should_prune is not supported for multi-objective optimization. "
+                "Report a sequence of values, one per objective, with Trial.report to enable "
+                "vector-based pruning."
             )
 
-        trial = self._get_latest_trial()
         return self.study.pruner.prune(self.study, trial)
 
     def set_user_attr(self, key: str, value: Any) -> None:
