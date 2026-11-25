@@ -305,6 +305,112 @@ classifier.disable_threshold    # disables threshold processing
 
 Using these convenience methods your applications can dynamically adjust threshold processing as required.
 
+## Minimum Risk Actions
+
+The highest score is not always the right business decision. A classifier may be
+confident enough to guess a category but still be safer to route the text to a
+human, or to treat one kind of mistake as far more expensive than another.
+`ClassifierReborn::Bayes` can therefore turn its scores into a decision over a
+caller supplied cost table.
+
+The table maps each candidate **action** to the cost of taking that action when
+the text really belongs to a given **category**. Costs may be supplied per
+category as a hash, positionally as an array in the classifier's category order,
+or as one flat number for every category.
+
+```ruby
+require 'classifier-reborn'
+
+classifier = ClassifierReborn::Bayes.new 'Review', 'Direct', enable_stemmer: false
+classifier.train 'Review', 'needs a human to look at this'
+classifier.train 'Direct', 'this one is clearly fine'
+
+# Sending a review item straight through costs 10, sending a fine item to
+# review costs 1.
+costs = {
+  'Review' => { 'Review' => 0, 'Direct' => 1 },
+  'Direct' => { 'Review' => 10, 'Direct' => 0 }
+}
+
+classifier.classify 'clearly fine'                 #=> 'Direct' (highest score)
+classifier.minimum_risk_action 'clearly fine', costs  #=> 'Review'
+```
+
+The probabilities come from the log scores through a max shifted softmax, so
+every expected cost sums over all true categories and moving all log scores by a
+common offset leaves the decision unchanged.
+
+Pass the table to the constructor instead to make it the default decision rule.
+The historical `classifications`, `classify_with_score` and `classify` scores
+stay readable; `classify` only switches to the risk decision when a table is in
+play.
+
+```ruby
+classifier = ClassifierReborn::Bayes.new 'Review', 'Direct',
+             cost_table: costs
+classifier.classify 'clearly fine'                 #=> 'Review'
+classifier.classify_with_risk 'clearly fine'
+#=> ['Review', {'Review' => 0.8, 'Direct' => 2.0}]
+classifier.expected_costs 'clearly fine'
+#=> {'Review' => 0.8, 'Direct' => 2.0}
+```
+
+When the table is keyed by true category instead, say so with
+`cost_table_orientation: :category`. Positional rows always follow the order of
+`classifications`, which is the classifier's category order.
+
+### Adding a Reject Action
+
+A reject (abstain) action is just another candidate: give it a name and the cost
+of rejecting when the text really belongs to each category. It competes on the
+same expected cost and, when it is cheapest, its own name is returned.
+
+```ruby
+classifier = ClassifierReborn::Bayes.new 'Review', 'Direct', 'Later',
+             cost_table: {
+               'Direct' => { 'Review' => 10, 'Direct' => 0, 'Later' => 9 },
+               'Review' => { 'Review' => 0,  'Direct' => 1, 'Later' => 5 },
+               'Later'  => { 'Review' => 5,  'Direct' => 3, 'Later' => 0 }
+             },
+             reject_action: 'Human',
+             reject_costs: { 'Review' => 1, 'Direct' => 1, 'Later' => 1 }
+
+classifier.classify 'anything'
+#=> 'Human'
+classifier.expected_costs 'anything'
+#=> {'Direct' => 3.8, 'Review' => 1.6, 'Later' => 2.8, 'Human' => 1.0}
+```
+
+`reject_costs` may also be a single number or a per category array. A reject
+action given without any cost defaults to `1.0`. Use the `reject_action`,
+`reject_costs` and `cost_table` writers, or call `clear_cost_table` to drop the
+table and return `classify` to the historical behaviour.
+
+### Decision Related Methods
+
+```ruby
+classifier.cost_table                          # expanded, action keyed table
+classifier.classify_with_risk 'text'           # [action, {action => cost}]
+classifier.minimum_risk_action 'text'          # just the action
+classifier.expected_costs 'text'               # {action => expected cost}
+classifier.expected_costs classifier.classifications('text')
+classifier.weights 'text'                      # {category => probability}
+classifier.cost_table = {...}
+classifier.reject_action = 'Human'
+classifier.reject_costs = 1.0
+classifier.clear_cost_table
+```
+
+Every method that performs a decision also accepts a cost table for that call
+only, either positionally or through the keywords `cost_table`, `reject_action`,
+`reject_costs` and `cost_table_orientation`. A few spellings such as `actions`,
+`costs`, `reject` and `abstain_action` are accepted as aliases of those
+keywords.
+
+Without a cost table `classify` keeps the existing Bayes behaviour, including the
+threshold. Thresholds are not applied to cost based decisions, because the
+action is chosen by expected cost rather than by an absolute score.
+
 ## Backend Benchmarks
 
 The following benchmarks were performed using the [SMS Spam Collection v.1](http://dcomp.sor.ufscar.br/talmeida/smsspamcollection/) dataset. `1`, `10`, `100`, `1,000`, and `5,000` records from the top of the dataset were used to `train`, `untrain`, and `classify` for both `Memory` and `Redis` backends (the `Redis` server was running locally). Tables represent values based on the observations of `5,000` records. The data used in these benchmarks can be found in [this spreadsheet](https://docs.google.com/spreadsheets/d/11pRZY1vbxWANcO6ABG-SuoUVqypjM45728Zk0uXog1s/edit?usp=sharing).

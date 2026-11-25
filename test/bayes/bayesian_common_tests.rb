@@ -191,7 +191,164 @@ module BayesianCommonTests
     assert classifier.categories.empty?
   end
 
+  # --- Minimum expected cost decisions -------------------------------
+
+  def test_without_cost_table_keeps_log_score_classification
+    classifier = review_classifier
+    assert_equal 'Direct', classifier.classify('anything')
+    assert_nil classifier.cost_table
+  end
+
+  def test_cost_table_switches_to_lowest_risk_action
+    legacy = review_classifier
+    risky = review_classifier(cost_table: review_cost_table)
+    assert_equal 'Direct', legacy.classify('anything') # default max log score
+    assert_equal 'Review', risky.classify('anything')
+    assert_equal 'Review', risky.minimum_risk_action('anything')
+  end
+
+  def test_expected_costs_sum_over_every_true_category
+    classifier = review_classifier(cost_table: review_cost_table)
+    assert_equal({ 'Review' => 0.8, 'Direct' => 2.0 }, classifier.expected_costs('anything'))
+  end
+
+  def test_classify_with_risk_returns_action_and_costs
+    classifier = review_classifier(cost_table: review_cost_table)
+    action, risks = classifier.classify_with_risk('anything')
+    assert_equal 'Review', action
+    assert_equal 0.8, risks['Review']
+    assert_equal 2.0, risks['Direct']
+  end
+
+  def test_three_categories_with_reject_action
+    classifier = reject_classifier(reject_costs: 1.0)
+    action, risks = classifier.classify_with_risk('anything')
+    assert_equal 'Human', action
+    assert_equal({'Direct' => 3.8, 'Review' => 1.6, 'Later' => 2.8, 'Human' => 1.0}.sort.to_h, risks.sort.to_h)
+  end
+
+  def test_common_log_offset_does_not_change_risks
+    baseline = reject_classifier(reject_costs: 1.0).expected_costs(scores_without_offset)
+    shifted = reject_classifier(reject_costs: 1.0).expected_costs(shifted_scores)
+    assert_equal baseline, shifted
+  end
+
+  def test_cost_table_order_does_not_change_the_decision
+    ordered = reject_classifier(reject_costs: 1.0).classify_with_risk('anything')
+    shuffled = ClassifierReborn::Bayes.new(*three_categories, enable_stemmer: false,
+                                           cost_table: three_category_table.to_a.reverse.to_h,
+                                           reject_action: 'Human', reject_costs: 1.0)
+    assert_equal ordered, stub_classifications(shuffled, shifted_scores).classify_with_risk('anything')
+  end
+
+  def test_reject_action_returns_its_own_identity_when_cheapest
+    classifier = reject_classifier(reject_costs: 1.0)
+    assert_equal 'Human', classifier.classify('anything')
+    refute_includes three_categories, classifier.classify('anything')
+  end
+
+  def test_reject_action_loses_when_it_costs_more
+    classifier = reject_classifier(reject_costs: 5.0)
+    action, risks = classifier.classify_with_risk('anything')
+    assert_equal 'Review', action
+    assert_equal 5.0, risks['Human']
+  end
+
+  def test_category_keyed_cost_table
+    classifier = ClassifierReborn::Bayes.new(*three_categories, enable_stemmer: false,
+                                             cost_table: category_keyed_table,
+                                             cost_table_orientation: :category,
+                                             reject_action: 'Human',
+                                             reject_costs: {'Review' => 1, 'Direct' => 1, 'Later' => 1})
+    stub_classifications(classifier, shifted_scores)
+    assert_equal reject_classifier(reject_costs: 1.0).classify_with_risk('anything'),
+                 classifier.classify_with_risk('anything')
+  end
+
+  def test_per_call_cost_table
+    classifier = review_classifier
+    assert_equal 'Direct', classifier.classify('anything')
+    assert_equal 'Review', classifier.classify('anything', review_cost_table)
+    assert_nil classifier.cost_table
+  end
+
+  def test_missing_cost_raises
+    classifier = review_classifier(cost_table: { 'Direct' => { 'Review' => 10 } })
+    assert_raises(ArgumentError) { classifier.expected_costs('anything') }
+  end
+
+  def test_threshold_still_applies_only_without_cost_table
+    classifier = review_classifier(enable_threshold: true, threshold: -0.1)
+    assert_nil classifier.classify('anything')
+    risky = review_classifier(cost_table: review_cost_table, enable_threshold: true, threshold: -0.1)
+    assert_equal 'Review', risky.classify('anything')
+  end
+
+  def test_positional_rows_follow_category_order
+    classifier = ClassifierReborn::Bayes.new(*three_categories, enable_stemmer: false)
+    positional = ClassifierReborn::Bayes.new(*three_categories, enable_stemmer: false,
+                                             cost_table: three_category_table)
+    assert_equal positional.expected_costs(shifted_scores),
+                 classifier.expected_costs(shifted_scores, three_category_table)
+  end
+
+  def test_expected_costs_accept_a_score_hash
+    classifier = review_classifier(cost_table: review_cost_table)
+    assert_equal classifier.expected_costs('anything'),
+                 classifier.expected_costs(classifier.classifications('anything'))
+  end
+
   private
+
+  def review_scores
+    { 'Review' => Math.log(0.2), 'Direct' => Math.log(0.8) }
+  end
+
+  def review_cost_table
+    # Row order matches #classifications keys: Review, Direct.
+    { 'Review' => { 'Review' => 0, 'Direct' => 1 },
+      'Direct' => { 'Review' => 10, 'Direct' => 0 } }
+  end
+
+  def review_classifier(**options)
+    classifier = ClassifierReborn::Bayes.new('Review', 'Direct', { enable_stemmer: false }.merge(options))
+    stub_classifications(classifier, review_scores)
+  end
+
+  def three_categories
+    %w[Review Direct Later]
+  end
+
+  def three_category_table
+    { 'Direct' => [10, 0, 9], 'Review' => [0, 1, 5], 'Later' => [5, 3, 0] }
+  end
+
+  def category_keyed_table
+    { 'Review' => { 'Direct' => 10, 'Review' => 0, 'Later' => 5 },
+      'Direct' => { 'Direct' => 0, 'Review' => 1, 'Later' => 3 },
+      'Later' => { 'Direct' => 9, 'Review' => 5, 'Later' => 0 } }
+  end
+
+  def scores_without_offset
+    { 'Review' => Math.log(0.2), 'Direct' => Math.log(0.6), 'Later' => Math.log(0.2) }
+  end
+
+  def shifted_scores
+    scores_without_offset.transform_values { |score| score - 1000.0 }
+  end
+
+  def reject_classifier(**options)
+    classifier = ClassifierReborn::Bayes.new(*three_categories,
+                                             { enable_stemmer: false,
+                                               cost_table: three_category_table,
+                                               reject_action: 'Human' }.merge(options))
+    stub_classifications(classifier, shifted_scores)
+  end
+
+  def stub_classifications(classifier, scores)
+    classifier.define_singleton_method(:classifications) { |*| scores.dup }
+    classifier
+  end
 
   def another_classifier
     ClassifierReborn::Bayes.new %w[Interesting Uninteresting], backend: @alternate_backend

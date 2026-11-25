@@ -1,7 +1,12 @@
 ## HEAD
 
+### Minor Enhancements
+
+  * Add optional minimum expected cost decisions to the Bayesian classifier, with a caller supplied cost table and an independent reject action.
+
 ### Documentation
 
+  * Document minimum risk decisions and reject actions for the Bayesian classifier.
   * Update macOS instructions in Numo docs (#199)
 
 ### Development Fixes
