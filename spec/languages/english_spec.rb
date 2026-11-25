@@ -381,6 +381,22 @@ describe PragmaticTokenizer do
           )
           expect(pt.tokenize(text)).to eq(["this", "is", "a", "#hashtag", "yay", "!"])
         end
+
+        it 'keeps a hashtag that follows a URL' do
+          text = "https://example.com/docs#intro #topic"
+          pt = PragmaticTokenizer::Tokenizer.new(
+              hashtags: :remove
+          )
+          expect(pt.tokenize(text)).to eq(["https://example.com/docs#intro"])
+        end
+
+        it 'cleans a hashtag that follows a URL' do
+          text = "https://example.com/docs#intro #topic"
+          pt = PragmaticTokenizer::Tokenizer.new(
+              hashtags: :keep_and_clean
+          )
+          expect(pt.tokenize(text)).to eq(["https://example.com/docs#intro", "topic"])
+        end
       end
 
       context 'option (mentions)' do
@@ -446,6 +462,82 @@ describe PragmaticTokenizer do
           text = "Here are some domains and urls google.com https://www.google.com www.google.com."
           pt = PragmaticTokenizer::Tokenizer.new
           expect(pt.tokenize(text)).to eq(["here", "are", "some", "domains", "and", "urls", "google.com", "https://www.google.com", "www.google.com", "."])
+        end
+
+        it 'keeps the anchor of a URL as part of the address' do
+          text = "https://example.com/docs#intro #topic"
+          pt = PragmaticTokenizer::Tokenizer.new
+          expect(pt.tokenize(text)).to eq(["https://example.com/docs#intro", "#topic"])
+        end
+
+        it 'keeps the anchor of a URL when removing hashtags' do
+          text = "https://example.com/docs#intro #topic"
+          pt = PragmaticTokenizer::Tokenizer.new(
+              hashtags: :remove
+          )
+          expect(pt.tokenize(text)).to eq(["https://example.com/docs#intro"])
+        end
+
+        it 'keeps the anchor of a URL when cleaning hashtags' do
+          text = "https://example.com/docs#intro #topic"
+          pt = PragmaticTokenizer::Tokenizer.new(
+              hashtags: :keep_and_clean
+          )
+          expect(pt.tokenize(text)).to eq(["https://example.com/docs#intro", "topic"])
+        end
+
+        it 'keeps a plain hashtag when the URL filter is the only one enabled' do
+          text = "https://example.com/docs#intro #topic"
+          pt = PragmaticTokenizer::Tokenizer.new(
+              remove_urls: true
+          )
+          expect(pt.tokenize(text)).to eq(["#topic"])
+        end
+
+        it 'removes the URL and its anchor but keeps the hashtag with remove_urls' do
+          text = "https://example.com/docs#intro #topic"
+          pt = PragmaticTokenizer::Tokenizer.new(
+              remove_urls: true,
+              hashtags: :keep_and_clean
+          )
+          expect(pt.tokenize(text)).to eq(["topic"])
+        end
+
+        it 'handles an address with a balanced bracket group and an anchor' do
+          text = "(https://example.com/wiki/Foo_(bar)#intro). #topic"
+          pt = PragmaticTokenizer::Tokenizer.new
+          expect(pt.tokenize(text)).to eq(["(", "https://example.com/wiki/foo_(bar)#intro", ")", ".", "#topic"])
+        end
+
+        it 'keeps the surrounding punctuation when removing such an URL' do
+          text = "(https://example.com/wiki/Foo_(bar)#intro). #topic"
+          pt = PragmaticTokenizer::Tokenizer.new(
+              remove_urls: true,
+              hashtags: :remove
+          )
+          expect(pt.tokenize(text)).to eq(["(", ")", "."])
+        end
+
+        it 'separates surrounding punctuation from the address' do
+          text = "See (https://example.com/docs#intro), and https://example.com/a(b)c."
+          pt = PragmaticTokenizer::Tokenizer.new
+          expect(pt.tokenize(text)).to eq(["see", "(", "https://example.com/docs#intro", ")", ",", "and", "https://example.com/a(b)c", "."])
+        end
+
+        it 'does not split a URL with an anchor with long_word_split' do
+          text = "https://example.com/some_path#intro"
+          pt = PragmaticTokenizer::Tokenizer.new(
+              long_word_split: 10
+          )
+          expect(pt.tokenize(text)).to eq(["https://example.com/some_path#intro"])
+        end
+
+        it 'does not mangle a URL with clean' do
+          text = "go https://example.com/a_b#c now"
+          pt = PragmaticTokenizer::Tokenizer.new(
+              clean: true
+          )
+          expect(pt.tokenize(text)).to eq(["go", "https://example.com/a_b#c", "now"])
         end
       end
 

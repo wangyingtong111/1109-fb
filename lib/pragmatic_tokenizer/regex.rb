@@ -70,6 +70,25 @@ module PragmaticTokenizer
     PERCENT_BEFORE_DIGIT          = /(%)\d+/
     COMMA_BEFORE_NON_DIGIT        = /(,)(?=\D)/
     COMMA_AFTER_NON_DIGIT         = /(?<=\D)(,)/
+
+    # Candidate URL: a scheme (or "www.") followed by address characters, not
+    # glued to a preceding word (so that emails such as "john@www.example.com"
+    # are left alone). The "#" of an anchor and the "?"/"&" of a query are part
+    # of an address, as are bracket groups (e.g. ".../wiki/Foo_(bar)"). Square
+    # and curly brackets, quotes and angle brackets are not: they belong to the
+    # surrounding markup/text, so they are left for the normal tokenization
+    # (e.g. a markdown link stays "[", url, "]", "(", url, ")"). Trailing
+    # sentence punctuation is handed back to the surrounding text by the
+    # pre-processor (see PreProcessor#split_trailing_punctuation), so it can
+    # still be tokenized separately
+    # (e.g. "(.../Foo_(bar)#intro)." -> "(", url, ")", ".").
+    URL_IN_TEXT                   = %r{(?<![[:alnum:]@＠])(?:(?:https?://)|www\.)[^\s<>"'’‘“”«»„…\[\]{}]+}i
+
+    # A URL token (as emitted by Tokenizer#tokenize_parts). Post-processing
+    # steps that would split it up (e.g. long_word_split, which breaks at "/")
+    # leave addresses in one piece.
+    URL_TOKEN                     = /\A(?:https?:\/\/|www\.)/i
+
     COLON_IN_URL                  = /(?<=[(https?|ftp)]):(?=\/\/)/
     QUOTE_BEFORE_PRINT            = /(('')|["“])(?=[[:print:]])/
     QUOTE                         = /('')|["”]/

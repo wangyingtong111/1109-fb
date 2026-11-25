@@ -1,6 +1,10 @@
 module PragmaticTokenizer
   module PreProcessor
 
+    # Punctuation that ends a sentence rather than an address
+    URL_TRAILING_PUNCTUATION = %w[. , ; : ! ? # & | ^ - ” ’ ， … « » „ \\].freeze
+    BRACKET_PAIRS            = { '(' => ')', '[' => ']', '{' => '}', '<' => '>' }.freeze
+
     def pre_process(language: Languages::Common)
       remove_non_breaking_space!
       shift_various_characters!
@@ -12,6 +16,38 @@ module PragmaticTokenizer
       convert_acute_accent_s!
       shift_hyphens!
       squeeze(' '.freeze)
+    end
+
+    # Trailing punctuation is not part of an address: it belongs to the
+    # surrounding sentence (e.g. the ")." of ".../Foo_(bar)#intro)."). Splits a
+    # URL candidate into the address itself and the punctuation that follows it.
+    def self.split_trailing_punctuation(candidate)
+      trailing = ''
+      loop do
+        break if candidate.length <= 1
+        character = candidate[-1]
+        if URL_TRAILING_PUNCTUATION.include?(character) || stray_bracket?(candidate, character)
+          trailing = character + trailing
+          candidate = candidate[0...-1]
+        else
+          break
+        end
+      end
+      [candidate, trailing]
+    end
+
+    # A closing bracket belongs to the address when it closes a bracket that was
+    # opened inside it (e.g. ".../wiki/Foo_(bar)"); otherwise it belongs to the
+    # surrounding text (e.g. the ")" of "(.../docs#intro)"). An opening bracket
+    # at the very end is never part of an address.
+    def self.stray_bracket?(candidate, character)
+      if BRACKET_PAIRS.key?(character)
+        candidate.count(character) > candidate.count(BRACKET_PAIRS[character])
+      elsif BRACKET_PAIRS.value?(character)
+        candidate.count(character) > candidate.count(BRACKET_PAIRS.key(character))
+      else
+        false
+      end
     end
 
     private

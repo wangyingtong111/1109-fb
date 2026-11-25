@@ -111,16 +111,46 @@ module PragmaticTokenizer
     private
 
       def process_segment(segment)
-        pre_processed = pre_process(segment)
-        cased_segment = chosen_case(pre_processed)
-        @tokens       = PostProcessor.new(text: cased_segment, abbreviations: @abbreviations, downcase: @downcase).call
+        @tokens = tokenize_parts(segment)
         post_process_tokens
+      end
+
+      # A segment is split around URLs. URLs (including a fragment/anchor such
+      # as ".../docs#intro") are kept as a single token and never reach the
+      # punctuation handling, which would mistake the "#" of an anchor for a
+      # hashtag and split the address up. Everything around them is tokenized
+      # as before. The URL and hashtag options are applied afterwards, so they
+      # act independently of each other.
+      def tokenize_parts(segment)
+        parts  = segment.split(/(#{Regex::URL_IN_TEXT})/)
+        tokens = []
+        text   = ''
+        parts.each_with_index do |part, index|
+          if index.odd?
+            tokens.concat(tokenize_text(text))
+            url, text = PreProcessor.split_trailing_punctuation(part)
+            tokens << cased(url)
+          else
+            text += part
+          end
+        end
+        tokens.concat(tokenize_text(text))
+      end
+
+      def tokenize_text(text)
+        return [] if text.empty?
+        pre_processed = pre_process(text)
+        PostProcessor.new(text: chosen_case(pre_processed), abbreviations: @abbreviations, downcase: @downcase).call
       end
 
       def pre_process(segment)
         segment
             .extend(PragmaticTokenizer::PreProcessor)
             .pre_process(language: @language_module)
+      end
+
+      def cased(text)
+        @downcase ? Unicode.downcase(text) : text
       end
 
       def post_process_tokens
@@ -143,6 +173,7 @@ module PragmaticTokenizer
       end
 
       def expand_token_contraction(token)
+        return token if url?(token)
         normalized = inverse_case(token.gsub(Regex::CONTRACTIONS, SINGLE_QUOTE))
         return token unless @contractions.key?(normalized)
         result    = @contractions[normalized].split(SPACE)
@@ -158,11 +189,12 @@ module PragmaticTokenizer
       end
 
       def split_underscores_asterisk(token)
-        return token if token =~ Regex::ONLY_HASHTAG_MENTION
+        return token if token =~ Regex::ONLY_HASHTAG_MENTION || url?(token)
         token.split(Regex::UNDERSCORES_ASTERISK)
       end
 
       def remove_irrelevant_characters(token)
+        return token if url?(token)
         token.gsub!(Regex::IRRELEVANT_CHARACTERS, NOTHING)
         return token if token =~ Regex::ONLY_HASHTAG_MENTION
         token.gsub!(Regex::ENDS_WITH_EXCITED_ONE, NOTHING)
@@ -170,13 +202,15 @@ module PragmaticTokenizer
       end
 
       def many_dots?(token)
-        token =~ Regex::MANY_PERIODS
+        token =~ Regex::MANY_PERIODS && !url?(token)
       end
 
       def classic_filter!
         @tokens.map! do |token|
-          token.delete!(DOT) if @abbreviations.include?(token.chomp(DOT))
-          token.sub!(Regex::ENDS_WITH_APOSTROPHE_AND_S, NOTHING)
+          unless url?(token)
+            token.delete!(DOT) if @abbreviations.include?(token.chomp(DOT))
+            token.sub!(Regex::ENDS_WITH_APOSTROPHE_AND_S, NOTHING)
+          end
           token
         end
       end
@@ -251,9 +285,14 @@ module PragmaticTokenizer
       def split_long_word(token)
         return token unless @long_word_split
         return token if token.length <= @long_word_split
-        return token if token =~ Regex::ONLY_HASHTAG_MENTION
+        return token if token =~ Regex::ONLY_HASHTAG_MENTION || url?(token)
         return token if token =~ Regex::DOMAIN_OR_EMAIL
         token.split(Regex::LONG_WORD_SPLIT)
+      end
+
+      # A URL emitted by #tokenize_parts (never altered by the tokenizer)
+      def url?(token)
+        token =~ Regex::URL_TOKEN
       end
 
       def chosen_case(text)
