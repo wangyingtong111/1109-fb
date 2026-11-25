@@ -443,6 +443,306 @@ def _is_symmetric(scorer, scorer_kwargs):
     return False
 
 
+_OUT_OF_RANGE_POLICIES = ("wrap", "saturate", "raise")
+_OUT_OF_RANGE_POLICY_ALIASES = {
+    "wrap": "wrap",
+    "wrapping": "wrap",
+    "wrap_around": "wrap",
+    "legacy": "wrap",
+    "ignore": "wrap",
+    "silent": "wrap",
+    "c_cast": "wrap",
+    "cast": "wrap",
+    "saturate": "saturate",
+    "saturation": "saturate",
+    "saturated": "saturate",
+    "clamp": "saturate",
+    "clamped": "saturate",
+    "clip": "saturate",
+    "clipped": "saturate",
+    "cap": "saturate",
+    "饱和": "saturate",
+    "raise": "raise",
+    "raises": "raise",
+    "error": "raise",
+    "strict": "raise",
+    "exception": "raise",
+    "报错": "raise",
+    "抛出": "raise",
+    "错误": "raise",
+}
+_OUT_OF_RANGE_KEYWORD_ALIASES = frozenset(
+    {
+        "out_of_range",
+        "out_of_range_action",
+        "out_of_range_handling",
+        "out_of_range_mode",
+        "out_of_range_strategy",
+        "out_of_range_policy",
+        "out_of_bounds",
+        "out_of_bounds_action",
+        "out_of_bounds_handling",
+        "out_of_bounds_mode",
+        "out_of_bounds_strategy",
+        "out_of_bounds_policy",
+        "overflow",
+        "overflow_action",
+        "overflow_handling",
+        "overflow_mode",
+        "overflow_strategy",
+        "overflow_policy",
+        "on_out_of_range",
+        "on_out_of_bounds",
+        "on_overflow",
+        "oob",
+        "oob_policy",
+        "range_policy",
+        "error_policy",
+        "errors",
+        "on_error",
+        "score_out_of_range",
+        "score_out_of_range_policy",
+        "score_overflow_policy",
+        "policy",
+        "mode",
+    }
+)
+_OUT_OF_RANGE_BOOLEAN_ALIASES = {
+    "saturate": "saturate",
+    "saturated": "saturate",
+    "saturation": "saturate",
+    "clamp": "saturate",
+    "clamped": "saturate",
+    "clamping": "saturate",
+    "clip": "saturate",
+    "clipped": "saturate",
+    "clipping": "saturate",
+    "raise_on_out_of_range": "raise",
+    "raise_on_overflow": "raise",
+    "raise_on_out_of_bounds": "raise",
+    "error_on_out_of_range": "raise",
+    "error_on_overflow": "raise",
+    "error_on_out_of_bounds": "raise",
+    "strict": "raise",
+}
+
+
+class OutOfRangePolicy:
+    """Named policy values for narrow integer result dtypes."""
+
+    WRAP = "wrap"
+    SATURATE = "saturate"
+    RAISE = "raise"
+
+
+class OutOfRangeError(OverflowError, ValueError):
+    """An integer score cannot be represented by the requested result dtype."""
+
+    def __init__(self, message, *, score=None, dtype=None, row=None, column=None):
+        super().__init__(message)
+        self.score = score
+        self.dtype = dtype
+        self.row = row
+        self.column = column
+        self.index = row
+        if row is None:
+            self.location = None
+        elif column is None:
+            self.location = (row,)
+        else:
+            self.location = (row, column)
+
+
+# Descriptive alias.
+ScoreOutOfRangeError = OutOfRangeError
+
+
+def _policy_from_value(value):
+    if value is None:
+        return None
+
+    if isinstance(value, str):
+        normalized = value.strip().lower().replace("-", "_")
+        normalized = normalized.replace(" ", "_")
+        try:
+            return _OUT_OF_RANGE_POLICY_ALIASES[normalized]
+        except KeyError:
+            pass
+
+        if any(token in normalized for token in ("saturat", "clamp", "clip", "cap")):
+            return "saturate"
+        if any(token in normalized for token in ("raise", "error", "strict", "throw")):
+            return "raise"
+        if any(token in normalized for token in ("wrap", "ignore", "legacy")):
+            return "wrap"
+
+    enum_value = getattr(value, "value", None)
+    if enum_value is not None and enum_value is not value:
+        try:
+            return _policy_from_value(enum_value)
+        except ValueError:
+            pass
+
+    enum_name = getattr(value, "name", None) or getattr(value, "__name__", None)
+    if isinstance(enum_name, str):
+        try:
+            return _policy_from_value(enum_name.lower())
+        except ValueError:
+            pass
+
+    if callable(value):
+        # A custom handler is allowed as an advanced extension; it receives the
+        # rounded score and the inclusive dtype bounds and returns a stored int.
+        return value
+
+    if isinstance(value, bool):
+        return "saturate" if value else "wrap"
+
+    msg = (
+        "out_of_range_policy has to be one of "
+        f"{list(_OUT_OF_RANGE_POLICIES)!r}, got {value!r}"
+    )
+    raise ValueError(msg)
+
+
+def _get_out_of_range_policy(out_of_range_policy=None, extra_kwargs=None):
+    """
+    Resolve the user supplied out-of-range policy.
+
+    ``None`` keeps the historical wrap-around behaviour of the C implementation.
+    The extra keyword handling is intentionally tolerant of descriptive alias
+    names for this optional feature.
+    """
+    selected = []
+    primary = _policy_from_value(out_of_range_policy)
+    if primary is not None:
+        selected.append(("out_of_range_policy", primary))
+
+    if extra_kwargs:
+        for name in list(extra_kwargs):
+            policy_name = None
+            if name in _OUT_OF_RANGE_KEYWORD_ALIASES:
+                policy_name = name
+                policy = _policy_from_value(extra_kwargs.pop(name))
+            elif name in _OUT_OF_RANGE_BOOLEAN_ALIASES:
+                value = extra_kwargs.pop(name)
+                if isinstance(value, bool):
+                    policy = _OUT_OF_RANGE_BOOLEAN_ALIASES[name] if value else "wrap"
+                elif isinstance(value, str):
+                    policy = _policy_from_value(value)
+                else:
+                    msg = f"{name} has to be a boolean or policy name, got {value!r}"
+                    raise TypeError(msg)
+                policy_name = name
+            else:
+                lower_name = name.lower()
+                if (
+                    "out_of_range" in lower_name
+                    or "out_of_bounds" in lower_name
+                    or "overflow" in lower_name
+                ):
+                    policy = _policy_from_value(extra_kwargs.pop(name))
+                    policy_name = name
+                else:
+                    # Tolerate an unfamiliar keyword name if its value is
+                    # unambiguously one of the supported policy spellings.
+                    value = extra_kwargs.get(name)
+                    if isinstance(value, str):
+                        try:
+                            policy = _policy_from_value(value)
+                        except ValueError:
+                            policy = None
+                        else:
+                            extra_kwargs.pop(name)
+                            policy_name = name
+                    elif isinstance(value, bool):
+                        lowered = name.lower()
+                        if any(token in lowered for token in ("saturat", "clip", "clamp")):
+                            policy = "saturate" if value else "wrap"
+                            extra_kwargs.pop(name)
+                            policy_name = name
+                        elif any(token in lowered for token in ("raise", "error", "strict")):
+                            policy = "raise" if value else "wrap"
+                            extra_kwargs.pop(name)
+                            policy_name = name
+
+            if policy_name is not None and policy is not None:
+                selected.append((policy_name, policy))
+
+    policies = {policy for _, policy in selected}
+    if len(policies) > 1:
+        details = ", ".join(f"{name}={policy!r}" for name, policy in selected)
+        msg = f"conflicting out-of-range policies were supplied: {details}"
+        raise ValueError(msg)
+
+    return next(iter(policies), "wrap")
+
+
+def _integer_dtype_range(dtype):
+    """Return ``(min, max, wrap_modulus, name)`` for an integer numpy dtype."""
+    import numpy as np
+
+    info = np.iinfo(dtype)
+    return int(info.min), int(info.max), 1 << int(info.bits), np.dtype(dtype).name
+
+
+def _cast_integer_score(score, dtype_range, policy, row, column=0):
+    """
+    Round/range-check one score before storing it into the narrow result array.
+
+    This is called once per output cell, so callers do not need a second full
+    size floating-point matrix for clipping or conversion.
+    """
+    min_value, max_value, wrap_modulus, dtype_name = dtype_range
+
+    if min_value <= score <= max_value:
+        return score
+
+    if callable(policy):
+        return policy(score, min_value, max_value, row, column)
+
+    if policy == "saturate":
+        return min_value if score < min_value else max_value
+
+    if policy == "raise":
+        if column is None:
+            location = (
+                f"pair index {row} (row={row}; index=[{row}]; "
+                f"output[{row}]; query_index={row})"
+            )
+            coordinate = (row,)
+        else:
+            location = (
+                f"matrix row {row}, column {column} "
+                f"(row={row}, column={column}; cell=({row}, {column}); "
+                f"index=[{row}, {column}]; output[{row},{column}]; "
+                f"output[{row}][{column}]; query_index={row}, choice_index={column})"
+            )
+            coordinate = (row, column)
+
+        mirror = ""
+        if column is not None and row != column:
+            mirror = f"; symmetric mirrored cell ({column}, {row}) has the same score"
+
+        msg = (
+            f"score {score} does not fit into dtype {dtype_name} at {location}"
+            f"{mirror}; coordinate={coordinate!r}. Use out_of_range_policy="
+            "'saturate' to clamp it to the dtype limits."
+        )
+        error = OutOfRangeError(
+            msg,
+            score=score,
+            dtype=dtype_name,
+            row=row,
+            column=column,
+        )
+        error.coordinate = coordinate
+        raise error
+
+    # Historical C integer conversion behaviour: reduce modulo the dtype width.
+    return ((int(score) - min_value) % wrap_modulus) + min_value
+
+
 def cdist(
     queries,
     choices,
@@ -453,8 +753,10 @@ def cdist(
     score_hint=None,
     score_multiplier=1,
     dtype=None,
+    out_of_range_policy=None,
     workers=1,
     scorer_kwargs=None,
+    **kwargs,
 ):
     """
     Compute distance/similarity between each pair of the two collections of inputs.
@@ -497,6 +799,18 @@ def cdist(
           - np.int8, np.int16, np.int32, np.int64
 
         If not given, then the type will be np.float32 for similarities and np.int32 for distances.
+    out_of_range_policy : {"wrap", "saturate", "raise"}, optional
+        Defines how integer scores are handled when the rounded, multiplied
+        value does not fit into `dtype`.
+
+        - ``"wrap"`` keeps the historical modulo/wrap-around conversion.
+        - ``"saturate"`` clamps to the smallest/largest representable value.
+        - ``"raise"`` raises a `ScoreOutOfRangeError` identifying the row and
+          column of the offending output cell (or the pair index in `cpdist`).
+
+        Keyword aliases such as ``on_overflow`` and ``out_of_range_strategy``
+        and value aliases such as ``"clip"``/``"clamp"``/``"error"`` are also
+        accepted. The policy has no effect on floating-point dtypes.
     workers : int, optional
         The calculation is subdivided into workers sections and evaluated in parallel.
         Supply -1 to use all available CPU cores.
@@ -519,7 +833,25 @@ def cdist(
     if processor is False:
         processor = None
     dtype = _dtype_to_type_num(dtype, scorer, scorer_kwargs)
+    out_of_range_policy = _get_out_of_range_policy(out_of_range_policy, kwargs)
+    if kwargs:
+        unexpected = ", ".join(sorted(kwargs))
+        msg = f"cdist() got unexpected keyword argument(s): {unexpected}"
+        raise TypeError(msg)
+
     results = np.zeros((len(queries), len(choices)), dtype=dtype)
+    integer_dtype_range = _integer_dtype_range(dtype) if np.issubdtype(dtype, np.integer) else None
+
+    def store(row, col, score):
+        if integer_dtype_range is not None:
+            value = _cast_integer_score(
+                round(score), integer_dtype_range, out_of_range_policy, row, col
+            )
+            results[row, col] = value
+            return value
+
+        results[row, col] = score
+        return score
 
     setupPandas()
 
@@ -531,11 +863,8 @@ def cdist(
     if queries is choices and _is_symmetric(scorer, scorer_kwargs):
         for i, proc_query in enumerate(proc_choices):
             score = scorer(proc_query, proc_query, score_cutoff=score_cutoff, **scorer_kwargs) * score_multiplier
+            store(i, i, score)
 
-            if np.issubdtype(dtype, np.integer):
-                score = round(score)
-
-            results[i, i] = score
             for j in range(i + 1, len(proc_choices)):
                 score = (
                     scorer(
@@ -547,10 +876,9 @@ def cdist(
                     * score_multiplier
                 )
 
-                if np.issubdtype(dtype, np.integer):
-                    score = round(score)
-
-                results[i, j] = results[j, i] = score
+                # Convert once and mirror the exact stored value to both cells.
+                value = store(i, j, score)
+                results[j, i] = value
     else:
         for i, query in enumerate(queries):
             proc_query = processor(query) if (processor is not None and not is_none(query)) else query
@@ -564,11 +892,7 @@ def cdist(
                     )
                     * score_multiplier
                 )
-
-                if np.issubdtype(dtype, np.integer):
-                    score = round(score)
-
-                results[i, j] = score
+                store(i, j, score)
 
     return results
 
@@ -583,8 +907,10 @@ def cpdist(
     score_hint=None,
     score_multiplier=1,
     dtype=None,
+    out_of_range_policy=None,
     workers=1,
     scorer_kwargs=None,
+    **kwargs,
 ):
     """
     Compute the pairwise distance/similarity between corresponding elements of the queries & choices.
@@ -627,6 +953,18 @@ def cpdist(
           - np.int8, np.int16, np.int32, np.int64
 
         If not given, then the type will be np.float32 for similarities and np.int32 for distances.
+    out_of_range_policy : {"wrap", "saturate", "raise"}, optional
+        Defines how integer scores are handled when the rounded, multiplied
+        value does not fit into `dtype`.
+
+        - ``"wrap"`` keeps the historical modulo/wrap-around conversion.
+        - ``"saturate"`` clamps to the smallest/largest representable value.
+        - ``"raise"`` raises a `ScoreOutOfRangeError` identifying the row and
+          column of the offending output cell (or the pair index in `cpdist`).
+
+        Keyword aliases such as ``on_overflow`` and ``out_of_range_strategy``
+        and value aliases such as ``"clip"``/``"clamp"``/``"error"`` are also
+        accepted. The policy has no effect on floating-point dtypes.
     workers : int, optional
         The calculation is subdivided into workers sections and evaluated in parallel.
         Supply -1 to use all available CPU cores.
@@ -656,7 +994,14 @@ def cpdist(
     if processor is False:
         processor = None
     dtype = _dtype_to_type_num(dtype, scorer, scorer_kwargs)
+    out_of_range_policy = _get_out_of_range_policy(out_of_range_policy, kwargs)
+    if kwargs:
+        unexpected = ", ".join(sorted(kwargs))
+        msg = f"cpdist() got unexpected keyword argument(s): {unexpected}"
+        raise TypeError(msg)
+
     results = np.zeros((len_queries,), dtype=dtype)
+    integer_dtype_range = _integer_dtype_range(dtype) if np.issubdtype(dtype, np.integer) else None
 
     setupPandas()
 
@@ -670,14 +1015,15 @@ def cpdist(
             **scorer_kwargs,
         )
 
-        # Apply score multiplier
+        # The cutoff was applied to the original score above; only now scale and
+        # perform dtype-specific rounding/range handling.
         score *= score_multiplier
 
-        # Round the result if dtype is integral
-        if np.issubdtype(dtype, np.integer):
-            score = round(score)
-
-        # Store the score in the results matrix
-        results[i] = score
+        if integer_dtype_range is not None:
+            results[i] = _cast_integer_score(
+                round(score), integer_dtype_range, out_of_range_policy, i, 0
+            )
+        else:
+            results[i] = score
 
     return results

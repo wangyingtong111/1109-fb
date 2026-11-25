@@ -412,6 +412,7 @@ try:
         score_hint: float | None = None,
         score_multiplier: float = 1,
         dtype: npt.DTypeLike | None = None,
+        out_of_range_policy: str | None = None,
         workers: int = 1,
         scorer_kwargs: dict[str, Any] | None = None,
     ) -> npt.NDArray[Any]: ...
@@ -426,6 +427,7 @@ try:
         score_hint: float | None = None,
         score_multiplier: float = 1,
         dtype: npt.DTypeLike | None = None,
+        out_of_range_policy: str | None = None,
         workers: int = 1,
         scorer_kwargs: dict[str, Any] | None = None,
     ) -> npt.NDArray[Any]: ...
@@ -440,6 +442,7 @@ try:
         score_hint: _ResultType | None = None,
         score_multiplier: _ResultType = 1,
         dtype: npt.DTypeLike | None = None,
+        out_of_range_policy: str | None = None,
         workers: int = 1,
         scorer_kwargs: dict[str, Any] | None = None,
     ) -> npt.NDArray[Any]: ...
@@ -454,6 +457,7 @@ try:
         score_hint: _ResultType | None = None,
         score_multiplier: _ResultType = 1,
         dtype: npt.DTypeLike | None = None,
+        out_of_range_policy: str | None = None,
         workers: int = 1,
         scorer_kwargs: dict[str, Any] | None = None,
     ) -> npt.NDArray[Any]: ...
@@ -468,6 +472,7 @@ try:
         score_hint: float | None = None,
         score_multiplier: float = 1,
         dtype: npt.DTypeLike | None = None,
+        out_of_range_policy: str | None = None,
         workers: int = 1,
         scorer_kwargs: dict[str, Any] | None = None,
     ) -> npt.NDArray[Any]: ...
@@ -482,6 +487,7 @@ try:
         score_hint: float | None = None,
         score_multiplier: float = 1,
         dtype: npt.DTypeLike | None = None,
+        out_of_range_policy: str | None = None,
         workers: int = 1,
         scorer_kwargs: dict[str, Any] | None = None,
     ) -> npt.NDArray[Any]: ...
@@ -496,6 +502,7 @@ try:
         score_hint: _ResultType | None = None,
         score_multiplier: _ResultType = 1,
         dtype: npt.DTypeLike | None = None,
+        out_of_range_policy: str | None = None,
         workers: int = 1,
         scorer_kwargs: dict[str, Any] | None = None,
     ) -> npt.NDArray[Any]: ...
@@ -510,6 +517,7 @@ try:
         score_hint: _ResultType | None = None,
         score_multiplier: _ResultType = 1,
         dtype: npt.DTypeLike | None = None,
+        out_of_range_policy: str | None = None,
         workers: int = 1,
         scorer_kwargs: dict[str, Any] | None = None,
     ) -> npt.NDArray[Any]: ...

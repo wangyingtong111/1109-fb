@@ -7,8 +7,22 @@ import contextlib
 import os
 
 from rapidfuzz._feature_detector import AVX2, SSE2, supports
+from rapidfuzz.process_py import (
+    OutOfRangeError,
+    OutOfRangePolicy,
+    ScoreOutOfRangeError,
+)
 
-__all__ = ["cdist", "cpdist", "extract", "extractOne", "extract_iter"]
+__all__ = [
+    "OutOfRangeError",
+    "OutOfRangePolicy",
+    "ScoreOutOfRangeError",
+    "cdist",
+    "cpdist",
+    "extract",
+    "extractOne",
+    "extract_iter",
+]
 
 _impl = os.environ.get("RAPIDFUZZ_IMPLEMENTATION")
 if _impl == "cpp":

@@ -66,12 +66,16 @@ def cdist(
     score_hint=None,
     score_multiplier=1,
     dtype=None,
+    out_of_range_policy=None,
     workers=1,
     **kwargs,
 ):
     import numpy as np
 
     dtype = _dtype_to_type_num(dtype)
+    policy_kwargs = (
+        {} if out_of_range_policy is None else {"out_of_range_policy": out_of_range_policy}
+    )
     return np.asarray(
         _cdist(
             queries,
@@ -83,6 +87,7 @@ def cdist(
             score_multiplier=score_multiplier,
             dtype=dtype,
             workers=workers,
+            **policy_kwargs,
             **kwargs,
         )
     )
@@ -101,12 +106,16 @@ def cpdist(
     score_hint=None,
     score_multiplier=1,
     dtype=None,
+    out_of_range_policy=None,
     workers=1,
     **kwargs,
 ):
     import numpy as np
 
     dtype = _dtype_to_type_num(dtype)
+    policy_kwargs = (
+        {} if out_of_range_policy is None else {"out_of_range_policy": out_of_range_policy}
+    )
     distance_matrix = _cpdist(
         queries,
         choices,
@@ -117,6 +126,7 @@ def cpdist(
         score_multiplier=score_multiplier,
         dtype=dtype,
         workers=workers,
+        **policy_kwargs,
         **kwargs,
     )
     return np.asarray(distance_matrix)
