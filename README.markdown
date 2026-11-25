@@ -103,6 +103,16 @@ Stop words are NOT removed when checking `:must_match_at_least_one_word` and whe
 * `must_match_at_least_one_word`: don't return a match unless the needle shares at least one word with the match. Note that "Foo's" is treated like one word (so that it won't match "'s") and "Bolivia," is treated as just "bolivia"
 * `gather_last_result`: enable `last_result`
 
+## Encodings
+
+By default, records and needles are compared as-is (byte-oriented scoring), which is fine when everything is UTF-8 or when you are deliberately matching binary (`ASCII-8BIT`) data.
+
+If your haystack mixes encodings — say an old roster stored as Latin-1 (`ISO-8859-1`) or UTF-16LE and new entries in UTF-8 — enable the explicit cross-encoding text mode:
+
+    >> fz = FuzzyMatch.new(old_roster + new_entries, :cross_encoding => true)
+
+In this mode every record and needle is transcoded to UTF-8 **by its actual characters** before word filtering (`:must_match_at_least_one_word`) and scoring, so `café` stored in Latin-1, UTF-16LE, or UTF-8 all match each other at full score. The returned value is still the original record, in its original encoding. Input that cannot be decoded raises `FuzzyMatch::UndecodableError` with a clear message. Leave the mode off to keep the previous binary-friendly behavior.
+
 ## Case sensitivity
 
 String similarity is case-insensitive. Everything is downcased before scoring. This is a change from previous versions.

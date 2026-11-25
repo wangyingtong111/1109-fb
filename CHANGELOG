@@ -1,3 +1,9 @@
+Unreleased
+
+* Enhancements
+
+  * New `:cross_encoding` rule: explicit cross-encoding text mode. Records and needles are transcoded to UTF-8 (by actual characters) before word filtering and scoring, so the same word stored in Latin-1, UTF-16LE, UTF-8, etc. matches at full score. Original records (and their encodings) are still returned. Undecodable input raises `FuzzyMatch::UndecodableError`. Off by default, so previous binary (ASCII-8BIT) usage is unchanged.
+
 2.1.0 / 2014-07-14
 
 * Breaking changes

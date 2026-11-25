@@ -50,6 +50,7 @@ class FuzzyMatch
   attr_reader :identities
   attr_reader :stop_words
   attr_accessor :read
+  attr_reader :cross_encoding
   attr_reader :default_options
 
   # haystack - a bunch of records that will compete to see who best matches the needle
@@ -59,6 +60,7 @@ class FuzzyMatch
   # * :<tt>groupings</tt> - regexps
   # * :<tt>stop_words</tt> - regexps
   # * :<tt>read</tt> - how to interpret each record in the 'haystack', either a Proc or a symbol
+  # * :<tt>cross_encoding</tt> - explicitly enable cross-encoding text mode: records and needles are transcoded to UTF-8 (by actual characters) before word filtering and scoring, so the same word stored in different encodings (UTF-8, ISO-8859-1/Latin-1, UTF-16LE, etc.) matches at full score. The original records (and their encodings) are still returned. Undecodable input raises FuzzyMatch::UndecodableError. Off by default, so previous binary (ASCII-8BIT) usage is unchanged.
   #
   # Options (can be specified at initialization or when calling #find)
   # * :<tt>must_match_grouping</tt> - don't return a match unless the needle fits into one of the groupings you specified
@@ -70,6 +72,7 @@ class FuzzyMatch
 
     # rules
     @read = o.delete(:read) || o.delete(:haystack_reader)
+    @cross_encoding = o.delete(:cross_encoding) || false
     @groupings = (o.delete(:groupings) || o.delete(:blockings) || []).map { |regexp| Rule::Grouping.make(regexp) }.flatten
     @identities = (o.delete(:identities) || []).map { |regexp| Rule::Identity.new(regexp) }
     @stop_words = o.delete(:stop_words) || []
@@ -80,7 +83,7 @@ class FuzzyMatch
     end
     @default_options = DEFAULT_OPTIONS.merge(o).freeze
 
-    @haystack = haystack.map { |original| Record.new original, :stop_words => @stop_words, :read => @read }
+    @haystack = haystack.map { |original| Record.new original, :stop_words => @stop_words, :read => @read, :cross_encoding => @cross_encoding }
   end
     
   def last_result
@@ -138,9 +141,9 @@ class FuzzyMatch
     
     needle = case needle
     when String
-      Record.new needle, :stop_words => stop_words
+      Record.new needle, :stop_words => stop_words, :cross_encoding => cross_encoding
     else
-      Record.new needle, :read => read, :stop_words => stop_words
+      Record.new needle, :read => read, :stop_words => stop_words, :cross_encoding => cross_encoding
     end
     
     if gather_last_result
