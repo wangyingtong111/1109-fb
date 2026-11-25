@@ -1,6 +1,18 @@
 Changelog
 =========
 
+## Unreleased
+
+**Enhancements**
+
+- Short circuits contractions whose output is provably empty (at least one
+  output axis has size zero): the whole expression is evaluated with a single
+  `einsum` call over the original operands instead of first multiplying the
+  intermediate operands together. The output shape and dtype are still derived
+  exactly as before, and explicit `backend` and `out` behaviour is preserved.
+  A zero-length *contracted* axis (which produces a non-empty tensor of zeros)
+  is unaffected and keeps the normal contraction plan.
+
 ## 3.4.0 / 2024-09-26
 
 NumPy has been removed from `opt_einsum` as a dependency allowing for more flexible installs.

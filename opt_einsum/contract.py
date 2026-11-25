@@ -100,6 +100,54 @@ class PathInfo:
         return "".join(path_print)
 
 
+def _has_empty_output(output_subscript: str, size_dict: dict[str, int]) -> bool:
+    """Check whether the output provably contains no elements.
+
+    The size of the output is the product of the sizes of the indices it is
+    labelled with, therefore a *single* zero-length output index makes the whole
+    result empty, no matter what the other dimensions are. If every output index
+    has a non-zero size the output is non-empty - even if an index which is
+    summed over (i.e. one that does not appear in the output) has zero length,
+    in which case the result is a non-empty tensor filled with zeros.
+
+    Examples:
+    --------
+    >>> _has_empty_output("acd", {"a": 2, "b": 3, "c": 4, "d": 0})
+    True
+
+    A zero-length *contracted* index does not empty the output:
+
+    >>> _has_empty_output("ac", {"a": 2, "b": 0, "c": 4})
+    False
+    """
+    return any(size_dict[index] == 0 for index in output_subscript)
+
+
+def _empty_output_contraction(
+    input_subscripts: str,
+    output_subscript: str,
+    indices: ArrayIndexType,
+    output_set: ArrayIndexType,
+) -> tuple[tuple[int, ...], ArrayIndexType, str, tuple[str, ...] | None, str | bool]:
+    """Build a single-step contraction for a provably empty output.
+
+    No pairwise product can contribute to an empty result, so the whole
+    expression is evaluated with one ``einsum`` call over the original
+    operands. That call derives the output shape and the output dtype in
+    exactly the same way the full contraction would, but returns straight away
+    without touching any element - in particular without first multiplying the
+    (possibly large) intermediate operands.
+
+    Operands are popped from the end of the operand list in ``_core_contract``,
+    so the terms are given in reverse order to line up with the indices.
+    """
+    terms = input_subscripts.split(",")
+    inds = tuple(range(len(terms) - 1, -1, -1))
+    einsum_str = ",".join(terms[::-1]) + "->" + output_subscript
+    idx_removed = indices - output_set
+    return (inds, idx_removed, einsum_str, (output_subscript,), False)
+
+
 def _choose_memory_arg(memory_limit: _MemoryLimit, size_list: list[int]) -> int | None:
     if memory_limit == "max_input":
         return max(size_list)
@@ -341,73 +389,90 @@ def contract_path(
     inner_product = (sum(len(x) for x in input_sets) - len(indices)) > 0
     naive_cost = helpers.flop_count(indices, inner_product, num_ops, size_dict)
 
-    # Compute the path
-    if optimize is False:
+    # If the output provably has no elements then no pairwise product can
+    # contribute to it, so the whole expression collapses into a single einsum.
+    # Note a zero-length *contracted* index still yields a (non-empty) tensor of
+    # zeros and so is handled by the normal planning below. With only two (or
+    # fewer) operands there is already just a single contraction step, so there
+    # is no intermediate product to skip - keep the normal plan in that case.
+    empty_output = (num_ops > 2) and _has_empty_output(output_subscript, size_dict)
+
+    cost_list: list[int] = []
+    scale_list: list[int] = []
+    size_list: list[int] = []
+    contraction_list: ContractionListType = []
+
+    if empty_output:
+        # Every contraction order produces the same (empty) result, so there is
+        # no point planning - collapse straight to one einsum over all inputs.
         path_tuple: PathType = [tuple(range(num_ops))]
-    elif not isinstance(optimize, (str, paths.PathOptimizer)):
-        # Custom path supplied
-        path_tuple = optimize  # type: ignore
-    elif num_ops <= 2:
-        # Nothing to be optimized
-        path_tuple = [tuple(range(num_ops))]
-    elif isinstance(optimize, paths.PathOptimizer):
-        # Custom path optimizer supplied
-        path_tuple = optimize(input_sets, output_set, size_dict, memory_arg)
+        contraction_list.append(_empty_output_contraction(input_subscripts, output_subscript, indices, output_set))
+        cost_list.append(naive_cost)
+        scale_list.append(len(indices))
+        size_list.append(0)
     else:
-        path_optimizer = paths.get_path_fn(optimize)
-        path_tuple = path_optimizer(input_sets, output_set, size_dict, memory_arg)
-
-    cost_list = []
-    scale_list = []
-    size_list = []
-    contraction_list = []
-
-    # Build contraction tuple (positions, gemm, einsum_str, remaining)
-    for cnum, contract_inds in enumerate(path_tuple):
-        # Make sure we remove inds from right to left
-        contract_inds = tuple(sorted(contract_inds, reverse=True))
-
-        contract_tuple = helpers.find_contraction(contract_inds, input_sets, output_set)
-        out_inds, input_sets, idx_removed, idx_contract = contract_tuple
-
-        # Compute cost, scale, and size
-        cost = helpers.flop_count(idx_contract, bool(idx_removed), len(contract_inds), size_dict)
-        cost_list.append(cost)
-        scale_list.append(len(idx_contract))
-        size_list.append(helpers.compute_size_by_dict(out_inds, size_dict))
-
-        tmp_inputs = [input_list.pop(x) for x in contract_inds]
-        tmp_shapes = [input_shapes.pop(x) for x in contract_inds]
-
-        if use_blas:
-            do_blas = blas.can_blas(tmp_inputs, "".join(out_inds), idx_removed, tmp_shapes)
+        # Compute the path
+        if optimize is False:
+            path_tuple = [tuple(range(num_ops))]
+        elif not isinstance(optimize, (str, paths.PathOptimizer)):
+            # Custom path supplied
+            path_tuple = optimize  # type: ignore
+        elif num_ops <= 2:
+            # Nothing to be optimized
+            path_tuple = [tuple(range(num_ops))]
+        elif isinstance(optimize, paths.PathOptimizer):
+            # Custom path optimizer supplied
+            path_tuple = optimize(input_sets, output_set, size_dict, memory_arg)
         else:
-            do_blas = False
+            path_optimizer = paths.get_path_fn(optimize)
+            path_tuple = path_optimizer(input_sets, output_set, size_dict, memory_arg)
 
-        # Last contraction
-        if (cnum - len(path_tuple)) == -1:
-            idx_result = output_subscript
-        else:
-            # use tensordot order to minimize transpositions
-            all_input_inds = "".join(tmp_inputs)
-            idx_result = "".join(sorted(out_inds, key=all_input_inds.find))
+        # Build contraction tuple (positions, gemm, einsum_str, remaining)
+        for cnum, contract_inds in enumerate(path_tuple):
+            # Make sure we remove inds from right to left
+            contract_inds = tuple(sorted(contract_inds, reverse=True))
 
-        shp_result = parser.find_output_shape(tmp_inputs, tmp_shapes, idx_result)
+            contract_tuple = helpers.find_contraction(contract_inds, input_sets, output_set)
+            out_inds, input_sets, idx_removed, idx_contract = contract_tuple
 
-        input_list.append(idx_result)
-        input_shapes.append(shp_result)
+            # Compute cost, scale, and size
+            cost = helpers.flop_count(idx_contract, bool(idx_removed), len(contract_inds), size_dict)
+            cost_list.append(cost)
+            scale_list.append(len(idx_contract))
+            size_list.append(helpers.compute_size_by_dict(out_inds, size_dict))
 
-        einsum_str = ",".join(tmp_inputs) + "->" + idx_result
+            tmp_inputs = [input_list.pop(x) for x in contract_inds]
+            tmp_shapes = [input_shapes.pop(x) for x in contract_inds]
 
-        # for large expressions saving the remaining terms at each step can
-        # incur a large memory footprint - and also be messy to print
-        if len(input_list) <= 20:
-            remaining: tuple[str, ...] | None = tuple(input_list)
-        else:
-            remaining = None
+            if use_blas:
+                do_blas = blas.can_blas(tmp_inputs, "".join(out_inds), idx_removed, tmp_shapes)
+            else:
+                do_blas = False
 
-        contraction = (contract_inds, idx_removed, einsum_str, remaining, do_blas)
-        contraction_list.append(contraction)
+            # Last contraction
+            if (cnum - len(path_tuple)) == -1:
+                idx_result = output_subscript
+            else:
+                # use tensordot order to minimize transpositions
+                all_input_inds = "".join(tmp_inputs)
+                idx_result = "".join(sorted(out_inds, key=all_input_inds.find))
+
+            shp_result = parser.find_output_shape(tmp_inputs, tmp_shapes, idx_result)
+
+            input_list.append(idx_result)
+            input_shapes.append(shp_result)
+
+            einsum_str = ",".join(tmp_inputs) + "->" + idx_result
+
+            # for large expressions saving the remaining terms at each step can
+            # incur a large memory footprint - and also be messy to print
+            if len(input_list) <= 20:
+                remaining: tuple[str, ...] | None = tuple(input_list)
+            else:
+                remaining = None
+
+            contraction = (contract_inds, idx_removed, einsum_str, remaining, do_blas)
+            contraction_list.append(contraction)
 
     opt_cost = sum(cost_list)
 
