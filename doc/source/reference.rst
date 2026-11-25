@@ -104,6 +104,10 @@ The `optimal` version uses the Hungarian algorithm to compute the mapping that m
 
 In practice, the `greedy` version is much faster than the `optimal` one, especially for files with a large number of speakers -- though it may slightly over-estimate the value of the diarization error rate.
 
+Both mappings are computed on exactly the same regions as the metric itself.
+In other words, :meth:`~pyannote.metrics.diarization.DiarizationErrorRate.optimal_mapping` and :meth:`~pyannote.metrics.diarization.GreedyDiarizationErrorRate.greedy_mapping` apply the evaluation map, remove collars around reference boundaries, and skip overlap regions (when requested) before looking for the mapping.
+A hypothesized speaker that only speaks outside of the evaluated regions is therefore never mapped.
+
 Purity and coverage
 *******************
 

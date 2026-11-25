@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- fix: compute `optimal_mapping` and `greedy_mapping` on the same regions as
+  the diarization error rate itself (evaluation map, collar, and overlap
+  regions are now applied before looking for the mapping, so that labels
+  that are not evaluated are no longer mapped). An explicitly empty
+  evaluation map now yields an empty mapping instead of falling back to the
+  union of reference and hypothesis extents.
+
 ## Version 4.2.0 (2026-10-16)
 
 - BREAKING: require Python 3.11 or newer; Python 3.10 is no longer supported

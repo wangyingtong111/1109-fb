@@ -39,6 +39,53 @@ from .utils import UEMSupportMixin
 DER_NAME = "diarization error rate"
 
 
+class _LabelMappingMixin:
+    """Shared logic for the mapping between hypothesis and reference labels
+
+    The mapping used by diarization error rates must be computed on exactly
+    the same regions as the metric itself, i.e. once reference and hypothesis
+    have been cropped to the evaluation map and collars and overlap regions
+    have been removed. Otherwise, a label speaking only outside of the
+    evaluated regions could be mapped (and would then influence the mapping
+    reported to the user) without ever contributing to the metric.
+
+    Subclasses must define a ``mapper_`` attribute (e.g. HungarianMapper or
+    GreedyMapper) and a public method exposing it (see `optimal_mapping`).
+    """
+
+    def _map_labels(
+        self,
+        reference: Annotation,
+        hypothesis: Annotation,
+    ) -> dict[Label, Label]:
+        """Map hypothesis labels onto reference labels
+
+        Both annotations must already have been preprocessed (i.e. cropped to
+        the evaluated regions, with collars and overlap regions removed when
+        requested).
+        """
+        return self.mapper_(hypothesis, reference)
+
+    def _mapping(
+        self,
+        reference: Annotation,
+        hypothesis: Annotation,
+        uem: Timeline | None = None,
+    ) -> dict[Label, Label]:
+        """Apply the same preprocessing as the metric, then map labels"""
+        # NOTE that `uem` must be tested against None (and not for truthiness):
+        # an explicitly empty evaluation map means "evaluate nothing" and
+        # must not be approximated by the union of both extents.
+        reference, hypothesis = self.uemify(
+            reference,
+            hypothesis,
+            uem=uem,
+            collar=self.collar,
+            skip_overlap=self.skip_overlap,
+        )
+        return self._map_labels(reference, hypothesis)
+
+
 class DiarizationSpeakerCountAccuracy(UEMSupportMixin, BaseMetric):
     """Fraction of files with the correct number of speakers.
 
@@ -131,7 +178,7 @@ class DiarizationSpeakerCountError(UEMSupportMixin, BaseMetric):
         return report
 
 
-class DiarizationErrorRate(IdentificationErrorRate):
+class DiarizationErrorRate(_LabelMappingMixin, IdentificationErrorRate):
     """Diarization error rate
 
     First, the optimal mapping between reference and hypothesis labels
@@ -197,28 +244,26 @@ class DiarizationErrorRate(IdentificationErrorRate):
     ) -> dict[Label, Label]:
         """Optimal label mapping
 
+        The mapping is computed on exactly the same regions as the diarization
+        error rate itself: reference and hypothesis are cropped to `uem` and
+        collars and overlap regions (as requested by `collar` and
+        `skip_overlap`) are removed before looking for the optimal mapping.
+
         Parameters
         ----------
         reference : Annotation
         hypothesis : Annotation
             Reference and hypothesis diarization
-        uem : Timeline
-            Evaluation map
+        uem : Timeline, optional
+            Evaluation map. When None, it is approximated by the union of
+            reference and hypothesis extents.
 
         Returns
         -------
         mapping : dict
             Mapping between hypothesis (key) and reference (value) labels
         """
-
-        # NOTE that this 'uemification' will not be called when
-        # 'optimal_mapping' is called from 'compute_components' as it
-        # has already been done in 'compute_components'
-        if uem:
-            reference, hypothesis = self.uemify(reference, hypothesis, uem=uem)
-
-        # call hungarian mapper
-        return self.mapper_(hypothesis, reference)
+        return self._mapping(reference, hypothesis, uem=uem)
 
     def compute_components(
         self,
@@ -248,7 +293,9 @@ class DiarizationErrorRate(IdentificationErrorRate):
         hypothesis = hypothesis.rename_labels(generator="int")
 
         # optimal (int --> str) mapping
-        mapping = self.optimal_mapping(reference, hypothesis)
+        # NOTE that 'reference' and 'hypothesis' have already been
+        # uemified above: they must not be preprocessed a second time.
+        mapping = self._map_labels(reference, hypothesis)
 
         # compute identification error rate based on mapped hypothesis
         # NOTE that collar is set to 0.0 because 'uemify' has already
@@ -259,7 +306,7 @@ class DiarizationErrorRate(IdentificationErrorRate):
         )
 
 
-class GreedyDiarizationErrorRate(IdentificationErrorRate):
+class GreedyDiarizationErrorRate(_LabelMappingMixin, IdentificationErrorRate):
     """Greedy diarization error rate
 
     First, the greedy mapping between reference and hypothesis labels is
@@ -324,22 +371,26 @@ class GreedyDiarizationErrorRate(IdentificationErrorRate):
     ) -> dict[Label, Label]:
         """Greedy label mapping
 
+        The mapping is computed on exactly the same regions as the diarization
+        error rate itself: reference and hypothesis are cropped to `uem` and
+        collars and overlap regions (as requested by `collar` and
+        `skip_overlap`) are removed before looking for the greedy mapping.
+
         Parameters
         ----------
         reference : Annotation
         hypothesis : Annotation
             Reference and hypothesis diarization
-        uem : Timeline
-            Evaluation map
+        uem : Timeline, optional
+            Evaluation map. When None, it is approximated by the union of
+            reference and hypothesis extents.
 
         Returns
         -------
         mapping : dict
             Mapping between hypothesis (key) and reference (value) labels
         """
-        if uem:
-            reference, hypothesis = self.uemify(reference, hypothesis, uem=uem)
-        return self.mapper_(hypothesis, reference)
+        return self._mapping(reference, hypothesis, uem=uem)
 
     def compute_components(
         self,
@@ -369,7 +420,9 @@ class GreedyDiarizationErrorRate(IdentificationErrorRate):
         hypothesis = hypothesis.rename_labels(generator="int")
 
         # greedy (int --> str) mapping
-        mapping = self.greedy_mapping(reference, hypothesis)
+        # NOTE that 'reference' and 'hypothesis' have already been
+        # uemified above: they must not be preprocessed a second time.
+        mapping = self._map_labels(reference, hypothesis)
 
         # compute identification error rate based on mapped hypothesis
         # NOTE that collar is set to 0.0 because 'uemify' has already
@@ -494,7 +547,9 @@ class JaccardErrorRate(DiarizationErrorRate):
         hypothesis = hypothesis.rename_labels(generator="int")
 
         # optimal (str --> int) mapping
-        mapping = self.optimal_mapping(hypothesis, reference)
+        # NOTE that 'reference' and 'hypothesis' have already been
+        # uemified above: they must not be preprocessed a second time.
+        mapping = self._map_labels(hypothesis, reference)
 
         detail = self.init_components()
 

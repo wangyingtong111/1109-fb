@@ -8,7 +8,9 @@ from pyannote.metrics.diarization import (
     DiarizationPurity,
     DiarizationSpeakerCountAccuracy,
     DiarizationSpeakerCountError,
+    GreedyDiarizationErrorRate,
 )
+from pyannote.metrics.identification import IdentificationErrorRate
 
 
 def speaker_annotation(count, duration=1.0):
@@ -136,6 +138,141 @@ def test_optimal_mapping(reference, hypothesis):
     diarizationErrorRate = DiarizationErrorRate()
     mapping = diarizationErrorRate.optimal_mapping(reference, hypothesis)
     assert mapping == {"a": "A", "b": "B", "c": "C"}
+
+
+@pytest.fixture
+def collar_reference():
+    """Reference speaker 'A' occupying the whole [0, 2] evaluation region."""
+    reference = Annotation()
+    reference[Segment(0, 2)] = "A"
+    return reference
+
+
+@pytest.fixture
+def collar_hypothesis():
+    """Hypothesis where only 'Y' (in [0.8, 1.2]) survives a 1.6s collar."""
+    hypothesis = Annotation()
+    hypothesis[Segment(0.0, 0.8)] = "X"
+    hypothesis[Segment(0.8, 1.2)] = "Y"
+    hypothesis[Segment(1.2, 2.0)] = "X"
+    return hypothesis
+
+
+@pytest.mark.parametrize(
+    "metric_class,mapping_method",
+    [
+        (DiarizationErrorRate, "optimal_mapping"),
+        (GreedyDiarizationErrorRate, "greedy_mapping"),
+    ],
+)
+def test_mapping_matches_collar_evaluation(
+    metric_class, mapping_method, collar_reference, collar_hypothesis
+):
+    """Public mapping must be computed on the regions actually evaluated.
+
+    With collar=1.6, only the central [0.8, 1.2] region survives: hypothesis
+    'X' (which only speaks outside of it) must not be mapped, 'Y' must be
+    mapped to 'A', and DER must be 0.
+    """
+    uem = Timeline([Segment(0, 2)])
+    metric = metric_class(collar=1.6)
+
+    details = metric(collar_reference, collar_hypothesis, uem=uem, detailed=True)
+    assert details["total"] == pytest.approx(0.4)
+    assert details[metric.name] == pytest.approx(0.0)
+
+    mapping = getattr(metric, mapping_method)(
+        collar_reference, collar_hypothesis, uem=uem
+    )
+    assert mapping == {"Y": "A"}
+    # same result when uem defaults to the union of both extents
+    with pytest.warns(UserWarning, match="uem"):
+        mapping = getattr(metric, mapping_method)(collar_reference, collar_hypothesis)
+    assert mapping == {"Y": "A"}
+
+
+@pytest.mark.parametrize(
+    "metric_class,mapping_method",
+    [
+        (DiarizationErrorRate, "optimal_mapping"),
+        (GreedyDiarizationErrorRate, "greedy_mapping"),
+    ],
+)
+def test_mapping_matches_skip_overlap_evaluation(
+    metric_class, mapping_method, reference_with_overlap, hypothesis
+):
+    """skip_overlap must be applied before looking for the mapping."""
+    uem = Timeline([Segment(0, 40)])
+
+    metric = metric_class(skip_overlap=True)
+    details = metric(reference_with_overlap, hypothesis, uem=uem, detailed=True)
+    assert details["total"] == pytest.approx(32)
+
+    mapping = getattr(metric, mapping_method)(
+        reference_with_overlap, hypothesis, uem=uem
+    )
+    # apply the public mapping and recompute IER on the same regions
+    mapped = hypothesis.rename_labels(mapping=mapping)
+    ier = IdentificationErrorRate(skip_overlap=True)(
+        reference_with_overlap, mapped, uem=uem
+    )
+    assert details[metric.name] == pytest.approx(ier)
+
+
+@pytest.mark.parametrize(
+    "metric_class,mapping_method",
+    [
+        (DiarizationErrorRate, "optimal_mapping"),
+        (GreedyDiarizationErrorRate, "greedy_mapping"),
+    ],
+)
+def test_mapping_matches_der(metric_class, mapping_method, reference, hypothesis):
+    """DER recomputed from the public mapping must equal the reported DER."""
+    for collar in (0.0, 1.0):
+        metric = metric_class(collar=collar)
+        with pytest.warns(UserWarning, match="uem"):
+            der = metric(reference, hypothesis)
+            mapping = getattr(metric, mapping_method)(reference, hypothesis)
+        mapped = hypothesis.rename_labels(mapping=mapping)
+        with pytest.warns(UserWarning, match="uem"):
+            ier = IdentificationErrorRate(collar=collar)(reference, mapped)
+        assert der == pytest.approx(ier)
+
+
+@pytest.mark.parametrize(
+    "metric_class,mapping_method",
+    [
+        (DiarizationErrorRate, "optimal_mapping"),
+        (GreedyDiarizationErrorRate, "greedy_mapping"),
+    ],
+)
+def test_mapping_empty_uem(metric_class, mapping_method, reference, hypothesis):
+    """An explicit empty evaluation map must yield an empty mapping.
+
+    A falsy-but-provided empty ``uem`` must not be mistaken for ``None``
+    (which would approximate it with the union of both extents).
+    """
+    metric = metric_class()
+    assert getattr(metric, mapping_method)(reference, hypothesis, uem=Timeline()) == {}
+    assert metric(reference, hypothesis, uem=Timeline()) == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize(
+    "metric_class", [DiarizationErrorRate, GreedyDiarizationErrorRate]
+)
+def test_evaluation_is_cropped_only_once(
+    metric_class, collar_reference, collar_hypothesis
+):
+    """Collars must be removed once, not once per preprocessing step.
+
+    Applying the collar a second time to the already extruded [0.8, 1.2]
+    region would leave nothing to evaluate (total would drop to 0).
+    """
+    uem = Timeline([Segment(0, 2)])
+    metric = metric_class(collar=1.6)
+    details = metric(collar_reference, collar_hypothesis, uem=uem, detailed=True)
+    assert details["total"] == pytest.approx(0.4)
+    assert details["correct"] == pytest.approx(0.4)
 
 
 def test_detailed(reference, hypothesis):
