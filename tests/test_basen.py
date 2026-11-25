@@ -6,6 +6,8 @@ import category_encoders as encoders
 import numpy as np
 import pandas as pd
 
+from category_encoders.basen import AMBIGUOUS, NO_MATCH, RECOVERED
+
 
 class TestBaseNEncoder(TestCase):
     """Tests for the BaseNEncoder class."""
@@ -261,3 +263,124 @@ class TestBaseNMutationHardening(TestCase):
             [], [str(w.message) for w in caught if issubclass(w.category, UserWarning)]
         )
         pd.testing.assert_frame_equal(train, restored)
+
+
+class TestBaseNPartialInverse(TestCase):
+    """Tests for partial inverse transform with erased digits."""
+
+    def setUp(self):
+        """Two encoded columns (4 and 2 categories) plus a pass-through column."""
+        self.fit_df = pd.DataFrame({
+            'a': ['w', 'x', 'y', 'z'],
+            'b': ['p', 'q', 'p', 'q'],
+            'plain': [10, 20, 30, 40],
+        })
+        self.encoder = encoders.BaseNEncoder(base=2, cols=['a', 'b']).fit(self.fit_df)
+
+    def test_fields_are_judged_independently(self):
+        """An ambiguous field must not block recovery of a uniquely matched field."""
+        batch = pd.DataFrame({
+            'a_0': [1, 0],
+            'a_1': [0, 1],
+            'a_2': [np.nan, np.nan],   # 10? -> z unique; 01? -> ambiguous
+            'b_0': [0, 1],
+            'b_1': [1, 0],             # complete words 01 -> p, 10 -> q
+        })
+        recovered, status = self.encoder.inverse_transform_partial(batch)
+
+        self.assertEqual('z', recovered['a'].iloc[0])
+        self.assertTrue(pd.isna(recovered['a'].iloc[1]))
+        self.assertListEqual(['p', 'q'], recovered['b'].tolist())
+        self.assertListEqual(
+            [RECOVERED, AMBIGUOUS], status['a_recovery_status'].tolist()
+        )
+        self.assertTrue((status['b_recovery_status'] == RECOVERED).all())
+
+    def test_reordered_columns_duplicate_index_and_passthrough(self):
+        """Bit columns are found by name and rows keep the input index/order."""
+        batch = pd.DataFrame({
+            'b_1': [1, 0],
+            'plain': [10, 20],
+            'a_0': [1, 0],
+            'a_1': [0, 1],
+            'a_2': [np.nan, np.nan],
+            'b_0': [0, 1],
+        }, index=[7, 7])
+        snapshot = batch.copy(deep=True)
+
+        recovered, status = self.encoder.inverse_transform_partial(batch)
+
+        self.assertListEqual([7, 7], recovered.index.tolist())
+        self.assertListEqual([7, 7], status.index.tolist())
+        self.assertEqual('z', recovered['a'].iloc[0])
+        self.assertTrue(pd.isna(recovered['a'].iloc[1]))
+        self.assertListEqual(['p', 'q'], recovered['b'].tolist())
+        self.assertListEqual([10, 20], recovered['plain'].tolist())
+        # the caller's frame is not modified by the decoding
+        pd.testing.assert_frame_equal(snapshot, batch)
+
+    def test_ndarray_input_reattaches_fitted_names_positionally(self):
+        """Arraylike input uses the fitted output names just like inverse_transform."""
+        encoded = self.encoder.transform(self.fit_df)
+        recovered, status = self.encoder.inverse_transform_partial(encoded.to_numpy())
+        self.assertListEqual(['w', 'x', 'y', 'z'], recovered['a'].tolist())
+        self.assertListEqual(['p', 'q', 'p', 'q'], recovered['b'].tolist())
+        self.assertTrue((status == RECOVERED).all().all())
+
+    def test_exact_inverse_interface_stays_compatible(self):
+        """The default inverse_transform still performs the exact round trip."""
+        encoded = self.encoder.transform(self.fit_df)
+        restored = self.encoder.inverse_transform(encoded)
+        pd.testing.assert_frame_equal(self.fit_df, restored)
+
+    def test_reserved_word_never_a_candidate(self):
+        """All-zero reserved words decode to no_match, not to any category."""
+        batch = pd.DataFrame({
+            'a_0': [0], 'a_1': [0], 'a_2': [0],
+            'b_0': [0], 'b_1': [0],
+        })
+        recovered, status = self.encoder.inverse_transform_partial(batch)
+        self.assertTrue(pd.isna(recovered['a'].iloc[0]))
+        self.assertTrue(pd.isna(recovered['b'].iloc[0]))
+        self.assertEqual(NO_MATCH, status['a_recovery_status'].iloc[0])
+        self.assertEqual(NO_MATCH, status['b_recovery_status'].iloc[0])
+
+    def test_base3_uses_base_alphabet_for_validity(self):
+        """Digits 0..base-1 are valid above base 2 and erase masks still resolve."""
+        fit_df = pd.DataFrame({'x': [f'v{i}' for i in range(6)]})
+        encoder = encoders.BaseNEncoder(base=3, cols=['x']).fit(fit_df)
+        encoded = encoder.transform(fit_df)
+        partial = encoded.copy()
+        partial['x_1'] = np.nan
+
+        recovered, status = encoder.inverse_transform_partial(partial)
+        # 20 is the only word starting with 2 in the six-word vocabulary
+        self.assertEqual('v5', recovered['x'].iloc[5])
+        self.assertEqual(RECOVERED, status['x_recovery_status'].iloc[5])
+
+    def test_lookup_preparation_runs_once_per_distinct_mask(self):
+        """Repeated masks share one vocabulary-sized preparation, not one per row."""
+        encoder = encoders.BaseNEncoder(base=2, cols=['a']).fit(self.fit_df[['a']])
+        words = encoder.mapping[0]['mapping'].loc[1:4].to_numpy()
+        rng = np.random.default_rng(1)
+        n = 3000
+        big = words[rng.integers(0, 4, size=n)].astype(float).copy()
+        big[rng.random((n, 3)) < 0.5] = np.nan
+        big_df = pd.DataFrame(big, columns=['a_0', 'a_1', 'a_2'])
+
+        calls = {'n': 0}
+        original = encoders.basen.BaseNEncoder._recover_column
+
+        def counting(words_arg, values, labels, base):
+            calls['n'] += 1
+            return original(words_arg, values, labels, base)
+
+        encoders.basen.BaseNEncoder._recover_column = staticmethod(counting)
+        try:
+            encoder.inverse_transform_partial(big_df)
+        finally:
+            encoders.basen.BaseNEncoder._recover_column = staticmethod(original)
+
+        # a single encoded column means one vocabulary-sized preparation, no matter
+        # how many rows repeat the same erasure masks
+        self.assertEqual(1, calls['n'])

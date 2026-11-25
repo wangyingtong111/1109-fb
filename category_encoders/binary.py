@@ -3,9 +3,25 @@
 from functools import partialmethod
 
 from category_encoders import utils
-from category_encoders.basen import BaseNEncoder
+from category_encoders.basen import (
+    AMBIGUOUS,
+    NO_MATCH,
+    RECOVERED,
+    BaseNEncoder,
+    PartialInverseResult,
+    RecoveryStatusFrame,
+)
 
 __author__ = 'willmcginnis'
+
+__all__ = [
+    'BinaryEncoder',
+    'RECOVERED',
+    'AMBIGUOUS',
+    'NO_MATCH',
+    'PartialInverseResult',
+    'RecoveryStatusFrame',
+]
 
 
 class BinaryEncoder(BaseNEncoder):

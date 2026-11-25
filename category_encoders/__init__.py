@@ -7,7 +7,14 @@
 """
 
 from category_encoders.backward_difference import BackwardDifferenceEncoder
-from category_encoders.basen import BaseNEncoder
+from category_encoders.basen import (
+    AMBIGUOUS,
+    NO_MATCH,
+    RECOVERED,
+    BaseNEncoder,
+    PartialInverseResult,
+    RecoveryStatusFrame,
+)
 from category_encoders.binary import BinaryEncoder
 from category_encoders.cat_boost import CatBoostEncoder
 from category_encoders.count import CountEncoder
