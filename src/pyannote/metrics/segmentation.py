@@ -51,6 +51,7 @@ RECALL_NAME = "segmentation recall"
 
 PR_BOUNDARIES = "number of boundaries"
 PR_MATCHES = "number of matches"
+PR_MATCHED = "matched boundaries"
 
 
 class SegmentationCoverage(BaseMetric):
@@ -250,25 +251,48 @@ class SegmentationPurityCoverageFMeasure(SegmentationCoverage):
 class SegmentationPrecision(UEMSupportMixin, BaseMetric):
     """Segmentation precision
 
+    Parameters
+    ----------
+    tolerance : float, optional
+        Maximum distance (in seconds) between two boundaries for them to be
+        considered a match. Defaults to 0.
+    matching : {"greedy", "optimal"}, optional
+        Boundary matching algorithm. "greedy" (default) repeatedly matches the
+        closest pair of remaining boundaries. "optimal" computes the best
+        alignment between reference and hypothesis boundaries: it maximizes
+        the number of matched pairs first, then minimizes the total deviation
+        between matched boundaries, each boundary being used at most once.
+        Remaining ties are broken in favor of the pairing that happens earlier
+        in time. The same pairing is used for both SegmentationPrecision and
+        SegmentationRecall.
+
+    The detailed result contains the list of actually matched boundaries
+    under the "matched boundaries" key, as (reference, hypothesis) timestamp
+    pairs.
+
     >>> from pyannote.core import Timeline, Segment
     >>> from pyannote.metrics.segmentation import SegmentationPrecision
     >>> precision = SegmentationPrecision()
 
-    >>> reference = Timeline()
-    >>> reference.add(Segment(0, 1))
-    >>> reference.add(Segment(1, 2))
-    >>> reference.add(Segment(2, 4))
+    >>> reference = Timeline([Segment(0, 1), Segment(1, 2), Segment(2, 4)])
 
-    >>> hypothesis = Timeline()
-    >>> hypothesis.add(Segment(0, 1))
-    >>> hypothesis.add(Segment(1, 2))
-    >>> hypothesis.add(Segment(2, 3))
-    >>> hypothesis.add(Segment(3, 4))
+    >>> hypothesis = Timeline(
+    ...     [Segment(0, 1), Segment(1, 2), Segment(2, 3), Segment(3, 4)]
+    ... )
     >>> precision(reference, hypothesis)
     0.6666666666666666
 
-    >>> hypothesis = Timeline()
-    >>> hypothesis.add(Segment(0, 4))
+    >>> hypothesis = Timeline([Segment(0, 4)])
+    >>> precision(reference, hypothesis)
+    1.0
+
+    With "optimal" matching, boundaries are aligned so that as many pairs
+    as possible fall within `tolerance`:
+
+    >>> reference = Timeline([Segment(0, 1), Segment(1, 2), Segment(2, 3)])
+    >>> hypothesis = Timeline([Segment(0, 0.4), Segment(0.4, 1.2), Segment(1.2, 3)])
+
+    >>> precision = SegmentationPrecision(tolerance=0.9, matching="optimal")
     >>> precision(reference, hypothesis)
     1.0
 
@@ -282,10 +306,112 @@ class SegmentationPrecision(UEMSupportMixin, BaseMetric):
     def metric_components(cls):
         return [PR_MATCHES, PR_BOUNDARIES]
 
-    def __init__(self, tolerance=0.0, **kwargs):
+    def __init__(self, tolerance=0.0, matching="greedy", **kwargs):
 
         super().__init__(**kwargs)
         self.tolerance = tolerance
+        if matching not in ("greedy", "optimal"):
+            raise ValueError(
+                f"'matching' must be 'greedy' or 'optimal' (got {matching!r})."
+            )
+        self.matching = matching
+
+    def _greedy_matching(
+        self, ref_boundaries: list[float], hyp_boundaries: list[float]
+    ) -> list[tuple[float, float]]:
+        """Match closest pairs of boundaries first"""
+
+        N, M = len(ref_boundaries), len(hyp_boundaries)
+
+        # temporal delta between all pairs of boundaries
+        delta = np.zeros((N, M))
+        for r, refBoundary in enumerate(ref_boundaries):
+            for h, hypBoundary in enumerate(hyp_boundaries):
+                delta[r, h] = abs(refBoundary - hypBoundary)
+
+        # make sure boundaries too far apart from each other cannot be matched
+        # (this is what np.inf is used for)
+        delta[np.where(delta > self.tolerance)] = np.inf
+
+        matches = []
+
+        # h always contains the minimum value in delta matrix
+        # h == np.inf means that no boundary can be matched
+        h = np.amin(delta)
+
+        # while there are still boundaries to match
+        while h < np.inf:
+            # find boundaries to match
+            k = np.argmin(delta)
+            i = k // M
+            j = k % M
+
+            matches.append((ref_boundaries[i], hyp_boundaries[j]))
+
+            # make sure they cannot be matched again
+            delta[i, :] = np.inf
+            delta[:, j] = np.inf
+
+            # update minimum value in delta
+            h = np.amin(delta)
+
+        return sorted(matches)
+
+    def _optimal_matching(
+        self, ref_boundaries: list[float], hyp_boundaries: list[float]
+    ) -> list[tuple[float, float]]:
+        """Find best alignment between reference and hypothesis boundaries
+
+        Maximize the number of matched pairs first, then minimize the total
+        deviation between matched boundaries. Remaining ties are broken in
+        favor of the pairing that happens earlier in time. Each boundary is
+        used at most once.
+        """
+
+        N, M = len(ref_boundaries), len(hyp_boundaries)
+
+        # because boundaries are sorted and deviation is a distance on the
+        # line, there always exists an optimal non-crossing matching: dynamic
+        # programming over prefixes of both boundary sequences is therefore
+        # exact. dp[i][j] is the best (number of matches, total deviation,
+        # matched pairs) alignment between ref_boundaries[:i] and
+        # hyp_boundaries[:j].
+        dp = [[(0, 0.0, ())] * (M + 1) for _ in range(N + 1)]
+
+        def better(a, b):
+            # is alignment `a` strictly better than alignment `b`?
+            if a[0] != b[0]:
+                # more matches is better
+                return a[0] > b[0]
+            if a[1] != b[1]:
+                # smaller total deviation is better
+                return a[1] < b[1]
+            # prefer the pairing that happens earlier in time
+            return a[2] < b[2]
+
+        for i in range(1, N + 1):
+            for j in range(1, M + 1):
+                # leave ref_boundaries[i-1] or hyp_boundaries[j-1] unmatched
+                best = dp[i - 1][j]
+                if better(dp[i][j - 1], best):
+                    best = dp[i][j - 1]
+
+                # match ref_boundaries[i-1] with hyp_boundaries[j-1]
+                deviation = abs(ref_boundaries[i - 1] - hyp_boundaries[j - 1])
+                if deviation <= self.tolerance:
+                    prev = dp[i - 1][j - 1]
+                    candidate = (
+                        prev[0] + 1,
+                        prev[1] + deviation,
+                        prev[2]
+                        + ((ref_boundaries[i - 1], hyp_boundaries[j - 1]),),
+                    )
+                    if better(candidate, best):
+                        best = candidate
+
+                dp[i][j] = best
+
+        return list(dp[N][M][2])
 
     def compute_components(
         self,
@@ -302,9 +428,6 @@ class SegmentationPrecision(UEMSupportMixin, BaseMetric):
 
         detail = self.init_components()
 
-        # number of matches so far...
-        n_matches = 0.0  # make sure it is a float (for later ratio)
-
         # number of boundaries in reference and hypothesis
         N = max(0, len(reference) - 1)
         M = max(0, len(hypothesis) - 1)
@@ -315,44 +438,20 @@ class SegmentationPrecision(UEMSupportMixin, BaseMetric):
         # corner case (no boundary in hypothesis or in reference)
         if M == 0 or N == 0:
             detail[PR_MATCHES] = 0.0
+            detail[PR_MATCHED] = []
             return detail
 
         # reference and hypothesis boundaries
         ref_boundaries = [segment.end for segment in reference][:-1]
         hyp_boundaries = [segment.end for segment in hypothesis][:-1]
 
-        # temporal delta between all pairs of boundaries
-        delta = np.zeros((N, M))
-        for r, refBoundary in enumerate(ref_boundaries):
-            for h, hypBoundary in enumerate(hyp_boundaries):
-                delta[r, h] = abs(refBoundary - hypBoundary)
+        if self.matching == "optimal":
+            matches = self._optimal_matching(ref_boundaries, hyp_boundaries)
+        else:
+            matches = self._greedy_matching(ref_boundaries, hyp_boundaries)
 
-        # make sure boundaries too far apart from each other cannot be matched
-        # (this is what np.inf is used for)
-        delta[np.where(delta > self.tolerance)] = np.inf
-
-        # h always contains the minimum value in delta matrix
-        # h == np.inf means that no boundary can be matched
-        h = np.amin(delta)
-
-        # while there are still boundaries to match
-        while h < np.inf:
-            # increment match count
-            n_matches += 1
-
-            # find boundaries to match
-            k = np.argmin(delta)
-            i = k // M
-            j = k % M
-
-            # make sure they cannot be matched again
-            delta[i, :] = np.inf
-            delta[:, j] = np.inf
-
-            # update minimum value in delta
-            h = np.amin(delta)
-
-        detail[PR_MATCHES] = n_matches
+        detail[PR_MATCHES] = float(len(matches))
+        detail[PR_MATCHED] = matches
         return detail
 
     def compute_metric(self, detail: Details) -> float:
@@ -372,25 +471,28 @@ class SegmentationPrecision(UEMSupportMixin, BaseMetric):
 class SegmentationRecall(SegmentationPrecision):
     """Segmentation recall
 
+    Parameters
+    ----------
+    tolerance : float, optional
+        Maximum distance (in seconds) between two boundaries for them to be
+        considered a match. Defaults to 0.
+    matching : {"greedy", "optimal"}, optional
+        Boundary matching algorithm. See SegmentationPrecision. Both metrics
+        rely on the same pairing when instantiated with the same options.
+
     >>> from pyannote.core import Timeline, Segment
     >>> from pyannote.metrics.segmentation import SegmentationRecall
     >>> recall = SegmentationRecall()
 
-    >>> reference = Timeline()
-    >>> reference.add(Segment(0, 1))
-    >>> reference.add(Segment(1, 2))
-    >>> reference.add(Segment(2, 4))
+    >>> reference = Timeline([Segment(0, 1), Segment(1, 2), Segment(2, 4)])
 
-    >>> hypothesis = Timeline()
-    >>> hypothesis.add(Segment(0, 1))
-    >>> hypothesis.add(Segment(1, 2))
-    >>> hypothesis.add(Segment(2, 3))
-    >>> hypothesis.add(Segment(3, 4))
+    >>> hypothesis = Timeline(
+    ...     [Segment(0, 1), Segment(1, 2), Segment(2, 3), Segment(3, 4)]
+    ... )
     >>> recall(reference, hypothesis)
     1.0
 
-    >>> hypothesis = Timeline()
-    >>> hypothesis.add(Segment(0, 4))
+    >>> hypothesis = Timeline([Segment(0, 4)])
     >>> recall(reference, hypothesis)
     0.0
 
@@ -406,4 +508,7 @@ class SegmentationRecall(SegmentationPrecision):
         hypothesis: Annotation | Timeline,
         **kwargs,
     ) -> Details:
-        return super().compute_components(hypothesis, reference)
+        detail = super().compute_components(hypothesis, reference)
+        # report matched boundaries as (reference, hypothesis) pairs
+        detail[PR_MATCHED] = [(h, r) for r, h in detail[PR_MATCHED]]
+        return detail
