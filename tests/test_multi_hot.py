@@ -243,3 +243,50 @@ class TestMultiHotEncoder(TestCase):
         out = enc.fit(arr).transform(arr)
         self.assertEqual(out.shape, (3, 3))
         self.assertEqual(out.iloc[0].tolist(), [1, 1, 0])
+
+    def test_escape_delimiter_shared_slot(self):
+        """Escaped delimiters let train and inference share the literal item slot."""
+        train = pd.DataFrame({'region': ['west\\|coast|blue']})
+        test = pd.DataFrame({'region': ['west\\|coast|new']})
+        enc = encoders.MultiHotEncoder(
+            escape_delimiter=True, handle_unknown='indicator', use_cat_names=True
+        ).fit(train)
+        self.assertEqual(
+            list(enc.get_feature_names_out()), ['region_west|coast', 'region_blue', 'region_-1']
+        )
+        out = enc.transform(test)
+        # 'west|coast' lights its trained slot, 'new' only lights the unknown slot
+        self.assertEqual(out.iloc[0].tolist(), [1, 0, 1])
+
+    def test_escape_delimiter_multi_char_boundaries(self):
+        """With delimiter '||', '\\\\' is a literal backslash and '\\||' a literal '||'."""
+        X = pd.DataFrame({'c': ['a\\\\||b', 'c\\||d']})
+        enc = encoders.MultiHotEncoder(
+            delimiter='||', escape_delimiter=True, use_cat_names=True
+        ).fit(X)
+        # slots follow the training order of the real (unescaped) labels
+        self.assertEqual(list(enc.get_feature_names_out()), ['c_a\\', 'c_b', 'c_c||d'])
+        out = enc.transform(X)
+        self.assertEqual(out.iloc[0].tolist(), [1, 1, 0])
+        self.assertEqual(out.iloc[1].tolist(), [0, 0, 1])
+
+    def test_escape_disabled_keeps_plain_split(self):
+        """Without escape_delimiter, backslashes are ordinary characters."""
+        X = pd.DataFrame({'region': ['west\\|coast|blue']})
+        enc = encoders.MultiHotEncoder(use_cat_names=True).fit(X)
+        self.assertEqual(
+            list(enc.get_feature_names_out()), ['region_west\\', 'region_coast', 'region_blue']
+        )
+
+    def test_escape_dangling_backslash_raises(self):
+        """A trailing backslash reports the column and row position, at fit and transform."""
+        X = pd.DataFrame({'region': ['ok', 'broken\\']})
+        enc = encoders.MultiHotEncoder(escape_delimiter=True)
+        with self.assertRaisesRegex(ValueError, "'region'.*row position 1"):
+            enc.fit(X)
+
+        enc2 = encoders.MultiHotEncoder(escape_delimiter=True).fit(
+            pd.DataFrame({'region': ['ok']})
+        )
+        with self.assertRaisesRegex(ValueError, "'region'.*row position 0"):
+            enc2.transform(pd.DataFrame({'region': ['broken\\']}))

@@ -23,9 +23,10 @@ class MultiHotEncoder(util.UnsupervisedTransformerMixin, util.BaseEncoder):
     This means a cell such as ``'a | b'``, ``'a||b'`` or ``'a|'`` contributes
     the items ``a`` and ``b`` (or, for the last two, only ``a``), and a cell
     that is empty or consists solely of the delimiter contributes no items.
-    Items cannot themselves contain the delimiter: a cell such as
-    ``'Smith, John'`` with the default delimiter is stored as two items, so
-    choose a delimiter that does not occur inside the items.
+    Items cannot themselves contain the delimiter unless ``escape_delimiter``
+    is enabled: a cell such as ``'Smith, John'`` with the default delimiter is
+    stored as two items, so choose a delimiter that does not occur inside the
+    items or switch the escaping on.
 
     The encoding is unsupervised and has no ``inverse_transform``: a multi-hot
     row does not uniquely determine the original cell.
@@ -69,7 +70,19 @@ class MultiHotEncoder(util.UnsupervisedTransformerMixin, util.BaseEncoder):
         per input column that is activated whenever a value is missing.
     delimiter: str
         the string that separates multiple items within one cell.
-        Must be a non-empty string and must not occur inside a single item.
+        Must be a non-empty string and must not occur inside a single item
+        (unless ``escape_delimiter`` is enabled).
+    escape_delimiter: bool
+        if True, a backslash inside a cell escapes the next character instead
+        of being split on, so items may literally contain the delimiter or a
+        backslash. ``'\\'`` directly before the delimiter keeps the delimiter
+        literal (``'west\\|coast|blue'`` with delimiter ``'|'`` yields the
+        items ``'west|coast'`` and ``'blue'``), and two adjacent backslashes
+        yield one literal backslash (``'a\\\\||b'`` with delimiter ``'||'``
+        yields ``'a\\'`` and ``'b'``). A backslash at the very end of a cell
+        is a dangling escape and raises a `ValueError` naming the column and
+        row position. If False (default), backslashes are ordinary characters
+        and the split behaves exactly as described above.
     use_cat_names: bool
         if True, the seen item values will be included in the encoded column
         names (e.g. ``city_paris``); collisions are suffixed with '#'. If False,
@@ -103,6 +116,7 @@ class MultiHotEncoder(util.UnsupervisedTransformerMixin, util.BaseEncoder):
         handle_unknown: str = 'value',
         handle_missing: str = 'value',
         delimiter: str = '|',
+        escape_delimiter: bool = False,
         use_cat_names: bool = False,
     ):
         super().__init__(
@@ -114,6 +128,7 @@ class MultiHotEncoder(util.UnsupervisedTransformerMixin, util.BaseEncoder):
             handle_missing=handle_missing,
         )
         self.delimiter = delimiter
+        self.escape_delimiter = escape_delimiter
         self.use_cat_names = use_cat_names
 
     def _fit(self, X, y=None, **kwargs):
@@ -128,13 +143,13 @@ class MultiHotEncoder(util.UnsupervisedTransformerMixin, util.BaseEncoder):
         slots: list[tuple[str, object]] = []
         seen: set[object] = set()
         nan_slot_seen = False
-        for cell in values.astype(object).to_numpy():
+        for row, cell in enumerate(values.astype(object).to_numpy()):
             if pd.isna(cell):
                 if self.handle_missing == 'value' and not nan_slot_seen:
                     nan_slot_seen = True
                     slots.append((True, None))
                 continue
-            for item in self._split_cell(cell):
+            for item in self._split_cell(cell, col, row):
                 if item not in seen:
                     seen.add(item)
                     slots.append((False, item))
@@ -180,13 +195,48 @@ class MultiHotEncoder(util.UnsupervisedTransformerMixin, util.BaseEncoder):
         counts[base] = found + 1
         return base + '#' * found
 
-    def _split_cell(self, cell: object) -> list[str]:
+    def _split_cell(self, cell: object, col: str, row: int) -> list[str]:
         """Split one cell into its non-empty, whitespace-stripped items."""
-        return [
-            item
-            for item in (fragment.strip() for fragment in str(cell).split(self.delimiter))
-            if item
-        ]
+        text = str(cell)
+        if self.escape_delimiter:
+            fragments = self._split_escaped(text, col, row)
+        else:
+            fragments = text.split(self.delimiter)
+        return [item for item in (fragment.strip() for fragment in fragments) if item]
+
+    def _split_escaped(self, text: str, col: str, row: int) -> list[str]:
+        """Split on the delimiter, honouring backslash escapes.
+
+        A backslash escapes the next character: two adjacent backslashes yield
+        one literal backslash, and a backslash directly before the delimiter
+        keeps the whole delimiter literal. A trailing backslash is a dangling
+        escape and raises a ValueError naming the column and row position.
+        """
+        fragments: list[str] = []
+        buf: list[str] = []
+        i = 0
+        end = len(text)
+        step = len(self.delimiter)
+        while i < end:
+            char = text[i]
+            if char == '\\':
+                if i + 1 >= end:
+                    raise ValueError(
+                        f'MultiHotEncoder: dangling escape backslash at the end of a cell '
+                        f'in column {col!r} at row position {row}. Escape the backslash '
+                        f"itself ('\\\\') or remove it."
+                    )
+                buf.append(text[i + 1])
+                i += 2
+            elif text.startswith(self.delimiter, i):
+                fragments.append(''.join(buf))
+                buf = []
+                i += step
+            else:
+                buf.append(char)
+                i += 1
+        fragments.append(''.join(buf))
+        return fragments
 
     def _transform(self, X):
         spec_by_col = {switch['col']: switch for switch in self.mapping}
@@ -230,7 +280,7 @@ class MultiHotEncoder(util.UnsupervisedTransformerMixin, util.BaseEncoder):
             # 'ignore' (and 'value' without a fitted missing slot): leave all zeros
 
         for row_idx in np.flatnonzero(~missing_mask):
-            items = self._split_cell(raw[row_idx])
+            items = self._split_cell(raw[row_idx], col, int(row_idx))
             if self.handle_unknown != 'value':
                 unknown_items = [item for item in items if item not in item_pos]
                 if unknown_items:
