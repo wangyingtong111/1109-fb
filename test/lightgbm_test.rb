@@ -236,9 +236,135 @@ class LightGBMTest < Minitest::Test
     assert_elements_in_delta expected, predictions
   end
 
+  def test_missing_default_child
+    model = Eps::Model.load_pmml(File.read("test/support/default_child.pmml"))
+
+    # root splits on x, missing x takes the declared right child; that child
+    # splits on z, missing z takes the declared left child (score 12)
+    rows = [
+      {x: nil, z: nil}, # both missing -> right, then left -> 12
+      {x: nil, z: 5},   # missing x -> right, z positive -> 13
+      {x: 5, z: nil},   # x positive -> right, missing z -> left -> 12
+      {x: 0, z: 5},     # satisfies x <= 0 -> left -> 10
+      {x: 5, z: 5},     # satisfies both predicates -> 13
+      {x: -1, z: 5}     # satisfies x <= 0 -> left -> 10
+    ]
+
+    assert_elements_in_delta [12, 13, 12, 10, 13, 10], model.predict(rows)
+  end
+
+  def test_missing_default_child_round_trip
+    pmml = File.read("test/support/default_child.pmml")
+    model = Eps::Model.load_pmml(pmml)
+
+    rows = [
+      {x: nil, z: nil},
+      {x: nil, z: 5},
+      {x: 5, z: nil},
+      {x: 0, z: 5}
+    ]
+    expected = [12, 13, 12, 10]
+    assert_elements_in_delta expected, model.predict(rows)
+
+    exported = model.to_pmml
+    assert_includes exported, "defaultChild"
+
+    model = Eps::Model.load_pmml(exported)
+    assert_elements_in_delta expected, model.predict(rows)
+  end
+
+  def test_missing_without_default_child
+    pmml = <<~XML
+      <?xml version="1.0" encoding="UTF-8"?>
+      <PMML xmlns="http://www.dmg.org/PMML-4_4" version="4.4">
+        <Header><Application name="test" version="1.0"/></Header>
+        <DataDictionary>
+          <DataField name="y" optype="continuous" dataType="double"/>
+          <DataField name="x" optype="continuous" dataType="double"/>
+        </DataDictionary>
+        <MiningModel functionName="regression">
+          <MiningSchema>
+            <MiningField name="y" usageType="target"/>
+            <MiningField name="x"/>
+          </MiningSchema>
+          <Segmentation multipleModelMethod="sum">
+            <Segment id="1">
+              <True/>
+              <TreeModel functionName="regression" missingValueStrategy="none" noTrueChildStrategy="returnLastPrediction" splitCharacteristic="multiSplit">
+                <MiningSchema><MiningField name="x"/></MiningSchema>
+                <Node score="7">
+                  <True/>
+                  <Node score="10"><SimplePredicate field="x" operator="lessOrEqual" value="0"/></Node>
+                  <Node score="11"><SimplePredicate field="x" operator="greaterThan" value="0"/></Node>
+                </Node>
+              </TreeModel>
+            </Segment>
+          </Segmentation>
+        </MiningModel>
+      </PMML>
+    XML
+
+    model = Eps::Model.load_pmml(pmml)
+    assert_elements_in_delta [7, 10, 11], model.predict([{x: nil}, {x: 0}, {x: 1}])
+  end
+
+  def test_missing_default_child_export
+    trees = [
+      Eps::Evaluators::Node.new(score: 0, children: [
+        Eps::Evaluators::Node.new(score: 10, predicate: {field: "x", operator: "lessOrEqual", value: 0}),
+        Eps::Evaluators::Node.new(score: 11, predicate: {field: "x", operator: "greaterThan", value: 0}, children: [
+          Eps::Evaluators::Node.new(score: 12, predicate: {field: "z", operator: "lessOrEqual", value: 0}),
+          Eps::Evaluators::Node.new(score: 13, predicate: {field: "z", operator: "greaterThan", value: 0})
+        ])
+      ])
+    ]
+    trees.first.default_child = trees.first.children.last
+    right = trees.first.children.last
+    right.default_child = right.children.first
+
+    model = Eps::LightGBM.new
+    features = {"x" => "numeric", "z" => "numeric"}
+    model.instance_variable_set(:@features, features)
+    model.instance_variable_set(:@text_features, {})
+    model.instance_variable_set(:@label_encoders, {})
+    model.instance_variable_set(:@objective, "regression")
+    model.instance_variable_set(:@labels, nil)
+    model.instance_variable_set(:@trees, trees)
+    model.instance_variable_set(:@target, "y")
+    model.instance_variable_set(:@evaluator, Eps::Evaluators::LightGBM.new(trees: trees, objective: "regression", labels: nil, features: features, text_features: {}))
+
+    pmml = model.to_pmml
+    assert_includes pmml, "defaultChild"
+    assert_valid_pmml(pmml)
+
+    rows = [{x: nil, z: nil}, {x: nil, z: 5}, {x: 5, z: nil}, {x: 0, z: 5}]
+    assert_elements_in_delta [12, 13, 12, 10], model.predict(rows)
+
+    model = Eps::Model.load_pmml(pmml)
+    assert_elements_in_delta [12, 13, 12, 10], model.predict(rows)
+  end
+
+  def test_missing_default_child_sparse_zero
+    absent = Eps::Evaluators::Node.new(score: 99, predicate: {field: ["t", "w"], operator: "equal", value: "sentinel"})
+    gt = Eps::Evaluators::Node.new(score: 1, predicate: {field: ["t", "w"], operator: "greaterThan", value: 0})
+    le = Eps::Evaluators::Node.new(score: 2, predicate: {field: ["t", "w"], operator: "lessOrEqual", value: 0})
+    root = Eps::Evaluators::Node.new(score: 0, children: [absent, gt, le])
+    root.default_child = absent
+
+    evaluator = Eps::Evaluators::LightGBM.new(trees: [root], objective: "regression", labels: nil, features: {"t" => "text"}, text_features: {})
+
+    df = Eps::DataFrame.new
+    df.columns[["t", "w"]] = [nil]
+
+    # a sparse term of zero is a real value, so it takes the <= branch, not the default child
+    assert_elements_in_delta [2], evaluator.predict(df)
+  end
+
   private
 
   def model
     @model ||= Eps::Model.load_pmml(File.read("test/support/python/lightgbm_regression.pmml"))
   end
 end
+
+

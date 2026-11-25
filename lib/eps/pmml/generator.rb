@@ -259,13 +259,16 @@ module Eps
           trees.each_with_index do |node, i|
             xml.Segment(id: i + 1) do
               xml.True
-              xml.TreeModel(functionName: "regression", missingValueStrategy: "none", noTrueChildStrategy: "returnLastPrediction", splitCharacteristic: "multiSplit") do
+              has_default = default_child?(node)
+              ids = has_default ? node_ids(node) : {}
+              strategy = has_default ? "defaultChild" : "none"
+              xml.TreeModel(functionName: "regression", missingValueStrategy: strategy, noTrueChildStrategy: "returnLastPrediction", splitCharacteristic: "multiSplit") do
                 xml.MiningSchema do
                   node_fields(node).uniq.each do |k|
                     xml.MiningField(name: display_field(k))
                   end
                 end
-                node_pmml(node, xml)
+                node_pmml(node, xml, ids)
               end
             end
           end
@@ -281,8 +284,23 @@ module Eps
         fields
       end
 
-      def node_pmml(node, xml)
-        xml.Node(score: node.score) do
+      # ids so default children survive export and reload
+      def node_ids(node, ids = {}, counter = [0])
+        ids[node] ||= (counter[0] += 1).to_s
+        node.children.each { |n| node_ids(n, ids, counter) }
+        ids
+      end
+
+      def default_child?(node)
+        !node.default_child.nil? || node.children.any? { |n| default_child?(n) }
+      end
+
+      def node_pmml(node, xml, ids)
+        attributes = {}
+        attributes[:score] = node.score unless node.score.nil?
+        attributes[:id] = ids[node] if ids.any?
+        attributes[:defaultChild] = ids[node.default_child] if node.default_child
+        xml.Node(**attributes) do
           if node.predicate.nil?
             xml.True
           elsif node.operator == "in"
@@ -295,7 +313,7 @@ module Eps
             xml.SimplePredicate(field: display_field(node.field), operator: node.operator, value: node.value)
           end
           node.children.each do |n|
-            node_pmml(n, xml)
+            node_pmml(n, xml, ids)
           end
         end
       end

@@ -73,46 +73,60 @@ module Eps
         end
       end
 
+      # true, false, or :unknown when the split value is missing
       def matches?(node, row)
-        if node.predicate.nil?
-          true
+        return true if node.predicate.nil?
+
+        v = row[node.field]
+
+        # sparse text feature: an absent term is zero, not missing
+        v = 0 if v.nil? && node.field.is_a?(Array)
+
+        # a missing split value leaves the predicate undecidable
+        return :unknown if v.nil?
+
+        case node.operator
+        when "equal"
+          v.to_s == node.value
+        when "in"
+          node.value.include?(v)
+        when "greaterThan"
+          v > node.value
+        when "lessOrEqual"
+          v <= node.value
         else
-          v = row[node.field]
-
-          # sparse text feature
-          v = 0 if v.nil? && node.field.is_a?(Array)
-
-          if v.nil?
-            # missingValueStrategy="none"
-            false
-          else
-            case node.operator
-            when "equal"
-              v.to_s == node.value
-            when "in"
-              node.value.include?(v)
-            when "greaterThan"
-              v > node.value
-            when "lessOrEqual"
-              v <= node.value
-            else
-              raise "Unknown operator: #{node.operator}"
-            end
-          end
+          raise "Unknown operator: #{node.operator}"
         end
       end
 
-      def node_score(node, row)
-        if matches?(node, row)
-          node.children.each do |c|
-            score = node_score(c, row)
-            return score if score
+      def node_score(node, row, last_score = nil, skip_predicate: false)
+        # an undecidable predicate (missing value) does not match on its own
+        matched = skip_predicate ? true : matches?(node, row)
+        return nil unless matched == true
+
+        last_score = node.score unless node.score.nil?
+
+        undecidable = false
+
+        node.children.each do |child|
+          case matches?(child, row)
+          when true
+            score = node_score(child, row, last_score)
+            return score unless score.nil?
+          when :unknown
+            undecidable = true
           end
-          # noTrueChildStrategy="returnLastPrediction"
-          node.score
-        else
-          nil
         end
+
+        # missingValueStrategy="defaultChild": when a split value is missing,
+        # take the declared child directly, bypassing its own predicate
+        if undecidable && node.default_child
+          score = node_score(node.default_child, row, last_score, skip_predicate: true)
+          return score unless score.nil?
+        end
+
+        # noTrueChildStrategy="returnLastPrediction"
+        last_score
       end
 
       def sigmoid(x)

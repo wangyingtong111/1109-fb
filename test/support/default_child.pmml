@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<PMML xmlns="http://www.dmg.org/PMML-4_4" version="4.4">
+  <Header>
+    <Application name="test" version="1.0"/>
+  </Header>
+  <DataDictionary>
+    <DataField name="y" optype="continuous" dataType="double"/>
+    <DataField name="x" optype="continuous" dataType="double"/>
+    <DataField name="z" optype="continuous" dataType="double"/>
+  </DataDictionary>
+  <MiningModel functionName="regression">
+    <MiningSchema>
+      <MiningField name="y" usageType="target"/>
+      <MiningField name="x"/>
+      <MiningField name="z"/>
+    </MiningSchema>
+    <Segmentation multipleModelMethod="sum">
+      <Segment id="1">
+        <True/>
+        <TreeModel functionName="regression" missingValueStrategy="defaultChild" noTrueChildStrategy="returnLastPrediction" splitCharacteristic="multiSplit">
+          <MiningSchema>
+            <MiningField name="x"/>
+            <MiningField name="z"/>
+          </MiningSchema>
+          <Node score="0" defaultChild="r">
+            <True/>
+            <Node id="l" score="10">
+              <SimplePredicate field="x" operator="lessOrEqual" value="0"/>
+            </Node>
+            <Node id="r" score="11" defaultChild="rzl">
+              <SimplePredicate field="x" operator="greaterThan" value="0"/>
+              <Node id="rzl" score="12">
+                <SimplePredicate field="z" operator="lessOrEqual" value="0"/>
+              </Node>
+              <Node id="rzr" score="13">
+                <SimplePredicate field="z" operator="greaterThan" value="0"/>
+              </Node>
+            </Node>
+          </Node>
+        </TreeModel>
+      </Segment>
+    </Segmentation>
+  </MiningModel>
+</PMML>

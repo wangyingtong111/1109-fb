@@ -199,7 +199,9 @@ module Eps
       end
 
       def find_nodes(xml, derived_fields)
-        score = xml.attribute("score").value.to_f
+        # score is optional on interior nodes
+        score_attr = xml.attribute("score")
+        score = score_attr ? score_attr.value.to_f : nil
 
         elements = xml.elements
         xml_predicate = elements.first
@@ -232,7 +234,13 @@ module Eps
 
         children = elements[1..-1].map { |n| find_nodes(n, derived_fields) }
 
-        Evaluators::Node.new(score: score, predicate: predicate, children: children)
+        # missingValueStrategy="defaultChild": link to the declared child
+        default_child_id = xml.attribute("defaultChild")&.value
+
+        node = Evaluators::Node.new(score: score, predicate: predicate, children: children, id: xml.attribute("id")&.value)
+        node.default_child = children.find { |c| c.id == default_child_id } if default_child_id
+
+        node
       end
     end
   end
