@@ -46,6 +46,56 @@ Philiprehberger::FuzzyMatch.damerau_levenshtein('teh', 'the')   # => 1
 Philiprehberger::FuzzyMatch.damerau_ratio('teh', 'the')         # => ~0.667
 ```
 
+### Jaro-Winkler Prefix Gate
+
+By default the Winkler common-prefix bonus is applied unconditionally. Pass
+`prefix_threshold:` to gate it on the plain Jaro base score: the bonus is only
+added when the base score reaches the threshold.
+
+```ruby
+# Base Jaro is 0.9167 >= 0.7, so the classic formula still boosts to 0.95
+Philiprehberger::FuzzyMatch.jaro_winkler('abcdxxxx', 'abcdxxxy', prefix_threshold: 0.7)
+# => 0.95
+
+# Base Jaro is 2/3 < 0.7, so the shared prefix is not rewarded
+Philiprehberger::FuzzyMatch.jaro_winkler('abcdxxxx', 'abcdyyyy', prefix_threshold: 0.7)
+# => 0.6666666666666666
+
+# Without the option the historical score is unchanged (0.8)
+Philiprehberger::FuzzyMatch.jaro_winkler('abcdxxxx', 'abcdyyyy')
+# => 0.8
+```
+
+Inspect the full breakdown behind a score — the Jaro base score, the common
+prefix length (still capped by the original rule at 4), whether the bonus was
+applied, and the final score:
+
+```ruby
+Philiprehberger::FuzzyMatch.jaro_winkler_components('abcdxxxx', 'abcdyyyy', prefix_threshold: 0.7)
+# => { base_score: 0.6666666666666666, prefix_length: 4, bonus_applied: false, score: 0.6666666666666666 }
+
+# Same hash via the explain alias
+Philiprehberger::FuzzyMatch.jaro_winkler_explain('abcdxxxx', 'abcdyyyy', prefix_threshold: 0.7)
+Philiprehberger::FuzzyMatch.jaro_winkler_bonus?('abcdxxxx', 'abcdyyyy', prefix_threshold: 0.7)  # => false
+```
+
+`.rank` (and `.closest_n` / `.top_n`) score every candidate with the same
+components, so passing the same `prefix_threshold:` keeps ranking and direct
+scoring in agreement. Ties keep input order, and `explain: true` attaches the
+per-candidate breakdown:
+
+```ruby
+candidates = %w[abcdyyyy ABCDXXXY abcdxxxy]
+results = Philiprehberger::FuzzyMatch.rank('abcdxxxx', candidates, prefix_threshold: 0.7)
+# => [{ value: "ABCDXXXY", score: 0.95 },
+#     { value: "abcdxxxy", score: 0.95 },
+#     { value: "abcdyyyy", score: 0.6666666666666666 }]
+
+results = Philiprehberger::FuzzyMatch.rank('abcdxxxx', candidates, prefix_threshold: 0.7, explain: true)
+results.last[:components]
+# => { base_score: 0.6666666666666666, prefix_length: 4, bonus_applied: false, score: 0.6666666666666666 }
+```
+
 ### Longest Common Subsequence
 
 ```ruby
@@ -197,7 +247,9 @@ Philiprehberger::FuzzyMatch.weighted_score('kitten', 'sitting',
 | Method | Description |
 |--------|-------------|
 | `.levenshtein(a, b)` | Levenshtein edit distance (integer) |
-| `.jaro_winkler(a, b)` | Jaro-Winkler similarity (0.0 to 1.0) |
+| `.jaro_winkler(a, b, prefix_threshold: nil)` | Jaro-Winkler similarity (0.0 to 1.0); optional Jaro base-score gate for the prefix bonus |
+| `.jaro_winkler_components(a, b, prefix_threshold: nil)` | Jaro-Winkler breakdown: `{ base_score:, prefix_length:, bonus_applied:, score: }` (aliases: `.jaro_winkler_explain`, `.jaro_winkler_detail`, `.jaro_winkler_breakdown`) |
+| `.jaro_winkler_bonus?(a, b, prefix_threshold: nil)` | Whether the common-prefix bonus applies for the pair |
 | `.dice_coefficient(a, b)` | Dice coefficient from bigram overlap (0.0 to 1.0) |
 | `.damerau_levenshtein(a, b)` | Damerau-Levenshtein distance with transpositions (integer) |
 | `.damerau_ratio(a, b)` | Normalized Damerau-Levenshtein similarity (0.0 to 1.0) |
@@ -208,9 +260,9 @@ Philiprehberger::FuzzyMatch.weighted_score('kitten', 'sitting',
 | `.best(query, candidates, threshold: 0.0)` | Best match as `{ match:, score: }` |
 | `.search(query, candidates, threshold: 0.3)` | Ranked array of `{ match:, score: }` |
 | `.suggest(query, candidates, threshold: 0.6, max: 5)` | Array of match strings |
-| `.rank(query, candidates, algorithm: :jaro_winkler)` | All candidates sorted desc as `{ value:, score: }` (stable) |
-| `.closest_n(query, candidates, n:, algorithm: :jaro_winkler)` | Top N matches as `{ match:, score: }` sorted by score descending |
-| `.top_n(query, candidates, n:, algorithm: :jaro_winkler, min_similarity: 0.0)` | Top-N matches as `{ value:, similarity: }` sorted by similarity descending, with optional similarity floor |
+| `.rank(query, candidates, algorithm: :jaro_winkler, prefix_threshold: nil, explain: false)` | All candidates sorted desc as `{ value:, score: }` (stable); forwards the Jaro gate and can attach `:components` |
+| `.closest_n(query, candidates, n:, algorithm: :jaro_winkler, prefix_threshold: nil, explain: false)` | Top N matches as `{ match:, score: }` sorted by score descending |
+| `.top_n(query, candidates, n:, algorithm: :jaro_winkler, min_similarity: 0.0, prefix_threshold: nil, explain: false)` | Top-N matches as `{ value:, similarity: }` sorted by similarity descending, with optional similarity floor |
 | `.soundex(string)` | Generate 4-character Soundex code |
 | `.metaphone(string)` | Generate Metaphone phonetic code |
 | `.phonetic_match?(a, b)` | Check if two strings match phonetically |

@@ -43,6 +43,60 @@ RSpec.describe Philiprehberger::FuzzyMatch do
     it 'is case insensitive' do
       expect(described_class.jaro_winkler('Hello', 'hello')).to eq(1.0)
     end
+
+    it 'keeps the classic 0.8 score when the new option is omitted' do
+      # base Jaro 2/3, shared prefix 4 => 2/3 + 4*0.1*(1/3) == 0.8
+      expect(described_class.jaro_winkler('abcdxxxx', 'abcdyyyy')).to eq(0.8)
+    end
+
+    it 'still boosts above the gate with prefix_threshold: 0.7' do
+      expect(described_class.jaro_winkler('abcdxxxx', 'abcdxxxy', prefix_threshold: 0.7)).to eq(0.95)
+    end
+
+    it 'withholds the bonus below the gate with prefix_threshold: 0.7' do
+      expect(described_class.jaro_winkler('abcdxxxx', 'abcdyyyy', prefix_threshold: 0.7)).to eq(2.0 / 3)
+    end
+  end
+
+  describe '.jaro_winkler_components' do
+    it 'reports base score, prefix length, bonus flag, and final score' do
+      components = described_class.jaro_winkler_components('abcdxxxx', 'abcdyyyy', prefix_threshold: 0.7)
+      expect(components).to eq(base_score: 2.0 / 3, prefix_length: 4, bonus_applied: false, score: 2.0 / 3)
+    end
+
+    it 'reports the boosted score when the gate is met' do
+      components = described_class.jaro_winkler_components('abcdxxxx', 'abcdxxxy', prefix_threshold: 0.7)
+      expect(components[:base_score]).to be_within(1e-12).of(11.0 / 12)
+      expect(components[:prefix_length]).to eq(4)
+      expect(components[:bonus_applied]).to be(true)
+      expect(components[:score]).to eq(0.95)
+    end
+
+    it 'matches the score returned by .jaro_winkler' do
+      [nil, 0.7, 0.95].each do |gate|
+        components = described_class.jaro_winkler_components('abcdxxxx', 'abcdyyyy', prefix_threshold: gate)
+        expect(components[:score]).to eq(described_class.jaro_winkler('abcdxxxx', 'abcdyyyy', prefix_threshold: gate))
+      end
+    end
+
+    it 'is available as .jaro_winkler_explain' do
+      expect(described_class.jaro_winkler_explain('abcdxxxx', 'abcdyyyy', prefix_threshold: 0.7))
+        .to eq(described_class.jaro_winkler_components('abcdxxxx', 'abcdyyyy', prefix_threshold: 0.7))
+    end
+
+    it 'can be requested from .jaro_winkler itself' do
+      components = described_class.jaro_winkler('abcdxxxx', 'abcdyyyy', prefix_threshold: 0.7, explain: true)
+      expect(components).to eq(described_class.jaro_winkler_components('abcdxxxx', 'abcdyyyy', prefix_threshold: 0.7))
+    end
+
+    it 'keeps .jaro_winkler returning a bare float by default' do
+      expect(described_class.jaro_winkler('abcdxxxx', 'abcdyyyy', prefix_threshold: 0.7)).to be_a(Float)
+    end
+
+    it 'reports whether the bonus applies via .jaro_winkler_bonus?' do
+      expect(described_class.jaro_winkler_bonus?('abcdxxxx', 'abcdyyyy', prefix_threshold: 0.7)).to be(false)
+      expect(described_class.jaro_winkler_bonus?('abcdxxxx', 'abcdxxxy', prefix_threshold: 0.7)).to be(true)
+    end
   end
 
   describe '.dice_coefficient (via Dice module)' do
@@ -258,6 +312,70 @@ RSpec.describe Philiprehberger::FuzzyMatch do
         expect(entry).to be_a(Hash)
         expect(entry.keys).to contain_exactly(:value, :score)
       end
+    end
+
+    context 'with prefix_threshold: 0.7' do
+      let(:gated_candidates) { %w[abcdyyyy ABCDXXXY abcdxxxy] }
+
+      it 'scores the below-gate candidate from its base score only' do
+        results = described_class.rank('abcdxxxx', gated_candidates, prefix_threshold: 0.7)
+        first = results.find { |entry| entry[:value] == 'abcdyyyy' }
+        expect(first[:score]).to eq(2.0 / 3)
+      end
+
+      it 'ranks the boosted candidates ahead of the unboosted one' do
+        results = described_class.rank('abcdxxxx', gated_candidates, prefix_threshold: 0.7)
+        expect(results.map { |entry| entry[:value] }).to eq(%w[ABCDXXXY abcdxxxy abcdyyyy])
+      end
+
+      it 'keeps input order between the tied boosted candidates' do
+        results = described_class.rank('abcdxxxx', gated_candidates, prefix_threshold: 0.7)
+        expect(results[0][:score]).to eq(results[1][:score])
+        expect([results[0][:value], results[1][:value]]).to eq(%w[ABCDXXXY abcdxxxy])
+      end
+
+      it 'uses the same score as the direct comparison' do
+        results = described_class.rank('abcdxxxx', gated_candidates, prefix_threshold: 0.7)
+        results.each do |entry|
+          expect(entry[:score]).to eq(described_class.jaro_winkler('abcdxxxx', entry[:value], prefix_threshold: 0.7))
+        end
+      end
+
+      it 'agrees with the reported components for the unboosted candidate' do
+        components = described_class.jaro_winkler_components('abcdxxxx', 'abcdyyyy', prefix_threshold: 0.7)
+        result = described_class.rank('abcdxxxx', ['abcdyyyy'], prefix_threshold: 0.7).first
+        expect(result[:score]).to eq(components[:base_score])
+        expect(components[:prefix_length]).to eq(4)
+        expect(components[:bonus_applied]).to be(false)
+      end
+
+      it 'attaches the same components as the direct call when explain: true is given' do
+        results = described_class.rank('abcdxxxx', gated_candidates, prefix_threshold: 0.7, explain: true)
+        results.each do |entry|
+          expect(entry[:components]).to eq(
+            described_class.jaro_winkler_components('abcdxxxx', entry[:value], prefix_threshold: 0.7)
+          )
+        end
+      end
+
+      it 'reports the weak candidate as unboosted in the rank explanation' do
+        weak = described_class.rank('abcdxxxx', gated_candidates, prefix_threshold: 0.7, explain: true).last
+        expect(weak[:components][:base_score]).to eq(2.0 / 3)
+        expect(weak[:components][:prefix_length]).to eq(4)
+        expect(weak[:components][:bonus_applied]).to be(false)
+        expect(weak[:score]).to eq(2.0 / 3)
+      end
+
+      it 'omits components and keeps the entry shape by default' do
+        results = described_class.rank('abcdxxxx', gated_candidates, prefix_threshold: 0.7)
+        results.each { |entry| expect(entry.keys).to contain_exactly(:value, :score) }
+      end
+    end
+
+    it 'keeps the default scoring when prefix_threshold is omitted' do
+      results = described_class.rank('abcdxxxx', %w[abcdyyyy abcdxxxx])
+      expect(results.last[:score]).to eq(0.8)
+      expect(results.last[:score]).to eq(described_class.jaro_winkler('abcdxxxx', 'abcdyyyy'))
     end
   end
 

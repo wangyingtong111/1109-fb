@@ -7,6 +7,11 @@ and this gem adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+- `jaro_winkler(a, b, prefix_threshold:)` gates the Winkler common-prefix bonus on the plain Jaro base score: the bonus is only applied when the base score reaches the threshold (e.g. `0.7`). Omitting the option keeps the historical always-boosted score, so existing results and return types are unchanged.
+- `jaro_winkler_components(a, b, prefix_threshold:)` (aliases `jaro_winkler_explain`, `jaro_winkler_detail`, `jaro_winkler_breakdown`) returns `{ base_score:, prefix_length:, bonus_applied:, score: }`. The prefix length always follows the original capped rule (max 4), even when the bonus is withheld. `jaro_winkler_bonus?` returns just the flag.
+- `rank`, `closest_n`, and `top_n` accept the same `prefix_threshold:` so ranking and direct scoring share one set of components and configuration; `explain: true` attaches the per-candidate breakdown while keeping the existing entry shape by default.
+
 ## [0.10.0] - 2026-05-09
 
 ### Added

@@ -19,8 +19,52 @@ module Philiprehberger
       Levenshtein.distance(str_a, str_b)
     end
 
-    def self.jaro_winkler(str_a, str_b)
-      JaroWinkler.similarity(str_a, str_b)
+    # Jaro-Winkler similarity (0.0 to 1.0)
+    #
+    # @param str_a [String]
+    # @param str_b [String]
+    # @param prefix_threshold [Float, nil] optional Jaro base-score gate; the
+    #   common-prefix bonus is only added when the base score reaches it.
+    #   When omitted (`nil`) the classic always-boosted formula is used.
+    # @param options [Hash] alias keywords for +prefix_threshold+; any detail
+    #   keyword (`explain:`, `detail:`, `components:`, ...) returns the
+    #   breakdown hash instead of the bare float
+    # @return [Float, Hash] the score, or `{ base_score:, prefix_length:,
+    #   bonus_applied:, score: }`
+    def self.jaro_winkler(str_a, str_b, prefix_threshold = nil, **options)
+      JaroWinkler.similarity(str_a, str_b, prefix_threshold, **options)
+    end
+
+    # Full breakdown of a Jaro-Winkler comparison.
+    #
+    # Returns the plain Jaro base score, the common-prefix length (measured by
+    # the original capped rule), whether the prefix bonus was applied, and the
+    # resulting score. The same components back both `.jaro_winkler` and
+    # `.rank`, so an explanation always agrees with the ranking.
+    #
+    # @param str_a [String]
+    # @param str_b [String]
+    # @param prefix_threshold [Float, nil] optional Jaro base-score gate
+    # @param options [Hash] alias keywords for +prefix_threshold+
+    # @return [Hash] `{ base_score:, prefix_length:, bonus_applied:, score: }`
+    def self.jaro_winkler_components(str_a, str_b, prefix_threshold = nil, **options)
+      JaroWinkler.components(str_a, str_b, prefix_threshold, **options)
+    end
+
+    class << self
+      alias jaro_winkler_explain jaro_winkler_components
+      alias jaro_winkler_detail jaro_winkler_components
+      alias jaro_winkler_breakdown jaro_winkler_components
+    end
+
+    # Whether the common-prefix bonus would be applied for a pair.
+    #
+    # @param str_a [String]
+    # @param str_b [String]
+    # @param prefix_threshold [Float, nil] optional Jaro base-score gate
+    # @return [Boolean]
+    def self.jaro_winkler_bonus?(str_a, str_b, prefix_threshold = nil, **options)
+      jaro_winkler_components(str_a, str_b, prefix_threshold, **options)[:bonus_applied]
     end
 
     def self.dice_coefficient(str_a, str_b)
@@ -115,16 +159,44 @@ module Philiprehberger
 
     # Rank all candidates by similarity to the query (descending)
     #
+    # Scores come from the very same components as `.jaro_winkler`, so passing
+    # the same +prefix_threshold+ makes the ranking and direct scores agree.
+    # Pass +explain: true+ to attach the per-candidate breakdown used to produce
+    # each score (only meaningful for :jaro_winkler).
+    #
     # @param query [String]
     # @param candidates [Array<String>]
     # @param algorithm [Symbol] :jaro_winkler (default), :dice, or :levenshtein
+    # @param prefix_threshold [Float, nil] optional Jaro base-score gate, forwarded
+    #   to the Jaro-Winkler scoring so ranking matches direct `.jaro_winkler` calls
+    # @param explain [Boolean] include `:components` in each entry (default false)
+    # @param options [Hash] alias keywords for +prefix_threshold+
     # @return [Array<Hash>] all candidates as `{ value:, score: }` sorted by score desc,
     #   ties broken by original input order (stable)
-    def self.rank(query, candidates, algorithm: :jaro_winkler)
+    def self.rank(query, candidates, algorithm: :jaro_winkler, prefix_threshold: nil, explain: false, **options)
       scored = candidates.each_with_index.map do |candidate, index|
-        [{ value: candidate, score: score_for(query, candidate.to_s, algorithm: algorithm) }, index]
+        [rank_entry(query, candidate, algorithm, prefix_threshold, explain, options), index]
       end
-      scored.sort_by { |pair, index| [-pair[:score], index] }.map(&:first)
+      scored.sort_by { |entry, index| [-entry[:score], index] }.map(&:first)
+    end
+
+    # Build one ranked entry from a single scoring pass.
+    #
+    # For :jaro_winkler the entry is built straight from `.jaro_winkler`'s
+    # components, so ranking and direct scoring cannot drift apart (and a
+    # breakdown is available without scoring the pair twice).
+    #
+    # @api private
+    # @return [Hash] `{ value:, score: }`, plus `:components` when explaining
+    def self.rank_entry(query, candidate, algorithm, prefix_threshold, explain, options)
+      if algorithm == :jaro_winkler
+        components = JaroWinkler.components(query, candidate.to_s, prefix_threshold, **options)
+        entry = { value: candidate, score: components[:score] }
+        entry[:components] = components if explain
+        entry
+      else
+        { value: candidate, score: score_for(query, candidate.to_s, algorithm: algorithm) }
+      end
     end
 
     # Return the top N matches sorted by score descending
@@ -133,10 +205,17 @@ module Philiprehberger
     # @param candidates [Array<String>]
     # @param n [Integer] number of results to return (required)
     # @param algorithm [Symbol] :jaro_winkler (default), :dice, or :levenshtein
+    # @param prefix_threshold [Float, nil] optional Jaro base-score gate
+    # @param options [Hash] alias keywords for +prefix_threshold+
     # @return [Array<Hash>] up to n candidates as `{ match:, score: }` sorted by score desc
-    def self.closest_n(query, candidates, n:, algorithm: :jaro_winkler)
-      ranked = rank(query, candidates, algorithm: algorithm)
-      ranked.first(n).map { |entry| { match: entry[:value], score: entry[:score] } }
+    def self.closest_n(query, candidates, n:, algorithm: :jaro_winkler, prefix_threshold: nil, explain: false, **options)
+      ranked = rank(query, candidates,
+                    algorithm: algorithm, prefix_threshold: prefix_threshold, explain: explain, **options)
+      ranked.first(n).map do |entry|
+        mapped = { match: entry[:value], score: entry[:score] }
+        mapped[:components] = entry[:components] if entry.key?(:components)
+        mapped
+      end
     end
 
     # Return the top N best matches above an optional similarity floor
@@ -146,11 +225,20 @@ module Philiprehberger
     # @param n [Integer] number of results to return (required)
     # @param algorithm [Symbol] :jaro_winkler (default), :dice, or :levenshtein
     # @param min_similarity [Float] minimum similarity threshold; entries below are filtered out (default 0.0)
+    # @param prefix_threshold [Float, nil] optional Jaro base-score gate
+    # @param explain [Boolean] include `:components` in each entry (default false)
+    # @param options [Hash] alias keywords for +prefix_threshold+
     # @return [Array<Hash>] up to n candidates as `{ value:, similarity: }` sorted by similarity desc
-    def self.top_n(query, candidates, n:, algorithm: :jaro_winkler, min_similarity: 0.0)
-      ranked = rank(query, candidates, algorithm: algorithm)
+    def self.top_n(query, candidates, n:, algorithm: :jaro_winkler, min_similarity: 0.0,
+                   prefix_threshold: nil, explain: false, **options)
+      ranked = rank(query, candidates,
+                    algorithm: algorithm, prefix_threshold: prefix_threshold, explain: explain, **options)
       filtered = ranked.select { |entry| entry[:score] >= min_similarity }
-      filtered.first(n).map { |entry| { value: entry[:value], similarity: entry[:score] } }
+      filtered.first(n).map do |entry|
+        mapped = { value: entry[:value], similarity: entry[:score] }
+        mapped[:components] = entry[:components] if entry.key?(:components)
+        mapped
+      end
     end
 
     # Generate a Soundex code for a string
@@ -330,17 +418,21 @@ module Philiprehberger
     # @param str_a [String]
     # @param str_b [String]
     # @param algorithm [Symbol] :jaro_winkler, :dice, or :levenshtein
+    # @param prefix_threshold [Float, nil] optional Jaro base-score gate, used
+    #   only by :jaro_winkler
+    # @param options [Hash] alias keywords for +prefix_threshold+
     # @return [Float] similarity between 0.0 and 1.0
     # @raise [Error] when the algorithm is not supported
-    def self.score_for(str_a, str_b, algorithm:)
+    def self.score_for(str_a, str_b, algorithm:, prefix_threshold: nil, **options)
       case algorithm
-      when :jaro_winkler then jaro_winkler(str_a, str_b)
+      when :jaro_winkler
+        jaro_winkler(str_a, str_b, prefix_threshold, **options)
       when :dice then dice_coefficient(str_a, str_b)
       when :levenshtein then ratio(str_a, str_b)
       else raise Error, "Unknown algorithm: #{algorithm}"
       end
     end
 
-    private_class_method :score_for
+    private_class_method :score_for, :rank_entry
   end
 end
