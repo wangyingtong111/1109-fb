@@ -96,7 +96,11 @@ class MiniFTS
     max_fuzzy: 6,
     boost: {},
     weights: { fuzzy: 0.45, prefix: 0.375 },
-    bm25: DEFAULT_BM25_PARAMS
+    bm25: DEFAULT_BM25_PARAMS,
+    # `nil` means "auto": analyze per field whenever the search names a field
+    # selection, and once for the whole query otherwise. `true` / `false` force
+    # one mode regardless of `:fields`.
+    per_field_analysis: nil
   }.freeze
 
   DEFAULT_AUTO_SUGGEST_OPTIONS = {
@@ -323,6 +327,10 @@ class MiniFTS
   end
 
   # Searches for documents matching +query+.
+  #
+  # Each result's +:query_terms+ are the *original* query terms a document
+  # covers. With per-field analysis (see +:per_field_analysis+) a term may match
+  # through several index terms derived from it, yet still appears once.
   #
   # @param query [String, Hash, Object] a query string, a combination Hash with a
   #   +:queries+ key, or {WILDCARD}
@@ -697,6 +705,10 @@ class MiniFTS
     search_tokenize = options[:tokenize]
     search_process_term = options[:process_term]
 
+    if per_field_analysis?(options)
+      return execute_per_field_query(query, options, search_tokenize, search_process_term)
+    end
+
     terms = search_tokenize.call(query)
                            .flat_map { |term| search_process_term.call(term) }
                            .select { |term| truthy?(term) }
@@ -705,6 +717,132 @@ class MiniFTS
     results = queries.map { |spec| execute_query_spec(spec, options) }
 
     combine_results(results, options[:combine_with])
+  end
+
+  # Whether this query should be analyzed once per searched field rather than
+  # once as a whole.
+  #
+  # An explicit `:per_field_analysis` always wins (truthy enables it, `false`
+  # restores the single whole-query analysis). With the default `nil`, an
+  # explicit field selection (`fields:` at search time, or on a subquery) *is*
+  # the choice of that field's rule — the meaning of "select the same field's
+  # rule". A search that names no fields keeps the historical single analysis.
+  def per_field_analysis?(options)
+    setting = options[:per_field_analysis]
+    return truthy?(setting) unless setting.nil?
+
+    !options[:fields].nil?
+  end
+
+  # Per-field analysis: each original query term is analyzed once per searched
+  # field with that field's own rule (`process_term.call(term, field)`), and the
+  # resulting index terms are only looked up in the field that produced them.
+  #
+  # Coverage is measured per *original* query term, not per derived index term:
+  # alternatives derived from one source term (e.g. a title rule that expands
+  # `C-7` into `c-7` and `kit-alias`) are OR-combined into a single group, so a
+  # document matching several of them still covers the source term once. The
+  # groups are then combined with the usual `OR` / `AND` / `AND_NOT` operator,
+  # which lets different original terms be covered by hits in different fields.
+  #
+  # The index itself is untouched: this is a query-time reading of the same
+  # postings, so indexes stay interchangeable with JavaScript. When the option is
+  # off, the single whole-query analysis above is used unchanged.
+  def execute_per_field_query(query, options, search_tokenize, search_process_term)
+    fields = options[:fields] || @options[:fields]
+
+    raw_terms = search_tokenize.call(query).select { |term| truthy?(term) }
+
+    groups = raw_terms.each_with_index.map do |raw_term, i|
+      per_field_term_results(raw_term, fields, search_process_term, options, i, raw_terms)
+    end
+    # An original term that every searched field analyzes away cannot be covered
+    # (`nil`), exactly like a `nil` from the single-analysis path, so it
+    # contributes no group. A term that *does* analyze into index terms yet
+    # matches nothing stays as an empty group, so `AND` still fails — dropping
+    # it would silently turn "no match" into "no constraint".
+    groups.compact!
+
+    combine_results(groups, options[:combine_with])
+  end
+
+  # Resolves one original query term into the index terms each searched field
+  # derives from it, then scores them in place (field-limited) and OR-combines
+  # them into one coverage group keyed by the original term.
+  def per_field_term_results(raw_term, fields, search_process_term, options, index, raw_terms)
+    field_terms = []
+    fields.each do |field|
+      analyzed = process_term_for_field(search_process_term, raw_term, field)
+      derived = analyzed.is_a?(Array) ? analyzed : [analyzed]
+      derived.each do |term|
+        next unless truthy?(term)
+        next if field_terms.include?([field, term])
+
+        field_terms.push([field, term])
+      end
+    end
+
+    # Nothing to look up under any searched field: the term was analyzed away.
+    return nil if field_terms.empty?
+
+    groups = field_terms.map do |field, term|
+      spec = term_to_query_spec(options, term, index, raw_terms)
+      # The analyzed term is the index term; `source_term` keeps the original
+      # query term as the coverage slot it is reported under.
+      spec[:source_term] = raw_term
+      execute_query_spec(spec, options.merge(fields: [field]))
+    end
+
+    # Alternatives are alternatives: OR them into one group so several of them
+    # matching one document still counts as a single coverage of the source
+    # term (`combine_or` cannot be reused here — its `merge!` would overwrite a
+    # derived term's field list when the same index term matches in two fields).
+    combine_per_field_groups(groups)
+  end
+
+  def combine_per_field_groups(groups)
+    combined = nil
+    groups.each do |group|
+      if combined.nil?
+        combined = group
+        next
+      end
+
+      group.each do |doc_id, value|
+        existing = combined[doc_id]
+        if existing.nil?
+          combined[doc_id] = value
+          next
+        end
+
+        existing[R_SCORE] += value[R_SCORE]
+        assign_unique_terms(existing[R_TERMS], value[R_TERMS])
+        value[R_MATCH].each do |term, fields|
+          match = existing[R_MATCH][term]
+          if match
+            fields.each { |field| match.push(field) unless match.include?(field) }
+          else
+            existing[R_MATCH][term] = fields.dup
+          end
+        end
+      end
+    end
+
+    combined || {}
+  end
+
+  # Calls `process_term` with the field name, but tolerates a one-argument
+  # callable (a field-agnostic rule, such as a search-time lambda). Indexing
+  # already passes the field unconditionally; this keeps a field-aware *search*
+  # from breaking a processor that only takes a term.
+  def process_term_for_field(process_term, term, field)
+    arity = process_term.respond_to?(:arity) ? process_term.arity : 2
+
+    case arity
+    when 0 then process_term.call
+    when 1 then process_term.call(term)
+    else process_term.call(term, field)
+    end
   end
 
   def execute_query_spec(query, search_options)
@@ -726,10 +864,14 @@ class MiniFTS
     prefix_weight = weights[:prefix]
 
     term = query[:term]
+    # Per-field analysis passes the original query term here so every derived
+    # index term reports coverage under the same source slot; the default path
+    # leaves this nil and the index term is its own source.
+    source_term = query[:source_term] || term
     term_boost = query[:term_boost]
 
     data = @index.get(term)
-    results = term_results(term, term, 1, term_boost, data, boosts, boost_document, bm25params)
+    results = term_results(source_term, term, 1, term_boost, data, boosts, boost_document, bm25params)
 
     prefix_matches = @index.at_prefix(term) if query[:prefix]
 

@@ -95,13 +95,56 @@ ms.search(
 
 Supported search options: `:fields`, `:filter`, `:boost`, `:boost_term`,
 `:weights`, `:boost_document`, `:prefix`, `:fuzzy`, `:max_fuzzy`,
-`:combine_with`, `:tokenize`, `:process_term`, `:bm25`.
+`:combine_with`, `:tokenize`, `:process_term`, `:bm25`, `:per_field_analysis`.
 
 `:weights` scales non-exact matches — defaults `{ fuzzy: 0.45, prefix: 0.375 }`,
 so a fuzzy or prefix hit counts for less than an exact one. `:boost_term` takes a
 callable returning a per-*query-term* multiplier (default `1`). `:bm25` tunes the
 BM25+ parameters `k`, `b`, and `d` (defaults `{ k: 1.2, b: 0.7, d: 0.5 }`).
 Defaults can be set once via the constructor's `:search_options`.
+
+### Per-field query analysis
+
+Documents are indexed with each field's own `process_term` rule, so a query term
+meant for one field may need that field's rule to reach the index. Selecting a
+field at search time selects its rule: `":fields" => ["sku"]` analyzes `C-7`
+with the SKU rule, and a derived index term is only looked up in the field that
+produced it.
+
+```ruby
+process_term = lambda do |term, field = nil|
+  case [field, term.downcase]
+  when ["sku", "c-7"]  then "c7"                 # SKU folds C-7 to c7
+  when ["title", "c-7"] then %w[c-7 kit-alias]   # title expands it
+  else term.downcase
+  end
+end
+
+ms = MiniFTS.new(fields: %w[sku title], tokenize: ->(value, *_args) { value.split },
+                 process_term: process_term)
+ms.add_all([
+  { "id" => 1, "sku" => "C-7", "title" => "kit" },
+  { "id" => 2, "sku" => "kit-alias", "title" => "kit" },
+  { "id" => 3, "title" => "kit-alias kit" }
+])
+
+# The default tokenizer splits on punctuation, so `C-7` would become `C` + `7`;
+# split on whitespace to keep it one token.
+ms.search("C-7", fields: ["sku"])                     # => [1]  (only the c7 posting)
+ms.search("C-7 kit", combine_with: "AND")             # => [1, 3]
+```
+
+Coverage is measured per **original** query term: the title rule derives `c-7`
+and `kit-alias` from one `C-7`, and a document matching either (or both) covers
+`C-7` exactly once — so `:query_terms` still lists `["C-7", "kit"]`. Different
+original terms may be covered in different fields, which is what `AND` needs.
+
+Pass `per_field_analysis: true` to force this mode without naming fields, or
+`per_field_analysis: false` to keep the historical single whole-query analysis
+even when `fields:` is given. A search that names neither keeps that single
+analysis, unchanged — the same `process_term.call(term)`, scores, and results.
+Because this only changes how the *query* is read, the index and its
+JavaScript-interchangeable serialization are untouched.
 
 ## Auto-suggestions
 
