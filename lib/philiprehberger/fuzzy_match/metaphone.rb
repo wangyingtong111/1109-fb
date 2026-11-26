@@ -42,7 +42,7 @@ module Philiprehberger
 
       def self.encode_complex(word, i, char, next_char)
         case char
-        when 'B' then next_char == 'B' ? [nil, 1] : ['B', 0]
+        when 'B' then encode_b(word, i)
         when 'C' then encode_c(next_char)
         when 'D' then %w[G J].include?(next_char) ? ['J', 1] : ['T', 0]
         when 'G' then encode_g(word, i, next_char)
@@ -54,6 +54,13 @@ module Philiprehberger
         when 'W', 'Y' then vowel?(next_char) ? [char, 0] : [nil, 0]
         else [nil, 0]
         end
+      end
+
+      def self.encode_b(word, i)
+        return [nil, 0] if i.positive? && word[i - 1] == 'B'
+        return [nil, 0] if i == word.length - 1 && i.positive? && word[i - 1] == 'M'
+
+        ['B', 0]
       end
 
       def self.encode_c(next_char)
@@ -79,7 +86,7 @@ module Philiprehberger
         %w[A E I O U].include?(char)
       end
 
-      private_class_method :drop_initial_silent, :encode_char, :encode_complex, :encode_c, :encode_g, :encode_h, :vowel?
+      private_class_method :drop_initial_silent, :encode_char, :encode_complex, :encode_b, :encode_c, :encode_g, :encode_h, :vowel?
     end
   end
 end
