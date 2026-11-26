@@ -83,7 +83,14 @@ def sentence_gleu(references, hypothesis, min_len=1, max_len=4):
     return corpus_gleu([references], [hypothesis], min_len=min_len, max_len=max_len)
 
 
-def corpus_gleu(list_of_references, hypotheses, min_len=1, max_len=4):
+def corpus_gleu(
+    list_of_references,
+    hypotheses,
+    min_len=1,
+    max_len=4,
+    precise_tie_break=False,
+    **kwargs,
+):
     """
     Calculate a single corpus-level GLEU score (aka. system-level GLEU) for all
     the hypotheses and their respective references.
@@ -131,6 +138,58 @@ def corpus_gleu(list_of_references, hypotheses, min_len=1, max_len=4):
     >>> (score1 + score2) / 2 # doctest: +ELLIPSIS
     0.6144...
 
+    By default, when two references yield the same GLEU ratio, the reference
+    encountered first while traversing ``references`` is kept (because
+    ``max()`` returns the first maximal element), so the corpus score may
+    depend on the order in which the references are listed. Pass
+    ``precise_tie_break=True`` to use an exact, order-independent rule: the
+    ratios ``n_match / n_all`` are compared exactly on the integer counts and,
+    on an exact tie, the reference with the larger denominator ``n_all`` is
+    selected. The per-sentence ``(n_match, n_all)`` counts that were selected
+    are then returned together with the corpus score. The corpus score itself
+    is always the aggregate ``sum(n_match) / sum(n_all)`` over those selected
+    per-sentence counts.
+
+    Unigram-only example where the first sentence has two tied references
+    (contributing 1/2 and 2/4) and the second sentence contributes 2/2:
+
+        >>> hyp1 = ['a', 'b']
+        >>> ref1a = ['a', 'x']               # 1 match out of 2 -> 1/2
+        >>> ref1b = ['a', 'b', 'x', 'y']     # 2 matches out of 4 -> 2/4
+        >>> hyp2 = ['a', 'b']
+        >>> ref2 = ['a', 'b']                # 2 matches out of 2 -> 2/2
+        >>> refs = [[ref1a, ref1b], [ref2]]
+        >>> hyps = [hyp1, hyp2]
+        >>> score, sentence_counts = corpus_gleu(
+        ...     refs, hyps, max_len=1, precise_tie_break=True
+        ... )
+        >>> score  # doctest: +ELLIPSIS
+        0.6666...
+        >>> sentence_counts
+        [(2, 4), (2, 2)]
+
+    Each sentence keeps its own raw counts, so the corpus total is 4/6.
+    Flipping the order of the first sentence's references selects the same
+    counts and therefore gives the same corpus score:
+
+        >>> flipped_refs = [[ref1b, ref1a], [ref2]]
+        >>> score_flipped, counts_flipped = corpus_gleu(
+        ...     flipped_refs, hyps, max_len=1, precise_tie_break=True
+        ... )
+        >>> score_flipped == score
+        True
+        >>> counts_flipped == sentence_counts
+        True
+
+    Without the new rule the original interface is preserved: a bare float is
+    returned, computed with the original reference traversal, which is still
+    sensitive to reference order on ties:
+
+        >>> corpus_gleu(refs, hyps, max_len=1)  # doctest: +ELLIPSIS
+        0.75
+        >>> corpus_gleu(flipped_refs, hyps, max_len=1)  # doctest: +ELLIPSIS
+        0.6666...
+
     :param list_of_references: a list of reference sentences, w.r.t. hypotheses
     :type list_of_references: list(list(list(str)))
     :param hypotheses: a list of hypothesis sentences
@@ -139,9 +198,31 @@ def corpus_gleu(list_of_references, hypotheses, min_len=1, max_len=4):
     :type min_len: int
     :param max_len: The maximum order of n-gram this function should extract.
     :type max_len: int
-    :return: The corpus-level GLEU score.
-    :rtype: float
+    :param precise_tie_break: When ``False`` (default), keep the original
+        reference traversal and return only the corpus-level GLEU score.
+        When ``True``, compare the per-reference GLEU ratios exactly using the
+        integer match counts, break exact ties by choosing the reference with
+        the larger denominator, and return the selected per-sentence counts as
+        well.
+    :type precise_tie_break: bool
+    :return: The corpus-level GLEU score, or a ``(score, sentence_counts)``
+        tuple when ``precise_tie_break=True``, where ``sentence_counts`` is a
+        list of ``(n_match, n_all)`` tuples holding the raw counts selected
+        for each hypothesis (``(0, 0)`` for sentences without any usable
+        reference).
+    :rtype: float or tuple(float, list(tuple(int, int)))
     """
+    # ``exact_tie_break`` is accepted as an alias for ``precise_tie_break``.
+    precise_tie_break = bool(
+        precise_tie_break or kwargs.pop("exact_tie_break", False)
+    )
+    if kwargs:
+        raise TypeError(
+            "Unexpected keyword argument(s): {}".format(
+                ", ".join(sorted(kwargs))
+            )
+        )
+
     # sanity check
     assert len(list_of_references) == len(
         hypotheses
@@ -150,6 +231,11 @@ def corpus_gleu(list_of_references, hypotheses, min_len=1, max_len=4):
     # sum matches and max-token-lengths over all sentences
     corpus_n_match = 0
     corpus_n_all = 0
+
+    # The raw (n_match, n_all) counts selected for each hypothesis. Only
+    # collected when the exact tie-breaking rule is requested so that the
+    # original single-float return interface stays untouched otherwise.
+    sentence_counts = []
 
     for references, hypothesis in zip(list_of_references, hypotheses):
         hyp_ngrams = Counter(everygrams(hypothesis, min_len, max_len))
@@ -177,9 +263,28 @@ def corpus_gleu(list_of_references, hypotheses, min_len=1, max_len=4):
 
         # use the reference yielding the highest score
         if hyp_counts:
-            n_match, n_all = max(hyp_counts, key=lambda hc: hc[0] / hc[1])
+            if precise_tie_break:
+                # Compare the ratios n_match / n_all exactly on the integer
+                # counts via cross multiplication (no floating-point
+                # rounding). On an exact tie keep the reference with the
+                # larger denominator, which makes the choice independent of
+                # the order in which the references are listed.
+                n_match, n_all = hyp_counts[0]
+                for cand_match, cand_all in hyp_counts[1:]:
+                    lhs = cand_match * n_all
+                    rhs = n_match * cand_all
+                    if lhs > rhs or (lhs == rhs and cand_all > n_all):
+                        n_match, n_all = cand_match, cand_all
+            else:
+                n_match, n_all = max(hyp_counts, key=lambda hc: hc[0] / hc[1])
             corpus_n_match += n_match
             corpus_n_all += n_all
+            if precise_tie_break:
+                sentence_counts.append((n_match, n_all))
+        elif precise_tie_break:
+            # No usable reference for this sentence: it contributes nothing
+            # to the aggregate but still gets an entry in the reported counts.
+            sentence_counts.append((0, 0))
 
     # corner case: empty corpus or empty references---don't divide by zero!
     if corpus_n_all == 0:
@@ -187,4 +292,6 @@ def corpus_gleu(list_of_references, hypotheses, min_len=1, max_len=4):
     else:
         gleu_score = corpus_n_match / corpus_n_all
 
+    if precise_tie_break:
+        return gleu_score, sentence_counts
     return gleu_score
