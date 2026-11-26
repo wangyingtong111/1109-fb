@@ -1,6 +1,6 @@
 import unittest
 
-from nltk import RegexpParser
+from nltk import RegexpParser, Tree
 
 
 class TestChunkRule(unittest.TestCase):
@@ -83,3 +83,61 @@ class TestChunkRule(unittest.TestCase):
   (CHUNK Mayor-nominate/NN-TL Ivan/NP Allen/NP Jr./NP)
   ./.)"""
         )
+
+
+class TestRegexpParserColumns(unittest.TestCase):
+    def setUp(self):
+        self.parser = RegexpParser(
+            "NP: {<JJ>?<NN>}\nWrap: {<NP><OLD>}",
+            loop=2,
+        )
+        self.red = ("red", "JJ")
+        self.tea = ("tea", "NN")
+        self.dark = ("dark", "NN")
+
+    def test_tokens_in_one_column_still_chunk(self):
+        result = self.parser.parse_columns([[self.red, self.tea]])
+
+        assert [tree.pformat() for tree in result.trees] == [
+            "(S (NP red/JJ tea/NN))"
+        ]
+        assert result.positions == [(0, 0), (0, 1)]
+
+    def test_chunk_rules_do_not_cross_column_or_empty_column_boundaries(self):
+        columns = [
+            [self.red],
+            [],
+            [self.tea, Tree("OLD", [self.dark])],
+        ]
+
+        result = self.parser.parse_columns(columns)
+
+        assert [tree.pformat() for tree in result.trees] == [
+            "(S red/JJ)",
+            "(S )",
+            "(S (Wrap (NP tea/NN) (OLD dark/NN)))",
+        ]
+        assert result.positions == [(0, 0), (2, 1), (2, 2)]
+        assert [tree.column_index for tree in result.trees] == [0, 1, 2]
+        assert result.trees[2].leaf_positions == [(2, 1), (2, 2)]
+        # The position objects remain tuple-compatible.
+        assert [tuple(position) for position in result.positions] == [
+            (0, 0),
+            (2, 1),
+            (2, 2),
+        ]
+
+    def test_nested_list_input_is_column_aware_but_flat_input_unchanged(self):
+        columns = [[self.red], [], [self.tea]]
+
+        column_result = self.parser.parse(columns)
+        assert column_result.trees[0].pformat() == "(S red/JJ)"
+        assert column_result.trees[2].pformat() == "(S (NP tea/NN))"
+
+        flat_tree = self.parser.parse([self.red, self.tea])
+        assert flat_tree.pformat() == "(S (NP red/JJ tea/NN))"
+
+    def test_columns_keyword_entry_point(self):
+        result = self.parser.parse(columns=[[self.red, self.tea]])
+        assert result.trees[0].pformat() == "(S (NP red/JJ tea/NN))"
+        assert result.positions == [(0, 0), (0, 1)]

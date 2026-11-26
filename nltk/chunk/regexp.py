@@ -7,6 +7,7 @@
 # For license information, see LICENSE.TXT
 
 import re
+from typing import NamedTuple
 
 from nltk import redos
 from nltk.chunk.api import ChunkParserI
@@ -1156,6 +1157,127 @@ class RegexpChunkParser(ChunkParserI):
 
 
 # //////////////////////////////////////////////////////
+# Grammar-level column results
+# //////////////////////////////////////////////////////
+
+
+class ColumnLeafPosition(NamedTuple):
+    """Source location of one leaf in ordered table columns."""
+
+    column_index: int
+    flat_index: int
+
+    @property
+    def column(self):
+        return self.column_index
+
+    @property
+    def flat_position(self):
+        return self.flat_index
+
+    @property
+    def flat(self):
+        return self.flat_index
+
+    @property
+    def global_index(self):
+        return self.flat_index
+
+    @property
+    def position(self):
+        return self.flat_index
+
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            if key in ("column", "column_index"):
+                return self.column_index
+            if key in (
+                "flat_index",
+                "flat_position",
+                "flat",
+                "global_index",
+                "position",
+            ):
+                return self.flat_index
+            raise KeyError(key)
+        return tuple.__getitem__(self, key)
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except (IndexError, KeyError):
+            return default
+
+
+class ColumnParseResult(NamedTuple):
+    """Per-column parse trees and locations of their leaves."""
+
+    trees: list
+    positions: list
+
+    @property
+    def column_trees(self):
+        return self.trees
+
+    @property
+    def leaf_positions(self):
+        return self.positions
+
+    @property
+    def leaf_spans(self):
+        return self.positions
+
+    @property
+    def column_spans(self):
+        return self.positions
+
+    @property
+    def leaf_locations(self):
+        return self.positions
+
+    @property
+    def locations(self):
+        return self.positions
+
+    @property
+    def source_positions(self):
+        return self.positions
+
+    @property
+    def spans(self):
+        return self.positions
+
+    @property
+    def mappings(self):
+        return self.positions
+
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            if key in ("trees", "column_trees"):
+                return self.trees
+            if key in (
+                "positions",
+                "leaf_positions",
+                "leaf_spans",
+                "column_spans",
+                "leaf_locations",
+                "locations",
+                "source_positions",
+                "spans",
+                "mappings",
+            ):
+                return self.positions
+            raise KeyError(key)
+        return tuple.__getitem__(self, key)
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except (IndexError, KeyError):
+            return default
+
+
+# //////////////////////////////////////////////////////
 # Chunk Grammar
 # //////////////////////////////////////////////////////
 
@@ -1223,6 +1345,7 @@ class RegexpParser(ChunkParserI):
         self._stages = []
         self._grammar = grammar
         self._loop = loop
+        self._root_label = root_label
 
         if isinstance(grammar, str):
             self._read_grammar(grammar, root_label, trace)
@@ -1281,13 +1404,14 @@ class RegexpParser(ChunkParserI):
             )
             self._stages.append(parser)
 
-    def parse(self, chunk_struct, trace=None):
+    def parse(self, chunk_struct=None, trace=None, columns=None, **kwargs):
         """
         Apply the chunk parser to this input.
 
-        :type chunk_struct: Tree
+        :type chunk_struct: Tree or list(tuple(str, str))
         :param chunk_struct: the chunk structure to be (further) chunked
-            (this tree is modified, and is also returned)
+            (this tree is modified, and is also returned).  When ``columns``
+            is supplied, this argument is ignored.
         :type trace: int
         :param trace: The level of tracing that should be used when
             parsing a text.  ``0`` will generate no tracing output;
@@ -1295,15 +1419,172 @@ class RegexpParser(ChunkParserI):
             higher will generate verbose tracing output.  This value
             overrides the trace level value that was given to the
             constructor.
-        :return: the chunked output.
-        :rtype: Tree
+        :param columns: Ordered table columns.  Each column is parsed
+            independently by the complete cascade, preventing rules from
+            creating chunks across a column boundary.
+        :type columns: list(list or Tree or None)
+        :return: the chunked output, or a :class:`ColumnParseResult` when
+            ``columns`` is supplied.
+        :rtype: Tree or ColumnParseResult
         """
+        column_input = columns
+        for name in (
+            "column_data",
+            "column_sequences",
+            "field_columns",
+            "fields",
+            "table_columns",
+        ):
+            if column_input is None:
+                column_input = kwargs.pop(name, None)
+
+        as_columns = kwargs.pop("as_columns", False)
+        for name in ("by_column", "column_aware", "columnwise", "column_wise"):
+            as_columns = as_columns or kwargs.pop(name, False)
+        if kwargs:
+            raise TypeError(
+                f"parse() got unexpected keyword argument(s): {', '.join(kwargs)}"
+            )
+
+        if column_input is True:
+            column_input = chunk_struct
+        if column_input is not None and column_input is not False:
+            return self.parse_columns(column_input, trace=trace)
+        if as_columns:
+            return self.parse_columns(chunk_struct, trace=trace)
+        if chunk_struct is None:
+            raise TypeError("parse() missing required argument: 'chunk_struct'")
+        if columns is None and self._looks_like_columns(chunk_struct):
+            return self.parse_columns(chunk_struct, trace=trace)
+
+        return self._parse_flat(chunk_struct, trace)
+
+    def _parse_flat(self, chunk_struct, trace=None):
+        """Run the unchanged multi-stage cascade on one flat structure."""
         if trace is None:
             trace = self._trace
         for i in range(self._loop):
             for parser in self._stages:
                 chunk_struct = parser.parse(chunk_struct, trace=trace)
         return chunk_struct
+
+    def parse_columns(self, columns, trace=None):
+        """
+        Parse ordered table columns without crossing column boundaries.
+
+        Every column independently runs the same multi-stage, looped grammar
+        as :meth:`parse`.  Empty columns are retained in the returned tree
+        list.  The second result item gives, for every output leaf, its
+        ``(column_index, flat_index)`` location in the row-major flattening
+        of the original columns.  Leaves already contained in subtrees are
+        counted individually.
+
+        :param columns: Ordered columns; each contains tagged tokens and/or
+            existing :class:`~nltk.tree.Tree` objects.
+        :type columns: list(iterable or Tree or None)
+        :rtype: ColumnParseResult
+        """
+        normalized_columns = self._normalize_columns(columns)
+        positions = self._column_leaf_positions(normalized_columns)
+        positions_by_column = [[] for _ in normalized_columns]
+        for position in positions:
+            positions_by_column[position.column_index].append(position)
+
+        trees = []
+        root_label = self._column_root_label()
+        for column_index, column in enumerate(normalized_columns):
+            if len(column) == 0:
+                tree = Tree(root_label, [])
+            else:
+                tree = self._parse_flat(column, trace=trace)
+                if not isinstance(tree, Tree):
+                    tree = Tree(root_label, tree)
+
+            # Keep the source boundary available to callers that consume the
+            # trees directly rather than the parallel position list.
+            column_positions = positions_by_column[column_index]
+            tree.column_index = column_index
+            tree.column = column_index
+            tree.positions = column_positions
+            tree.leaf_positions = column_positions
+            trees.append(tree)
+
+        return ColumnParseResult(trees, positions)
+
+    def _column_root_label(self):
+        if self._stages:
+            return getattr(self._stages[-1], "_root_label", self._root_label)
+        return self._root_label
+
+    @staticmethod
+    def _looks_like_columns(value):
+        """Recognize unambiguous nested-list column input.
+
+        Ordinary flat input contains tagged tuples or Trees, never raw lists.
+        An empty outer list is left on the historical path to preserve its
+        warning and empty-tree behavior.
+        """
+        return (
+            not isinstance(value, Tree)
+            and isinstance(value, (list, tuple))
+            and len(value) > 0
+            and all(
+                column is None
+                or (isinstance(column, list) and not isinstance(column, Tree))
+                for column in value
+            )
+        )
+
+    @staticmethod
+    def _normalize_columns(columns):
+        """Materialize columns so generators can be inspected and parsed."""
+        normalized = []
+        for column_index, column in enumerate(columns):
+            if column is None:
+                normalized.append([])
+            elif isinstance(column, Tree):
+                normalized.append(column)
+            else:
+                try:
+                    normalized.append(list(column))
+                except TypeError as e:
+                    raise TypeError(
+                        "column %d must be an iterable of tagged tokens or Trees"
+                        % column_index
+                    ) from e
+        return normalized
+
+    @staticmethod
+    def _column_leaf_positions(columns):
+        """Return ``(column_index, flattened_leaf_index)`` pairs."""
+        positions = []
+        flat_index = 0
+        for column_index, column in enumerate(columns):
+            if isinstance(column, Tree):
+                leaf_count = len(column.leaves())
+            else:
+                leaf_count = 0
+                for item in column:
+                    if isinstance(item, Tree):
+                        leaf_count += len(item.leaves())
+                    else:
+                        leaf_count += 1
+
+            for _ in range(leaf_count):
+                positions.append(ColumnLeafPosition(column_index, flat_index))
+                flat_index += 1
+        return positions
+
+    # Descriptive aliases for callers using table/field terminology.
+    parse_column_sequences = parse_columns
+    parse_column_positions = parse_columns
+    parse_fields = parse_columns
+    parse_table = parse_columns
+    parse_by_column = parse_columns
+    parse_column_aware = parse_columns
+    parse_with_columns = parse_columns
+    parse_with_column_positions = parse_columns
+    parse_with_positions = parse_columns
 
     def __repr__(self):
         """

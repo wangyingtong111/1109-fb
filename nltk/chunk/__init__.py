@@ -154,7 +154,12 @@ zero-length assertions).
 
 from nltk.chunk.api import ChunkParserI
 from nltk.chunk.named_entity import Maxent_NE_Chunker
-from nltk.chunk.regexp import RegexpChunkParser, RegexpParser
+from nltk.chunk.regexp import (
+    ColumnLeafPosition,
+    ColumnParseResult,
+    RegexpChunkParser,
+    RegexpParser,
+)
 from nltk.chunk.util import (
     ChunkScore,
     accuracy,
