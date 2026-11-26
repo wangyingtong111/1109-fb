@@ -181,7 +181,8 @@ Options:
                                   [required]
   -a, --is-asr                    A flag to indicate that model is for ASR.
   -p, --possibly-use-first-token  Use the first token as part of truecase
-                                  training.
+                                  training, counting a lone capitalised word
+                                  card at a tenth of a normal weight.
   -h, --help                      Show this message and exit.
 
 $ sacremoses -j 4 truecase -m big.model < big.txt.tok > big.txt.tok.true

@@ -255,7 +255,9 @@ def normalize_file(
     "-p",
     default=False,
     is_flag=True,
-    help="Use the first token as part of truecasing.",
+    help="Also learn from sentence-initial tokens: a lone capitalised word "
+    "card counts at a tenth of a normal weight, an ordinary sentence-initial "
+    "capital does not count.",
 )
 @processor
 def train_truecaser(
@@ -298,7 +300,8 @@ def train_truecaser(
     "-p",
     default=False,
     is_flag=True,
-    help="Use the first token as part of truecase training.",
+    help="Use the first token as part of truecase training, counting a lone "
+    "capitalised word card at a tenth of a normal weight.",
 )
 @processor
 def truecase_file(

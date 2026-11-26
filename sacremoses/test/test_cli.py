@@ -269,6 +269,29 @@ class TestCliTruecase(CliTestCase):
         self.run_cli(["train-truecase", "-m", modelfile, "-p"], self.TEXT)
         self.assertTrue(model_tokens(modelfile))
 
+    def test_train_truecase_word_card_gets_low_weight(self):
+        """`-p` learns a lone capitalised word card at a tenth of the weight,
+        while an ordinary sentence-initial capital still does not vote."""
+        modelfile = self.path("cards.model")
+        self.run_cli(
+            ["train-truecase", "-m", modelfile, "-p"],
+            "Oak\n<x> Oak </x>\n\nThe cat sat .\n",
+        )
+        with open(modelfile, encoding="utf8") as fin:
+            entries = dict(line.split(None, 1) for line in fin if line.strip())
+        # Two cards at 0.1 each, i.e. 0.2 of mass, all of it surface "Oak".
+        self.assertEqual(entries["Oak"].strip(), "(0.2/0.2)")
+        # "The" is an ordinary capitalised sentence start, so it does not vote;
+        # the rest of that sentence is counted as usual.
+        self.assertNotIn("The", entries)
+        self.assertNotIn("the", entries)
+        self.assertEqual(entries["cat"].strip(), "(1/1)")
+
+    def test_train_truecase_without_option_ignores_word_cards(self):
+        modelfile = self.path("nocards.model")
+        self.run_cli(["train-truecase", "-m", modelfile], "Oak\n<x> Oak </x>\nthe cat sat .\n")
+        self.assertNotIn("Oak", model_tokens(modelfile))
+
     def test_train_truecase_is_asr(self):
         modelfile = self.path("asr.model")
         self.run_cli(["train-truecase", "-m", modelfile, "-a"], self.TEXT)

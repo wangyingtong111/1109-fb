@@ -28,6 +28,13 @@ class MosesTruecaser(object):
     #: a limit on legitimate vocabularies, which sit far below it.
     MAX_MODEL_ENTRIES = 2_000_000
 
+    #: Weight of a "word card": a segment whose only cased word is a single
+    #: capitalised token (`Oak`, `&quot; Oak`, `<x> Oak </x>`). Such a token is
+    #: real casing evidence -- a heading, a vocabulary entry -- but it is also
+    #: indistinguishable from an ordinary sentence-initial capital, so it is
+    #: counted at a tenth of a normal word rather than being dropped outright.
+    SINGLETON_WEIGHT = 0.1
+
     # Perl Unicode Properties character sets.
     Lowercase_Letter = str("".join(perluniprops.chars("Lowercase_Letter")))
     Uppercase_Letter = str("".join(perluniprops.chars("Uppercase_Letter")))
@@ -76,11 +83,19 @@ class MosesTruecaser(object):
         """
         This function checks through each tokens in a sentence and returns the
         appropriate weight of each surface token form.
+
+        :param possibly_use_first_token: When True, sentence-initial tokens are
+            allowed to contribute evidence, under the rules described in
+            `_learn_wordcard_weights()`. When False (the default) they never
+            do, which is the original behaviour.
+        :type possibly_use_first_token: bool
         """
+        if possibly_use_first_token:
+            return self._learn_wordcard_weights(tokens)
         # Keep track of first tokens in the sentence(s) of the line.
         is_first_word = True
         truecase_weights = []
-        for i, token in enumerate(tokens):
+        for token in tokens:
             # Skip XML tags.
             if re.search(r"(<\S[^>]*>)", token):
                 continue
@@ -102,20 +117,86 @@ class MosesTruecaser(object):
             current_word_weight = 0
             if not is_first_word:
                 current_word_weight = 1
-            # Otherwise check whether user wants to optionally
-            # use the first word.
-            elif possibly_use_first_token:
-                # Gated special handling of first word of sentence.
-                # Check if first characer of token is lowercase.
-                if token[0].islower():
-                    current_word_weight = 1
-                elif i == 1:
-                    current_word_weight = 0.1
 
             is_first_word = False
 
             if current_word_weight > 0:
                 truecase_weights.append((token.lower(), token, current_word_weight))
+        return truecase_weights
+
+    def _learn_wordcard_weights(self, tokens):
+        """
+        Weight every cased token of a line, word card included.
+
+        A *word card* is a segment whose only cased token is a single
+        capitalised word -- a heading, a vocabulary entry, or the same entry
+        wrapped in markup, i.e. ``Oak``, ``&quot; Oak`` or ``<x> Oak </x>``.
+        Such a token is genuine casing evidence, but it is surface-identical to
+        an ordinary sentence-initial capital, so it is taken at
+        ``SINGLETON_WEIGHT`` rather than at full weight.
+
+        Everything that carries no case evidence is transparent: XML tags,
+        delayed sentence starters (quotes and brackets), numbers, and
+        punctuation. None of them occupies the sentence-initial slot or splits
+        a segment, so ``&quot; 2 Oak`` and ``Oak`` describe the same card, and
+        a segment of pure digits or punctuation yields no entry at all.
+
+        Each segment ends at a sentence-ending symbol *or* at the end of
+        ``tokens``. Both end a sentence, so one line holding two sentences and
+        the same two sentences on separate lines produce the same weights.
+
+        A capitalised first word of a longer segment is still not evidence:
+        that is what an ordinary sentence start looks like, and the whole point
+        of this mode is that ordinary sentence starts do not vote.
+
+        :returns: a list of ``(lowercase_token, surface_token, weight)``.
+        :rtype: list(tuple(str, str, float))
+        """
+        truecase_weights = []
+        segment = []
+
+        def flush():
+            """Score the cased tokens collected since the last boundary."""
+            if not segment:
+                return  # A pure digit / punctuation / tag segment adds nothing.
+            head, rest = segment[0], segment[1:]
+            if rest:
+                # Only the segment opener is ambiguous. If it is capitalised it
+                # looks exactly like an ordinary sentence start, so it does not
+                # vote; a lowercase opener is real evidence and does.
+                if head[0].islower():
+                    truecase_weights.append((head.lower(), head, 1))
+                truecase_weights.extend((token.lower(), token, 1) for token in rest)
+            elif head[0].isupper():
+                # The whole segment is one capitalised word: a word card.
+                truecase_weights.append((head.lower(), head, self.SINGLETON_WEIGHT))
+            else:
+                # A lone word that does not start with a capital cannot be a
+                # sentence-start capital, so its casing is unambiguous.
+                truecase_weights.append((head.lower(), head, 1))
+            del segment[:]
+
+        for token in tokens:
+            # Skip XML tags: markup is not part of the word.
+            if re.search(r"(<\S[^>]*>)", token):
+                continue
+            # Skip delayed sentence starters (quotes, brackets, entities):
+            # they do not consume the sentence-initial slot.
+            if token in self.DELAYED_SENT_START:
+                continue
+            # A sentence-ending symbol closes the current segment.
+            if token in self.SENT_END:
+                flush()
+                continue
+            # Skip tokens with nothing to case, i.e. bare numbers and
+            # punctuation; they never become a word card.
+            if not self.SKIP_LETTERS_REGEX.search(token):
+                continue
+            segment.append(token)
+
+        # The end of the line ends a sentence too, which is what makes training
+        # independent of where the caller chose to break the input into lines.
+        flush()
         return truecase_weights
 
     def _train(
@@ -131,11 +212,18 @@ class MosesTruecaser(object):
                           the inner list is the list of tokens for each sentence.
         :type document_iterator: iter(list(str))
 
-        :param possibly_use_first_token: When True, on the basis that the first
-            word of a sentence is always capitalized; if this option is provided then:
-            a) if a sentence-initial token is *not* capitalized, then it is counted, and
-            b) if a capitalized sentence-initial token is the only token of the segment,
-               then it is counted, but with only 10% of the weight of a normal token.
+        :param possibly_use_first_token: When True, allow sentence-initial
+            tokens to contribute evidence, treating a *word card* -- a segment
+            whose only cased word is a single capitalised token, e.g. ``Oak``,
+            ``&quot; Oak`` or ``<x> Oak </x>`` -- as a low-weight sample, while
+            an ordinary capitalised sentence start still does not count. Tags,
+            quotes and numbers are transparent: they neither take the
+            sentence-initial slot nor split a segment. Each document is scored
+            as an independent sentence list, so splitting sentences over more
+            lines does not change the statistics. A segment of pure digits or
+            punctuation contributes no entry. When False (the default) the
+            original rule applies unchanged: a sentence-initial token is never
+            counted, unless it is *not* capitalised.
         :type possibly_use_first_token: bool
 
         :returns: A dictionary of the best, known objects as values from `_casing_to_model()`
