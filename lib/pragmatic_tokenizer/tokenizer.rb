@@ -42,6 +42,7 @@ module PragmaticTokenizer
       # Numbers 'semi': Removes tokens that include only digits
       # Numbers 'none': Removes all tokens that include a number from the result (including Roman numerals)
       # Numbers 'only': Removes everything except tokens that include a number
+    # @option opts [Boolean] :strict_roman_numerals - (default: false) when true, Roman numerals are identified by their original (pre-downcase, HTML-unescaped) form and only fully uppercase standalone tokens using standard notation for 1 through 3999 (e.g. "IX", but not "ix" or the non-standard "IIII") count as Roman numerals. The surviving tokens can still be downcased via the :downcase option. When false (default) Roman numerals continue to be matched case-insensitively.
     # @option opts [Integer] :minimum_length - minimum length of the token in characters
     # @option opts [Integer] :long_word_split - the specified length to split long words at any hyphen or underscore.
     # @option opts [String] :mentions - :remove (will completely remove it), :keep_and_clean (will prefix) and :keep_original (don't alter the token at all). - can be a String or symbol (i.e. :keep_and_clean or 'keep_and_clean')
@@ -72,6 +73,7 @@ module PragmaticTokenizer
       @remove_emails       = opts[:remove_emails]
       @remove_urls         = opts[:remove_urls]
       @remove_domains      = opts[:remove_domains]
+      @strict_roman_numerals = opts[:strict_roman_numerals]
       @contractions        = opts[:contractions] || {}
       @abbreviations       = Set.new(opts[:abbreviations])
       @stop_words          = Set.new(opts[:stop_words])
@@ -114,6 +116,9 @@ module PragmaticTokenizer
         pre_processed = pre_process(segment)
         cased_segment = chosen_case(pre_processed)
         @tokens       = PostProcessor.new(text: cased_segment, abbreviations: @abbreviations, downcase: @downcase).call
+        if @strict_roman_numerals
+          @original_tokens = PostProcessor.new(text: pre_processed, abbreviations: @abbreviations, downcase: false).call
+        end
         post_process_tokens
       end
 
@@ -124,8 +129,8 @@ module PragmaticTokenizer
       end
 
       def post_process_tokens
-        remove_by_options!
         process_numbers!
+        remove_by_options!
         process_punctuation!
         expand_contractions! if @expand_contractions
         clean!               if @clean
@@ -182,13 +187,40 @@ module PragmaticTokenizer
       end
 
       def process_numbers!
+        if @strict_roman_numerals
+          process_strict_numbers!
+        else
+          case @numbers
+          when :semi
+            @tokens.delete_if { |token| token =~ Regex::ONLY_DECIMALS }
+          when :none
+            @tokens.delete_if { |token| token =~ Regex::NO_DECIMALS_NO_NUMERALS }
+          when :only
+            @tokens.delete_if { |token| token =~ Regex::NO_DECIMALS }
+          end
+        end
+      end
+
+      def process_strict_numbers!
+        @tokens = @tokens.each_index.reject { |index| strict_number_token?(index) }.map { |index| @tokens[index] }
+      ensure
+        @original_tokens = nil
+      end
+
+      def strict_number_token?(index)
+        token           = @tokens[index]
+        original_token  = @original_tokens[index]
+        roman_numeral   = original_token =~ Regex::STRICT_ROMAN_NUMERALS
+        has_decimal     = token =~ Regex::ALSO_DECIMALS
         case @numbers
         when :semi
-          @tokens.delete_if { |token| token =~ Regex::ONLY_DECIMALS }
+          token =~ Regex::ONLY_DECIMALS
         when :none
-          @tokens.delete_if { |token| token =~ Regex::NO_DECIMALS_NO_NUMERALS }
+          has_decimal || roman_numeral
         when :only
-          @tokens.delete_if { |token| token =~ Regex::NO_DECIMALS }
+          !(has_decimal || roman_numeral)
+        else
+          false
         end
       end
 

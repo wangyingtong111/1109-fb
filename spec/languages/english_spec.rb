@@ -815,6 +815,89 @@ describe PragmaticTokenizer do
           )
           expect(pt.tokenize(text)).to eq(["remove", "roman", "numerals", "and", ".", "with", "a", "period", "."])
         end
+
+        context 'with strict_roman_numerals: true' do
+          it 'only treats standard uppercase Roman numerals (1-3999) as numerals with numbers: :none' do
+            text = "mix IX IIII"
+            pt = PragmaticTokenizer::Tokenizer.new(
+                numbers: :none,
+                strict_roman_numerals: true
+            )
+            expect(pt.tokenize(text)).to eq(["mix", "iiii"])
+          end
+
+          it 'identifies bracketed and HTML-entity-decoded uppercase Roman numerals with numbers: :only' do
+            text = "mix (IX) &#73;&#88; IIII 23 X-99"
+            pt = PragmaticTokenizer::Tokenizer.new(
+                numbers: :only,
+                strict_roman_numerals: true
+            )
+            expect(pt.tokenize(text)).to eq(["ix", "ix", "23", "x-99"])
+          end
+
+          it 'keeps Roman numerals in their original case when downcase is false' do
+            text = "mix (IX) &#73;&#88; IIII 23"
+            pt = PragmaticTokenizer::Tokenizer.new(
+                numbers: :only,
+                downcase: false,
+                strict_roman_numerals: true
+            )
+            expect(pt.tokenize(text)).to eq(["IX", "IX", "23"])
+          end
+
+          it 'does not treat lowercase or non-standard forms as Roman numerals with numbers: :none' do
+            text = "mix ix IIII vv"
+            pt = PragmaticTokenizer::Tokenizer.new(
+                numbers: :none,
+                strict_roman_numerals: true
+            )
+            expect(pt.tokenize(text)).to eq(["mix", "ix", "iiii", "vv"])
+          end
+
+          it 'still removes tokens containing Arabic digits with numbers: :none' do
+            text = "2pac U2 50cent blink-182 $500 zero7 M83 B-52s 500 mix IX"
+            pt = PragmaticTokenizer::Tokenizer.new(
+                numbers: :none,
+                strict_roman_numerals: true
+            )
+            expect(pt.tokenize(text)).to eq(["mix"])
+          end
+
+          it 'only removes all-digit tokens with numbers: :semi' do
+            text = "500 2pac IX iiii"
+            pt = PragmaticTokenizer::Tokenizer.new(
+                numbers: :semi,
+                strict_roman_numerals: true
+            )
+            expect(pt.tokenize(text)).to eq(["2pac", "ix", "iiii"])
+          end
+
+          it 'keeps everything with numbers: :all' do
+            text = "500 IX iiii mix"
+            pt = PragmaticTokenizer::Tokenizer.new(
+                numbers: :all,
+                strict_roman_numerals: true
+            )
+            expect(pt.tokenize(text)).to eq(["500", "ix", "iiii", "mix"])
+          end
+
+          it 'respects the 1 to 3999 range with numbers: :none' do
+            text = "MMMCMXCIX MMMM mix"
+            pt = PragmaticTokenizer::Tokenizer.new(
+                numbers: :none,
+                strict_roman_numerals: true
+            )
+            expect(pt.tokenize(text)).to eq(["mmmm", "mix"])
+          end
+        end
+
+        it 'keeps the case-insensitive Roman numeral judgment when strict_roman_numerals is not enabled' do
+          text = "number iv VI III"
+          pt = PragmaticTokenizer::Tokenizer.new(
+              numbers: :none
+          )
+          expect(pt.tokenize(text)).to eq(["number"])
+        end
       end
 
       context 'option (minimum_length)' do

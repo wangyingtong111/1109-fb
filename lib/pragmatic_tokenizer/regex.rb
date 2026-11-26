@@ -98,6 +98,7 @@ module PragmaticTokenizer
     NO_DECIMALS                   = /(?:^\D+$)/
     ONLY_PUNCTUATION              = /^[[[:punct:]]^|+]+$/
     ONLY_ROMAN_NUMERALS           = /^(?=[MDCLXVI])M*(C[MD]|D?C*)(X[CL]|L?X*)(I[XV]|V?I*)$/i
+    STRICT_ROMAN_NUMERALS         = /^M{0,3}(?:CM|CD|D?C{0,3})(?:XC|XL|L?X{0,3})(?:IX|IV|V?I{0,3})$/
     ONLY_EMAIL                    = /^#{EMAIL}$/
     ONLY_HASHTAG_MENTION          = /^#{HASHTAG_OR_MENTION}$/
     ONLY_HASHTAG                  = /^#{HASHTAG}$/

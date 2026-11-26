@@ -43,6 +43,7 @@ options = {
   filter_languages:    [:en, :de], # process abbreviations, contractions and stop words for this array of languages
   punctuation:         :none, # see below for more details
   numbers:             :none, # see below for more details
+  strict_roman_numerals: true, # recognize only standard uppercase 1-3999 Roman numerals (see below for more details)
   remove_emoji:        :true, # remove any emoji tokens
   remove_urls:         :true, # remove any urls
   remove_emails:       :true, # remove any emails
@@ -130,6 +131,15 @@ options = {
   Removes all tokens that include a number from the result (including Roman numerals)
 - `:only`  
   Removes everything except tokens that include a number
+
+<hr>
+
+##### `strict_roman_numerals`
+  **default** = `false`
+- `true`  
+  Roman numerals are identified by their original word form (after HTML entities have been unescaped, before any downcasing). Only fully uppercase standalone tokens written in standard notation for 1 through 3999 count as Roman numerals (e.g. `IX` and `MCMXCVIII`, but not `ix`, `IIII`, or `MMMM`). The surviving tokens can still be returned downcased via the `downcase` option. The Arabic digit behavior of the `numbers` option is unchanged.
+- `false`   
+  Roman numerals continue to be matched case-insensitively (the default behavior).
 
 <hr>
 
