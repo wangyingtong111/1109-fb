@@ -53,6 +53,14 @@ import jiwer
     help="Compute CER instead of WER.",
 )
 @click.option(
+    "--graphemes",
+    "--grapheme-clusters",
+    "grapheme_clusters",
+    is_flag=True,
+    default=False,
+    help="For CER, count Unicode extended grapheme clusters instead of code points.",
+)
+@click.option(
     "--align",
     "-a",
     "show_alignment",
@@ -73,6 +81,7 @@ def cli(
     reference_file: pathlib.Path,
     hypothesis_file: pathlib.Path,
     compute_cer: bool,
+    grapheme_clusters: bool,
     show_alignment: bool,
     global_alignment: bool,
 ):
@@ -108,16 +117,23 @@ def cli(
 
     if compute_cer:
         if global_alignment:
+            contiguous_transform = (
+                jiwer.cer_grapheme_contiguous
+                if grapheme_clusters
+                else jiwer.cer_contiguous
+            )
             out = jiwer.process_characters(
                 reference_sentences,
                 hypothesis_sentences,
-                reference_transform=jiwer.cer_contiguous,
-                hypothesis_transform=jiwer.cer_contiguous,
+                reference_transform=contiguous_transform,
+                hypothesis_transform=contiguous_transform,
+                grapheme_clusters=grapheme_clusters,
             )
         else:
             out = jiwer.process_characters(
                 reference_sentences,
                 hypothesis_sentences,
+                grapheme_clusters=grapheme_clusters,
             )
     else:
         if global_alignment:

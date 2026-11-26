@@ -28,6 +28,10 @@ import jiwer.transforms as tr
 __all__ = [
     "cer_contiguous",
     "cer_default",
+    "cer_grapheme",
+    "cer_grapheme_contiguous",
+    "cer_grapheme_default",
+    "grapheme_default",
     "wer_contiguous",
     "wer_default",
     "wer_standardize",
@@ -111,9 +115,34 @@ cer_default = tr.Compose(
 )
 """
 This is the default transformation when using `process_characters`. Each input string
-will  have its leading and tailing white space removed. Then each string is 
-transformed into a list with lists of strings, where each string is a single character. 
+will  have its leading and tailing white space removed. Then each string is
+transformed into a list with lists of strings, where each string is a single character.
 """
+
+cer_grapheme_default = tr.Compose(
+    [
+        tr.Strip(),
+        tr.ReduceToListOfListOfGraphemes(normalize="NFC"),
+    ]
+)
+"""
+Character-error-rate transformation that compares Unicode extended grapheme clusters.
+Leading and trailing whitespace is stripped as in `cer_default`; canonical equivalents
+are NFC-normalized for comparison while source spans retain original code-point indices.
+"""
+
+# Concise aliases for callers that prefer the `cer_grapheme` naming.
+cer_grapheme = cer_grapheme_default
+grapheme_default = cer_grapheme_default
+
+cer_grapheme_contiguous = tr.Compose(
+    [
+        tr.Strip(),
+        tr.ReduceToSingleSentence(),
+        tr.ReduceToListOfListOfGraphemes(normalize="NFC"),
+    ]
+)
+"""Grapheme-cluster equivalent of `cer_contiguous`."""
 
 cer_contiguous = tr.Compose(
     [

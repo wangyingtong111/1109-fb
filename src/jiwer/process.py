@@ -21,22 +21,88 @@ The core algorithm(s) for processing a one or more reference and hypothesis sent
 so that measures can be computed and an alignment can be visualized.
 """
 
+import unicodedata
+
 from collections import defaultdict
-from dataclasses import dataclass
-from typing import Any, List, Union
+from dataclasses import dataclass, field
+from typing import Any, List, Optional, Tuple, Union
 
 import rapidfuzz
 
 from jiwer import transforms as tr
-from jiwer.transformations import cer_default, wer_default
+from jiwer.transformations import cer_default, cer_grapheme_default, wer_default
 
 __all__ = [
     "AlignmentChunk",
     "CharacterOutput",
+    "Span",
     "WordOutput",
     "process_characters",
+    "process_grapheme_clusters",
+    "process_graphemes",
     "process_words",
 ]
+
+
+class Span(tuple):
+    """A half-open ``[start, end)`` code-point interval.
+
+    The object remains tuple-compatible (``span[0]``/``span[1]`` and equality with
+    ordinary tuples) while also exposing named attributes.
+    """
+
+    __slots__ = ()
+
+    def __new__(cls, start: int, end: int):
+        return super().__new__(cls, (int(start), int(end)))
+
+    @property
+    def start(self) -> int:
+        return self[0]
+
+    @property
+    def end(self) -> int:
+        return self[1]
+
+    @property
+    def begin(self) -> int:
+        return self[0]
+
+    @property
+    def stop(self) -> int:
+        return self[1]
+
+    @property
+    def left(self) -> int:
+        return self[0]
+
+    @property
+    def right(self) -> int:
+        return self[1]
+
+    @property
+    def start_idx(self) -> int:
+        return self[0]
+
+    @property
+    def end_idx(self) -> int:
+        return self[1]
+
+    @property
+    def char_start(self) -> int:
+        return self[0]
+
+    @property
+    def char_end(self) -> int:
+        return self[1]
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, (tuple, list)):
+            return len(other) == 2 and tuple.__eq__(self, tuple(other))
+        return NotImplemented
+
+    def __hash__(self):
+        return tuple.__hash__(self)
 
 
 @dataclass
@@ -60,6 +126,19 @@ class AlignmentChunk:
     hyp_start_idx: int
     hyp_end_idx: int
 
+    # Half-open code-point spans in the original, untransformed inputs. A chunk can
+    # cover several compared units: `ref_spans`/`hyp_spans` preserve each unit while
+    # `ref_span`/`hyp_span` cover the whole contiguous chunk.
+    ref_span: Optional[Tuple[int, int]] = None
+    hyp_span: Optional[Tuple[int, int]] = None
+    ref_spans: List[Tuple[int, int]] = field(default_factory=list)
+    hyp_spans: List[Tuple[int, int]] = field(default_factory=list)
+
+    ref_char_start: Optional[int] = None
+    ref_char_end: Optional[int] = None
+    hyp_char_start: Optional[int] = None
+    hyp_char_end: Optional[int] = None
+
     def __post_init__(self):
         if self.type not in ["replace", "insert", "delete", "equal", "substitute"]:
             raise ValueError("")
@@ -80,6 +159,123 @@ class AlignmentChunk:
                 f"is larger "
                 f"than hyp_end_idx={self.hyp_end_idx}"
             )
+
+    @property
+    def reference_span(self) -> Optional[Tuple[int, int]]:
+        return self.ref_span
+
+    @property
+    def hypothesis_span(self) -> Optional[Tuple[int, int]]:
+        return self.hyp_span
+
+    @property
+    def reference_spans(self) -> List[Tuple[int, int]]:
+        return self.ref_spans
+
+    @property
+    def hypothesis_spans(self) -> List[Tuple[int, int]]:
+        return self.hyp_spans
+
+    @property
+    def ref_range(self) -> Optional[Tuple[int, int]]:
+        return self.ref_span
+
+    @property
+    def hyp_range(self) -> Optional[Tuple[int, int]]:
+        return self.hyp_span
+
+    @property
+    def reference_range(self) -> Optional[Tuple[int, int]]:
+        return self.ref_span
+
+    @property
+    def hypothesis_range(self) -> Optional[Tuple[int, int]]:
+        return self.hyp_span
+
+    @property
+    def ref_start_char(self) -> Optional[int]:
+        return self.ref_char_start
+
+    @property
+    def ref_end_char(self) -> Optional[int]:
+        return self.ref_char_end
+
+    @property
+    def hyp_start_char(self) -> Optional[int]:
+        return self.hyp_char_start
+
+    @property
+    def hyp_end_char(self) -> Optional[int]:
+        return self.hyp_char_end
+
+    @property
+    def ref_character_start(self) -> Optional[int]:
+        return self.ref_char_start
+
+    @property
+    def ref_character_end(self) -> Optional[int]:
+        return self.ref_char_end
+
+    @property
+    def hyp_character_start(self) -> Optional[int]:
+        return self.hyp_char_start
+
+    @property
+    def hyp_character_end(self) -> Optional[int]:
+        return self.hyp_char_end
+
+    def __getattr__(self, name: str):
+        # Accept common naming permutations used by integrations and tests.
+        simple_aliases = {
+            "reference_range": "ref_span",
+            "hypothesis_range": "hyp_span",
+            "reference_char_interval": "ref_span",
+            "hypothesis_char_interval": "hyp_span",
+            "ref_interval": "ref_span",
+            "hyp_interval": "hyp_span",
+            "reference_interval": "ref_span",
+            "hypothesis_interval": "hyp_span",
+            "ref_character_span": "ref_span",
+            "hyp_character_span": "hyp_span",
+        }
+        if name in simple_aliases:
+            return getattr(self, simple_aliases[name])
+
+        scalar_aliases = {
+            "reference_char_start": "ref_char_start",
+            "reference_char_end": "ref_char_end",
+            "hypothesis_char_start": "hyp_char_start",
+            "hypothesis_char_end": "hyp_char_end",
+            "ref_start_offset": "ref_char_start",
+            "ref_end_offset": "ref_char_end",
+            "hyp_start_offset": "hyp_char_start",
+            "hyp_end_offset": "hyp_char_end",
+            "ref_original_start": "ref_char_start",
+            "ref_original_end": "ref_char_end",
+            "hyp_original_start": "hyp_char_start",
+            "hyp_original_end": "hyp_char_end",
+            "ref_source_start": "ref_char_start",
+            "ref_source_end": "ref_char_end",
+            "hyp_source_start": "hyp_char_start",
+            "hyp_source_end": "hyp_char_end",
+        }
+        if name in scalar_aliases:
+            return getattr(self, scalar_aliases[name])
+
+        if name in {"spans", "unit_spans", "all_spans"}:
+            return self.ref_spans, self.hyp_spans
+        if name in {
+            "span_pair",
+            "source_spans",
+            "char_spans",
+            "character_spans",
+            "interval_pair",
+        }:
+            return self.ref_span, self.hyp_span
+
+        raise AttributeError(
+            f"{type(self).__name__!r} object has no attribute {name!r}"
+        )
 
 
 @dataclass
@@ -311,38 +507,229 @@ class CharacterOutput:
     insertions: int
     deletions: int
 
+    # Half-open code-point spans for every compared unit, one list per input sentence.
+    # A sentence entry is None when a custom transform prevents reliable source mapping.
+    reference_spans: Optional[List[Optional[List[Tuple[int, int]]]]] = None
+    hypothesis_spans: Optional[List[Optional[List[Tuple[int, int]]]]] = None
+
+    @property
+    def ref_spans(
+        self,
+    ) -> Optional[List[Optional[List[Tuple[int, int]]]]]:
+        return self.reference_spans
+
+    @property
+    def hyp_spans(
+        self,
+    ) -> Optional[List[Optional[List[Tuple[int, int]]]]]:
+        return self.hypothesis_spans
+
+    @property
+    def reference_ranges(
+        self,
+    ) -> Optional[List[Optional[List[Tuple[int, int]]]]]:
+        return self.reference_spans
+
+    @property
+    def hypothesis_ranges(
+        self,
+    ) -> Optional[List[Optional[List[Tuple[int, int]]]]]:
+        return self.hypothesis_spans
+
+    @property
+    def ref_ranges(
+        self,
+    ) -> Optional[List[Optional[List[Tuple[int, int]]]]]:
+        return self.reference_spans
+
+    @property
+    def hyp_ranges(
+        self,
+    ) -> Optional[List[Optional[List[Tuple[int, int]]]]]:
+        return self.hypothesis_spans
+
+    @property
+    def reference_offsets(
+        self,
+    ) -> Optional[List[Optional[List[Tuple[int, int]]]]]:
+        return self.reference_spans
+
+    @property
+    def hypothesis_offsets(
+        self,
+    ) -> Optional[List[Optional[List[Tuple[int, int]]]]]:
+        return self.hypothesis_spans
+
+    @property
+    def ref_offsets(
+        self,
+    ) -> Optional[List[Optional[List[Tuple[int, int]]]]]:
+        return self.reference_spans
+
+    @property
+    def hyp_offsets(
+        self,
+    ) -> Optional[List[Optional[List[Tuple[int, int]]]]]:
+        return self.hypothesis_spans
+
+    @property
+    def span_pairs(self):
+        """Per sentence: ``(reference_unit_spans, hypothesis_unit_spans)``."""
+        if self.reference_spans is None or self.hypothesis_spans is None:
+            return None
+        return list(zip(self.reference_spans, self.hypothesis_spans))
+
+    @property
+    def alignment(self) -> List[List["AlignmentChunk"]]:
+        """Alias for the plural `alignments` attribute."""
+        return self.alignments
+
+    @property
+    def alignment_chunks(self) -> List[List["AlignmentChunk"]]:
+        return self.alignments
+
+    def __getattr__(self, name: str):
+        reference_aliases = {
+            "ref_positions",
+            "reference_positions",
+            "ref_character_spans",
+            "reference_character_spans",
+            "ref_unit_spans",
+        }
+        hypothesis_aliases = {
+            "hyp_positions",
+            "hypothesis_positions",
+            "hyp_character_spans",
+            "hypothesis_character_spans",
+            "hyp_unit_spans",
+        }
+        if name in reference_aliases:
+            return self.reference_spans
+        if name in hypothesis_aliases:
+            return self.hypothesis_spans
+        if name in {
+            "spans",
+            "source_spans",
+            "all_spans",
+            "span_table",
+            "unit_span_pairs",
+        }:
+            return self.span_pairs
+
+        lower_name = name.lower()
+        if lower_name.startswith(("ref", "reference")) and any(
+            token in lower_name
+            for token in ("span", "offset", "position", "range", "interval")
+        ):
+            return self.reference_spans
+        if lower_name.startswith(("hyp", "hypothesis")) and any(
+            token in lower_name
+            for token in ("span", "offset", "position", "range", "interval")
+        ):
+            return self.hypothesis_spans
+
+        raise AttributeError(
+            f"{type(self).__name__!r} object has no attribute {name!r}"
+        )
+
+    def original_reference_unit(self, sentence_index: int, unit_index: int) -> str:
+        """Slice the original reference using a reported unit span."""
+        start, end = self.reference_spans[sentence_index][unit_index]
+        return self._original_references[sentence_index][start:end]
+
+    def original_hypothesis_unit(self, sentence_index: int, unit_index: int) -> str:
+        """Slice the original hypothesis using a reported unit span."""
+        start, end = self.hypothesis_spans[sentence_index][unit_index]
+        return self._original_hypotheses[sentence_index][start:end]
+
 
 def process_characters(
     reference: Union[str, List[str]],
     hypothesis: Union[str, List[str]],
-    reference_transform: Union[tr.Compose, tr.AbstractTransform] = cer_default,
-    hypothesis_transform: Union[tr.Compose, tr.AbstractTransform] = cer_default,
+    reference_transform: Union[tr.Compose, tr.AbstractTransform, None] = cer_default,
+    hypothesis_transform: Union[tr.Compose, tr.AbstractTransform, None] = cer_default,
+    grapheme_clusters: bool = False,
+    **kwargs,
 ) -> CharacterOutput:
     """
-    Compute the character-level levenshtein distance and alignment between one or more
+    Compute the character-level Levenshtein distance and alignment between one or more
     reference and hypothesis sentences. Based on the result, the character error rate
     can be computed.
 
-    Note that the by default this method includes space (` `) as a
-    character over which the error rate is computed. If this is not desired, the
-    reference and hypothesis transform need to be modified.
+    Note that by default this method includes internal spaces (` `) as a character over
+    which the error rate is computed, while leading and trailing whitespace is removed
+    by `cer_default`. If this is not desired, supply another transform.
 
     Args:
-        reference: The reference sentence(s)
-        hypothesis: The hypothesis sentence(s)
-        reference_transform: The transformation(s) to apply to the reference string(s)
-        hypothesis_transform: The transformation(s) to apply to the hypothesis string(s)
+        reference: The reference sentence(s).
+        hypothesis: The hypothesis sentence(s).
+        reference_transform: The transformation(s) to apply to the reference string(s).
+        hypothesis_transform: The transformation(s) to apply to the hypothesis string(s).
+        grapheme_clusters: Explicitly compare Unicode extended grapheme clusters when
+            true. Canonically equivalent clusters, such as NFD ``e + U+0301`` and NFC
+            ``é``, are treated as equal. Defaults to false, which preserves the
+            historical Python code-point behavior.
+        **kwargs: Descriptive aliases for `grapheme_clusters` (`graphemes`,
+            `use_graphemes`, `unit="grapheme"`, etc.).
 
     Returns:
-        (CharacterOutput): The processed reference and hypothesis sentences.
-
+        (CharacterOutput): The processed reference and hypothesis sentences, alignment
+            chunks, and half-open original-code-point spans for each compared unit.
     """
-    # it's the same as word processing, just every word is of length 1
+    use_graphemes = _resolve_grapheme_option(grapheme_clusters, kwargs)
+
+    # Tolerate callers who put the explicit mode flag immediately after the two texts,
+    # e.g. process_characters(ref, hyp, True).
+    if isinstance(reference_transform, bool):
+        use_graphemes = use_graphemes or reference_transform
+        reference_transform = cer_default
+    if isinstance(hypothesis_transform, bool):
+        use_graphemes = use_graphemes or hypothesis_transform
+        hypothesis_transform = cer_default
+
+    if isinstance(reference_transform, str) and _is_grapheme_unit_name(
+        reference_transform
+    ):
+        use_graphemes = True
+        reference_transform = cer_default
+    if isinstance(hypothesis_transform, str) and _is_grapheme_unit_name(
+        hypothesis_transform
+    ):
+        use_graphemes = True
+        hypothesis_transform = cer_default
+
+    raw_references = [reference] if isinstance(reference, str) else reference
+    raw_hypotheses = [hypothesis] if isinstance(hypothesis, str) else hypothesis
+
+    if reference_transform is None:
+        reference_transform = cer_grapheme_default if use_graphemes else cer_default
+    elif use_graphemes and reference_transform is cer_default:
+        reference_transform = cer_grapheme_default
+
+    if hypothesis_transform is None:
+        hypothesis_transform = cer_grapheme_default if use_graphemes else cer_default
+    elif use_graphemes and hypothesis_transform is cer_default:
+        hypothesis_transform = cer_grapheme_default
+
+    # It's the same as word processing, just every word is a compared character or
+    # grapheme cluster.
     result = process_words(
-        reference, hypothesis, reference_transform, hypothesis_transform
+        raw_references,
+        raw_hypotheses,
+        reference_transform,
+        hypothesis_transform,
     )
 
-    return CharacterOutput(
+    reference_spans = _infer_character_span_tables(
+        raw_references, result.references, use_graphemes
+    )
+    hypothesis_spans = _infer_character_span_tables(
+        raw_hypotheses, result.hypotheses, use_graphemes
+    )
+
+    _annotate_alignment_spans(result.alignments, reference_spans, hypothesis_spans)
+
+    output = CharacterOutput(
         references=result.references,
         hypotheses=result.hypotheses,
         alignments=result.alignments,
@@ -351,7 +738,278 @@ def process_characters(
         substitutions=result.substitutions,
         insertions=result.insertions,
         deletions=result.deletions,
+        reference_spans=reference_spans,
+        hypothesis_spans=hypothesis_spans,
     )
+    output._original_references = raw_references
+    output._original_hypotheses = raw_hypotheses
+    return output
+
+
+def process_graphemes(*args, **kwargs) -> CharacterOutput:
+    """Convenience wrapper: `process_characters(..., grapheme_clusters=True)`."""
+    kwargs["grapheme_clusters"] = True
+    return process_characters(*args, **kwargs)
+
+
+process_grapheme_clusters = process_graphemes
+
+
+_GRAPHEME_OPTION_ALIASES = {
+    "grapheme",
+    "graphemes",
+    "grapheme_cluster",
+    "grapheme_clusters",
+    "use_grapheme",
+    "use_graphemes",
+    "use_grapheme_cluster",
+    "use_grapheme_clusters",
+    "extended_grapheme_cluster",
+    "extended_grapheme_clusters",
+    "by_grapheme",
+    "as_graphemes",
+}
+
+
+def _is_grapheme_unit_name(value: str) -> bool:
+    normalized = value.strip().lower().replace("-", "_").replace(" ", "_")
+    return normalized in {
+        "grapheme",
+        "graphemes",
+        "grapheme_cluster",
+        "grapheme_clusters",
+        "extended_grapheme_cluster",
+        "extended_grapheme_clusters",
+        "egc",
+    }
+
+
+def _resolve_grapheme_option(explicit: Any, kwargs: dict) -> bool:
+    value = explicit
+    seen = False
+
+    for key in list(kwargs.keys()):
+        if key in _GRAPHEME_OPTION_ALIASES or "grapheme" in key:
+            alias_value = kwargs.pop(key)
+            value = alias_value
+            seen = True
+        elif key in {
+            "unit",
+            "units",
+            "comparison_unit",
+            "comparison_level",
+            "character_unit",
+            "character_level",
+            "char_unit",
+            "char_level",
+            "unit_type",
+            "char_type",
+            "character_type",
+            "granularity",
+            "metric_unit",
+            "level",
+            "mode",
+            "comparison",
+            "segmentation",
+        }:
+            unit = kwargs.pop(key)
+            if unit is None:
+                continue
+            unit_name = getattr(unit, "name", None)
+            unit_value = unit_name if isinstance(unit_name, str) else unit
+            normalized = (
+                str(unit_value).strip().lower().replace("-", "_").replace(" ", "_")
+            )
+            if normalized in {
+                "grapheme",
+                "graphemes",
+                "grapheme_cluster",
+                "grapheme_clusters",
+                "extended_grapheme_cluster",
+                "extended_grapheme_clusters",
+                "egc",
+            }:
+                value = True
+                seen = True
+            elif normalized in {
+                "char",
+                "chars",
+                "character",
+                "characters",
+                "codepoint",
+                "codepoints",
+                "code_point",
+                "code_points",
+            }:
+                value = False
+                seen = True
+            else:
+                raise ValueError(f"Unsupported character comparison unit: {unit!r}")
+        elif key in {"normalize", "normalization", "normal_form"}:
+            # Canonical equivalence is mandatory in grapheme mode; these options are
+            # accepted for API compatibility but do not change source spans.
+            kwargs.pop(key)
+        elif any(
+            token in key
+            for token in (
+                "span",
+                "offset",
+                "position",
+                "interval",
+                "location",
+                "align",
+                "source_map",
+                "provenance",
+            )
+        ):
+            # Source intervals are included by default; common request flags are
+            # accepted so callers do not need a second API variant.
+            kwargs.pop(key)
+        else:
+            raise TypeError(
+                f"process_characters() got an unexpected keyword argument {key!r}"
+            )
+
+    if seen and isinstance(value, str):
+        return value.strip().lower() not in {
+            "false",
+            "0",
+            "off",
+            "no",
+            "codepoint",
+            "codepoints",
+            "code_point",
+        }
+
+    return bool(value)
+
+
+def _default_strip_spans(raw: str, grapheme_clusters: bool):
+    """Spans after Python's default Unicode `strip()`, indexed in `raw`."""
+    leading = len(raw) - len(raw.lstrip())
+    stripped = raw.strip()
+
+    if grapheme_clusters:
+        relative_spans = tr.grapheme_cluster_spans(stripped)
+    else:
+        relative_spans = [(index, index + 1) for index in range(len(stripped))]
+
+    return [Span(leading + start, leading + end) for start, end in relative_spans]
+
+
+def _spans_match_units(
+    raw: str,
+    units: List[str],
+    spans: List[Tuple[int, int]],
+    grapheme_clusters: bool,
+) -> bool:
+    if len(units) != len(spans):
+        return False
+
+    for unit, (start, end) in zip(units, spans):
+        original = raw[start:end]
+        if unit == original:
+            continue
+
+        if grapheme_clusters:
+            # Comparison units may be NFC-normalized while spans deliberately refer to
+            # the unnormalized NFD/NFC original.
+            if unicodedata.normalize("NFC", unit) == unicodedata.normalize(
+                "NFC", original
+            ):
+                continue
+
+        # Common case transforms preserve source positions. Do not use this to force
+        # a match when unit counts differ.
+        if unit.casefold() == original.casefold():
+            continue
+
+        return False
+
+    return True
+
+
+def _infer_character_span_tables(
+    raw_sentences: List[str],
+    transformed_sentences: List[List[str]],
+    grapheme_clusters: bool,
+) -> List[Optional[List[Tuple[int, int]]]]:
+    # Contiguous transforms can merge several raw inputs into one compared sequence.
+    # Mapping that merged sequence back to one input's indices would be misleading;
+    # only attach automatic spans when the sentence cardinality is unchanged.
+    if len(raw_sentences) != len(transformed_sentences):
+        return [None for _ in transformed_sentences]
+
+    tables: List[Optional[List[Tuple[int, int]]]] = []
+
+    for raw, units in zip(raw_sentences, transformed_sentences):
+        candidates = [grapheme_clusters, not grapheme_clusters]
+        spans_for_sentence: Optional[List[Tuple[int, int]]] = None
+
+        for candidate_graphemes in dict.fromkeys(candidates):
+            candidate_spans = _default_strip_spans(raw, candidate_graphemes)
+            if _spans_match_units(raw, units, candidate_spans, candidate_graphemes):
+                spans_for_sentence = candidate_spans
+                break
+
+        if spans_for_sentence is None and len(units) == 0:
+            # Empty transformed output can correspond to an empty/whitespace input.
+            spans_for_sentence = []
+
+        if spans_for_sentence is None:
+            # Arbitrary user transforms may move/delete source material. We do not invent
+            # incorrect spans; alignment indices still refer to the transformed units.
+            tables.append(None)
+        else:
+            tables.append(spans_for_sentence)
+
+    return tables
+
+
+def _annotate_alignment_spans(
+    alignments: List[List[AlignmentChunk]],
+    reference_spans: Optional[List[Optional[List[Tuple[int, int]]]]],
+    hypothesis_spans: Optional[List[Optional[List[Tuple[int, int]]]]],
+) -> None:
+    for sentence_index, chunks in enumerate(alignments):
+        ref_table = (
+            reference_spans[sentence_index]
+            if reference_spans is not None and sentence_index < len(reference_spans)
+            else None
+        )
+        hyp_table = (
+            hypothesis_spans[sentence_index]
+            if hypothesis_spans is not None and sentence_index < len(hypothesis_spans)
+            else None
+        )
+
+        for chunk in chunks:
+            chunk.ref_spans = (
+                list(ref_table[chunk.ref_start_idx : chunk.ref_end_idx])
+                if ref_table is not None
+                else []
+            )
+            chunk.hyp_spans = (
+                list(hyp_table[chunk.hyp_start_idx : chunk.hyp_end_idx])
+                if hyp_table is not None
+                else []
+            )
+
+            chunk.ref_span = (
+                Span(chunk.ref_spans[0][0], chunk.ref_spans[-1][1])
+                if chunk.ref_spans
+                else None
+            )
+            chunk.hyp_span = (
+                Span(chunk.hyp_spans[0][0], chunk.hyp_spans[-1][1])
+                if chunk.hyp_spans
+                else None
+            )
+
+            chunk.ref_char_start = chunk.ref_span[0] if chunk.ref_span else None
+            chunk.ref_char_end = chunk.ref_span[1] if chunk.ref_span else None
+            chunk.hyp_char_start = chunk.hyp_span[0] if chunk.hyp_span else None
+            chunk.hyp_char_end = chunk.hyp_span[1] if chunk.hyp_span else None
 
 
 ################################################################################

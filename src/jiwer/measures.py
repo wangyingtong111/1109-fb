@@ -50,6 +50,8 @@ from jiwer.transformations import cer_default, wer_default
 
 __all__ = [
     "cer",
+    "character_error_rate",
+    "grapheme_cer",
     "mer",
     "wer",
     "wil",
@@ -177,6 +179,8 @@ def cer(
     hypothesis: Union[str, List[str]] = None,
     reference_transform: Union[tr.Compose, tr.AbstractTransform] = cer_default,
     hypothesis_transform: Union[tr.Compose, tr.AbstractTransform] = cer_default,
+    grapheme_clusters: bool = False,
+    **kwargs,
 ) -> float:
     """
     Calculate the character error rate (CER) between one or more reference and
@@ -187,13 +191,32 @@ def cer(
         hypothesis: The hypothesis sentence(s)
         reference_transform: The transformation(s) to apply to the reference string(s)
         hypothesis_transform: The transformation(s) to apply to the hypothesis string(s)
+        grapheme_clusters: Compare Unicode extended grapheme clusters instead of code
+            points. Canonically equivalent clusters are treated as equal.
+        **kwargs: Additional grapheme-mode aliases accepted by
+            `jiwer.process_characters`.
 
     Returns:
         (float): The character error rate of the given reference and hypothesis
                  sentence(s).
     """
     output = process_characters(
-        reference, hypothesis, reference_transform, hypothesis_transform
+        reference,
+        hypothesis,
+        reference_transform,
+        hypothesis_transform,
+        grapheme_clusters=grapheme_clusters,
+        **kwargs,
     )
 
     return output.cer
+
+
+def grapheme_cer(*args, **kwargs) -> float:
+    """Convenience wrapper: `cer(..., grapheme_clusters=True)`."""
+    kwargs["grapheme_clusters"] = True
+    return cer(*args, **kwargs)
+
+
+# Descriptive long name.
+character_error_rate = cer
