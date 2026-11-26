@@ -1356,6 +1356,26 @@ class Matrix
   alias_method :det, :determinant
 
   #
+  # Returns the pair <tt>[log(|det|), phase]</tt> of the matrix, computed
+  # through the LUP factorization without forming the determinant first.
+  #
+  # Unlike #determinant, the magnitude is accumulated as a sum of pivot
+  # logarithms, so a determinant that would overflow or underflow a
+  # Float still yields a finite logarithm.  The phase is the sign +1 or
+  # +-1 for a real determinant, a unit Complex number for a complex one,
+  # and includes the sign of the row permutations of the factorization.
+  #
+  #   Matrix.diagonal(-1e200, 1e200).slogdet
+  #   #  => [921.0340371976183, -1]
+  #
+  # A singular matrix returns <tt>[-Float::INFINITY, 0]</tt>.
+  #
+  def slogdet
+    raise ErrDimensionMismatch unless square?
+    lup.slogdet
+  end
+
+  #
   # Private. Use Matrix#determinant
   #
   # Returns the determinant of the matrix, using

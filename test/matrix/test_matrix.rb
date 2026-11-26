@@ -188,6 +188,42 @@ class TestMatrix < Test::Unit::TestCase
     assert_equal(42, Matrix[[7,0,1,0,12],[8,1,1,9,1],[4,0,0,-7,17],[-1,0,0,-4,8],[10,1,1,8,6]].determinant)
   end
 
+  def test_slogdet
+    # Ordinary determinants are still returned unchanged.
+    assert_equal(45, Matrix[[7,6], [3,9]].determinant)
+
+    # The product of the pivots overflows, but the separate log is finite.
+    m = Matrix.diagonal(-1e200, 1e200)
+    assert_equal(-Float::INFINITY, m.determinant)
+    log, phase = m.slogdet
+    assert_in_delta(2 * Math.log(1e200), log, 1e-9)
+    assert_equal(-1, phase)
+
+    # A complex pivot whose modulus overflows; the LUP also swaps two rows.
+    m = Matrix[[0, Complex(1.4e308, 1.4e308)], [2.0, 0]]
+    log, phase = m.slogdet
+    assert_in_delta(Math.log(1.4e308) + Math.log(2) + Math.log(2) / 2, log, 1e-9)
+    assert_in_delta(-1 / Math.sqrt(2), phase.real, 1e-12)
+    assert_in_delta(-1 / Math.sqrt(2), phase.imag, 1e-12)
+    assert(m.determinant.real.infinite?)
+
+    # The phase carries the sign of the row permutation.
+    assert_equal([0.0, 1], Matrix[[0, -1], [1, 0]].slogdet)
+    assert_equal([0.0, -1], Matrix[[0, 1], [1, 0]].slogdet)
+
+    # A singular factor has a negative infinite log and a zero phase.
+    assert_equal([-Float::INFINITY, 0], Matrix[[0, 0], [0, 1]].slogdet)
+    assert_equal([-Float::INFINITY, 0], Matrix[[1, 2, 3], [2, 4, 6], [1, 1, 1]].slogdet)
+
+    # The factorization entry point agrees with the matrix entry point.
+    assert_equal(m.lup.slogdet, m.slogdet)
+
+    # Exact integers keep ordinary determinants exact.
+    assert_equal(6, Matrix[[2, 1], [0, 3]].determinant)
+
+    assert_raise(ExceptionForMatrix::ErrDimensionMismatch) { @m1.slogdet }
+  end
+
   def test_new_matrix
     assert_raise(TypeError) { Matrix[Object.new] }
     o = Object.new

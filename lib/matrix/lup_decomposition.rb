@@ -88,6 +88,36 @@ class Matrix
     end
     alias_method :determinant, :det
 
+    # Returns the pair <tt>[log(|det(A)|), phase]</tt> of +A+, calculated
+    # from the factorization without ever forming the determinant itself.
+    #
+    # The logarithms of the pivots are added one by one, so a determinant
+    # whose magnitude overflows or underflows a Float still gets a finite
+    # logarithm.  The phase is +1+ or +-1+ when the determinant is real,
+    # and a unit Complex number when it is complex; in both cases it
+    # includes the sign of the row permutations performed by the
+    # factorization.  The phase of a singular matrix is +0+, matching the
+    # negative infinite logarithm of its zero determinant.
+    #
+    #   Matrix.diagonal(-1e200, 1e200).lup.slogdet
+    #   #  => [921.0340371976183, -1]
+
+    def slogdet
+      if (@row_count != @column_count)
+        raise Matrix::ErrDimensionMismatch
+      end
+      log_abs = 0.0
+      phase = @pivot_sign
+      @column_count.times do |j|
+        pivot = @lu[j][j]
+        return [-Float::INFINITY, 0] if pivot == 0
+        pivot_log, pivot_phase = pivot_log_and_phase(pivot)
+        log_abs += pivot_log
+        phase *= pivot_phase
+      end
+      [log_abs, phase]
+    end
+
     # Returns +m+ so that <tt>A*m = b</tt>,
     # or equivalently so that <tt>L*U*m = P*b</tt>
     # +b+ can be a Matrix or a Vector
@@ -213,6 +243,50 @@ class Matrix
             @lu[i][j] = @lu[i][j].quo(@lu[j][j])
           end
         end
+      end
+    end
+
+    private
+
+    # Returns <tt>[log(|value|), phase]</tt> for a non-zero pivot.
+    # The magnitude is split off before any multiplication, so a pivot
+    # whose modulus overflows a Float (as with a large Complex entry)
+    # still yields a finite logarithm and an exact unit phase.
+
+    def pivot_log_and_phase(value)
+      if value.is_a?(Complex)
+        real, imag = value.real, value.imag
+        # A complex value with a zero imaginary part is still real-valued.
+        return pivot_log_and_phase(real) if imag == 0
+        scale = [real.abs, imag.abs].max
+        return [0.0, 1] if scale == 0
+        if scale.infinite?
+          return [log_of(scale), Complex(real, imag).arg]
+        end
+        scaled_real, scaled_imag = real.quo(scale), imag.quo(scale)
+        magnitude = Math.hypot(scaled_real.to_f, scaled_imag.to_f)
+        phase = Complex((scaled_real.to_f / magnitude), (scaled_imag.to_f / magnitude))
+        [log_of(scale) + Math.log(magnitude), phase]
+      else
+        [log_of(value.abs), value < 0 ? -1 : 1]
+      end
+    end
+
+    # Returns the natural logarithm of a non-negative Numeric without
+    # converting it through an overflowing Float first.
+
+    def log_of(value)
+      if defined?(BigDecimal) && value.is_a?(BigDecimal)
+        _sign, digits, base, exponent = value.abs.split
+        return Math.log(digits.to_i) + (exponent - digits.length) * Math.log(base)
+      end
+      case value
+      when Integer
+        Math.log(value)
+      when Rational
+        Math.log(value.numerator) - Math.log(value.denominator)
+      else
+        Math.log(value.to_f)
       end
     end
   end
