@@ -8,7 +8,11 @@ module PragmaticTokenizer
     # - check multiple punctuation regex
 
     # Text that needs to be tokenized is initially split into chunks of this length:
-    CHUNK_LONG_INPUT_TEXT         = /\S.{1,10000}(?!\S)/m
+    # A chunk starts on a non-whitespace character, may span up to this many
+    # characters and ends on a word boundary (the whitespace following a word).
+    # A single unbreakable word longer than this budget is kept whole rather
+    # than being truncated.
+    LONG_INPUT_CHUNK_MAX_LENGTH   = 10_001
 
     # Ranges
     RANGE_DINGBATS                = /[\u2701-\u27BE]/ # e.g. ✁✎✳❄➾

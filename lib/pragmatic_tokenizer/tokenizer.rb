@@ -103,12 +103,53 @@ module PragmaticTokenizer
     def tokenize(text)
       return [] unless text
       raise "In PragmaticTokenizer text must be a String or subclass of String" unless text.class <= String
-      CGI.unescapeHTML(text)
-          .scan(Regex::CHUNK_LONG_INPUT_TEXT)
+      chunk_long_input(CGI.unescapeHTML(text))
           .flat_map { |segment| process_segment(segment) }
     end
 
     private
+
+      # Splits the text into segments while preserving every character and word
+      # boundary in its original order.
+      #
+      # Segments follow the original scan budget: they span at most
+      # Regex::LONG_INPUT_CHUNK_MAX_LENGTH characters and end on a word boundary
+      # (the whitespace right after a word). When the budget falls inside a word
+      # that cannot be split at a boundary, the whole word is emitted as one
+      # segment even if it exceeds the budget, instead of truncating or skipping
+      # any of its characters. Whitespace separating segments is kept with the
+      # preceding segment so that no leading or trailing single character is lost.
+      def chunk_long_input(text)
+        segments = []
+        index    = 0
+        length   = text.length
+
+        while index < length
+          index += 1 while index < length && text[index] =~ /\s/
+
+          break if index >= length
+
+          budget_end = index + Regex::LONG_INPUT_CHUNK_MAX_LENGTH
+
+          if budget_end >= length
+            segments << text[index..-1]
+            break
+          end
+
+          boundary = text.rindex(/\s/, budget_end)
+
+          if boundary.nil? || boundary <= index
+            word_end = text.index(/\s/, index) || length
+            segments << text[index...word_end]
+            index = word_end
+          else
+            segments << text[index..boundary]
+            index = boundary + 1
+          end
+        end
+
+        segments
+      end
 
       def process_segment(segment)
         pre_processed = pre_process(segment)
