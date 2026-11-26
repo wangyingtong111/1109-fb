@@ -54,6 +54,36 @@ ps.clean
 # => "This is a sentence cut off in the middle because pdf."
 ```
 
+### Input source: literal prose vs. escaped fields
+
+Literal backslash sequences depend on where the text came from. Declare the
+source with the `source:` keyword:
+
+```ruby
+# Ordinary body prose (source: :plain / :literal / :text / :body ...).
+# A literal "\n" is two text characters and is preserved, not decoded.
+text = 'Review \\n next.'
+PragmaticSegmenter::Segmenter.new(text: text, source: :plain).segment
+# => ["Review \\n next."]
+
+# A transport-escaped field (source: :escaped / :transport / :field ...).
+# One pass decodes \r\n as one CRLF sequence, standalone \r / \n, and a
+# doubled backslash (\\) as one literal backslash that is never decoded again.
+text = 'First.\\nNext.'
+PragmaticSegmenter::Segmenter.new(text: text, source: :escaped).segment
+# => ["First.", "Next."]
+
+text = 'One.\\r\\nTwo.\\\\nThree.\\rFour.'
+PragmaticSegmenter::Segmenter.new(text: text, source: :escaped, clean: false).segment
+# => ["One.", "Two.", "\\nThree.", "Four."]
+```
+
+When `source:` is omitted the historical behaviour is preserved: the cleaner
+decodes literal `\n` / `\r` exactly as before, so
+`Segmenter.new(text: 'Review \\n next.').segment` still returns
+`["Review", "next."]`.
+
+
 ## Live Demo
 
 Try out a [live demo](https://www.tm-town.com/natural-language-processing) of Pragmatic Segmenter in the browser.
