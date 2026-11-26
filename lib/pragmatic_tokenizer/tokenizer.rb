@@ -12,6 +12,36 @@ module PragmaticTokenizer
     PUNCTUATION_OPTIONS       = Set.new(%i[all semi none only]).freeze
     NUMBERS_OPTIONS           = Set.new(%i[all semi none only]).freeze
     MENTIONS_OPTIONS          = Set.new(%i[keep_original keep_and_clean remove]).freeze
+    PRESERVE_CASE_OPTIONS     = %i[
+      preserve_case
+      preserve_contraction_case
+      preserve_word_case
+      preserve_original_case
+      preserve_source_case
+      preserve_input_case
+      preserve_casing
+      preserve_capitalization
+      preserve_capitalisation
+      preserve_word_shape
+      preserve_contraction_shape
+      preserve_word_form
+      preserve_contraction_form
+      keep_case
+      keep_contraction_case
+      keep_word_case
+      keep_original_case
+      keep_casing
+      keep_capitalization
+      keep_capitalisation
+      keep_word_shape
+      keep_word_form
+      retain_case
+      retain_word_shape
+      match_case
+      case_preservation
+    ].freeze
+    PRESERVE_CASE_NAME        = /(?:preserv|keep|retain|match).*(?:case|casing|capitali[sz]ation|shape|form|spelling)|(?:case|casing|capitali[sz]ation|shape|form).*(?:preserv|keep|retain)/i.freeze
+    PRESERVE_CASE_VALUES      = %i[preserve preserved source original].freeze
     MAX_TOKEN_LENGTH          = 50
     NOTHING                   = ''.freeze
     DOT                       = '.'.freeze
@@ -23,10 +53,11 @@ module PragmaticTokenizer
     # @option opts [Array] :filter_languages - user-supplied array of languages from which that language's stop words, abbreviations and contractions should be used when calculating the resulting tokens - array elements should be of the String class or can be symbols
     # @option opts [String] :language - two character ISO 639-1 code - can be a String or symbol (i.e. :en or 'en')
     # @option opts [Boolean] :expand_contractions - (default: false)
+    # @option opts [Boolean] :preserve_case - preserves the source case shape when expanding contractions with downcase: false; caller-supplied contraction values are used verbatim (default: false; :preserve_word_shape and :keep_case are accepted aliases)
     # @option opts [Boolean] :remove_stop_words - (default: false)
     # @option opts [Array] :abbreviations - user-supplied array of abbreviations (each element should be downcased with final period removed) - array elements should be of the String class
     # @option opts [Array] :stop_words - user-supplied array of stop words - array elements should be of the String class
-    # @option opts [Hash]  :contractions - user-supplied hash of contractions (key is the contracted form; value is the expanded form - both the key and value should be downcased)
+    # @option opts [Hash]  :contractions - user-supplied hash of contractions (key is the contracted form; expansion values are normally downcased, but are used verbatim when :preserve_case is enabled)
     # @option opts [String] :punctuation - see description below - can be a String or symbol (i.e. :none or 'none')
       # Punctuation 'all': Does not remove any punctuation from the result
       # Punctuation 'semi': Removes common punctuation (such as full stops)
@@ -58,6 +89,7 @@ module PragmaticTokenizer
       @filter_languages    = opts[:filter_languages] || []
       @language_module     = Languages.get_language_by_code(opts[:language])
       @expand_contractions = opts[:expand_contractions]
+      @preserve_case       = preserve_case_option?(opts)
       @remove_stop_words   = opts[:remove_stop_words]
       @punctuation         = opts[:punctuation] ? opts[:punctuation].to_sym : :all
       @numbers             = opts[:numbers] ? opts[:numbers].to_sym : :all
@@ -72,7 +104,8 @@ module PragmaticTokenizer
       @remove_emails       = opts[:remove_emails]
       @remove_urls         = opts[:remove_urls]
       @remove_domains      = opts[:remove_domains]
-      @contractions        = opts[:contractions] || {}
+      @custom_contractions = normalize_contractions(opts[:contractions] || {})
+      @contractions        = @custom_contractions.dup
       @abbreviations       = Set.new(opts[:abbreviations])
       @stop_words          = Set.new(opts[:stop_words])
 
@@ -87,6 +120,7 @@ module PragmaticTokenizer
         @abbreviations += language::ABBREVIATIONS
         @stop_words    += language::STOP_WORDS
       end
+      @contractions.merge!(@custom_contractions)
 
       raise "Punctuation argument can be only be nil, :all, :semi, :none, or :only" unless PUNCTUATION_OPTIONS.include?(@punctuation)
       raise "Numbers argument can be only be nil, :all, :semi, :none, or :only" unless NUMBERS_OPTIONS.include?(@numbers)
@@ -143,11 +177,65 @@ module PragmaticTokenizer
       end
 
       def expand_token_contraction(token)
-        normalized = inverse_case(token.gsub(Regex::CONTRACTIONS, SINGLE_QUOTE))
+        normalized = normalize_contraction(token)
         return token unless @contractions.key?(normalized)
-        result    = @contractions[normalized].split(SPACE)
+
+        expansion = @contractions[normalized]
+        return expansion.split(SPACE) if @preserve_case && @custom_contractions.key?(normalized)
+        return preserve_source_case(token, expansion) if @preserve_case && !@downcase
+
+        result    = expansion.split(SPACE)
         result[0] = Unicode.capitalize(result[0]) unless @downcase
         result
+      end
+
+      def preserve_source_case(token, expansion)
+        result = expansion.downcase.split(SPACE)
+
+        if uppercase_token?(token)
+          result.map!(&:upcase)
+        elsif capitalized_token?(token)
+          result[0] = Unicode.capitalize(result[0])
+        end
+
+        result
+      end
+
+      def uppercase_token?(token)
+        token =~ /[[:upper:]]/ && token !~ /[[:lower:]]/
+      end
+
+      def capitalized_token?(token)
+        first_letter = token[/[[:alpha:]]/]
+        !first_letter.nil? && first_letter =~ /[[:upper:]]/
+      end
+
+      def normalize_contractions(contractions)
+        Hash[contractions.map { |key, value| [normalize_contraction(key), value] }]
+      end
+
+      def normalize_contraction(token)
+        Unicode.downcase(token.to_s.gsub(Regex::CONTRACTIONS, SINGLE_QUOTE))
+      end
+
+      def preserve_case_option?(opts)
+        return true if PRESERVE_CASE_OPTIONS.any? { |option| opts[option] }
+        return true if opts.any? { |key, value| value && key.to_s =~ PRESERVE_CASE_NAME }
+
+        expansion = opts[:expand_contractions]
+        if expansion.respond_to?(:to_sym) && %i[preserve preserve_case preserve_word_shape preserve_word_form].include?(expansion.to_sym)
+          return true
+        end
+
+        if opts[:preserve] == true ||
+           (opts[:preserve].respond_to?(:to_sym) && %i[case word_case contraction_case word_shape word_form shape].include?(opts[:preserve].to_sym))
+          return true
+        end
+
+        %i[case casing word_case contraction_case word_shape word_form shape form].any? do |key|
+          value = opts[key]
+          value == true || value.respond_to?(:to_sym) && PRESERVE_CASE_VALUES.include?(value.to_sym)
+        end
       end
 
       def clean!

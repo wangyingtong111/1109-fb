@@ -40,6 +40,7 @@ options = {
   remove_stop_words:   true, # remove stop words
   contractions:        { "i'm" => "i am" }, # a user-supplied hash of contractions (key is the contracted form; value is the expanded form - both the key and value should be downcased)
   expand_contractions: true, # (i.e. ["isn't"] will change to two tokens ["is", "not"])
+  preserve_case:       true, # preserve the source case shape when expanding contractions with downcase: false
   filter_languages:    [:en, :de], # process abbreviations, contractions and stop words for this array of languages
   punctuation:         :none, # see below for more details
   numbers:             :none, # see below for more details
@@ -98,6 +99,15 @@ options = {
   Expands contractions (i.e. i'll -> i will).
 - `false`   
   Leaves contractions as is.
+
+<hr>
+
+##### `preserve_case`
+  **default** = `false`
+- Use with `downcase: false` and `expand_contractions: true`.
+- Built-in contractions are expanded using the source token's lowercase, capitalized or uppercase shape (i.e. `don't`, `Don't` and `DON’T` become `do not`, `Do not` and `DO NOT`).
+- Straight and curly apostrophes are treated as the same contraction spelling.
+- Values supplied with `contractions:` are used verbatim. `preserve_word_shape:` and `keep_case:` are accepted aliases.
 
 <hr>
 
