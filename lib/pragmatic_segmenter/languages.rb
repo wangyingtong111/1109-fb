@@ -55,7 +55,22 @@ module PragmaticSegmenter
     }
 
     def self.get_language_by_code(code)
-      LANGUAGE_CODES[code] || Common
+      return code if code.is_a?(Module)
+      LANGUAGE_CODES[code.to_s] || mode_language(code.to_s) || Common
+    end
+
+    # Resolve a language code that carries an explicit punctuation mode,
+    # e.g. 'ar-written'. Unknown base codes and languages without
+    # punctuation modes fall back to the default module; an unsupported
+    # mode on a known language is reported instead of silently ignored.
+    def self.mode_language(code)
+      base, separator, mode = code.partition('-')
+      return if separator.empty? || mode.empty?
+      language = LANGUAGE_CODES[base]
+      return unless language && language.const_defined?(:PUNCTUATION_MODES)
+      language::PUNCTUATION_MODES.fetch(mode.strip.downcase) do
+        raise ArgumentError, "unsupported #{base} punctuation mode: #{mode.inspect}"
+      end
     end
   end
 end
