@@ -5,6 +5,7 @@
 # URL: <https://www.nltk.org/>
 # For license information, see LICENSE.TXT
 import math
+import random
 from math import fsum as sum
 from operator import itemgetter
 
@@ -627,6 +628,178 @@ def test_generate_None_text_seed(mle_trigram_model):
     assert mle_trigram_model.generate(
         text_seed=None, random_seed=3
     ) == mle_trigram_model.generate(random_seed=3)
+
+
+###############################################################################
+#                Generating Text Restricted to Given Candidates               #
+###############################################################################
+
+
+@pytest.fixture
+def restricted_vocabulary():
+    # "b" and "c" are vocabulary items; "x" below is out of vocabulary and so
+    # gets looked up as the unknown label while fitting.
+    return Vocabulary(["a", "b", "c", "<s>", "</s>"], unk_cutoff=1)
+
+
+@pytest.fixture
+def restricted_training_data():
+    # "a" is only ever followed by "b".
+    return [list(padded_everygrams(2, ["a", "b", "x", "b"]))]
+
+
+@pytest.fixture
+def restricted_wb_model(restricted_vocabulary, restricted_training_data):
+    model = WittenBellInterpolated(2, vocabulary=restricted_vocabulary)
+    model.fit(restricted_training_data)
+    return model
+
+
+@pytest.fixture
+def restricted_mle_model(restricted_vocabulary, restricted_training_data):
+    model = MLE(2, vocabulary=restricted_vocabulary)
+    model.fit(restricted_training_data)
+    return model
+
+
+def test_generate_candidates_single_continuation(
+    restricted_wb_model, restricted_mle_model
+):
+    # Allowing only the single observed continuation must always produce it,
+    # independently of the random stream.
+    for model in (restricted_wb_model, restricted_mle_model):
+        for seed in range(10):
+            assert (
+                model.generate(text_seed=["a"], random_seed=seed, candidates=["b"])
+                == "b"
+            )
+
+
+def test_generate_candidates_wb_unseen_in_vocab_word(restricted_wb_model):
+    # "c" is a vocabulary item but never seen after "a"; Witten-Bell reserves
+    # unseen probability mass for the unknown label rather than for "c".
+    assert restricted_wb_model.score("c", ["a"]) == 0
+    with pytest.raises(ValueError):
+        restricted_wb_model.generate(
+            text_seed=["a"], random_seed=1, candidates=["c"]
+        )
+
+
+def test_generate_candidates_mle_zero_score_raises(restricted_mle_model):
+    # MLE assigns zero to the unseen continuation "c".
+    assert restricted_mle_model.score("c", ["a"]) == 0
+    with pytest.raises(ValueError):
+        restricted_mle_model.generate(
+            text_seed=["a"], random_seed=1, candidates=["c"]
+        )
+
+
+def test_generate_candidates_does_not_shorten_context(restricted_mle_model):
+    # The model must not quietly drop the history to make "c" sampleable.
+    with pytest.raises(ValueError):
+        restricted_mle_model.generate(
+            text_seed=["a"], random_seed=1, candidates=["c"]
+        )
+
+    # An unseen context is treated the same way: no backoff to a shorter
+    # history that would give the candidate a positive MLE score.
+    model = MLE(2, vocabulary=restricted_mle_model.vocab)
+    model.fit([list(padded_everygrams(2, ["c", "b"]))])
+    with pytest.raises(ValueError):
+        model.generate(text_seed=["z"], random_seed=1, candidates=["c"])
+
+
+def test_generate_candidates_wb_oov_uses_unknown_label(restricted_wb_model):
+    # The unseen word receives the unknown label's smoothed probability mass
+    # and the generated token is the model's unknown label.
+    unk_label = restricted_wb_model.vocab.unk_label
+    assert restricted_wb_model.score("mars", ["a"]) > 0
+    assert (
+        restricted_wb_model.generate(
+            text_seed=["a"], random_seed=1, candidates=["mars"]
+        )
+        == unk_label
+    )
+
+
+def test_generate_candidates_oov_collapses_to_single_unknown(restricted_wb_model):
+    # Two unseen candidates both look up to the same unknown symbol, so they
+    # carry a single share of the probability mass and the output is the
+    # model's unknown label.
+    unk_label = restricted_wb_model.vocab.unk_label
+    for seed in range(10):
+        assert (
+            restricted_wb_model.generate(
+                text_seed=["a"],
+                random_seed=seed,
+                candidates=["mars", "venus"],
+            )
+            == unk_label
+        )
+
+
+def test_generate_candidates_mle_oov_raises(restricted_mle_model):
+    # MLE has no probability mass for unknown continuations.
+    assert restricted_mle_model.score("mars", ["a"]) == 0
+    with pytest.raises(ValueError):
+        restricted_mle_model.generate(
+            text_seed=["a"], random_seed=1, candidates=["mars"]
+        )
+
+
+def test_generate_candidates_mixed_sample_both(restricted_wb_model):
+    unk_label = restricted_wb_model.vocab.unk_label
+    outcomes = {
+        restricted_wb_model.generate(
+            text_seed=["a"], random_seed=seed, candidates=["b", "mars"]
+        )
+        for seed in range(40)
+    }
+    assert outcomes == {"b", unk_label}
+
+
+def test_generate_candidates_empty_raises(restricted_wb_model):
+    with pytest.raises(ValueError):
+        restricted_wb_model.generate(text_seed=["a"], candidates=[])
+
+
+def test_generate_candidates_reproducible(restricted_wb_model):
+    first = restricted_wb_model.generate(
+        5, text_seed=["a"], random_seed=42, candidates=["b", "mars"]
+    )
+    second = restricted_wb_model.generate(
+        5, text_seed=["a"], random_seed=42, candidates=["b", "mars"]
+    )
+    assert first == second
+
+
+def test_generate_candidates_multi_word_uses_single_random_stream(restricted_wb_model):
+    # Reproduce the multi-word call step by step while sharing one Random,
+    # relocating the history from the words already generated at each step.
+    generator = random.Random(7)
+    manual, history = [], ["a"]
+    for _ in range(4):
+        word = restricted_wb_model.generate(
+            text_seed=history,
+            random_seed=generator,
+            candidates=["b", "mars"],
+        )
+        manual.append(word)
+        history = history + [word]
+
+    assert restricted_wb_model.generate(
+        4, text_seed=["a"], random_seed=7, candidates=["b", "mars"]
+    ) == manual
+
+
+def test_generate_without_candidates_keeps_observed_range(
+    restricted_wb_model, restricted_mle_model
+):
+    # Without candidates, generation still samples observed continuations and
+    # never reaches the smoothed unknown mass.
+    for model in (restricted_wb_model, restricted_mle_model):
+        for seed in range(10):
+            assert model.generate(text_seed=["a"], random_seed=seed) == "b"
 
 
 def test_stupid_backoff_unigram_long_context_matches_empty_context(vocabulary):

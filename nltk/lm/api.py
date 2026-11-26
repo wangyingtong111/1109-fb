@@ -183,14 +183,33 @@ class LanguageModel(metaclass=ABCMeta):
         """
         return pow(2.0, self.entropy(text_ngrams))
 
-    def generate(self, num_words=1, text_seed=None, random_seed=None):
+    def generate(
+        self, num_words=1, text_seed=None, random_seed=None, candidates=None
+    ):
         """Generate words from the model.
 
         :param int num_words: How many words to generate. By default 1.
         :param text_seed: Generation can be conditioned on preceding context.
         :param random_seed: A random seed or an instance of `random.Random`. If provided,
             makes the random sampling part of generation reproducible.
+        :param candidates: Optional collection of words the generated word must be
+            chosen from. When given, sampling is driven directly by each model's
+            (possibly smoothed) `score` for the candidates instead of by the words
+            observed as continuations of the context. This allows smoothed models
+            such as `WittenBellInterpolated` to generate words never seen after the
+            context, whose probability mass is reserved by the smoothing but which
+            the default sampling can never reach. Candidates not in the vocabulary
+            are looked up (and so collapse onto the vocabulary's unknown label)
+            before scoring: several unknown candidates therefore count once and the
+            generated word is the model's unknown label. Candidates whose score is
+            zero are not sampleable; if none of the candidates has a positive score
+            a `ValueError` is raised. When `None` (the default), generation keeps
+            its original behaviour of sampling the observed continuations of the
+            context.
+        :type candidates: Iterable(str) or None
         :return: One (str) word or a list of words generated from model.
+        :raises ValueError: If `candidates` is provided but contains no word with a
+            positive score for the context.
 
         Examples:
 
@@ -213,10 +232,30 @@ class LanguageModel(metaclass=ABCMeta):
                 if len(text_seed) >= self.order
                 else text_seed
             )
-            samples = self.context_counts(self.vocab.lookup(context))
-            while context and not samples:
-                context = context[1:] if len(context) > 1 else []
+            if candidates is None:
                 samples = self.context_counts(self.vocab.lookup(context))
+                while context and not samples:
+                    context = context[1:] if len(context) > 1 else []
+                    samples = self.context_counts(self.vocab.lookup(context))
+            else:
+                # Restrict sampling to the caller's candidates. Look each word up
+                # in the vocabulary first so that out-of-vocabulary words collapse
+                # onto the unknown label (the same word several times only counts
+                # once), then drop everything the model assigns no probability
+                # mass. Unlike the default branch the context is never shortened:
+                # a zero-score candidate must stay unsampleable rather than become
+                # legal through a lower-order history.
+                samples = {
+                    self.vocab.lookup(candidate)
+                    for candidate in candidates
+                    if self.score(candidate, context) > 0
+                }
+                if not samples:
+                    raise ValueError(
+                        "No candidate has a positive score for the context "
+                        f"{tuple(context)!r}; cannot sample a word from "
+                        f"{list(candidates)!r}."
+                    )
             # Sorting samples achieves two things:
             # - reproducible randomness when sampling
             # - turns Mapping into Sequence which `_weighted_choice` expects
@@ -234,6 +273,7 @@ class LanguageModel(metaclass=ABCMeta):
                     num_words=1,
                     text_seed=text_seed + generated,
                     random_seed=random_generator,
+                    candidates=candidates,
                 )
             )
         return generated
