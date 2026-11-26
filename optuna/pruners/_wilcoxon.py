@@ -104,8 +104,9 @@ class WilcoxonPruner(BasePruner):
 
 
     .. note::
-        This pruner cannot handle ``infinity`` or ``nan`` values.
-        Trials containing those values are never pruned.
+        This pruner cannot handle ``infinity`` or ``nan`` values in paired reported steps.
+        If either value in a pair is non-finite, the trial is never pruned.
+        Non-finite values reported by only one trial are ignored as unpaired observations.
 
     .. note::
         If :func:`~optuna.trial.FrozenTrial.should_prune` returns :obj:`True`, you can return an
@@ -157,17 +158,23 @@ class WilcoxonPruner(BasePruner):
             return False
 
         steps, step_values = np.array(list(trial.intermediate_values.items())).T
-
-        if np.any(~np.isfinite(step_values)):
-            optuna_warn(
-                f"The intermediate values of the current trial (trial {trial.number}) "
-                f"contain infinity/NaNs. WilcoxonPruner will not prune this trial."
-            )
-            return False
+        current_values_are_non_finite = np.any(~np.isfinite(step_values))
 
         try:
             best_trial = study.best_trial
         except ValueError:
+            if current_values_are_non_finite:
+                optuna_warn(
+                    f"The intermediate values of the current trial (trial {trial.number}) "
+                    f"contain infinity/NaNs. WilcoxonPruner will not prune this trial."
+                )
+            return False
+
+        if len(best_trial.intermediate_values) == 0 and current_values_are_non_finite:
+            optuna_warn(
+                f"The intermediate values of the current trial (trial {trial.number}) "
+                f"contain infinity/NaNs. WilcoxonPruner will not prune this trial."
+            )
             return False
 
         if len(best_trial.intermediate_values) == 0:
@@ -180,14 +187,23 @@ class WilcoxonPruner(BasePruner):
 
         best_steps, best_step_values = np.array(list(best_trial.intermediate_values.items())).T
 
-        if np.any(~np.isfinite(best_step_values)):
+        _, idx1, idx2 = np.intersect1d(steps, best_steps, return_indices=True)
+        paired_step_values = step_values[idx1]
+        paired_best_step_values = best_step_values[idx2]
+
+        if np.any(~np.isfinite(paired_step_values)):
+            optuna_warn(
+                f"The intermediate values of the current trial (trial {trial.number}) "
+                f"contain infinity/NaNs. WilcoxonPruner will not prune this trial."
+            )
+            return False
+
+        if np.any(~np.isfinite(paired_best_step_values)):
             optuna_warn(
                 f"The intermediate values of the best trial (trial {best_trial.number}) "
                 f"contain infinity/NaNs. WilcoxonPruner will not prune the current trial."
             )
             return False
-
-        _, idx1, idx2 = np.intersect1d(steps, best_steps, return_indices=True)
 
         if len(idx1) < len(step_values):
             # This if-statement is never satisfied if following "average_is_best" safety works,
@@ -198,22 +214,20 @@ class WilcoxonPruner(BasePruner):
                 "Those values are ignored."
             )
 
-        diff_values = step_values[idx1] - best_step_values[idx2]
+        diff_values = paired_step_values - paired_best_step_values
 
         if len(diff_values) < max(2, self._n_startup_steps):
             return False
 
         alt: Literal["less", "greater"]
+        paired_step_average = sum(paired_step_values) / len(paired_step_values)
+        paired_best_step_average = sum(paired_best_step_values) / len(paired_best_step_values)
         if study.direction == StudyDirection.MAXIMIZE:
             alt = "less"
-            average_is_best = sum(best_step_values) / len(best_step_values) <= sum(
-                step_values
-            ) / len(step_values)
+            average_is_best = paired_best_step_average <= paired_step_average
         else:
             alt = "greater"
-            average_is_best = sum(best_step_values) / len(best_step_values) >= sum(
-                step_values
-            ) / len(step_values)
+            average_is_best = paired_best_step_average >= paired_step_average
 
         # We use zsplit to avoid the problem when all values are zero.
         p = ss.wilcoxon(diff_values, alternative=alt, zero_method="zsplit").pvalue
