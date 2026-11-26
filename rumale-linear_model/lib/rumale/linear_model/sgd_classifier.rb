@@ -118,17 +118,24 @@ module Rumale
       #
       # @param x [Numo::DFloat] (shape: [n_samples, n_features]) The training data to be used for fitting the model.
       # @param y [Numo::Int32] (shape: [n_samples]) The binary labels to be used for fitting the model.
+      # @param classes [Array, Numo::Int32, nil] The two class labels used in all subsequent partial fits.
+      #   It can be passed either positionally or as the +classes+ keyword.
+      #   If nil is given, the classes are inferred from the first batch. The order of declared classes is preserved.
       # @return [SGDClassifier] The learned classifier itself.
-      def partial_fit(x, y)
+      def partial_fit(x, y, classes = nil, **options)
         x = Rumale::Validation.check_convert_sample_array(x)
         y = Rumale::Validation.check_convert_label_array(y)
         Rumale::Validation.check_sample_size(x, y)
 
-        n_features = x.shape[1]
-        n_features += 1 if fit_bias?
-        need_init = @weight.nil? || @weight.shape[0] != n_features
+        classes = classes[:classes] if classes.is_a?(Hash)
+        declared_classes = classes || options[:classes] || options[:class_labels] ||
+                           options[:fixed_classes] || options[:labels]
+        class_labels = resolve_partial_fit_classes(y, declared_classes)
+        @classes = class_labels
+        check_partial_fit_labels(y, class_labels)
+        check_partial_fit_feature_size(x)
 
-        @classes = Numo::Int32[*y.to_a.uniq.sort] if need_init
+        need_init = @weight.nil?
         negative_label = @classes[0]
         bin_y = Numo::Int32.cast(y.ne(negative_label)) * 2 - 1
 
@@ -139,6 +146,14 @@ module Rumale
 
         self
       end
+
+      # Return the number of SGD update steps performed by partial_fit.
+      # @return [Integer]
+      def n_iter
+        @optimizer&.iter || 0
+      end
+
+      alias n_iter_ n_iter
 
       # Calculate confidence scores for samples.
       #
@@ -171,6 +186,43 @@ module Rumale
       end
 
       private
+
+      def resolve_partial_fit_classes(y, declared_classes)
+        if declared_classes.nil?
+          return @classes unless @classes.nil?
+
+          return Numo::Int32[*y.to_a.uniq.sort]
+        end
+
+        declared_classes = declared_classes[:classes] if declared_classes.is_a?(Hash)
+        class_labels = Rumale::Validation.check_convert_label_array(declared_classes)
+        unless class_labels.ndim == 1 && class_labels.to_a.uniq.size == 2
+          raise ArgumentError, 'partial_fit supports exactly two fixed classes'
+        end
+
+        unless @classes.nil? || @classes.to_a == class_labels.to_a
+          raise ArgumentError, 'the declared classes do not match the classes used in previous partial_fit calls'
+        end
+
+        class_labels
+      end
+
+      def check_partial_fit_labels(y, class_labels)
+        unknown_labels = y.to_a.uniq - class_labels.to_a
+        return if unknown_labels.empty?
+
+        raise ArgumentError, "labels #{unknown_labels.inspect} are not included in the fixed class list"
+      end
+
+      def check_partial_fit_feature_size(x)
+        return if @weight.nil?
+
+        n_features = x.shape[1]
+        n_features += 1 if fit_bias?
+        return if @weight.shape[0] == n_features
+
+        raise ArgumentError, 'the feature size of the given samples does not match the fitted feature size'
+      end
 
       def fit_hinge(x, y)
         if multiclass_problem?

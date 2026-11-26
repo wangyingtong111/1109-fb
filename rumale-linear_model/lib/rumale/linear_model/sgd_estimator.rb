@@ -55,6 +55,9 @@ module Rumale
       # This class is used internally.
       class SGD
         # @!visibility private
+        attr_reader :iter, :update
+
+        # @!visibility private
         # Create a new SGD optimizer.
         # @param learning_rate [Float] The initial value of learning rate.
         # @param momentum [Float] The initial value of momentum.
@@ -189,6 +192,10 @@ module Rumale
     # SGDEstimator is an abstract class for implementation of linear model with mini-batch stochastic gradient descent (SGD) optimization.
     # This class is used internally.
     class SGDEstimator < Rumale::LinearModel::BaseEstimator
+      # Return the SGD optimizer holding the current momentum and update count.
+      # @return [Rumale::LinearModel::Optimizer::SGD, nil]
+      attr_reader :optimizer
+
       # Create an initial linear model with SGD.
       def initialize
         super
