@@ -142,6 +142,32 @@ class TestTruecaser(unittest.TestCase):
         ])
         self.assertEqual(moses.truecase('" start start', use_known=True), ['"', 'Start', 'start'])
 
+    def test_factors_training_only_learnt_from_surface_word(self):
+        """Training a word|POS corpus learns casing from the surface word only,
+        and truecasing changes only the word before the first pipe."""
+        moses = MosesTruecaser()
+        moses.train([['start', 'iPhone|N']])
+        self.assertEqual(moses.truecase('start iphone|A'), ['start', 'iPhone|A'])
+        # Neither the factors nor the punctuation may leak into the vocabulary.
+        self.assertEqual(moses.model['best'], {'iphone': 'iPhone'})
+        self.assertEqual(list(moses.model['casing']), ['iphone'])
+
+    def test_factors_use_known(self):
+        """With use_known, a known variant keeps its surface form and factors,
+        while a sentence-initial word gets the sentence's preferred casing; the
+        factors are returned untouched. The punctuation's own factor must not
+        hide its sentence-ending role."""
+        moses = MosesTruecaser()
+        moses.train([['start', 'iPhone|N', '.|P'], ['also', 'iphone|N']])
+        self.assertEqual(moses.model['best']['iphone'], 'iPhone')
+        self.assertIn('iphone', moses.model['known'])
+        self.assertNotIn('|N', moses.model['known'])
+        self.assertNotIn('.|P', moses.model['best'])
+        self.assertEqual(
+            moses.truecase('start iphone|A .|P iphone|B|keep', use_known=True),
+            ['start', 'iphone|A', '.|P', 'iPhone|B|keep'],
+        )
+
 
 class TestDetruecaser(unittest.TestCase):
     def test_moses_detruecase_str(self):

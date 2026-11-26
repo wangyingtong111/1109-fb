@@ -72,10 +72,30 @@ class MosesTruecaser(object):
         if load_from:
             self.model = self._load_model(load_from)
 
+    @staticmethod
+    def _split_token(token):
+        """
+        Split a token into its surface word and the factors that follow it,
+        e.g. ``iPhone|N|keep`` -> ``("iPhone", "|N|keep")``.
+
+        The word is everything before the first pipe; the factor tail (which
+        may be empty) is kept verbatim. A token that starts with a pipe has no
+        surface word of its own -- it is a bare/escaped factor -- and is
+        returned unchanged with an empty tail.
+        """
+        match = re.search(r"^([^\|]+)(.*)", token)
+        if not match:
+            return token, ""
+        return match.groups()
+
     def learn_truecase_weights(self, tokens, possibly_use_first_token=False):
         """
         This function checks through each tokens in a sentence and returns the
         appropriate weight of each surface token form.
+
+        Tokens may be in ``word|factor|...`` form. Only the surface word is
+        learnt and counted; the factors are ignored and never enter the
+        vocabulary.
         """
         # Keep track of first tokens in the sentence(s) of the line.
         is_first_word = True
@@ -84,16 +104,19 @@ class MosesTruecaser(object):
             # Skip XML tags.
             if re.search(r"(<\S[^>]*>)", token):
                 continue
+            # Only the surface word participates in the sentence bookkeeping
+            # and the casing weights; the factors are dropped.
+            word, _ = self._split_token(token)
             # Skip if sentence start symbols.
-            elif token in self.DELAYED_SENT_START:
+            if word in self.DELAYED_SENT_START:
                 continue
 
             # Resets the `is_first_word` after seeing sent end symbols.
-            if not is_first_word and token in self.SENT_END:
+            if not is_first_word and word in self.SENT_END:
                 is_first_word = True
                 continue
             # Skips tokens with nothing to case.
-            if not self.SKIP_LETTERS_REGEX.search(token):
+            if not self.SKIP_LETTERS_REGEX.search(word):
                 is_first_word = False
                 continue
 
@@ -107,7 +130,7 @@ class MosesTruecaser(object):
             elif possibly_use_first_token:
                 # Gated special handling of first word of sentence.
                 # Check if first characer of token is lowercase.
-                if token[0].islower():
+                if word[0].islower():
                     current_word_weight = 1
                 elif i == 1:
                     current_word_weight = 0.1
@@ -115,7 +138,7 @@ class MosesTruecaser(object):
             is_first_word = False
 
             if current_word_weight > 0:
-                truecase_weights.append((token.lower(), token, current_word_weight))
+                truecase_weights.append((word.lower(), word, current_word_weight))
         return truecase_weights
 
     def _train(
@@ -273,33 +296,37 @@ class MosesTruecaser(object):
                 truecased_tokens.append(token)
                 continue
 
-            # Reads the word token and factors separatedly
-            token, other_factors = re.search(r"^([^\|]+)(.*)", token).groups()
+            # Reads the word token and factors separatedly. Only the surface
+            # word before the first pipe is truecased; the factor tail is
+            # preserved verbatim.
+            word, other_factors = self._split_token(token)
 
             # Lowercase the ASR tokens.
             if self.is_asr:
-                token = token.lower()
+                word = word.lower()
 
             # The actual case replacement happens here.
             # "Most frequent" case of the word.
-            best_case = self.model["best"].get(token.lower(), None)
+            best_case = self.model["best"].get(word.lower(), None)
             # If it's the start of sentence.
             if is_first_word and best_case:  # Truecase sentence start.
-                token = best_case
-            elif use_known and token in self.model["known"]:  # Don't change known tokens.
+                word = best_case
+            elif use_known and word in self.model["known"]:  # Don't change known tokens.
                 pass
             elif best_case:  # Truecase otherwise unknown tokens? Heh? From https://github.com/moses-smt/mosesdecoder/blob/master/scripts/recaser/truecase.perl#L66
-                token = best_case
+                word = best_case
             # Else, it's an unknown word, don't change the word.
             # Concat the truecased `word` with the `other_factors`
-            token = token + other_factors
+            token = word + other_factors
             # Adds the truecased word.
             truecased_tokens.append(token)
 
             # Resets sentence start if this token is an ending punctuation.
-            if token in self.SENT_END:
+            # The factors (if any) must not hide the underlying word from the
+            # sentence-boundary bookkeeping.
+            if word in self.SENT_END:
                 is_first_word = True
-            elif token not in self.DELAYED_SENT_START:
+            elif word not in self.DELAYED_SENT_START:
                 is_first_word = False
 
         # return ' '.join(tokens)
