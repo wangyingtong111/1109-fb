@@ -14,7 +14,7 @@ module Rumale
     #   require 'rumale/nearest_neighbors/k_neighbors_regressor'
     #
     #   estimator =
-    #     Rumale::NearestNeighbors::KNeighborsRegressor.new(n_neighbors: 5)
+    #     Rumale::NearestNeighbors::KNeighborsRegressor.new(n_neighbors: 5, weights: 'distance')
     #   estimator.fit(training_samples, traininig_target_values)
     #   results = estimator.predict(testing_samples)
     #
@@ -37,11 +37,18 @@ module Rumale
       # @param metric [String] The metric to calculate the distances.
       #   If metric is 'euclidean', Euclidean distance is calculated for distance between points.
       #   If metric is 'precomputed', the fit and predict methods expect to be given a distance matrix.
-      def initialize(n_neighbors: 5, metric: 'euclidean')
+      # @param weights [String] The weight function used in prediction.
+      #   If weights is 'uniform', all neighbors are weighted equally and the mean of their target values is predicted.
+      #   If weights is 'distance', the neighbors are weighted by the inverse of their distances.
+      #   When some of the selected neighbors have zero distance, only the zero-distance neighbors are averaged.
+      def initialize(n_neighbors: 5, metric: 'euclidean', weights: 'uniform')
+        raise ArgumentError, "Expect weights to be 'uniform' or 'distance'" unless %w[uniform distance].include?(weights)
+
         super()
         @params = {
           n_neighbors: n_neighbors,
-          metric: (metric == 'precomputed' ? 'precomputed' : 'euclidean')
+          metric: (metric == 'precomputed' ? 'precomputed' : 'euclidean'),
+          weights: weights
         }
       end
 
@@ -82,10 +89,41 @@ module Rumale
         # Predict values for the given samples.
         distance_matrix = @params[:metric] == 'precomputed' ? x : ::Rumale::PairwiseMetric.euclidean_distance(x, @prototypes)
         predicted_values = Array.new(n_samples) do |n|
-          neighbor_ids = distance_matrix[n, true].to_a.each_with_index.sort.map(&:last)[0...n_neighbors]
-          n_outputs.nil? ? @values[neighbor_ids].mean : @values[neighbor_ids, true].mean(0).to_a
+          sorted_neighbors = distance_matrix[n, true].to_a.each_with_index.sort
+          neighbor_ids = sorted_neighbors.map(&:last)[0...n_neighbors]
+          neighbor_distances = sorted_neighbors.map(&:first)[0...n_neighbors]
+          neighbor_values = n_outputs.nil? ? @values[neighbor_ids] : @values[neighbor_ids, true]
+          if @params[:weights] == 'distance'
+            weighted_neighbor_values(neighbor_values, neighbor_distances, n_outputs)
+          elsif n_outputs.nil?
+            neighbor_values.mean
+          else
+            neighbor_values.mean(0).to_a
+          end
         end
         Numo::DFloat[*predicted_values]
+      end
+
+      private
+
+      # Compute the inverse-distance-weighted average of the neighbor target values.
+      # The weights are normalized per query by the minimum distance to avoid division by zero or overflow,
+      # while keeping the true ratio of the inverse distances among positive distances.
+      # When zero-distance neighbors exist, only their target values are averaged.
+      def weighted_neighbor_values(neighbor_values, neighbor_distances, n_outputs)
+        zero_ids = neighbor_distances.each_index.select { |i| neighbor_distances[i].zero? }
+        unless zero_ids.empty?
+          zero_values = n_outputs.nil? ? neighbor_values[zero_ids] : neighbor_values[zero_ids, true]
+          return n_outputs.nil? ? zero_values.mean : zero_values.mean(0).to_a
+        end
+
+        min_distance = neighbor_distances.min
+        weights = Numo::DFloat.asarray(neighbor_distances.map { |d| min_distance / d })
+        if n_outputs.nil?
+          (neighbor_values * weights).sum / weights.sum
+        else
+          (neighbor_values.transpose.dot(weights) / weights.sum).to_a
+        end
       end
     end
   end
