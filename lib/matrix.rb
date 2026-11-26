@@ -1085,6 +1085,142 @@ class Matrix
   end
 
   #
+  # Returns the diagonal of <tt>self * m</tt> without constructing the full
+  # product. For rectangular matrices, the returned diagonal has
+  # <tt>[row_count, m.column_count].min</tt> elements.
+  #
+  #   a = Matrix[[1, 2, 0], [0, 2, 1]]
+  #   b = Matrix[[3, 0], [2, 5], [0, 1]]
+  #   a.diagonal_product(b) # => [7, 11]
+  #
+  def diagonal_product(m)
+    raise ErrDimensionMismatch if column_count != m.row_count
+
+    m_rows = m.rows
+    diagonal_size = [row_count, m.column_count].min
+    Array.new(diagonal_size) do |i|
+      value = 0
+      column_count.times do |k|
+        value += @rows[i][k] * m_rows[k][i]
+      end
+      value
+    end
+  end
+  alias product_diagonal diagonal_product
+  alias diag_product diagonal_product
+
+  #
+  # Computes the diagonal of <tt>self * m</tt> and its weighted sum.
+  #
+  # Returns an array containing the diagonal and the weighted sum:
+  #
+  #   a = Matrix[[1, 2, 0], [0, 2, 1]]
+  #   b = Matrix[[3, 0], [2, 5], [0, 1]]
+  #   a.weighted_diagonal_product(b, [2, 0])
+  #     # => [[7, 11], 14]
+  #
+  # The number of weights must equal the diagonal length.
+  #
+  def weighted_diagonal_product(m, positional_weights = nil, weights: nil, weight: nil)
+    raise ErrDimensionMismatch if column_count != m.row_count
+
+    weights ||= weight || positional_weights
+    diagonal_size = [row_count, m.column_count].min
+    weights = prepare_diagonal_weights(weights, diagonal_size)
+    diagonal = diagonal_product(m)
+    weighted_sum = 0
+    diagonal_size.times do |i|
+      weighted_sum += diagonal[i] * weights[i]
+    end
+
+    result = [diagonal, weighted_sum]
+    result.define_singleton_method(:diagonal) { self[0] }
+    result.define_singleton_method(:weighted_sum) { self[1] }
+    result.define_singleton_method(:weighted_total) { self[1] }
+    result.define_singleton_method(:sum) { self[1] }
+    result.define_singleton_method(:total) { self[1] }
+    result.define_singleton_method(:trace) { self[1] }
+    result.define_singleton_method(:weighted_trace) { self[1] }
+    result
+  end
+  alias weighted_product_diagonal weighted_diagonal_product
+  alias weighted_diagonal_and_sum weighted_diagonal_product
+  alias weighted_diagonal weighted_diagonal_product
+  alias weighted_diag weighted_diagonal_product
+
+  #
+  # Returns only the weighted sum of the diagonal of <tt>self * m</tt>.
+  #
+  def weighted_diagonal_sum(m, positional_weights = nil, weights: nil, weight: nil)
+    weighted_diagonal_product(m, positional_weights,
+                              weights: weights, weight: weight)[1]
+  end
+  alias diagonal_weighted_sum weighted_diagonal_sum
+  alias diag_weighted_sum weighted_diagonal_sum
+  alias weighted_diag_sum weighted_diagonal_sum
+  alias weighted_trace weighted_diagonal_sum
+  alias weighted_product_trace weighted_diagonal_sum
+
+  class << self
+    #
+    # Matrix.diagonal_product(a, b) -> Array
+    #
+    # Returns the diagonal of <tt>a * b</tt> without materializing the
+    # complete product.
+    #
+    def diagonal_product(a, b)
+      a.diagonal_product(b)
+    end
+    alias product_diagonal diagonal_product
+    alias diag_product diagonal_product
+
+    #
+    # Matrix.weighted_diagonal_product(a, b, weights) -> [diagonal, sum]
+    #
+    # Returns the diagonal of <tt>a * b</tt> and its weighted sum.
+    #
+    def weighted_diagonal_product(a, b, positional_weights = nil, weights: nil, weight: nil)
+      a.weighted_diagonal_product(b, positional_weights,
+                                  weights: weights, weight: weight)
+    end
+    alias weighted_product_diagonal weighted_diagonal_product
+    alias weighted_diagonal_and_sum weighted_diagonal_product
+    alias weighted_diagonal weighted_diagonal_product
+    alias weighted_diag weighted_diagonal_product
+
+    #
+    # Matrix.weighted_diagonal_sum(a, b, weights) -> Numeric
+    #
+    def weighted_diagonal_sum(a, b, positional_weights = nil, weights: nil, weight: nil)
+      a.weighted_diagonal_sum(b, positional_weights,
+                              weights: weights, weight: weight)
+    end
+    alias diagonal_weighted_sum weighted_diagonal_sum
+    alias diag_weighted_sum weighted_diagonal_sum
+    alias weighted_diag_sum weighted_diagonal_sum
+    alias weighted_trace weighted_diagonal_sum
+    alias weighted_product_trace weighted_diagonal_sum
+  end
+
+  private
+
+  def prepare_diagonal_weights(weights, expected_size) # :nodoc:
+    weights = weights.to_a if weights.respond_to?(:to_a)
+    unless weights.is_a?(Array)
+      raise ArgumentError,
+            "weights must be an Array or respond to #to_a"
+    end
+
+    unless weights.size == expected_size
+      raise ErrDimensionMismatch,
+            "Wrong number of weights: expected #{expected_size}, got #{weights.size}"
+    end
+    weights
+  end
+
+  public
+
+  #
   # Matrix addition.
   #   Matrix.scalar(2,5) + Matrix[[1,0], [-4,7]]
   #   #  =>  6  0
