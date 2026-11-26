@@ -52,7 +52,11 @@ class PartialFixedSampler(BaseSampler):
             A dictionary of parameters to be fixed.
 
         base_sampler:
-            A sampler which samples unfixed parameters.
+            A sampler which samples unfixed parameters. If it implements
+            ``sample_with_conditions(study, trial, search_space, fixed_params)``,
+            the effective fixed parameters for the current trial are passed as
+            conditional signals. The fixed parameters themselves are still
+            returned through the existing fixed-parameter path.
 
     """
 
@@ -81,8 +85,20 @@ class PartialFixedSampler(BaseSampler):
         trial: FrozenTrial,
         search_space: dict[str, BaseDistribution],
     ) -> dict[str, Any]:
-        # Fixed params are never sampled here.
-        return self._base_sampler.sample_relative(study, trial, search_space)
+        sample_with_conditions = getattr(self._base_sampler, "sample_with_conditions", None)
+        if not callable(sample_with_conditions):
+            # Fixed params are never sampled here.
+            return self._base_sampler.sample_relative(study, trial, search_space)
+
+        # Explicitly conditional joint samplers can use fixed values as conditions even
+        # though the fixed parameters themselves are returned through the fixed-param path.
+        # Queued params take precedence over this wrapper's fixed params, just as they do in
+        # Trial._suggest. Merge them per trial so the wrapper configuration is not mutated.
+        fixed_params = {
+            **self._fixed_params,
+            **trial.system_attrs.get("fixed_params", {}),
+        }
+        return sample_with_conditions(study, trial, search_space, fixed_params)
 
     def sample_independent(
         self,
