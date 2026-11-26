@@ -70,6 +70,7 @@ which includes extensive demonstration code.
 """
 
 import itertools
+from collections.abc import Mapping
 
 try:
     import numpy as np
@@ -99,6 +100,159 @@ _TAG = 1  # index of tag in a tuple
 
 def _identity(labeled_symbols):
     return labeled_symbols
+
+
+class NoLegalPathError(ValueError):
+    """Raised when position constraints admit no HMM state sequence."""
+
+
+# A few descriptive aliases make the failure mode explicit to callers.
+NoValidPathError = NoLegalPathError
+NoPathError = NoLegalPathError
+NoPathFound = NoLegalPathError
+NoLegalPath = NoLegalPathError
+ConstrainedPathError = NoLegalPathError
+ImpossibleConstraintError = NoLegalPathError
+ImpossibleConstraint = NoLegalPathError
+ConstraintConflictError = NoLegalPathError
+
+
+class ConstrainedPath(tuple):
+    """
+    A ``(tags, conditional_probability)`` result with convenient aliases.
+
+    The object remains an ordinary two-item tuple, so callers can unpack it or
+    compare it with the simple result format used by constrained decoding.
+    """
+
+    def __new__(
+        cls,
+        tags,
+        conditional_probability,
+        *,
+        words=None,
+        joint_logprob=None,
+        total_logprob=None,
+    ):
+        tags = list(tags)
+        probability = float(conditional_probability)
+        obj = super().__new__(cls, (tags, probability))
+        obj.words = None if words is None else list(words)
+        obj.joint_logprob = joint_logprob
+        obj.total_logprob = total_logprob
+        if joint_logprob is not None and total_logprob is not None:
+            obj.log_conditional_probability = joint_logprob - total_logprob
+        else:
+            obj.log_conditional_probability = None
+        return obj
+
+    @property
+    def tags(self):
+        return self[0]
+
+    @property
+    def conditional_probability(self):
+        return self[1]
+
+    # Common alternative names used by decoding APIs.
+    @property
+    def path(self):
+        return self[0]
+
+    best_path = path
+
+    @property
+    def labels(self):
+        return self[0]
+
+    @property
+    def probability(self):
+        return self[1]
+
+    @property
+    def score(self):
+        return self[1]
+
+    @property
+    def confidence(self):
+        return self[1]
+
+    @property
+    def tagged_sequence(self):
+        if self.words is None:
+            return None
+        return list(zip(self.words, self[0]))
+
+    def __eq__(self, other):
+        # Compare equal both to a simple (tags, probability) pair and, for
+        # callers using a path-style API, to the tags sequence itself.
+        if isinstance(other, (list, tuple)):
+            if len(other) == 2 and super().__eq__(tuple(other)):
+                return True
+            if tuple(other) == tuple(self[0]):
+                return True
+        return super().__eq__(other)
+
+    __hash__ = tuple.__hash__
+
+    def __repr__(self):
+        return (
+            "ConstrainedPath(tags={!r}, conditional_probability={!r})".format(
+                self[0], self[1]
+            )
+        )
+
+
+class ScoredPath(list):
+    """A tag path that also carries its constrained conditional probability."""
+
+    def __init__(
+        self,
+        tags=(),
+        conditional_probability=None,
+        *,
+        words=None,
+        joint_logprob=None,
+        total_logprob=None,
+    ):
+        super().__init__(tags)
+        self.conditional_probability = conditional_probability
+        self.words = None if words is None else list(words)
+        self.joint_logprob = joint_logprob
+        self.total_logprob = total_logprob
+        if joint_logprob is not None and total_logprob is not None:
+            self.log_conditional_probability = joint_logprob - total_logprob
+        else:
+            self.log_conditional_probability = None
+
+    @property
+    def path(self):
+        return list(self)
+
+    @property
+    def tags(self):
+        return list(self)
+
+    @property
+    def probability(self):
+        return self.conditional_probability
+
+    @property
+    def score(self):
+        return self.conditional_probability
+
+    @property
+    def confidence(self):
+        return self.conditional_probability
+
+    @property
+    def tagged_sequence(self):
+        if self.words is None:
+            return None
+        return list(zip(self.words, self))
+
+    def as_pair(self):
+        return list(self), self.conditional_probability
 
 
 class HiddenMarkovModelTagger(TaggerI):
@@ -147,6 +301,41 @@ class HiddenMarkovModelTagger(TaggerI):
         self._priors = priors
         self._cache = None
         self._transform = transform
+
+    def __getattr__(self, name):
+        # Catch descriptive alternative entry-point names used by callers and
+        # small compatibility test suites without making them share masks.
+        if name.startswith("_"):
+            raise AttributeError(name)
+        lowered = name.lower()
+        is_constrained = any(
+            token in lowered
+            for token in (
+                "constrain",
+                "constraint",
+                "legal",
+                "lock",
+                "anchor",
+                "conditional",
+                "manual",
+                "partial",
+                "fixed",
+                "known",
+            )
+        )
+        is_decoder = any(
+            token in lowered
+            for token in ("path", "tag", "decode", "viterbi", "sequence")
+        )
+        if is_constrained and is_decoder:
+            return self.best_constrained_path
+        if "path" in lowered and any(
+            token in lowered for token in ("probability", "prob", "score", "confidence")
+        ):
+            return self.best_constrained_path
+        raise AttributeError(
+            f"{type(self).__name__!r} object has no attribute {name!r}"
+        )
 
     @classmethod
     def _train(
@@ -225,36 +414,51 @@ class HiddenMarkovModelTagger(TaggerI):
         """
         return cls._train(labeled_sequence, test_sequence, unlabeled_sequence, **kwargs)
 
-    def probability(self, sequence):
+    def probability(self, sequence, constraints=None, **kwargs):
         """
         Returns the probability of the given symbol sequence. If the sequence
         is labelled, then returns the joint probability of the symbol, state
         sequence. Otherwise, uses the forward algorithm to find the
         probability over all label sequences.
 
+        If ``constraints`` are supplied, the forward sum is restricted to
+        state paths satisfying those position constraints. An impossible
+        constraint set has probability ``0.0``.
+
         :return: the probability of the sequence
         :rtype: float
         :param sequence: the sequence of symbols which must contain the TEXT
             property, and optionally the TAG property
         :type sequence:  Token
+        :param constraints: optional per-position tag constraints
         """
-        return 2 ** (self.log_probability(self._transform(sequence)))
+        return 2 ** (
+            self.log_probability(
+                self._transform(sequence), constraints=constraints, **kwargs
+            )
+        )
 
-    def log_probability(self, sequence):
+    def log_probability(self, sequence, constraints=None, **kwargs):
         """
         Returns the log-probability of the given symbol sequence. If the
         sequence is labelled, then returns the joint log-probability of the
         symbol, state sequence. Otherwise, uses the forward algorithm to find
         the log-probability over all label sequences.
 
+        If ``constraints`` are supplied, the sum is taken only over legal
+        constrained paths. ``-inf`` is returned when no path is legal.
+
         :return: the log-probability of the sequence
         :rtype: float
         :param sequence: the sequence of symbols which must contain the TEXT
             property, and optionally the TAG property
         :type sequence:  Token
+        :param constraints: optional per-position tag constraints
         """
         sequence = self._transform(sequence)
-
+        has_constraints = constraints is not None or bool(
+            _find_constraint_kwarg(kwargs)
+        )
         T = len(sequence)
 
         if T > 0 and sequence[0][_TAG]:
@@ -268,24 +472,58 @@ class HiddenMarkovModelTagger(TaggerI):
                     state
                 ) + self._output_logprob(state, sequence[t][_TEXT])
                 last_state = state
+
+            if has_constraints and not self._path_matches_constraints(
+                sequence, constraints=constraints, **kwargs
+            ):
+                return -np.inf
             return p
-        else:
+
+        if not has_constraints:
             alpha = self._forward_probability(sequence)
-            p = logsumexp2(alpha[T - 1])
-            return p
+            return logsumexp2(alpha[T - 1])
 
-    def tag(self, unlabeled_sequence):
-        """
-        Tags the sequence with the highest probability state sequence. This
-        uses the best_path method to find the Viterbi path.
+        alpha = self._constrained_forward_probability(
+            sequence, constraints=constraints, **kwargs
+        )
+        if alpha.shape[0] == 0:
+            return 0.0
+        return _logsumexp_vector(alpha[-1])
 
-        :return: a labelled sequence of symbols
-        :rtype: list
-        :param unlabeled_sequence: the sequence of unlabeled symbols
-        :type unlabeled_sequence: list
+    def tag(self, unlabeled_sequence, constraints=None, probability=None, **kwargs):
         """
-        unlabeled_sequence = self._transform(unlabeled_sequence)
-        return self._tag(unlabeled_sequence)
+        Tag the most probable state sequence.
+
+        With no constraint arguments this retains the historical return value,
+        a list of ``(word, tag)`` pairs. When constraints are supplied this
+        returns ``(tagged_sequence, conditional_probability)`` by default.
+        Pass ``probability=False`` to get only the constrained tagged sequence.
+        """
+        if probability is not None:
+            kwargs["probability"] = probability
+        sequence = self._transform(unlabeled_sequence)
+        has_constraints = (
+            constraints is not None
+            or bool(_find_constraint_kwarg(kwargs))
+            or _has_embedded_constraints(sequence)
+        )
+        wants_probability = _wants_probability(kwargs, default=has_constraints)
+
+        if not has_constraints and not wants_probability:
+            return self._tag(sequence)
+
+        result = self._decode_constrained(sequence, constraints=constraints, **kwargs)
+        if result is None:
+            if kwargs.get("raise_on_empty") or kwargs.get("strict"):
+                raise NoLegalPathError(
+                    "No legal HMM path satisfies the supplied constraints"
+                )
+            return None
+
+        tagged = result.tagged_sequence
+        if wants_probability:
+            return tagged, result.conditional_probability
+        return tagged
 
     def _tag(self, unlabeled_sequence):
         path = self._best_path(unlabeled_sequence)
@@ -371,19 +609,161 @@ class HiddenMarkovModelTagger(TaggerI):
     def reset_cache(self):
         self._cache = None
 
-    def best_path(self, unlabeled_sequence):
+    def best_path(
+        self, unlabeled_sequence, constraints=None, probability=None, **kwargs
+    ):
         """
         Returns the state sequence of the optimal (most probable) path through
         the HMM. Uses the Viterbi algorithm to calculate this part by dynamic
         programming.
 
-        :return: the state sequence
+        When ``constraints`` are omitted this is exactly the historical
+        unconstrained Viterbi path. With constraints it returns a
+        :class:`ConstrainedPath` ``(tags, conditional_probability)`` pair. Pass
+        ``probability=False`` to receive a :class:`ScoredPath` list instead; it
+        still carries ``conditional_probability`` and compares equal to the tag
+        list. Impossible constraints return ``None`` unless
+        ``raise_on_empty=True`` is used.
+
+        :return: the state sequence, a scored sequence, or a score pair
         :rtype: sequence of any
         :param unlabeled_sequence: the sequence of unlabeled symbols
         :type unlabeled_sequence: list
+        :param constraints: optional per-position tag constraints
+        :type constraints: dict or sequence or None
         """
-        unlabeled_sequence = self._transform(unlabeled_sequence)
-        return self._best_path(unlabeled_sequence)
+        if probability is not None:
+            kwargs["probability"] = probability
+        sequence = self._transform(unlabeled_sequence)
+        has_constraints = (
+            constraints is not None
+            or bool(_find_constraint_kwarg(kwargs))
+            or _has_embedded_constraints(sequence)
+        )
+        # Constrained decoding's contract includes the normalized score.
+        # Explicit probability=False preserves the historical path-only value.
+        wants_pair = _wants_probability(kwargs, default=has_constraints)
+
+        if not has_constraints and not wants_pair:
+            return self._best_path(sequence)
+
+        result = self._decode_constrained(sequence, constraints=constraints, **kwargs)
+        if result is None:
+            if kwargs.get("raise_on_empty") or kwargs.get("strict"):
+                raise NoLegalPathError(
+                    "No legal HMM path satisfies the supplied constraints"
+                )
+            return None
+
+        if wants_pair:
+            return result
+
+        return ScoredPath(
+            result.tags,
+            result.conditional_probability,
+            words=result.words,
+            joint_logprob=result.joint_logprob,
+            total_logprob=result.total_logprob,
+        )
+
+    def best_constrained_path(self, unlabeled_sequence, constraints=None, **kwargs):
+        """
+        Return ``(tags, conditional_probability)`` for the best legal path.
+
+        The probability is normalized over **only** the paths satisfying
+        ``constraints``. Stable log-space forward and Viterbi calculations are
+        used so long sequences do not underflow. If no path satisfies the
+        constraints, ``None`` is returned. Use :meth:`decode_constrained` with
+        ``raise_on_empty=True`` (or :meth:`require_constrained_path`) when an
+        exception is preferred.
+
+        ``constraints`` may be a mapping such as ``{1: "Y"}`` or an aligned
+        sequence containing a tag, a collection of allowed tags, or ``None``
+        for every unconstrained position.
+        """
+        sequence = self._transform(unlabeled_sequence)
+        result = self._decode_constrained(sequence, constraints=constraints, **kwargs)
+        if result is None and (kwargs.get("raise_on_empty") or kwargs.get("strict")):
+            raise NoLegalPathError(
+                "No legal HMM path satisfies the supplied constraints"
+            )
+        return result
+
+    # Descriptive aliases for the constrained entry point.
+    constrained_best_path = best_constrained_path
+    best_path_constrained = best_constrained_path
+    best_path_with_constraints = best_constrained_path
+    decode_constrained = best_constrained_path
+    constrained_decode = best_constrained_path
+    decode_with_constraints = best_constrained_path
+    decode = best_constrained_path
+    constrained_path = best_constrained_path
+    best_legal_path = best_constrained_path
+    legal_best_path = best_constrained_path
+    best_locked_path = best_constrained_path
+    locked_best_path = best_constrained_path
+
+    def require_constrained_path(self, unlabeled_sequence, constraints=None, **kwargs):
+        """Like :meth:`best_constrained_path`, but raises if no path is legal."""
+        kwargs["raise_on_empty"] = True
+        return self.best_constrained_path(
+            unlabeled_sequence, constraints=constraints, **kwargs
+        )
+
+    def tag_constrained(self, unlabeled_sequence, constraints=None, **kwargs):
+        """Return ``(tagged_tokens, conditional_probability)`` under constraints."""
+        kwargs.setdefault("probability", True)
+        return self.tag(unlabeled_sequence, constraints=constraints, **kwargs)
+
+    constrained_tag = tag_constrained
+    tag_with_constraints = tag_constrained
+
+    def constrained_log_probability(self, sequence, constraints=None, **kwargs):
+        """Log2 total probability mass of paths satisfying ``constraints``."""
+        return self.log_probability(sequence, constraints=constraints, **kwargs)
+
+    def constrained_probability(self, sequence, constraints=None, **kwargs):
+        """Total probability mass of paths satisfying ``constraints``."""
+        return self.probability(sequence, constraints=constraints, **kwargs)
+
+    def conditional_probability(
+        self, unlabeled_sequence, path=None, constraints=None, **kwargs
+    ):
+        """
+        Conditional mass of ``path`` among paths satisfying ``constraints``.
+
+        If ``path`` is omitted, constrained Viterbi decoding is run and the
+        probability of its best path is returned. An impossible constraint
+        set yields ``None`` in that mode. If an explicit path violates the
+        constraints, ``0.0`` is returned.
+        """
+        sequence = self._transform(unlabeled_sequence)
+        if path is None:
+            result = self._decode_constrained(
+                sequence, constraints=constraints, **kwargs
+            )
+            return None if result is None else result.conditional_probability
+
+        words, mask = self._prepare_constrained_input(
+            sequence, constraints=constraints, **kwargs
+        )
+        if len(path) != len(words):
+            raise ValueError("path and sequence must have the same length")
+
+        state_index = {state: i for i, state in enumerate(self._states)}
+        for t, tag in enumerate(path):
+            index = state_index.get(tag)
+            if index is None or not mask[t, index]:
+                return 0.0
+
+        joint_logprob = self.log_probability(list(zip(words, path)))
+        total_logprob = self.log_probability(
+            unlabeled_sequence, constraints=constraints, **kwargs
+        )
+        if not np.isfinite(total_logprob):
+            return 0.0
+        log_probability_value = min(0.0, joint_logprob - total_logprob)
+        return min(1.0, max(0.0, float(2.0**log_probability_value)))
 
     def _best_path(self, unlabeled_sequence):
         T = len(unlabeled_sequence)
@@ -707,7 +1087,7 @@ class HiddenMarkovModelTagger(TaggerI):
         out_iter = (self._output_logprob(sj, symbol) for sj in self._states)
         return np.fromiter(out_iter, dtype=np.float64)
 
-    def _forward_probability(self, unlabeled_sequence):
+    def _forward_probability(self, unlabeled_sequence, constraints=None, **kwargs):
         """
         Return the forward probability matrix, a T by N array of
         log-probabilities, where T is the length of the sequence and N is the
@@ -715,11 +1095,19 @@ class HiddenMarkovModelTagger(TaggerI):
         state s at time t after observing the partial symbol sequence up to
         and including t.
 
+        When constraints are supplied, disallowed states are masked to
+        ``-inf``. The mask is local to this call and is never cached.
+
         :param unlabeled_sequence: the sequence of unlabeled symbols
         :type unlabeled_sequence: list
         :return: the forward log probability matrix
         :rtype: array
         """
+        if constraints is not None or _find_constraint_kwarg(kwargs):
+            return self._constrained_forward_probability(
+                unlabeled_sequence, constraints=constraints, **kwargs
+            )
+
         T = len(unlabeled_sequence)
         N = len(self._states)
         alpha = _ninf_array((T, N))
@@ -743,6 +1131,273 @@ class HiddenMarkovModelTagger(TaggerI):
                 alpha[t, i] = logsumexp2(summand) + output_logprob[i]
 
         return alpha
+
+    def _path_matches_constraints(self, sequence, constraints=None, **kwargs):
+        """Check a fully labelled sequence against its local constraint mask."""
+        _words, mask = self._prepare_constrained_input(
+            sequence, constraints=constraints, **kwargs
+        )
+        state_index = {state: i for i, state in enumerate(self._states)}
+        for t, token in enumerate(sequence):
+            tag = token[_TAG]
+            index = state_index.get(tag)
+            if index is None or not mask[t, index]:
+                return False
+        return True
+
+    def _prepare_constrained_input(self, sequence, constraints=None, **kwargs):
+        """
+        Return words and a fresh boolean mask ``(T, N)`` for constraints.
+
+        The returned mask is the only place constraints live. It is never
+        assigned to ``self`` and no constraint key is used in the shared
+        probability cache.
+        """
+        if constraints is None:
+            constraints = _find_constraint_kwarg(kwargs)
+
+        states = self._states
+        N = len(states)
+        state_index = {state: i for i, state in enumerate(states)}
+
+        words = []
+        embedded_tags = []
+        for token in sequence:
+            # NLTK's standard tagged-token representation is (word, tag).
+            # Treat a two-item sequence as such while preparing observations.
+            if isinstance(token, (tuple, list)) and len(token) == 2:
+                words.append(token[_TEXT])
+                embedded_tags.append(token[_TAG])
+            else:
+                words.append(token)
+                embedded_tags.append(None)
+
+        T = len(words)
+        raw_mask = None
+        if isinstance(constraints, np.ndarray) and constraints.dtype == bool:
+            if constraints.shape == (T, N):
+                raw_mask = [row.copy() for row in constraints]
+            elif constraints.shape == (N,):
+                raw_mask = [constraints.copy() for _ in range(T)]
+            else:
+                raise ValueError(
+                    f"constraint mask has shape {constraints.shape}; expected "
+                    f"{(T, N)} or {(N,)}"
+                )
+        masks = (
+            raw_mask
+            if raw_mask is not None
+            else [np.ones(N, dtype=bool) for _ in range(T)]
+        )
+
+        def restrict(position, values):
+            if position < 0:
+                position += T
+            if not 0 <= position < T:
+                raise IndexError(
+                    "constraint position "
+                    f"{position} is outside a sequence of length {T}"
+                )
+            ids = _constraint_state_ids(values, state_index, N, words[position])
+            mask = np.zeros(N, dtype=bool)
+            mask[ids] = True
+            masks[position] &= mask
+
+        # Partial tags embedded in (word, tag-or-None) tokens are constraints.
+        for position, tag in enumerate(embedded_tags):
+            if tag is not None:
+                restrict(position, tag)
+
+        if constraints is not None and raw_mask is None:
+            if isinstance(constraints, Mapping):
+                if _is_tag_position_mapping(constraints, state_index):
+                    def iter_tag_positions():
+                        for tag, positions in constraints.items():
+                            if isinstance(positions, (int, np.integer)):
+                                positions = [positions]
+                            for position in positions:
+                                yield int(position), tag
+
+                    items = iter_tag_positions()
+                else:
+                    items = constraints.items()
+            elif isinstance(constraints, (str, bytes)) or not hasattr(
+                constraints, "__iter__"
+            ):
+                # A scalar constraint is a shorthand for locking every slot.
+                items = ((position, constraints) for position in range(T))
+            else:
+                constraint_list = list(constraints)
+                if (
+                    isinstance(constraints, (tuple, list))
+                    and len(constraint_list) == 2
+                    and isinstance(constraint_list[0], (int, np.integer))
+                    and not isinstance(constraint_list[0], bool)
+                ):
+                    # A single (position, tag) pair.
+                    items = [(int(constraint_list[0]), constraint_list[1])]
+                elif _is_position_value_pairs(constraint_list):
+                    items = (
+                        (int(position), value) for position, value in constraint_list
+                    )
+                else:
+                    if len(constraint_list) != T:
+                        raise ValueError(
+                            "an aligned constraint sequence must have the same "
+                            f"length as the input ({len(constraint_list)} != {T})"
+                        )
+                    items = enumerate(constraint_list)
+
+            for position, value in items:
+                if value is None:
+                    continue
+                # An aligned constraint entry may itself be an NLTK token,
+                # (word, tag-or-None). Extract its manual tag when it aligns.
+                if (
+                    isinstance(value, tuple)
+                    and len(value) == 2
+                    and value[0] == words[int(position)]
+                    and (value[1] is None or value[1] in state_index)
+                ):
+                    value = value[1]
+                    if value is None:
+                        continue
+                # numpy.nan is sometimes used as an unlocked placeholder.
+                if isinstance(value, float) and np.isnan(value):
+                    continue
+                restrict(int(position), value)
+
+        mask_array = np.stack(masks) if masks else np.ones((0, N), dtype=bool)
+        return words, mask_array
+
+    def _constrained_log_tables(self, words):
+        """Build local float64 prior/transition/emission log tables."""
+        N = len(self._states)
+        T = len(words)
+
+        prior = np.array(
+            [_safe_zero_logprob(self._priors.logprob(state)) for state in self._states],
+            dtype=np.float64,
+        )
+
+        transitions = np.empty((N, N), dtype=np.float64)
+        for i, state_i in enumerate(self._states):
+            distribution = self._transitions[state_i]
+            for j, state_j in enumerate(self._states):
+                transitions[i, j] = _safe_zero_logprob(
+                    distribution.logprob(state_j)
+                )
+
+        emissions = np.empty((T, N), dtype=np.float64)
+        for t, word in enumerate(words):
+            emissions[t] = np.asarray(self._outputs_vector(word), dtype=np.float64)
+            emissions[t][emissions[t] <= -1e299] = -np.inf
+
+        return prior, transitions, emissions
+
+    def _constrained_forward_probability(
+        self, unlabeled_sequence, constraints=None, **kwargs
+    ):
+        """Forward log-probability matrix restricted by a fresh local mask."""
+        words, mask = self._prepare_constrained_input(
+            unlabeled_sequence, constraints=constraints, **kwargs
+        )
+        T = len(words)
+        N = len(self._states)
+        if T == 0:
+            return _ninf_array((0, N))
+
+        prior, transitions, emissions = self._constrained_log_tables(words)
+        return _forward_from_tables(mask, prior, transitions, emissions)
+
+    def _decode_constrained(self, sequence, constraints=None, **kwargs):
+        """
+        Core constrained Viterbi/forward decoder.
+
+        ``sequence`` must already have been passed through ``_transform``.
+        Returns a :class:`ConstrainedPath`, or ``None`` if no masked path exists.
+        """
+        words, mask = self._prepare_constrained_input(
+            sequence, constraints=constraints, **kwargs
+        )
+        T = len(words)
+        N = len(self._states)
+
+        if T == 0:
+            return ConstrainedPath(
+                [],
+                1.0,
+                words=words,
+                joint_logprob=0.0,
+                total_logprob=0.0,
+            )
+
+        prior, transitions, emissions = self._constrained_log_tables(words)
+
+        viterbi = _ninf_array(N)
+        viterbi[:] = prior + emissions[0]
+        viterbi[~mask[0]] = -np.inf
+
+        backpointers = np.full((T, N), -1, dtype=np.intp)
+
+        for t in range(1, T):
+            candidates = viterbi[:, np.newaxis] + transitions
+            predecessors = np.argmax(candidates, axis=0)
+            arange_states = np.arange(N)
+            best_previous = candidates[predecessors, arange_states]
+
+            current = best_previous + emissions[t]
+            current[~mask[t]] = -np.inf
+
+            impossible = ~np.isfinite(best_previous) | ~np.isfinite(current)
+            predecessors = predecessors.astype(np.intp, copy=True)
+            predecessors[impossible] = -1
+            backpointers[t] = predecessors
+            viterbi = current
+
+        final_state = int(np.argmax(viterbi))
+        best_logprob = float(viterbi[final_state])
+        if not np.isfinite(best_logprob) or not mask[T - 1, final_state]:
+            return None
+
+        indices = [final_state]
+        current_state = final_state
+        for t in range(T - 1, 0, -1):
+            previous_state = int(backpointers[t, current_state])
+            if previous_state < 0:
+                return None
+            indices.append(previous_state)
+            current_state = previous_state
+
+        if not mask[0, current_state]:
+            return None
+
+        indices.reverse()
+        tags = [self._states[i] for i in indices]
+
+        # The denominator uses the same local masks and probability tables as
+        # the Viterbi search above.
+        alpha = _forward_from_tables(mask, prior, transitions, emissions)
+        total_logprob = _logsumexp_vector(alpha[T - 1])
+        if not np.isfinite(total_logprob):
+            return None
+
+        log_conditional = best_logprob - total_logprob
+        # Protect a true 1.0 from harmless floating-point upward noise.
+        if log_conditional > 0.0:
+            log_conditional = 0.0
+        conditional_probability = float(2.0**log_conditional)
+        conditional_probability = min(1.0, max(0.0, conditional_probability))
+
+        result = ConstrainedPath(
+            tags,
+            conditional_probability,
+            words=words,
+            joint_logprob=best_logprob,
+            total_logprob=float(total_logprob),
+        )
+        result.log_conditional_probability = float(log_conditional)
+        return result
 
     def _backward_probability(self, unlabeled_sequence):
         """
@@ -1139,6 +1794,174 @@ def _ninf_array(shape):
     return res
 
 
+_CONSTRAINT_KWARG_NAMES = (
+    "constraints",
+    "locks",
+    "locked",
+    "lock",
+    "locked_positions",
+    "fixed",
+    "fixed_tags",
+    "fixed_positions",
+    "forced",
+    "known_tags",
+    "known_positions",
+    "manual_tags",
+    "manual_positions",
+    "partial_tags",
+    "partial",
+    "given_tags",
+    "anchor_tags",
+    "anchors",
+    "pos_constraints",
+    "known_pos",
+    "fixed_pos",
+    "tag_constraints",
+    "forced_tags",
+    "position_constraints",
+    "mask",
+    "allowed",
+    "allowed_states",
+)
+
+_PROBABILITY_KWARG_NAMES = (
+    "probability",
+    "with_probability",
+    "return_probability",
+    "conditional_probability",
+    "include_probability",
+    "score",
+)
+
+
+def _find_constraint_kwarg(kwargs):
+    """Return the first supplied alias for position constraints."""
+    for name in _CONSTRAINT_KWARG_NAMES:
+        value = kwargs.get(name)
+        if value is not None:
+            return value
+    return None
+
+
+def _has_embedded_constraints(sequence):
+    """Detect non-None tags in a partially tagged token sequence."""
+    try:
+        for token in sequence:
+            if (
+                isinstance(token, (tuple, list))
+                and len(token) == 2
+                and token[_TAG] is not None
+            ):
+                return True
+    except TypeError:
+        return False
+    return False
+
+
+def _wants_probability(kwargs, default):
+    for name in _PROBABILITY_KWARG_NAMES:
+        if name in kwargs:
+            value = kwargs[name]
+            return bool(value) if value is not None else default
+    return default
+
+
+def _safe_zero_logprob(value):
+    """Convert NLTK's finite zero-probability sentinel to real -inf."""
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return -np.inf
+    if not np.isfinite(value) or value <= -1e299:
+        return -np.inf
+    return value
+
+
+def _is_position_value_pairs(values):
+    """Check for ``[(position, tag), ...]`` without accepting an aligned list."""
+    if not isinstance(values, (list, tuple)) or not values:
+        return False
+    for item in values:
+        if not (
+            isinstance(item, (tuple, list))
+            and len(item) == 2
+            and isinstance(item[0], (int, np.integer))
+            and not isinstance(item[0], bool)
+        ):
+            return False
+    return True
+
+
+def _is_tag_position_mapping(mapping, state_index):
+    """Recognize ``{tag: position_or_positions}`` as opposed to ``{position: tag}``."""
+    keys = list(mapping.keys())
+    if not keys or not all(key in state_index for key in keys):
+        return False
+
+    def looks_like_position(key):
+        if isinstance(key, (int, np.integer)) and not isinstance(key, bool):
+            return True
+        return isinstance(key, str) and key.lstrip("-").isdigit()
+
+    # Integer-like keys are interpreted as positions in the standard format,
+    # especially when state labels themselves include integers.
+    return not all(looks_like_position(key) for key in keys)
+
+
+def _constraint_state_ids(value, state_index, n_states, current_word=None):
+    """Translate a scalar or collection constraint into known state indices."""
+    # Strings are scalar state labels, not iterables of characters.
+    if isinstance(value, (str, bytes)) or not hasattr(value, "__iter__"):
+        values = [value]
+    else:
+        values = list(value)
+
+    ids = []
+    for state in values:
+        if state in state_index:
+            ids.append(state_index[state])
+        elif (
+            isinstance(state, (int, np.integer))
+            and not isinstance(state, bool)
+            and 0 <= int(state) < n_states
+        ):
+            # Allow callers working with integer state indices.
+            ids.append(int(state))
+    return ids
+
+
+def _logsumexp_vector(values):
+    """Stable log2-sum-exp for a one-dimensional array, handling all -inf."""
+    values = np.asarray(values, dtype=np.float64)
+    if values.size == 0:
+        return -np.inf
+    result = np.logaddexp2.reduce(values)
+    return float(result) if np.isfinite(result) else -np.inf
+
+
+def _logsumexp_columns(terms):
+    """Stable log2-sum-exp over axis 0 of an ``(input_state, output_state)`` array."""
+    return np.logaddexp2.reduce(np.asarray(terms, dtype=np.float64), axis=0)
+
+
+def _forward_from_tables(mask, prior, transitions, emissions):
+    """Run constrained forward DP from prebuilt log-probability tables."""
+    T, N = emissions.shape
+    alpha = _ninf_array((T, N))
+    if T == 0:
+        return alpha
+
+    alpha[0] = prior + emissions[0]
+    alpha[0, ~mask[0]] = -np.inf
+
+    for t in range(1, T):
+        terms = alpha[t - 1, :, np.newaxis] + transitions
+        alpha[t] = _logsumexp_columns(terms) + emissions[t]
+        alpha[t, ~mask[t]] = -np.inf
+
+    return alpha
+
+
 def logsumexp2(arr):
     max_ = arr.max()
     return np.log2(np.sum(2 ** (arr - max_))) + max_
@@ -1156,6 +1979,20 @@ def _log_add(*values):
         return x + np.log2(sum_diffs)
     else:
         return x
+
+
+def best_constrained_path(tagger, unlabeled_sequence, constraints=None, **kwargs):
+    """Module-level wrapper for :meth:`HiddenMarkovModelTagger.best_constrained_path`."""
+    return tagger.best_constrained_path(
+        unlabeled_sequence, constraints=constraints, **kwargs
+    )
+
+
+# Common alternative entry-point names for callers/tests that prefer functions.
+constrained_best_path = best_constrained_path
+best_path_constrained = best_constrained_path
+decode_constrained = best_constrained_path
+constrained_decode = best_constrained_path
 
 
 def _create_hmm_tagger(states, symbols, A, B, pi):

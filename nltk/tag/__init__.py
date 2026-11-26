@@ -87,7 +87,12 @@ from nltk.tag.brill_trainer import BrillTaggerTrainer
 from nltk.tag.tnt import TnT
 from nltk.tag.hunpos import HunposTagger
 from nltk.tag.stanford import StanfordTagger, StanfordPOSTagger, StanfordNERTagger
-from nltk.tag.hmm import HiddenMarkovModelTagger, HiddenMarkovModelTrainer
+from nltk.tag.hmm import (
+    ConstrainedPath,
+    HiddenMarkovModelTagger,
+    HiddenMarkovModelTrainer,
+    NoLegalPathError,
+)
 from nltk.tag.senna import SennaTagger, SennaChunkTagger, SennaNERTagger
 from nltk.tag.mapping import tagset_mapping, map_tag
 from nltk.tag.crf import CRFTagger
