@@ -144,6 +144,53 @@ Philiprehberger::FuzzyMatch.deduplicate(%w[hello helo world wrld], threshold: 0.
 # => ["hello", "world"]
 ```
 
+The greedy pass only compares each string against the representatives kept so
+far, so a chain such as `cat`–`bat`–`bag` can split whenever the input order
+changes. Pass `cluster: true` for connected grouping instead:
+
+```ruby
+clusters = Philiprehberger::FuzzyMatch.deduplicate(
+  %w[cat bat bag], threshold: 0.5, algorithm: :levenshtein, cluster: true
+)
+# `connected: true`, `.connected_groups(...)`, and `.deduplicate_connected(...)`
+# are available as aliases for the same connected-grouping result.
+# => [{ representative: "bag",
+#       members: ["bag", "bat", "cat"],
+#       paths: {
+#         "bag" => { path: ["bag"], weakest: 1.0 },
+#         "bat" => { path: ["bag", "bat"], weakest: 0.6667 },
+#         "cat" => { path: ["bag", "bat", "cat"], weakest: 0.6667 }
+#       } }]
+```
+
+### Connected Clusters
+
+```ruby
+strings = %w[bbaa baaa aaaa abaa]
+clusters = Philiprehberger::FuzzyMatch.clusters(strings, threshold: 0.5, algorithm: :levenshtein)
+# => [{ representative: "aaaa",
+#       members: ["aaaa", "abaa", "baaa", "bbaa"],
+#       paths: {
+#         "aaaa" => { path: ["aaaa"], weakest: 1.0 },
+#         "abaa" => { path: ["aaaa", "abaa"], weakest: 0.75 },
+#         "baaa" => { path: ["aaaa", "baaa"], weakest: 0.75 },
+#         "bbaa" => { path: ["aaaa", "abaa", "bbaa"], weakest: 0.75 }
+#       } }]
+```
+
+Two strings are joined when their similarity reaches the threshold, and a
+cluster is one connected component of that graph. The representative is the
+lexicographically first member, members are sorted by name, and each member gets
+one replayable path from the representative plus the weakest edge on that path.
+
+Every step of a reported path is a real above-threshold pair. Candidate paths
+are ranked by their weakest edge (higher wins), then by edge count (fewer wins),
+then by the member names along the path. The barely-passing `aaaa`–`bbaa` edge
+(0.5) therefore loses to the `aaaa`–`abaa`–`bbaa` chain (weakest edge 0.75), and
+the equal-strength `baaa` detour loses on the name comparison. Nothing depends
+on input order, so reversing the input yields the same clusters,
+representatives, and paths.
+
 ### Hamming Distance
 
 ```ruby
@@ -219,7 +266,9 @@ Philiprehberger::FuzzyMatch.weighted_score('kitten', 'sitting',
 | `.token_set_ratio(a, b)` | Token-set-based similarity (0.0 to 1.0) |
 | `.weighted_score(a, b, weights:)` | Weighted multi-algorithm score (0.0 to 1.0) |
 | `.similarity_matrix(strings, algorithm:, threshold:)` | Pairwise similarity hash-of-hashes for batch comparison |
-| `.deduplicate(array, threshold:, algorithm:)` | Group and deduplicate similar strings |
+| `.deduplicate(array, threshold:, algorithm:)` | Group and deduplicate similar strings (greedy representatives) |
+| `.deduplicate(array, threshold:, algorithm:, cluster: true)` | Connected clustering instead of the greedy pass (`connected: true` is also accepted) |
+| `.clusters(array, threshold:, algorithm:)` | Connected clusters with representative, members, and path evidence; `.connected_groups` is an alias |
 
 All methods are case-insensitive by default.
 

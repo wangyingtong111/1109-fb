@@ -7,6 +7,10 @@ and this gem adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+- `FuzzyMatch.clusters(array, threshold:, algorithm:)` — connected grouping over the thresholded similarity graph. Each cluster reports its lexicographically first representative, its members, and for every member a replayable path from the representative plus the weakest edge on that path. Paths are ranked by their weakest edge first, then by edge count, then by the member names along the path, so a barely-passing direct edge loses to a stronger multi-step chain and the result does not depend on input order.
+- `FuzzyMatch.deduplicate(..., cluster: true)` — opt into the connected grouping result; `connected: true`, `.connected_groups`, and `.deduplicate_connected` are compatibility aliases. The default greedy call keeps its return type and order.
+
 ## [0.10.0] - 2026-05-09
 
 ### Added

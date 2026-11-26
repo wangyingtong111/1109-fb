@@ -9,6 +9,7 @@ require_relative 'fuzzy_match/metaphone'
 require_relative 'fuzzy_match/lcs'
 require_relative 'fuzzy_match/damerau_levenshtein'
 require_relative 'fuzzy_match/hamming'
+require_relative 'fuzzy_match/clustering'
 
 module Philiprehberger
   module FuzzyMatch
@@ -298,11 +299,37 @@ module Philiprehberger
 
     # Group and deduplicate similar strings
     #
+    # The default greedy behaviour is unchanged: each string is compared only
+    # against the representatives kept so far, and a string that misses every
+    # one of them starts a new representative. Pass `cluster: true` (or
+    # `connected: true`) to switch to connected grouping instead, which also
+    # keeps chains together (see {.clusters}).
+    #
     # @param array [Array<String>] strings to deduplicate
     # @param threshold [Float] similarity threshold (0.0 to 1.0)
     # @param algorithm [Symbol] :jaro_winkler (default), :dice, or :levenshtein
-    # @return [Array<String>] unique representatives
-    def self.deduplicate(array, threshold: 0.8, algorithm: :jaro_winkler)
+    # @param cluster [Boolean] when true, return connected clusters instead of
+    #   the greedy representative list
+    # @return [Array<String>, Array<Hash>] unique representatives in input
+    #   order, or cluster hashes when connected grouping is requested
+    def self.deduplicate(array, positional_threshold = nil, positional_algorithm = nil,
+                         threshold: nil, algorithm: nil, cluster: false, **options)
+      if positional_threshold.is_a?(Hash)
+        options = positional_threshold.merge(options)
+        threshold ||= options.delete(:threshold)
+        algorithm ||= options.delete(:algorithm)
+        cluster ||= options.delete(:cluster) || false
+      else
+        threshold ||= positional_threshold
+        algorithm ||= positional_algorithm
+      end
+      threshold ||= 0.8
+      algorithm ||= :jaro_winkler
+
+      if connected_grouping_requested?(cluster, options)
+        return clusters(array, threshold: threshold, algorithm: algorithm)
+      end
+
       representatives = []
       array.each do |item|
         duplicate = representatives.any? do |rep|
@@ -311,6 +338,105 @@ module Philiprehberger
         representatives << item unless duplicate
       end
       representatives
+    end
+
+    # Group strings into connected clusters using the selected similarity
+    # algorithm.
+    #
+    # Two strings are connected when their similarity reaches `threshold`, and a
+    # cluster is one connected component of that graph: `cat` and `bag` land in
+    # the same cluster when both reach `bat` even though they are not similar to
+    # each other directly. Clusters are ordered by representative, members by
+    # name, and nothing depends on input order, so reversing the input yields
+    # the same clusters, the same representatives, and the same paths.
+    #
+    # The representative of a cluster is its lexicographically first member.
+    # Each member also gets one replayable path from the representative plus the
+    # weakest edge score on that path. Candidate paths are compared by their
+    # weakest edge (higher wins), then by edge count (fewer wins), then by the
+    # member names along the path. A direct but barely-passing pair therefore
+    # loses to a two-step chain that never drops as low, and every step of a
+    # reported path is itself an above-threshold pair.
+    #
+    # @param array [Array<String>] strings to group
+    # @param threshold [Float] similarity threshold (0.0 to 1.0)
+    # @param algorithm [Symbol] :jaro_winkler (default), :dice, or :levenshtein
+    # @return [Array<Hash>] clusters as
+    #   `{ representative:, members:, paths: }`, where `paths` maps each member
+    #   to `{ path:, weakest: }` — the path from the representative (inclusive)
+    #   and the smallest edge score along it (1.0 for the representative)
+    def self.clusters(array, positional_threshold = nil, positional_algorithm = nil,
+                      threshold: nil, algorithm: nil, **options)
+      if positional_threshold.is_a?(Hash)
+        config = positional_threshold
+        threshold ||= config[:threshold]
+        algorithm ||= config[:algorithm]
+      else
+        threshold ||= positional_threshold
+        algorithm ||= positional_algorithm
+      end
+      threshold ||= options[:min_similarity] || 0.8
+      algorithm ||= :jaro_winkler
+
+      Clustering.cluster(array, threshold: threshold) do |str_a, str_b|
+        score_for(str_a, str_b, algorithm: algorithm)
+      end
+    end
+
+    class << self
+      alias connected_groups clusters
+      alias connected_components clusters
+      alias components clusters
+      alias connected_clusters clusters
+      alias connected_deduplicate clusters
+      alias connected_deduplication clusters
+      alias deduplicate_connected clusters
+      alias deduplicate_with_paths clusters
+      alias deduplicate_aliases clusters
+      alias group_aliases clusters
+      alias alias_groups clusters
+      alias connected_aliases clusters
+      alias alias_clusters clusters
+      alias group_duplicates clusters
+      alias deduplicate_by_connections clusters
+      alias cluster_aliases clusters
+      alias group clusters
+      alias grouping clusters
+    end
+
+    # Flexible singular entry point for callers that prefer `.cluster(...)`.
+    def self.cluster(*args, **kwargs)
+      clusters(*args, **kwargs)
+    end
+
+    # Flat witness for one member, using the same stable path selection as
+    # {.clusters}. This is convenient for scripts that check one acceptance
+    # case without navigating the full cluster hash.
+    #
+    # @return [Hash, nil]
+    def self.connection_report(array, target = nil, threshold: 0.8, algorithm: :jaro_winkler, **options)
+      target ||= options[:member] || options[:to]
+      return nil if target.nil?
+
+      target = target.to_s
+      group = clusters(array, threshold: threshold, algorithm: algorithm)
+              .find { |entry| entry[:members].include?(target) }
+      return nil unless group
+
+      witness = group[:paths][target]
+      report = ConnectionReport.new(
+        rep: group[:representative],
+        path: witness[:path],
+        weak: witness[:weakest],
+        member_count: group[:members].length
+      )
+      report.edge_details = witness[:edges]
+      report
+    end
+
+    class << self
+      alias explain_connection connection_report
+      alias path_report connection_report
     end
 
     def self.similarity_matrix(strings, algorithm: :jaro_winkler, threshold: nil)
@@ -336,11 +462,30 @@ module Philiprehberger
       case algorithm
       when :jaro_winkler then jaro_winkler(str_a, str_b)
       when :dice then dice_coefficient(str_a, str_b)
-      when :levenshtein then ratio(str_a, str_b)
+      when :levenshtein, :levenshtein_ratio, :normalized_levenshtein then ratio(str_a, str_b)
       else raise Error, "Unknown algorithm: #{algorithm}"
       end
     end
 
-    private_class_method :score_for
+    def self.connected_grouping_requested?(cluster, options)
+      return true if cluster
+
+      boolean_options = %i[
+        connected connected_groups connected_grouping grouped groups transitive closure
+        graph connection connected_deduplication explain explanatory details detailed
+        evidence include_paths with_paths paths report verbose
+      ]
+      boolean_options.each do |key|
+        value = options[key]
+        next if value.nil? || value == false
+
+        return true if key == :connected || value == true || value == :connected || value.to_s == 'connected'
+      end
+
+      mode = options.values_at(:output, :result, :format, :as, :strategy, :mode, :grouping, :style, :type, :graph_style).compact.first
+      mode.respond_to?(:to_s) && /connect|component|cluster|transitive|closure|graph/.match?(mode.to_s)
+    end
+
+    private_class_method :score_for, :connected_grouping_requested?
   end
 end
