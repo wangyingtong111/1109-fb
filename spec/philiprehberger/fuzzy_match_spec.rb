@@ -99,6 +99,26 @@ RSpec.describe Philiprehberger::FuzzyMatch do
     it 'is case insensitive' do
       expect(described_class.damerau_ratio('Hello', 'hello')).to eq(1.0)
     end
+
+    it 'keeps the no-mode score on the OSA distance contract' do
+      expect(described_class.damerau_ratio('CA', 'ABC')).to eq(0.0)
+      expect(described_class.damerau_ratio('CA', 'ABBC')).to eq(0.0)
+    end
+
+    it 'normalizes the requested full distance independently' do
+      expect(described_class.damerau_ratio('AB', 'BA', mode: :full)).to eq(0.5)
+      expect(described_class.damerau_ratio('CA', 'ABC', mode: :full)).to be_within(1e-9).of(1.0 / 3.0)
+      expect(described_class.damerau_ratio('CA', 'ABBC', mode: :full)).to eq(0.25)
+      expect(described_class.full_damerau_ratio('CA', 'ABC')).to be_within(1e-9).of(1.0 / 3.0)
+      expect(described_class.damerau_full_ratio('CA', 'ABBC')).to eq(0.25)
+    end
+
+    it 'preserves empty-string scores in both modes' do
+      expect(described_class.damerau_ratio('', '')).to eq(1.0)
+      expect(described_class.damerau_ratio('', '', mode: :full)).to eq(1.0)
+      expect(described_class.damerau_ratio('', 'abc', mode: :full)).to eq(0.0)
+      expect(described_class.damerau_ratio('abc', '', mode: :full)).to eq(0.0)
+    end
   end
 
   describe '.lcs' do

@@ -7,6 +7,9 @@ and this gem adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+- `damerau_levenshtein(a, b, mode: :full)` and `full_damerau_levenshtein(a, b)` for unrestricted/full Damerau-Levenshtein distance, plus `damerau_ratio(..., mode: :full)` and `full_damerau_ratio(a, b)` for its normalized score. The default mode remains optimal string alignment.
+
 ## [0.10.0] - 2026-05-09
 
 ### Added

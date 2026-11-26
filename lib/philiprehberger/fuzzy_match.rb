@@ -45,28 +45,76 @@ module Philiprehberger
       Lcs.ratio(str_a, str_b)
     end
 
-    # Damerau-Levenshtein edit distance (counts transpositions as 1 edit)
+    # Damerau-Levenshtein edit distance (counts adjacent transpositions as 1).
     #
-    # @param str_a [String]
-    # @param str_b [String]
+    # Without a mode this preserves the optimal string alignment (OSA) default.
+    # Pass mode: :full (or full: true) for unrestricted/full Damerau-Levenshtein.
+    #
+    # @param str_a [Object]
+    # @param str_b [Object]
+    # @param mode_or_options [Symbol, Hash, nil] :full or an options hash
+    # @param options [Hash] optional mode/variant/full keyword options
     # @return [Integer]
-    def self.damerau_levenshtein(str_a, str_b)
-      DamerauLevenshtein.distance(str_a, str_b)
+    def self.damerau_levenshtein(str_a, str_b, mode_or_options = nil, **options)
+      DamerauLevenshtein.distance(str_a, str_b, mode_or_options, **options)
     end
 
-    # Normalized Damerau-Levenshtein similarity (0.0 to 1.0)
+    # Full/unrestricted Damerau-Levenshtein edit distance.
     #
-    # @param str_a [String]
-    # @param str_b [String]
+    # @return [Integer]
+    def self.full_damerau_levenshtein(str_a, str_b, **options)
+      damerau_levenshtein(str_a, str_b, **options, mode: :full)
+    end
+
+    # Normalized Damerau-Levenshtein similarity (0.0 to 1.0).
+    #
+    # The normalization uses whichever distance mode is requested; the default
+    # score is based on the historical OSA distance.
+    #
     # @return [Float]
-    def self.damerau_ratio(str_a, str_b)
+    def self.damerau_ratio(str_a, str_b, mode_or_options = nil, **options)
       a = str_a.to_s.downcase
       b = str_b.to_s.downcase
       max_len = [a.length, b.length].max
       return 1.0 if max_len.zero?
 
-      distance = DamerauLevenshtein.distance(a, b)
+      distance = DamerauLevenshtein.distance(a, b, mode_or_options, **options)
       1.0 - (distance.to_f / max_len)
+    end
+
+    # Normalized similarity based on the full/unrestricted distance.
+    #
+    # @return [Float]
+    def self.full_damerau_ratio(str_a, str_b, **options)
+      damerau_ratio(str_a, str_b, **options, mode: :full)
+    end
+
+    # Explicit normalized score for the default optimal string alignment mode.
+    #
+    # @return [Float]
+    def self.optimal_string_alignment_ratio(str_a, str_b, **options)
+      damerau_ratio(str_a, str_b, **options, mode: :optimal_string_alignment)
+    end
+
+    class << self
+      alias damerau_distance damerau_levenshtein
+      alias full_damerau_distance full_damerau_levenshtein
+      alias full_damerau full_damerau_levenshtein
+      alias damerau_full full_damerau_levenshtein
+      alias damerau_full_distance full_damerau_levenshtein
+      alias true_damerau_levenshtein full_damerau_levenshtein
+      alias unrestricted_damerau_levenshtein full_damerau_levenshtein
+      alias damerau_score damerau_ratio
+      alias damerau_similarity damerau_ratio
+      alias damerau_levenshtein_ratio damerau_ratio
+      alias full_damerau_levenshtein_ratio full_damerau_ratio
+      alias osa_damerau_ratio optimal_string_alignment_ratio
+      alias optimal_string_alignment_score optimal_string_alignment_ratio
+      alias osa_ratio optimal_string_alignment_ratio
+      alias damerau_full_ratio full_damerau_ratio
+      alias full_damerau_score full_damerau_ratio
+      alias full_damerau_similarity full_damerau_ratio
+      alias unrestricted_damerau_ratio full_damerau_ratio
     end
 
     def self.ratio(str_a, str_b)
@@ -285,7 +333,9 @@ module Philiprehberger
         dice: ->(a, b) { dice_coefficient(a, b) },
         levenshtein_ratio: ->(a, b) { ratio(a, b) },
         lcs_ratio: ->(a, b) { lcs_ratio(a, b) },
-        damerau_ratio: ->(a, b) { damerau_ratio(a, b) }
+        damerau_ratio: ->(a, b) { damerau_ratio(a, b) },
+        full_damerau_ratio: ->(a, b) { full_damerau_ratio(a, b) },
+        damerau_full_ratio: ->(a, b) { full_damerau_ratio(a, b) }
       }
 
       weights.reduce(0.0) do |total, (algo, weight)|
@@ -329,14 +379,17 @@ module Philiprehberger
     #
     # @param str_a [String]
     # @param str_b [String]
-    # @param algorithm [Symbol] :jaro_winkler, :dice, or :levenshtein
+    # @param algorithm [Symbol] :jaro_winkler, :dice, :levenshtein,
+    #   :damerau_levenshtein, or :full_damerau
     # @return [Float] similarity between 0.0 and 1.0
     # @raise [Error] when the algorithm is not supported
-    def self.score_for(str_a, str_b, algorithm:)
+    def self.score_for(str_a, str_b, algorithm:, **options)
       case algorithm
       when :jaro_winkler then jaro_winkler(str_a, str_b)
       when :dice then dice_coefficient(str_a, str_b)
       when :levenshtein then ratio(str_a, str_b)
+      when :damerau, :damerau_levenshtein, :damerau_ratio then damerau_ratio(str_a, str_b, **options)
+      when :full_damerau, :full_damerau_ratio then full_damerau_ratio(str_a, str_b, **options)
       else raise Error, "Unknown algorithm: #{algorithm}"
       end
     end

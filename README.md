@@ -44,6 +44,16 @@ Philiprehberger::FuzzyMatch.ratio('kitten', 'sitting')  # => ~0.57
 # Counts adjacent transpositions as 1 edit (Levenshtein counts them as 2)
 Philiprehberger::FuzzyMatch.damerau_levenshtein('teh', 'the')   # => 1
 Philiprehberger::FuzzyMatch.damerau_ratio('teh', 'the')         # => ~0.667
+
+# The default is optimal string alignment (OSA). Request the full/unrestricted
+# Damerau-Levenshtein distance when a transposed position may also take part
+# in later insertions or deletions.
+Philiprehberger::FuzzyMatch.damerau_levenshtein('CA', 'ABC')                 # => 3
+Philiprehberger::FuzzyMatch.damerau_levenshtein('CA', 'ABC', mode: :full)   # => 2
+Philiprehberger::FuzzyMatch.full_damerau_ratio('CA', 'ABC')                 # => ~0.333
+
+# Full mode also accepts full: true or a positional :full.
+Philiprehberger::FuzzyMatch.damerau_levenshtein('CA', 'ABBC', full: true)   # => 3
 ```
 
 ### Longest Common Subsequence
@@ -186,7 +196,7 @@ one and returns the maximum Levenshtein-based ratio. FuzzyWuzzy parity.
 Philiprehberger::FuzzyMatch.weighted_score('kitten', 'sitting',
   weights: { jaro_winkler: 0.5, dice: 0.3, levenshtein_ratio: 0.2 })
 # => weighted combination of algorithm scores
-# Supported keys: :jaro_winkler, :dice, :levenshtein_ratio, :lcs_ratio, :damerau_ratio
+# Supported keys: :jaro_winkler, :dice, :levenshtein_ratio, :lcs_ratio, :damerau_ratio, :full_damerau_ratio
 # Weights must sum to 1.0
 ```
 
@@ -199,8 +209,10 @@ Philiprehberger::FuzzyMatch.weighted_score('kitten', 'sitting',
 | `.levenshtein(a, b)` | Levenshtein edit distance (integer) |
 | `.jaro_winkler(a, b)` | Jaro-Winkler similarity (0.0 to 1.0) |
 | `.dice_coefficient(a, b)` | Dice coefficient from bigram overlap (0.0 to 1.0) |
-| `.damerau_levenshtein(a, b)` | Damerau-Levenshtein distance with transpositions (integer) |
-| `.damerau_ratio(a, b)` | Normalized Damerau-Levenshtein similarity (0.0 to 1.0) |
+| `.damerau_levenshtein(a, b, mode: :osa)` | OSA Damerau-Levenshtein distance; use `mode: :full` for full DL (integer) |
+| `.full_damerau_levenshtein(a, b)` | Full/unrestricted Damerau-Levenshtein distance (integer) |
+| `.damerau_ratio(a, b, mode: :osa)` | Normalized OSA/full Damerau-Levenshtein similarity (0.0 to 1.0) |
+| `.full_damerau_ratio(a, b)` | Normalized full Damerau-Levenshtein similarity (0.0 to 1.0) |
 | `.lcs(a, b)` | Longest common subsequence length (integer) |
 | `.lcs_ratio(a, b)` | Normalized LCS similarity (0.0 to 1.0) |
 | `.ratio(a, b)` | Normalized Levenshtein ratio (0.0 to 1.0) |
