@@ -30,6 +30,47 @@ class MiniFTS
   # combinators, incompatible serialized indexes).
   class Error < StandardError; end
 
+  # Raised when a phrase query is issued against an index that does not carry
+  # term positions. This is deliberately distinct from an empty result: an
+  # index built (or loaded) with +positions: true+ that simply has no matching
+  # phrase returns +[]+, while a position-less index reports that the phrase
+  # capability is unavailable at all. Check {#positions_enabled?} (or
+  # {#phrase_search_available?}) to test the capability without raising.
+  class PhraseSearchUnavailable < Error; end
+
+  # A contiguous-phrase query leaf: only documents whose analyzed terms occur
+  # at consecutive token positions, in the same field and in query order, match.
+  #
+  # Build one with {MiniFTS.phrase} (or +MiniFTS::Phrase.new+), or pass the
+  # equivalent Hash leaf +{ phrase: "red oak" }+ to {#search}. The phrase text
+  # is tokenized with the search tokenizer and processed per field, so a
+  # field-specific +process_term+ applies exactly as it did at indexing time.
+  #
+  # @example
+  #   ms = MiniFTS.new(fields: ["title"], positions: true)
+  #   ms.search(MiniFTS.phrase("red oak"))
+  #   ms.search({ combine_with: "AND", queries: ["oak", { phrase: "red oak" }] })
+  class Phrase
+    # @return [String, Array<String>] the phrase text, or its pre-tokenized
+    #   terms when constructed from an Array.
+    attr_reader :value
+
+    # @param value [String, Array<String>] the phrase text (tokenized on search)
+    #   or an Array of already-tokenized terms.
+    def initialize(value)
+      unless value.is_a?(String) || value.is_a?(Array)
+        raise Error, "MiniFTS: a phrase must be a String or an Array of terms"
+      end
+
+      @value = value
+    end
+
+    # @return [String] the phrase text; pre-tokenized terms join with a space.
+    def to_s
+      @value.is_a?(Array) ? @value.join(" ") : @value
+    end
+  end
+
   # Combination operators.
   OR = "or"
   AND = "and"
@@ -86,7 +127,8 @@ class MiniFTS
     search_options: nil,
     store_fields: [],
     logger: DEFAULT_LOGGER,
-    auto_vacuum: true
+    auto_vacuum: true,
+    positions: false
   }.freeze
 
   DEFAULT_SEARCH_OPTIONS = {
@@ -117,6 +159,14 @@ class MiniFTS
     WILDCARD
   end
 
+  # Builds a {Phrase} query leaf.
+  #
+  # @param value [String, Array<String>] the phrase text, or pre-tokenized terms.
+  # @return [Phrase]
+  def self.phrase(value)
+    Phrase.new(value)
+  end
+
   # @param options [Hash] configuration. +:fields+ (an Array of field-name
   #   strings to index) is required. See the README for the full list.
   def initialize(options = {})
@@ -133,6 +183,15 @@ class MiniFTS
     @options[:auto_vacuum] = auto_vacuum
     @options[:search_options] = DEFAULT_SEARCH_OPTIONS.merge(options[:search_options] || {})
     @options[:auto_suggest_options] = DEFAULT_AUTO_SUGGEST_OPTIONS.merge(options[:auto_suggest_options] || {})
+
+    # Whether this engine was asked to record analyzed-term positions (the
+    # +positions: true+ option), and whether they are actually being recorded.
+    # They diverge on load: a payload that lacks positions cannot be trusted to
+    # answer phrases even if the option asks for them, so the capability is
+    # reported unavailable instead of silently missing documents (see
+    # {#phrase_search_available?}).
+    @positions_enabled = truthy?(@options[:positions])
+    @position_tracking = @positions_enabled
 
     reset_index
     add_fields(@options[:fields])
@@ -162,13 +221,19 @@ class MiniFTS
       unique_terms = tokens.uniq.length
       add_field_length(short_document_id, field_id, @document_count - 1, unique_terms)
 
-      tokens.each do |term|
+      tokens.each_with_index do |term, position|
         processed_term = process_term.call(term, field)
+        slot = track_positions? ? [] : nil
         if processed_term.is_a?(Array)
-          processed_term.each { |t| add_term(field_id, short_document_id, t) }
+          processed_term.each do |t|
+            add_term(field_id, short_document_id, t)
+            slot.push(t) if slot
+          end
         elsif truthy?(processed_term)
           add_term(field_id, short_document_id, processed_term)
+          slot.push(processed_term) if slot
         end
+        record_position_slot(short_document_id, field_id, slot) if slot
       end
     end
 
@@ -216,6 +281,7 @@ class MiniFTS
       end
     end
 
+    @positions.delete(short_id)
     @stored_fields.delete(short_id)
     @document_ids.delete(short_id)
     @id_to_short_id.delete(id)
@@ -254,6 +320,7 @@ class MiniFTS
       remove_field_length(short_id, field_id, @document_count, field_length)
     end
 
+    @positions.delete(short_id)
     @field_length.delete(short_id)
     @document_count -= 1
     @dirt_count += 1
@@ -312,6 +379,25 @@ class MiniFTS
   # @return [Boolean] whether a document with the given ID is present and searchable
   def has?(id)
     @id_to_short_id.key?(id)
+  end
+
+  # @return [Boolean] whether this engine records analyzed-term positions, i.e.
+  #   whether it was constructed with +positions: true+ (or loaded an index
+  #   that carried them).
+  def positions_enabled?
+    @position_tracking
+  end
+
+  # @return [Boolean] whether phrase queries can actually be answered right now.
+  #   True when positions are being recorded — because this engine was
+  #   constructed with +positions: true+ and its documents were indexed here, or
+  #   because it loaded an index whose payload carried them. False for an engine
+  #   built without positions and for an index loaded from a position-less
+  #   (legacy) payload, even when +positions: true+ was requested: {#search}
+  #   reports those as {PhraseSearchUnavailable}, distinct from an enabled
+  #   capability that simply found no contiguous phrase.
+  def phrase_search_available?
+    @position_tracking
   end
 
   # @return [Hash, nil] the stored fields for the given document ID, or +nil+
@@ -401,6 +487,11 @@ class MiniFTS
 
   # Serializes the index to a plain Hash matching the JavaScript AsPlainObject
   # shape (string keys, +serializationVersion: 2+).
+  #
+  # When the positions capability is active (see {#positions_enabled?}) the
+  # analyzed-term positions travel in an additional +"positions"+ key. An index
+  # built without positions (the default) serializes exactly as before: no extra
+  # key, same bytes, so the original format stays loadable and comparable.
   def as_plain_object
     index = []
     @index.each do |term, field_index|
@@ -413,7 +504,7 @@ class MiniFTS
       index.push([term, data])
     end
 
-    {
+    plain = {
       "documentCount" => @document_count,
       "nextId" => @next_id,
       "documentIds" => @document_ids,
@@ -422,9 +513,15 @@ class MiniFTS
       "averageFieldLength" => @avg_field_length,
       "storedFields" => @stored_fields,
       "dirtCount" => @dirt_count,
-      "index" => index,
-      "serializationVersion" => 2
+      "index" => index
     }
+
+    # Only live documents are emitted, so a discarded (or replaced) version's
+    # positions can never come back on reload.
+    plain["positions"] = positions_plain_object if @position_tracking
+
+    plain["serializationVersion"] = 2
+    plain
   end
 
   # Serializes the index to a JSON string. Integer keys are rendered as strings,
@@ -482,6 +579,11 @@ class MiniFTS
     @next_id = 0
     @stored_fields = {}
     @dirt_count = 0
+    # short_document_id => field_id => [term, position] pairs. Populated only
+    # when positions are being tracked; this side table is deliberately outside
+    # the inverted index so the default (position-less) postings keep their exact
+    # shape and score.
+    @positions = {}
   end
 
   def load_plain_object(js)
@@ -509,6 +611,43 @@ class MiniFTS
       end
       @index.set(term, data_map)
     end
+
+    # A payload without "positions" was written by an engine (or a JS build)
+    # that never recorded them. The capability is then genuinely absent for
+    # these documents — not merely unmatched — so tracking is switched off and
+    # phrase queries report it, even if positions: true was requested (a loaded
+    # index cannot be re-analyzed without the original documents).
+    payload_positions = js["positions"]
+    @position_tracking = !payload_positions.nil?
+    @positions = {}
+
+    unless payload_positions.nil?
+      payload_positions.each do |short_id, fields|
+        document_positions = {}
+        fields.each do |field_id, slots|
+          document_positions[field_id.to_i] = slots.map { |slot| slot.to_a }
+        end
+        @positions[short_id.to_i] = document_positions
+      end
+    end
+  end
+
+  # The optional "positions" section of the plain object: each live document's
+  # per-field token slots, as arrays of processed terms. Documents are keyed by
+  # their short ids (matching "documentIds"/"fieldLength") and only documents
+  # still in the index are emitted — a discarded document's slots are gone the
+  # moment it is discarded, so neither a tombstone nor a replaced document's old
+  # version can be resurrected by a save-and-reload.
+  def positions_plain_object
+    positions = {}
+    @positions.each do |short_id, fields|
+      next unless @document_ids.key?(short_id)
+
+      document_positions = {}
+      fields.each { |field_id, slots| document_positions[field_id] = slots }
+      positions[short_id] = document_positions unless document_positions.empty?
+    end
+    positions
   end
 
   def object_to_numeric_map(object)
@@ -618,6 +757,26 @@ class MiniFTS
     )
   end
 
+  # --- positions ----------------------------------------------------------
+
+  # Whether positions are being recorded for documents indexed from now on.
+  # (Serialization asks the same question to decide whether the optional
+  # "positions" section is emitted.)
+  def track_positions?
+    @position_tracking
+  end
+
+  # Records the analyzed terms that share one token position, so a phrase can
+  # later require them at consecutive slots in the same field. A +slot+ is the
+  # (possibly empty) list of processed terms the tokenizer/processor produced
+  # for that token — empty tokens and dropped terms still advance the position,
+  # which is what makes "red  old oak" and a stop-word-removing +process_term+
+  # behave like the field's own token stream.
+  def record_position_slot(short_document_id, field_id, slot)
+    document_positions = (@positions[short_document_id] ||= {})
+    (document_positions[field_id] ||= []).push(slot)
+  end
+
   # --- vacuuming ----------------------------------------------------------
 
   def maybe_auto_vacuum
@@ -682,6 +841,7 @@ class MiniFTS
 
   def execute_query(query, search_options = {})
     return execute_wildcard_query(search_options) if wildcard_query?(query)
+    return execute_phrase_query(query, search_options) if phrase_query?(query)
 
     unless query.is_a?(String)
       options = search_options.merge(query)
@@ -781,6 +941,157 @@ class MiniFTS
     end
 
     results
+  end
+
+  # --- phrase queries -----------------------------------------------------
+
+  def phrase_query?(query)
+    query.is_a?(Phrase) || (query.is_a?(Hash) && query.key?(:phrase))
+  end
+
+  def phrase_value(query)
+    query.is_a?(Phrase) ? query.value : query[:phrase]
+  end
+
+  # Executes a contiguous-phrase leaf. Per field it gathers candidates exactly
+  # as a normal AND over that field's analyzed phrase terms (so BM25+ scores,
+  # matched terms and matched fields come from the same path), then keeps only
+  # documents whose positions show the terms adjacent, in order, within that
+  # field. A phrase can match in any one field, so the per-field results are
+  # combined with OR.
+  #
+  # An index that cannot answer phrases raises {PhraseSearchUnavailable} rather
+  # than returning +[]+, so "this index has no positions" is never confused with
+  # "the phrase did not occur".
+  def execute_phrase_query(query, search_options)
+    unless phrase_search_available?
+      raise PhraseSearchUnavailable,
+            "MiniFTS: phrase search is unavailable: this index carries no term positions " \
+            "(build it with positions: true, or load an index serialized with positions)"
+    end
+
+    options = { tokenize: @options[:tokenize], process_term: @options[:process_term] }
+              .merge(@options[:search_options])
+              .merge(search_options)
+
+    if query.is_a?(Hash)
+      options = options.merge(query)
+      options.delete(:phrase)
+      options.delete(:queries)
+    end
+
+    fields = options[:fields] || @options[:fields]
+    tokens = phrase_tokens(phrase_value(query), options[:tokenize])
+    return {} if tokens.empty?
+
+    process_term = options[:process_term]
+    field_results = []
+
+    fields.each do |field|
+      field_id = @field_ids[field]
+      next if field_id.nil?
+
+      slots, terms = analyzed_phrase_slots(tokens, field, process_term)
+      # The phrase can still occupy positions here only if some token survived;
+      # the slots are kept either way so dropped tokens still consume a position.
+      next if terms.empty?
+
+      specs = terms.each_with_index.map do |term, i|
+        boost = options[:boost_term].respond_to?(:call) ? options[:boost_term].call(term, i, terms) : 1
+        { term: term, fuzzy: false, prefix: false, term_boost: boost }
+      end
+      field_options = options.merge(fields: [field])
+      candidates = combine_results(specs.map { |spec| execute_query_spec(spec, field_options) }, AND)
+
+      accepted = {}
+      candidates.each do |short_id, data|
+        document_positions = @positions[short_id]
+        next if document_positions.nil?
+
+        accepted[short_id] = data if slots_align?(document_positions[field_id], slots)
+      end
+      field_results.push(accepted)
+    end
+
+    combine_results(field_results, OR)
+  end
+
+  # Splits a phrase value into its raw query tokens. A String goes through the
+  # search tokenizer (so it splits exactly as the indexed text did); an Array is
+  # taken as already tokenized.
+  def phrase_tokens(value, search_tokenize)
+    if value.is_a?(Array)
+      value.select { |token| truthy?(token) }
+    else
+      search_tokenize.call(value.to_s)
+    end
+  end
+
+  # Analyzes the phrase token stream for one field, the way indexing did, and
+  # returns +[slots, terms]+: +slots+ is an Array of term-sets, one per token
+  # position (an empty set marks a token this field's +process_term+ dropped,
+  # which still consumes a position), and +terms+ is the unique non-empty terms.
+  def analyzed_phrase_slots(tokens, field, process_term)
+    terms = []
+    slots = tokens.map do |token|
+      processed = call_process_term(process_term, token, field)
+      slot_terms =
+        if processed.is_a?(Array)
+          processed.select { |term| truthy?(term) }
+        elsif truthy?(processed)
+          [processed]
+        else
+          []
+        end
+      slot_terms.each { |term| terms.push(term) unless terms.include?(term) }
+      slot_terms
+    end
+
+    [slots, terms]
+  end
+
+  # Calls +process_term+ with the field name when it accepts one. A lambda or
+  # method object of arity 1 rejects the extra argument (procs ignore it), so
+  # the arity decides how many arguments to pass.
+  def call_process_term(process_term, term, field)
+    if process_term.respond_to?(:arity) && process_term.arity == 1
+      process_term.call(term)
+    else
+      process_term.call(term, field)
+    end
+  end
+
+  # Whether this document's slots for the field contain the phrase at some
+  # offset: every non-empty phrase slot must intersect the document slot at the
+  # same relative position, in order.
+  def slots_align?(document_slots, phrase_slots)
+    return false if document_slots.nil?
+
+    document_length = document_slots.length
+    phrase_length = phrase_slots.length
+    return false if phrase_length.zero? || phrase_length > document_length
+
+    last_offset = document_length - phrase_length
+    offset = 0
+    while offset <= last_offset
+      aligned = true
+      index = 0
+      while index < phrase_length
+        wanted = phrase_slots[index]
+        unless wanted.empty?
+          present = document_slots[offset + index]
+          if present.nil? || (wanted & present).empty?
+            aligned = false
+            break
+          end
+        end
+        index += 1
+      end
+      return true if aligned
+
+      offset += 1
+    end
+    false
   end
 
   def combine_results(results, combine_with = OR)
