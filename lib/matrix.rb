@@ -1085,6 +1085,94 @@ class Matrix
   end
 
   #
+  # Returns the product of the Kronecker product of +self+ and +b+
+  # with +x+, computed without ever forming the Kronecker matrix itself.
+  #
+  # If +self+ is m x n and +b+ is p x q, their Kronecker product is the
+  # (m*p) x (n*q) matrix whose outer blocking is given by +self+ and
+  # whose inner blocks are the elements of +self+ times +b+.  This
+  # method applies that product to +x+, which must have n*q rows: a
+  # Matrix with any number of columns, or a Vector of size n*q.
+  # The result has m*p rows and as many columns as +x+; a Vector input
+  # produces a Vector result.
+  #
+  #   Matrix[[1, 2]].kron_mul(Matrix[[3], [4]], Vector[5, 6])
+  #   #  => Vector[51, 68]
+  #
+  # The contraction order is chosen according to the dimensions so that
+  # the number of scalar multiplications stays low, and every entry is
+  # computed with the same exact scalar multiply-add as Matrix#*.
+  # Only blocks the size of +b+ times a few columns of +x+ are ever
+  # formed; the full Kronecker matrix is never materialized.
+  # Zero-sized dimensions are honored: the result keeps the shape
+  # (m*p) x k, e.g. a zero-row result still has the column count of +x+.
+  #
+  def kron_mul(b, x)
+    vector = x.is_a?(Vector)
+    x = self.class.column_vector(x) if vector
+    m = row_count
+    n = column_count
+    p = b.row_count
+    q = b.column_count
+    raise ErrDimensionMismatch unless n * q == x.row_count
+    k = x.column_count
+    x_rows = x.rows
+    b_rows = b.rows
+
+    if m * q * (n + p) <= n * p * (q + m)
+      # Contract +self+ with +x+ first: (m x n) times x seen as n
+      # row-blocks of q*k elements, then apply +b+ to each m blocks.
+      xt = Array.new(n) {|j| x_rows[j * q, q].flatten }
+      mid = Array.new(m) do |i|
+        ai = @rows[i]
+        Array.new(q * k) do |j|
+          vij = 0
+          n.times {|jj| vij += ai[jj] * xt[jj][j] }
+          vij
+        end
+      end
+      rows = Array.new(m * p)
+      m.times do |i|
+        mi = mid[i]
+        p.times do |r|
+          br = b_rows[r]
+          rows[i * p + r] = Array.new(k) do |c|
+            vij = 0
+            q.times {|s| vij += br[s] * mi[s * k + c] }
+            vij
+          end
+        end
+      end
+    else
+      # Contract +b+ with +x+ first: n blocks of (p x q) times (q x k),
+      # then combine the n blocks of p*k elements with +self+.
+      w = Array.new(n) do |j|
+        base = j * q
+        Array.new(p) do |r|
+          br = b_rows[r]
+          Array.new(k) do |c|
+            vij = 0
+            q.times {|s| vij += br[s] * x_rows[base + s][c] }
+            vij
+          end
+        end
+      end
+      rows = Array.new(m * p) do |idx|
+        ai = @rows[idx / p]
+        r = idx % p
+        Array.new(k) do |c|
+          vij = 0
+          n.times {|j| vij += ai[j] * w[j][r][c] }
+          vij
+        end
+      end
+    end
+    result = new_matrix(rows, k)
+    vector ? result.column(0) : result
+  end
+  alias_method :kronecker_mul, :kron_mul
+
+  #
   # Matrix addition.
   #   Matrix.scalar(2,5) + Matrix[[1,0], [-4,7]]
   #   #  =>  6  0

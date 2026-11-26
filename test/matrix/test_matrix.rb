@@ -394,6 +394,84 @@ class TestMatrix < Test::Unit::TestCase
     assert_equal(Matrix[[14,32],[32,77]], @m1 * o)
   end
 
+  # Counts scalar multiplications performed on matrix entries.
+  class KronMulScalar # :nodoc:
+    attr_reader :value
+    def self.count
+      @count
+    end
+    def self.reset
+      @count = 0
+    end
+    def initialize(value)
+      @value = value
+    end
+    def *(other)
+      KronMulScalar.class_eval { @count += 1 }
+      other = other.value if other.is_a?(KronMulScalar)
+      KronMulScalar.new(value * other)
+    end
+    def +(other)
+      other = other.value if other.is_a?(KronMulScalar)
+      KronMulScalar.new(value + other)
+    end
+    def coerce(other)
+      [KronMulScalar.new(other), self]
+    end
+  end
+
+  def kron_expansion(a, b)
+    Matrix.build(a.row_count * b.row_count, a.column_count * b.column_count) do |i, j|
+      a[i / b.row_count, j / b.column_count] * b[i % b.row_count, j % b.column_count]
+    end
+  end
+
+  def test_kron_mul
+    assert_equal(Vector[51, 68],
+                 Matrix[[1, 2]].kron_mul(Matrix[[3], [4]], Vector[5, 6]))
+    assert_equal(Matrix[[51], [68]],
+                 Matrix[[1, 2]].kron_mul(Matrix[[3], [4]], Matrix[[5], [6]]))
+
+    # Rectangular A and B, exact rationals, checked against direct expansion
+    a = Matrix[[Rational(1, 2), 2], [3, Rational(-1, 3)]]
+    b = Matrix[[Rational(2, 3), 0, 1], [-1, Rational(1, 4), 2]]
+    x = Matrix[[1, Rational(1, 2)], [2, 0], [Rational(-1, 3), 1],
+               [0, 2], [Rational(3, 4), -1], [1, 1]]
+    assert_equal(kron_expansion(a, b) * x, a.kron_mul(b, x))
+    assert_equal((kron_expansion(a, b) * x).column(0), a.kron_mul(b, x.column(0)))
+    assert_raise(Matrix::ErrDimensionMismatch) { a.kron_mul(b, Matrix.I(5)) }
+  end
+
+  def test_kron_mul_scalar_multiplication_count
+    # Both "opposite" shapes must stay within 100 scalar multiplications
+    # for a 10x2 right hand side, including all shared intermediates.
+    [[2, 5, 5, 2], [5, 2, 2, 5]].each do |m, n, p, q|
+      a = Matrix.build(m, n) {|i, j| Rational(i - j, 3) }
+      b = Matrix.build(p, q) {|i, j| Rational(i + 2 * j + 1, 4) }
+      x = Matrix.build(n * q, 2) {|i, j| Rational(i * j - 2, 5) }
+      expected = kron_expansion(a, b) * x
+
+      wrap = ->(mat) { Matrix.build(mat.row_count, mat.column_count) {|i, j| KronMulScalar.new(mat[i, j]) } }
+      KronMulScalar.reset
+      result = wrap.(a).kron_mul(wrap.(b), wrap.(x))
+      assert_operator(KronMulScalar.count, :<=, 100)
+      assert_equal(expected, result.map {|e| e.value })
+    end
+  end
+
+  def test_kron_mul_empty
+    b = Matrix[[1, 2], [3, 4]]
+    # Zero rows from A: shape keeps the column count of the RHS
+    assert_equal(Matrix.empty(0, 2), Matrix.empty(0, 3).kron_mul(b, Matrix.zero(6, 2)))
+    # Zero rows from B
+    assert_equal(Matrix.empty(0, 1), Matrix.I(2).kron_mul(Matrix.empty(0, 3), Matrix.zero(6, 1)))
+    # Zero columns in the RHS
+    assert_equal(Matrix.empty(4, 0), Matrix.I(2).kron_mul(b, Matrix.empty(4, 0)))
+    # Zero inner dimension: result is a zero matrix of the proper shape
+    assert_equal(Matrix.zero(6, 2),
+                 Matrix.empty(2, 0).kron_mul(Matrix.empty(3, 0), Matrix.empty(0, 2)))
+  end
+
   def test_add
     assert_equal(Matrix[[6,0],[-4,12]], Matrix.scalar(2,5) + Matrix[[1,0],[-4,7]])
     assert_equal(Matrix[[3,5,7],[9,11,13]], @m1 + @n1)
