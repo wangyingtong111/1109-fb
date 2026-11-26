@@ -30,6 +30,11 @@ class MiniFTS
   # combinators, incompatible serialized indexes).
   class Error < StandardError; end
 
+  # Raised when a search asks for highlight ranges against an index that holds
+  # no range data: one built without the +ranges: true+ option, or a serialized
+  # index written before the feature existed.
+  class RangesUnavailableError < Error; end
+
   # Combination operators.
   OR = "or"
   AND = "and"
@@ -85,6 +90,7 @@ class MiniFTS
     fields: nil,
     search_options: nil,
     store_fields: [],
+    ranges: false,
     logger: DEFAULT_LOGGER,
     auto_vacuum: true
   }.freeze
@@ -96,7 +102,8 @@ class MiniFTS
     max_fuzzy: 6,
     boost: {},
     weights: { fuzzy: 0.45, prefix: 0.375 },
-    bm25: DEFAULT_BM25_PARAMS
+    bm25: DEFAULT_BM25_PARAMS,
+    ranges: false
   }.freeze
 
   DEFAULT_AUTO_SUGGEST_OPTIONS = {
@@ -156,18 +163,25 @@ class MiniFTS
       field_value = extract_field.call(document, field)
       next if field_value.nil?
 
-      tokens = tokenize.call(stringify_field.call(field_value, field), field)
+      text = stringify_field.call(field_value, field)
+      tokens = tokenize.call(text, field)
       field_id = @field_ids[field]
 
       unique_terms = tokens.uniq.length
       add_field_length(short_document_id, field_id, @document_count - 1, unique_terms)
 
-      tokens.each do |term|
+      # The index-time tokenizer owns the token boundaries; re-derive each
+      # token's half-open character span by a forward, non-overlapping scan of
+      # the stringified text so range support works with any custom tokenizer.
+      token_spans = ranges_enabled? ? token_spans(text, tokens) : nil
+
+      tokens.each_with_index do |term, token_index|
+        span = token_spans && token_spans[token_index]
         processed_term = process_term.call(term, field)
         if processed_term.is_a?(Array)
-          processed_term.each { |t| add_term(field_id, short_document_id, t) }
+          processed_term.each { |t| add_term(field_id, short_document_id, t, span) }
         elsif truthy?(processed_term)
-          add_term(field_id, short_document_id, processed_term)
+          add_term(field_id, short_document_id, processed_term, span)
         end
       end
     end
@@ -200,18 +214,22 @@ class MiniFTS
       field_value = extract_field.call(document, field)
       next if field_value.nil?
 
-      tokens = tokenize.call(stringify_field.call(field_value, field), field)
+      text = stringify_field.call(field_value, field)
+      tokens = tokenize.call(text, field)
       field_id = @field_ids[field]
 
       unique_terms = tokens.uniq.length
       remove_field_length(short_id, field_id, @document_count, unique_terms)
 
-      tokens.each do |term|
+      token_spans = ranges_enabled? ? token_spans(text, tokens) : nil
+
+      tokens.each_with_index do |term, token_index|
+        span = token_spans && token_spans[token_index]
         processed_term = process_term.call(term, field)
         if processed_term.is_a?(Array)
-          processed_term.each { |t| remove_term(field_id, short_id, t) }
+          processed_term.each { |t| remove_term(field_id, short_id, t, span) }
         elsif truthy?(processed_term)
-          remove_term(field_id, short_id, processed_term)
+          remove_term(field_id, short_id, processed_term, span)
         end
       end
     end
@@ -322,6 +340,14 @@ class MiniFTS
     @stored_fields[short_id]
   end
 
+  # @return [Boolean] whether this index carries highlight-range data, i.e. it
+  #   was built with +ranges: true+ (or loaded from an index that was). An index
+  #   serialized before the feature existed returns +false+, and a search with
+  #   +ranges: true+ against it raises {RangesUnavailableError}.
+  def ranges?
+    !@term_ranges.nil?
+  end
+
   # Searches for documents matching +query+.
   #
   # @param query [String, Hash, Object] a query string, a combination Hash with a
@@ -329,11 +355,20 @@ class MiniFTS
   # @param search_options [Hash] per-search options overriding the defaults
   # @return [Array<Hash>] results sorted by descending score. Each is a Hash with
   #   +:id+, +:score+, +:terms+ (matched document terms), +:query_terms+, +:match+,
-  #   plus any stored fields (under their string keys).
+  #   an optional +:ranges+ (field name => sorted, unique half-open character
+  #   spans, only with +ranges: true+), plus any stored fields (under their
+  #   string keys).
   def search(query, search_options = {})
     search_options_with_defaults = @options[:search_options].merge(search_options)
+    collect_ranges = search_options_with_defaults[:ranges] == true
 
-    raw_results = execute_query(query, search_options)
+    if collect_ranges && !ranges?
+      raise RangesUnavailableError,
+            "MiniFTS: highlight ranges were requested, but this index has no range data. " \
+            "Build it with the `ranges: true` option (or load an index that was)."
+    end
+
+    raw_results = execute_query(query, search_options, collect_ranges)
     results = []
 
     raw_results.each do |doc_id, data|
@@ -348,6 +383,8 @@ class MiniFTS
         query_terms: terms,
         match: match
       }
+
+      result[:ranges] = ranges_from_record(data) if collect_ranges
 
       stored = @stored_fields[doc_id]
       result.merge!(stored) if stored
@@ -403,6 +440,7 @@ class MiniFTS
   # shape (string keys, +serializationVersion: 2+).
   def as_plain_object
     index = []
+    term_ranges = []
     @index.each do |term, field_index|
       data = {}
       # JavaScript objects iterate integer-like keys in ascending numeric order,
@@ -411,9 +449,14 @@ class MiniFTS
       # serialize its field ids out of order). Sort to stay byte-identical.
       field_index.keys.sort.each { |field_id| data[field_id] = field_index[field_id] }
       index.push([term, data])
+
+      next if @term_ranges.nil?
+
+      range_data = serializable_term_ranges(term)
+      term_ranges.push([term, range_data]) unless range_data.nil?
     end
 
-    {
+    plain = {
       "documentCount" => @document_count,
       "nextId" => @next_id,
       "documentIds" => @document_ids,
@@ -425,6 +468,10 @@ class MiniFTS
       "index" => index,
       "serializationVersion" => 2
     }
+    # Omitted entirely from indexes built without range support, so the default
+    # serialized shape stays byte-identical to the upstream library.
+    plain["termRanges"] = term_ranges unless @term_ranges.nil?
+    plain
   end
 
   # Serializes the index to a JSON string. Integer keys are rendered as strings,
@@ -482,6 +529,10 @@ class MiniFTS
     @next_id = 0
     @stored_fields = {}
     @dirt_count = 0
+    # nil means the index carries no highlight ranges (the default); an empty
+    # Hash means range tracking is enabled but nothing has been indexed yet.
+    # Kept parallel to @index: term -> field id -> document id -> [start, stop).
+    @term_ranges = ranges_enabled? ? {} : nil
   end
 
   def load_plain_object(js)
@@ -508,6 +559,28 @@ class MiniFTS
         data_map[field_id.to_i] = object_to_numeric_map(index_entry)
       end
       @index.set(term, data_map)
+    end
+
+    load_term_ranges(js["termRanges"])
+  end
+
+  def load_term_ranges(serialized)
+    if serialized.nil?
+      # An archive written before range support: report the unavailability
+      # distinctly via #ranges? rather than pretending ranges are present.
+      @term_ranges = nil
+      return
+    end
+
+    @term_ranges = {}
+    serialized.each do |term, field_data|
+      field_map = {}
+      field_data.each do |field_id, doc_data|
+        doc_map = {}
+        doc_data.each { |doc_id, ranges| doc_map[doc_id.to_i] = ranges }
+        field_map[field_id.to_i] = doc_map
+      end
+      @term_ranges[term] = field_map
     end
   end
 
@@ -564,7 +637,31 @@ class MiniFTS
     end
   end
 
-  def add_term(field_id, document_id, term)
+  def ranges_enabled?
+    @options[:ranges] == true
+  end
+
+  # Re-derive the half-open character span of every token produced by the
+  # configured tokenizer. The scan is forward and non-overlapping, so repeated
+  # tokens each resolve to their own occurrence. Tokens that do not appear
+  # literally in the text (a tokenizer that rewrites content) get a nil span and
+  # simply contribute no range.
+  def token_spans(text, tokens)
+    cursor = 0
+    tokens.map do |token|
+      next nil if token.nil? || token.empty?
+
+      position = text.index(token, cursor)
+      if position.nil?
+        nil
+      else
+        cursor = position + token.length
+        [position, cursor]
+      end
+    end
+  end
+
+  def add_term(field_id, document_id, term, span = nil)
     index_data = @index.fetch(term) { {} }
 
     field_index = index_data[field_id]
@@ -576,9 +673,11 @@ class MiniFTS
       docs = field_index[document_id]
       field_index[document_id] = (docs || 0) + 1
     end
+
+    add_term_range(term, field_id, document_id, span)
   end
 
-  def remove_term(field_id, document_id, term)
+  def remove_term(field_id, document_id, term, span = nil)
     unless @index.has?(term)
       warn_document_changed(document_id, field_id, term)
       return
@@ -600,6 +699,62 @@ class MiniFTS
     end
 
     @index.delete(term) if @index.get(term).empty?
+    remove_term_range(term, field_id, document_id, span)
+  end
+
+  # --- highlight ranges ---------------------------------------------------
+
+  # Record one original-text span for a term. The same span may be offered many
+  # times (one token can expand into several derived terms, or the same token
+  # can repeat); keep each [start, stop) pair once.
+  def add_term_range(term, field_id, document_id, span)
+    return if @term_ranges.nil? || span.nil?
+
+    term_map = (@term_ranges[term] ||= {})
+    field_map = (term_map[field_id] ||= {})
+    ranges = (field_map[document_id] ||= [])
+    ranges.push(span) unless ranges.include?(span)
+  end
+
+  def remove_term_range(term, field_id, document_id, span)
+    return if @term_ranges.nil?
+
+    term_map = @term_ranges[term]
+    return if term_map.nil?
+
+    field_map = term_map[field_id]
+    return if field_map.nil?
+
+    ranges = field_map[document_id]
+    return if ranges.nil?
+
+    if span.nil?
+      ranges.clear
+    else
+      ranges.delete(span)
+    end
+
+    field_map.delete(document_id) if ranges.empty?
+    term_map.delete(field_id) if field_map.empty?
+    @term_ranges.delete(term) if term_map.empty?
+  end
+
+  # Drop range postings for a discarded (tombstoned) document, mirroring the
+  # targeted inverted-index cleanup performed during searches and vacuuming.
+  # A nil span clears every span held for the term/field/document pair.
+  def prune_term_range(term, field_id, document_id)
+    remove_term_range(term, field_id, document_id, nil)
+  end
+
+  # Serialize one term's ranges with field ids sorted, matching the integer-key
+  # ordering used for the inverted index in #as_plain_object.
+  def serializable_term_ranges(term)
+    term_map = @term_ranges[term]
+    return nil if term_map.nil?
+
+    data = {}
+    term_map.keys.sort.each { |field_id| data[field_id] = term_map[field_id] }
+    data
   end
 
   def warn_document_changed(short_document_id, field_id, term)
@@ -650,6 +805,7 @@ class MiniFTS
         field_index.keys.each do |short_id|
           next if @document_ids.key?(short_id)
 
+          prune_term_range(term, field_id, short_id)
           if field_index.size <= 1
             fields_data.delete(field_id)
           else
@@ -675,18 +831,22 @@ class MiniFTS
   # and this record is the dominant search allocation. The MATCH slot stays a Hash
   # (it is handed straight to the public output). JS keeps a plain object here;
   # this positional form is a Ruby-side allocation optimization, output-identical.
+  # The optional R_RANGES slot exists only for a ranges: true search and carries
+  # the merged field-name => [[start, stop), ...] accumulator; default searches
+  # never allocate it, preserving the 3-slot shape and its allocation profile.
   R_SCORE = 0
   R_TERMS = 1
   R_MATCH = 2
-  private_constant :R_SCORE, :R_TERMS, :R_MATCH
+  R_RANGES = 3
+  private_constant :R_SCORE, :R_TERMS, :R_MATCH, :R_RANGES
 
-  def execute_query(query, search_options = {})
-    return execute_wildcard_query(search_options) if wildcard_query?(query)
+  def execute_query(query, search_options = {}, collect_ranges = false)
+    return execute_wildcard_query(search_options, collect_ranges) if wildcard_query?(query)
 
     unless query.is_a?(String)
       options = search_options.merge(query)
       options.delete(:queries)
-      results = query[:queries].map { |subquery| execute_query(subquery, options) }
+      results = query[:queries].map { |subquery| execute_query(subquery, options, collect_ranges) }
       return combine_results(results, options[:combine_with])
     end
 
@@ -702,12 +862,12 @@ class MiniFTS
                            .select { |term| truthy?(term) }
 
     queries = terms.each_with_index.map { |term, i| term_to_query_spec(options, term, i, terms) }
-    results = queries.map { |spec| execute_query_spec(spec, options) }
+    results = queries.map { |spec| execute_query_spec(spec, options, collect_ranges) }
 
     combine_results(results, options[:combine_with])
   end
 
-  def execute_query_spec(query, search_options)
+  def execute_query_spec(query, search_options, collect_ranges = false)
     options = @options[:search_options].merge(search_options)
 
     fields = options[:fields] || @options[:fields]
@@ -729,7 +889,8 @@ class MiniFTS
     term_boost = query[:term_boost]
 
     data = @index.get(term)
-    results = term_results(term, term, 1, term_boost, data, boosts, boost_document, bm25params)
+    results = term_results(term, term, 1, term_boost, data, boosts, boost_document, bm25params,
+                           {}, collect_ranges)
 
     prefix_matches = @index.at_prefix(term) if query[:prefix]
 
@@ -753,7 +914,8 @@ class MiniFTS
         # decay is slower than for fuzzy matches, since prefix matches stay
         # relevant longer.
         weight = prefix_weight * prefix_term.length / (prefix_term.length + (0.3 * distance))
-        term_results(term, prefix_term, weight, term_boost, prefix_data, boosts, boost_document, bm25params, results)
+        term_results(term, prefix_term, weight, term_boost, prefix_data, boosts, boost_document,
+                     bm25params, results, collect_ranges)
       end
     end
 
@@ -763,21 +925,24 @@ class MiniFTS
         next if distance.zero?
 
         weight = fuzzy_weight * fuzzy_term.length / (fuzzy_term.length + distance)
-        term_results(term, fuzzy_term, weight, term_boost, fuzzy_data, boosts, boost_document, bm25params, results)
+        term_results(term, fuzzy_term, weight, term_boost, fuzzy_data, boosts, boost_document,
+                     bm25params, results, collect_ranges)
       end
     end
 
     results
   end
 
-  def execute_wildcard_query(search_options)
+  def execute_wildcard_query(search_options, collect_ranges = false)
     results = {}
     options = @options[:search_options].merge(search_options)
     boost_document = options[:boost_document]
 
     @document_ids.each do |short_id, id|
       score = boost_document ? boost_document.call(id, "", @stored_fields[short_id]) : 1
-      results[short_id] = [score, [], {}]
+      record = [score, [], {}]
+      record.push({}) if collect_ranges
+      results[short_id] = record
     end
 
     results
@@ -810,6 +975,7 @@ class MiniFTS
         existing[R_SCORE] += b_value[R_SCORE]
         existing[R_MATCH].merge!(b_value[R_MATCH])
         assign_unique_terms(existing[R_TERMS], b_value[R_TERMS])
+        merge_record_ranges(existing, b_value)
       end
     end
     a
@@ -822,11 +988,13 @@ class MiniFTS
       next if existing.nil?
 
       assign_unique_terms(existing[R_TERMS], b_value[R_TERMS])
-      combined[doc_id] = [
+      record = [
         existing[R_SCORE] + b_value[R_SCORE],
         existing[R_TERMS],
         existing[R_MATCH].merge!(b_value[R_MATCH])
       ]
+      record.push(merged_ranges(existing[R_RANGES], b_value[R_RANGES])) if existing[R_RANGES] || b_value[R_RANGES]
+      combined[doc_id] = record
     end
     combined
   end
@@ -836,8 +1004,40 @@ class MiniFTS
     a
   end
 
+  # Union two per-field range accumulators, keeping each [start, stop) pair
+  # once. Only present during a ranges: true search; nil otherwise.
+  def merge_record_ranges(existing_record, other_record)
+    other = other_record[R_RANGES]
+    return if other.nil?
+
+    current = existing_record[R_RANGES]
+    if current.nil?
+      existing_record.push(other)
+    else
+      existing_record[R_RANGES] = merged_ranges(current, other)
+    end
+  end
+
+  def merged_ranges(a, b)
+    return deep_dup_ranges(b) if a.nil?
+    return deep_dup_ranges(a) if b.nil?
+
+    merged = a
+    b.each do |field, ranges|
+      target = (merged[field] ||= [])
+      ranges.each { |span| target.push(span.dup) unless target.include?(span) }
+    end
+    merged
+  end
+
+  def deep_dup_ranges(ranges_by_field)
+    copy = {}
+    ranges_by_field.each { |field, ranges| copy[field] = ranges.map { |span| span.dup } }
+    copy
+  end
+
   def term_results(source_term, derived_term, term_weight, term_boost, field_term_data, field_boosts,
-                   boost_document_fn, bm25params, results = {})
+                   boost_document_fn, bm25params, results = {}, collect_ranges = false)
     return results if field_term_data.nil?
 
     field_boosts.each do |field, field_boost|
@@ -852,6 +1052,7 @@ class MiniFTS
       field_term_freqs.keys.each do |doc_id|
         unless @document_ids.key?(doc_id)
           remove_term(field_id, doc_id, derived_term)
+          prune_term_range(derived_term, field_id, doc_id) if collect_ranges
           matching_fields -= 1
           next
         end
@@ -882,12 +1083,47 @@ class MiniFTS
             result[R_MATCH][derived_term] = [field]
           end
         else
-          results[doc_id] = [weighted_score, [source_term], { derived_term => [field] }]
+          record = [weighted_score, [source_term], { derived_term => [field] }]
+          record.push({}) if collect_ranges
+          results[doc_id] = record
         end
+
+        collect_range_hits(results[doc_id], field, derived_term, field_id, doc_id) if collect_ranges
       end
     end
 
     results
+  end
+
+  # Attach the stored original-text spans of one matched term to the result
+  # record's range accumulator. Several derived terms may point at the same
+  # span, so each [start, stop) pair is kept once per field.
+  def collect_range_hits(record, field_name, term, field_id, doc_id)
+    return if @term_ranges.nil?
+
+    term_map = @term_ranges[term]
+    return if term_map.nil?
+
+    field_map = term_map[field_id]
+    return if field_map.nil?
+
+    spans = field_map[doc_id]
+    return if spans.nil? || spans.empty?
+
+    accumulator = record[R_RANGES] ||= {}
+    target = (accumulator[field_name] ||= [])
+    spans.each { |span| target.push(span.dup) unless target.include?(span) }
+  end
+
+  # Transcribe the internal range accumulator into the public result shape:
+  # field name => sorted, unique [start, stop) pairs.
+  def ranges_from_record(record)
+    ranges = record[R_RANGES]
+    return {} if ranges.nil?
+
+    ranges.each_with_object({}) do |(field, spans), output|
+      output[field] = spans.uniq.sort_by { |start, stop| [start, stop] }
+    end
   end
 
   def calc_bm25_score(term_freq, matching_count, total_count, field_length, avg_field_length, bm25params)

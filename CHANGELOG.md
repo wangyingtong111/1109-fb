@@ -1,3 +1,19 @@
+## [Unreleased]
+
+- Optional highlight ranges. Build an index with `ranges: true` and search with
+  `ranges: true` to receive a `:ranges` entry on each result mapping field name
+  to the sorted, unique half-open `[start, stop)` character offsets of the
+  original text that matched. Ranges are tracked in a side structure parallel to
+  the inverted index (the field text need not be in `store_fields`), attribute
+  every derived term back to its source token (so one token expanded by
+  `process_term` into several terms yields a single span), and survive
+  `to_json` / `load_json` via a new `termRanges` serialization entry.
+- `MiniFTS#ranges?` reports whether an index carries range data. Indexes built
+  without the option, or archives written before this feature, return `false`;
+  a `ranges: true` search against them raises `MiniFTS::RangesUnavailableError`.
+- Default searches are unchanged: no `:ranges` key, identical scores and result
+  shape, and an index built without `ranges: true` serializes byte-identically.
+
 ## [1.0.1] - 2026-07-18
 
 - Require MFA for gem pushes (`rubygems_mfa_required` gemspec metadata). No

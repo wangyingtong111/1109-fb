@@ -66,6 +66,45 @@ Each result is a Hash: `:id`, `:score`, `:terms` (the matched *document* terms),
 `:query_terms` (the matched query terms), `:match` (term → fields it matched in),
 plus any `store_fields` under their **string** keys.
 
+## Highlight ranges
+
+Optionally, the engine can record the **original-text character spans** matched by
+a query, so a result page can highlight them without re-tokenizing the text.
+Enable tracking at construction with `ranges: true` (the field text itself does
+**not** need to be in `store_fields`), then ask for them per search:
+
+```ruby
+ms = MiniFTS.new(fields: %w[title text], ranges: true)
+ms.add("id" => 1, "title" => "oak", "text" => "茶 oak")
+
+ms.search("oak", ranges: true).first[:ranges]
+# => { "text" => [[2, 5]], "title" => [[0, 3]] }
+```
+
+Each range is a half-open `[start, stop)` pair of **character** offsets (counted
+from zero) into the stringified field value, grouped under the field's name.
+When one original token expands into several lookup terms in `process_term` (for
+example `NYC` → `new` + `york`), every derived term points back at the token's
+single span, so a span is returned only once even though several terms matched:
+
+```ruby
+process = ->(term, _field = nil) { term.downcase == "nyc" ? %w[new york] : term.downcase }
+ms = MiniFTS.new(fields: %w[title text], process_term: process, ranges: true)
+ms.add("id" => 1, "title" => "new", "text" => "茶 NYC NYC")
+
+# After saving with #to_json and reloading with MiniFTS.load_json ...
+ms.search("new york", ranges: true).first[:ranges]
+# => { "text" => [[2, 5], [6, 9]], "title" => [[0, 3]] }
+```
+
+Ranges travel inside the serialized index (a `termRanges` entry), so they survive
+`to_json` / `load_json`. Use `ms.ranges?` to ask whether an index carries range
+data: an index built without `ranges: true`, or one serialized before the feature
+existed, returns `false`, and a `ranges: true` search against it raises
+`MiniFTS::RangesUnavailableError`. A plain search (without the option) keeps its
+usual shape and score — `:ranges` is only present when requested, and an index
+built without the option serializes exactly as before.
+
 ## Search options
 
 Pass options as the second argument to `search`:
@@ -95,7 +134,7 @@ ms.search(
 
 Supported search options: `:fields`, `:filter`, `:boost`, `:boost_term`,
 `:weights`, `:boost_document`, `:prefix`, `:fuzzy`, `:max_fuzzy`,
-`:combine_with`, `:tokenize`, `:process_term`, `:bm25`.
+`:combine_with`, `:tokenize`, `:process_term`, `:bm25`, `:ranges`.
 
 `:weights` scales non-exact matches — defaults `{ fuzzy: 0.45, prefix: 0.375 }`,
 so a fuzzy or prefix hit counts for less than an exact one. `:boost_term` takes a
@@ -133,7 +172,7 @@ searches, and via `vacuum`). Auto-vacuuming runs on your behalf once enough
 documents have been discarded.
 
 Introspection: `document_count`, `term_count`, `has?(id)`,
-`get_stored_fields(id)`, `dirt_count`, `dirt_factor`.
+`get_stored_fields(id)`, `ranges?`, `dirt_count`, `dirt_factor`.
 
 ## Configuration
 
@@ -142,6 +181,7 @@ MiniFTS.new(
   fields: %w[title text],       # REQUIRED: field names (strings) to index
   id_field: "id",               # unique-ID field (default "id")
   store_fields: %w[title],      # fields to keep and return in results
+  ranges: false,                # index highlight ranges: per-term [start, stop) text spans
   extract_field: ->(doc, field) { doc[field] },   # how to read a field
   stringify_field: ->(value, field) { value.to_s },
   tokenize: ->(text, field = nil) { text.split(/\s+/) },
