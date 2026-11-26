@@ -4,8 +4,7 @@ module PragmaticTokenizer
     def pre_process(language: Languages::Common)
       remove_non_breaking_space!
       shift_various_characters!
-      replace_colon_in_url!
-      shift_remaining_colons!
+      shift_colons!
       shift_hashtag!
       convert_double_quotes!
       convert_single_quotes!(language)
@@ -24,12 +23,13 @@ module PragmaticTokenizer
         gsub!(Regex::PRE_PROCESS, ' \1 \2 \3 \4 \5 \6 \7 \8 \9 ')
       end
 
-      def replace_colon_in_url!
-        gsub!(Regex::COLON_IN_URL, replacement_for_key(':'.freeze))
-      end
-
-      def shift_remaining_colons!
-        gsub!(':'.freeze, ' :'.freeze) if self !~ Regex::TIME_WITH_COLON
+      # Colons are preserved only inside the match they belong to: a time (e.g. 09:45)
+      # or a complete url (e.g. https://a.test:8080). Every other colon is prefixed
+      # with a space so that it ends up as a token of its own.
+      def shift_colons!
+        gsub!(Regex::COLONS) do |match|
+          match == ':' ? ' :'.freeze : match
+        end
       end
 
       def shift_hashtag!

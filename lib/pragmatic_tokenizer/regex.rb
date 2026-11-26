@@ -38,7 +38,9 @@ module PragmaticTokenizer
     DINGBATS                      = /(?:(#{RANGE_DINGBATS.source}#{RANGE_VARIATION_SELECTORS.source}*+))/
     NO_BREAK_SPACE                = /(?:\u00A0+)/
     HTTP                          = /(?:https?:\/\/)/
-    TIME_WITH_COLON               = /(?:\d:\d)/
+    TIME_WITH_COLON               = /(?:(?<![[:alnum:]])\d+(?::\d+)+(?:\s?[ap]\.?m\.?)?(?![[:alnum:]]))/i # a time, e.g. "09:45" or "9:45pm"
+    URL_WITH_COLONS               = /(?:(?:https?|ftp):\/\/\S*)/ # a complete url, e.g. "https://a.test:8080"
+    COLONS                        = Regexp.union(TIME_WITH_COLON, URL_WITH_COLONS, /:/)
     DOMAIN_PREFIX                 = /(?:https?:\/\/|www\.|[[:alpha:]]\.)/
     DOMAIN_SUFFIX                 = /(?:[[:alpha:]]\.(?:com|net|org|edu|gov|mil|int|[[:alpha:]]{2}))/
     DOMAIN1                       = /(?:((https?:\/\/|)[[:print:]]+\.[[:alpha:]]{2,6}(:[0-9]{1,5})?(\/[[:print:]]*+)?))/
@@ -70,7 +72,6 @@ module PragmaticTokenizer
     PERCENT_BEFORE_DIGIT          = /(%)\d+/
     COMMA_BEFORE_NON_DIGIT        = /(,)(?=\D)/
     COMMA_AFTER_NON_DIGIT         = /(?<=\D)(,)/
-    COLON_IN_URL                  = /(?<=[(https?|ftp)]):(?=\/\/)/
     QUOTE_BEFORE_PRINT            = /(('')|["“])(?=[[:print:]])/
     QUOTE                         = /('')|["”]/
     HYPHEN_AFTER_NON_WORD         = /(?<=\W)(-)/

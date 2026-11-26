@@ -1486,6 +1486,27 @@ describe PragmaticTokenizer do
         expect(PragmaticTokenizer::Tokenizer.new.tokenize(text)).to eq(["please", "visit", "the", "site", ":", "https://www.tm-town.com"])
       end
 
+      it 'only protects the colons of the time they belong to' do
+        text = "09:45 x:y"
+        expect(PragmaticTokenizer::Tokenizer.new.tokenize(text)).to eq(["09:45", "x", ":y"])
+      end
+
+      it 'protects time colons and url colons separately in the same input' do
+        text = "\"09:45\" x:y https://a.test:8080"
+        expect(PragmaticTokenizer::Tokenizer.new.tokenize(text)).to eq(["\"", "09:45", "\"", "x", ":y", "https://a.test:8080"])
+      end
+
+      it 'keeps the protocol and port of a url whole' do
+        text = "https://a.test:8080"
+        expect(PragmaticTokenizer::Tokenizer.new.tokenize(text)).to eq(["https://a.test:8080"])
+      end
+
+      it 'splits plain colons the same way with or without a time in the input' do
+        text = "x:y \"p:q\""
+        expect(PragmaticTokenizer::Tokenizer.new.tokenize(text)).to eq(["x", ":y", "\"", "p", ":q", "\""])
+        expect(PragmaticTokenizer::Tokenizer.new.tokenize("x:y")).to eq(["x", ":y"])
+      end
+
       it 'handles multiple dashes' do
         text = "John--here is your ticket."
         expect(PragmaticTokenizer::Tokenizer.new.tokenize(text)).to eq(["john", "-", "here", "is", "your", "ticket", "."])
