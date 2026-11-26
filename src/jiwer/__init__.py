@@ -3,9 +3,11 @@ from .measures import cer, mer, wer, wil, wip
 from .process import (
     AlignmentChunk,
     CharacterOutput,
+    KeyedWordOutput,
     WordOutput,
     process_characters,
     process_words,
+    process_words_with_ids,
 )
 from .transformations import (
     cer_contiguous,
@@ -49,9 +51,11 @@ __all__ = [
     wip,
     AlignmentChunk,
     CharacterOutput,
+    KeyedWordOutput,
     WordOutput,
     process_characters,
     process_words,
+    process_words_with_ids,
     AbstractTransform,
     Compose,
     ExpandCommonEnglishContractions,

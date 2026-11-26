@@ -23,7 +23,7 @@ so that measures can be computed and an alignment can be visualized.
 
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, List, Union
+from typing import Any, Iterable, List, Tuple, Union
 
 import rapidfuzz
 
@@ -33,9 +33,11 @@ from jiwer.transformations import cer_default, wer_default
 __all__ = [
     "AlignmentChunk",
     "CharacterOutput",
+    "KeyedWordOutput",
     "WordOutput",
     "process_characters",
     "process_words",
+    "process_words_with_ids",
 ]
 
 
@@ -268,6 +270,118 @@ def process_words(
         insertions=num_insertions,
         deletions=num_deletions,
     )
+
+
+@dataclass
+class KeyedWordOutput(WordOutput):
+    """
+    The output of `process_words_with_ids`. Contains everything `WordOutput`
+    contains, plus the utterance IDs in the order the aligned pairs appear in
+    `references`, `hypotheses` and `alignments`.
+
+    Attributes:
+        ids: The utterance IDs, in output order. The IDs provided by the
+             reference list come first (in the order they were given), followed
+             by the IDs only present in the hypothesis list (in the order they
+             were given there).
+    """
+
+    ids: List[str]
+
+
+def process_words_with_ids(
+    reference: Iterable[Tuple[str, str]],
+    hypothesis: Iterable[Tuple[str, str]],
+    reference_transform: Union[tr.Compose, tr.AbstractTransform] = wer_default,
+    hypothesis_transform: Union[tr.Compose, tr.AbstractTransform] = wer_default,
+) -> KeyedWordOutput:
+    """
+    Compute the word-level levenshtein distance and alignment between two
+    collections of `(id, sentence)` records, pairing sentences by their ID
+    instead of by position.
+
+    Both `reference` and `hypothesis` may be any iterable of `(id, sentence)`
+    pairs, including one-shot iterables such as generators. Each iterable is
+    consumed exactly once.
+
+    When an ID only has a sentence on one side, the other side is aligned with
+    an empty sentence, so a missing hypothesis contributes deletions and a
+    missing reference contributes insertions. Empty sentences are allowed on
+    both sides and contribute edit counts as usual.
+
+    The output order follows the order of the reference records first; IDs
+    unique to the hypothesis are appended in the order they appear in the
+    hypothesis records.
+
+    Args:
+        reference: An iterable of `(id, reference sentence)` pairs
+        hypothesis: An iterable of `(id, hypothesis sentence)` pairs
+        reference_transform: The transformation(s) to apply to the reference string(s)
+        hypothesis_transform: The transformation(s) to apply to the hypothesis string(s)
+
+    Returns:
+        (KeyedWordOutput): The processed reference and hypothesis sentences,
+        including the utterance IDs in output order
+
+    Raises:
+        ValueError: If the same ID appears more than once on either side. The
+                    entire computation fails; no partial result is returned.
+    """
+    ref_by_id = _collect_keyed_sentences(reference, side="reference")
+    hyp_by_id = _collect_keyed_sentences(hypothesis, side="hypothesis")
+
+    # Output order: reference order first, then hypothesis-only IDs in
+    # hypothesis order.
+    ids = list(ref_by_id.keys())
+    ids.extend(id_ for id_ in hyp_by_id if id_ not in ref_by_id)
+
+    ref_sentences = [ref_by_id.get(id_, "") for id_ in ids]
+    hyp_sentences = [hyp_by_id.get(id_, "") for id_ in ids]
+
+    output = process_words(
+        reference=ref_sentences,
+        hypothesis=hyp_sentences,
+        reference_transform=reference_transform,
+        hypothesis_transform=hypothesis_transform,
+    )
+
+    return KeyedWordOutput(
+        references=output.references,
+        hypotheses=output.hypotheses,
+        alignments=output.alignments,
+        wer=output.wer,
+        mer=output.mer,
+        wil=output.wil,
+        wip=output.wip,
+        hits=output.hits,
+        substitutions=output.substitutions,
+        insertions=output.insertions,
+        deletions=output.deletions,
+        ids=ids,
+    )
+
+
+def _collect_keyed_sentences(
+    records: Iterable[Tuple[str, str]], side: str
+) -> "dict[str, str]":
+    """
+    Consume an iterable of `(id, sentence)` records exactly once into an
+    insertion-ordered dict, rejecting duplicate IDs.
+    """
+    sentences = {}
+
+    for record in records:
+        record_id, sentence = record
+
+        if record_id in sentences:
+            raise ValueError(
+                f"Duplicate ID {record_id!r} in the {side} records. "
+                "Each ID may appear at most once per side."
+            )
+
+        sentences[record_id] = sentence
+
+    return sentences
 
 
 ########################################################################################
