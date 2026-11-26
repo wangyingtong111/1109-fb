@@ -99,13 +99,15 @@ module Philiprehberger
     end
 
     def self.search(query, candidates, threshold: 0.3)
-      scored = candidates.map do |candidate|
+      scored = candidates.each_with_index.map do |candidate, index|
         score = ratio(query, candidate.to_s)
-        { match: candidate, score: score.round(4) }
+        { match: candidate, score: score.round(4), real_score: score, index: index }
       end
 
-      results = scored.select { |r| r[:score] >= threshold }
-      results.sort_by { |r| -r[:score] }
+      scored
+        .select { |r| r[:real_score] >= threshold }
+        .sort_by { |r| [-r[:real_score], r[:index]] }
+        .map { |r| { match: r[:match], score: r[:score] } }
     end
 
     def self.suggest(query, candidates, threshold: 0.6, max: 5)
@@ -318,8 +320,8 @@ module Philiprehberger
       strings.each do |a|
         matrix[a] = {}
         strings.each do |b|
-          score = score_for(a, b, algorithm: algorithm).round(4)
-          matrix[a][b] = score if threshold.nil? || score >= threshold
+          score = score_for(a, b, algorithm: algorithm)
+          matrix[a][b] = score.round(4) if threshold.nil? || score >= threshold
         end
       end
       matrix
