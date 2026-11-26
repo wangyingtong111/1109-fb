@@ -76,3 +76,59 @@ class TestNormalizer(unittest.TestCase):
         text = 'from the ‘bad bank’, Northern, wala\u00A0«\u00A0dox ci jawwu Les «\u00A0wagonways\u00A0»\u00A0étaient construits'
         expected = '''from the 'bad bank," Northern, wala "dox ci jawwu Les "wagonways" étaient construits'''
         assert moses_perl_parity.normalize(text) == expected
+
+
+class TestLocaleNumberGrouping(unittest.TestCase):
+    """Optional locale thousands grouping on MosesPunctNormalizer."""
+
+    NBSP = "\u00A0"
+    NNBSP = "\u202F"
+
+    def test_french_grouped_number_is_merged_and_located(self):
+        moses = MosesPunctNormalizer(lang="fr", locale_number_grouping=True)
+        text = "12" + self.NBSP + "345,50"
+        assert moses.normalize(text, return_spans=True) == ("12345,50", [(0, 9, text)])
+
+    def test_narrow_nbsp_is_also_a_separator(self):
+        moses = MosesPunctNormalizer(lang="fr", locale_number_grouping=True)
+        text = "1" + self.NNBSP + "234" + self.NBSP + "567,80"
+        assert moses.normalize(text, return_spans=True) == ("1234567,80", [(0, 12, text)])
+
+    def test_invalid_grouping_is_left_as_separate_numbers(self):
+        # `1 23 456,78` is not a legal grouping: the middle group is too short.
+        moses = MosesPunctNormalizer(lang="fr", locale_number_grouping=True)
+        text = "1" + self.NBSP + "23" + self.NBSP + "456,78"
+        assert moses.normalize(text, return_spans=True) == ("1 23 456,78", [])
+
+    def test_only_merged_numbers_are_reported(self):
+        moses = MosesPunctNormalizer(lang="fr", locale_number_grouping=True)
+        group = "1" + self.NNBSP + "234" + self.NBSP + "567,80"
+        text = ("\u00ABA\u00BB1" + self.NBSP + "23" + self.NBSP + "456,78\u2014B "
+                + group + " et 1234567,80")
+        normalized, spans = moses.normalize(text, return_spans=True)
+        assert normalized == '"A"1 23 456,78 - B 1234567,80 et 1234567,80'
+        # The offset is into the *input*, where the dash is one character; the
+        # output is longer because `\u2014` became ` - `.
+        anchor = text.index(group)
+        assert spans == [(anchor, anchor + len(group), group)]
+        assert [text[start:end] for start, end, _ in spans] == [group]
+
+    def test_output_is_stable_under_reprocessing(self):
+        moses = MosesPunctNormalizer(lang="fr", locale_number_grouping=True)
+        text = "12" + self.NBSP + "345,50"
+        once, spans = moses.normalize(text, return_spans=True)
+        assert moses.normalize(once, return_spans=True) == (once, [])
+
+    def test_disabled_mode_keeps_nbsp_behaviour(self):
+        moses = MosesPunctNormalizer(lang="fr")
+        text = "12" + self.NBSP + "345,50"
+        assert moses.normalize(text) == "12,345,50"
+
+    def test_default_word_boundaries_are_untouched(self):
+        moses = MosesPunctNormalizer(lang="fr", locale_number_grouping=True)
+        assert moses.normalize("cat dog", return_spans=True) == ("cat dog", [])
+
+    def test_dot_decimal_language_uses_its_own_mark(self):
+        moses = MosesPunctNormalizer(lang="en", locale_number_grouping=True)
+        text = "12" + self.NBSP + "345.50"
+        assert moses.normalize(text, return_spans=True) == ("12345.50", [(0, 9, text)])

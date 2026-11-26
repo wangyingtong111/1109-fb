@@ -199,6 +199,13 @@ def detokenize_file(
     "--normalize-numbers", "-d", default=True, is_flag=True, help="Normalize number."
 )
 @click.option(
+    "--locale-number-grouping",
+    "-g",
+    default=False,
+    is_flag=True,
+    help="Merge numbers written with locale thousands grouping, e.g. '12 345,50' -> '12345,50'.",
+)
+@click.option(
     "--replace-unicode-puncts",
     "-p",
     default=False,
@@ -220,6 +227,7 @@ def normalize_file(
     quiet,
     normalize_quote_commas,
     normalize_numbers,
+    locale_number_grouping,
     replace_unicode_puncts,
     remove_control_chars,
 ):
@@ -227,6 +235,7 @@ def normalize_file(
         language,
         norm_quote_commas=normalize_quote_commas,
         norm_numbers=normalize_numbers,
+        locale_number_grouping=locale_number_grouping,
         pre_replace_unicode_punct=replace_unicode_puncts,
         post_remove_control_chars=remove_control_chars,
     )

@@ -81,6 +81,39 @@ True
 'THIS EBOOK IS OTHERWISE PROVIDED TO YOU "AS-IS."'
 ```
 
+### Locale number grouping
+
+By default numbers keep the historical NBSP handling, so a French
+`12 345,50` (with a no-break space) becomes `12,345,50`. Pass
+`locale_number_grouping=True` to merge numbers written with the language's
+own grouping instead: a first group of one to three digits and then groups of
+exactly three, separated by NBSP or narrow NBSP, with the language's decimal
+mark.
+
+```python
+>>> mpn = MosesPunctNormalizer(lang='fr', locale_number_grouping=True)
+>>> mpn.normalize('12 345,50')
+'12345,50'
+```
+
+Only complete, well-formed numbers are merged; `1 23 456,78` is not a legal
+grouping, so it stays as three numbers. `normalize(..., return_spans=True)`
+returns `(text, spans)` where each span is `(start, end, source)`, a
+half-open Python character range into the *input* that still spells the
+number with its separators:
+
+```python
+>>> text = '«A»1 23 456,78—B 1 234 567,80 et 1234567,80'
+>>> normalized, spans = mpn.normalize(text, return_spans=True)
+>>> normalized
+'"A"1 23 456,78 - B 1234567,80 et 1234567,80'
+>>> [text[start:end] for start, end, _ in spans]
+['1 234 567,80']
+```
+
+The offsets point into the input, not the output: the dash above expands to
+` - `, so reusing an output offset would land on the wrong characters.
+
 # Usage (CLI)
 
 Since version `0.0.42`, the pipeline feature for CLI is introduced, thus there
@@ -211,6 +244,8 @@ Usage: sacremoses normalize [OPTIONS]
 Options:
   -q, --normalize-quote-commas  Normalize quotations and commas.
   -d, --normalize-numbers       Normalize number.
+  -g, --locale-number-grouping  Merge numbers written with locale thousands
+                                grouping, e.g. '12 345,50' -> '12345,50'.
   -p, --replace-unicode-puncts  Replace unicode punctuations BEFORE
                                 normalization.
   -c, --remove-control-chars    Remove control characters AFTER normalization.
