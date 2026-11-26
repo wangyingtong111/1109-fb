@@ -6,6 +6,7 @@ from .process import (
     WordOutput,
     process_characters,
     process_words,
+    process_words_with_timestamps,
 )
 from .transformations import (
     cer_contiguous,
@@ -52,6 +53,7 @@ __all__ = [
     WordOutput,
     process_characters,
     process_words,
+    process_words_with_timestamps,
     AbstractTransform,
     Compose,
     ExpandCommonEnglishContractions,

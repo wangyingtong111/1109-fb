@@ -116,6 +116,48 @@ wer=88.89%
 
 Note that it also possible to visualize the character-level alignment, simply use the output of `jiwer.process_characters()` instead. 
 
+## Alignment with word timestamps
+
+When the same word is spoken (and recognized) multiple times, a plain edit-distance
+alignment cannot tell *which* occurrence was missed. If you know the timestamp of every
+word, you can pass them to `jiwer.process_words` (or use the convenience wrapper
+`jiwer.process_words_with_timestamps`). The alignment is then chosen with the following
+priority:
+
+1. the edit (Levenshtein) distance always remains the first optimization objective,
+2. among all alignments with the same edit distance, the one with the smallest sum of
+   the absolute timestamp differences over all hit word pairs is chosen,
+3. when the timestamp sums are equal as well, a stable, index-based alignment is returned.
+
+The resulting `WordOutput` additionally exposes:
+
+* `hit_pairs`: for each sentence, the `(reference_index, hypothesis_index)` pairs of
+  every hit, and
+* `delete_intervals`: for each sentence, the half-open
+  `(reference_start_index, reference_end_index)` intervals of the deleted reference
+  words.
+
+Both use the (transformed) word positions. For example, with a reference containing
+`go` at 0 and 5 seconds and a hypothesis only containing `go` at 5 seconds, the first
+reference word is reported as the deletion:
+
+```python3
+import jiwer
+
+out = jiwer.process_words(
+    reference="go go",
+    hypothesis="go",
+    reference_timestamps=[[0.0, 5.0]],
+    hypothesis_timestamps=[[5.0]],
+)
+
+print(out.hit_pairs)         # [[(1, 0)]]
+print(out.delete_intervals)  # [[(0, 1)]]
+```
+
+Without timestamps, `process_words` keeps its original tokenization, edit counts, WER
+and alignment order, and the two additional attributes stay empty.
+
 ## Error frequencies
 
 You can list all the substitutions, insertions, and deletion, along with their frequencies:
