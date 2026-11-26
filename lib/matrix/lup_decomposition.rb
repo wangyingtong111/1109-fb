@@ -151,6 +151,114 @@ class Matrix
       end
     end
 
+    # Returns +m+ so that <tt>A.transpose * m = b</tt>, using the
+    # existing factorization of +A+ (no refactorization is performed).
+    # +b+ can be a Matrix or a Vector.
+
+    def solve_transpose b
+      transposed_solve(b, false)
+    end
+
+    # Returns +m+ so that <tt>A.adjoint * m = b</tt>, using the
+    # existing factorization of +A+ (no refactorization is performed).
+    # +b+ can be a Matrix or a Vector.
+
+    def solve_adjoint b
+      transposed_solve(b, true)
+    end
+
+    private
+
+    # Shared implementation for +solve_transpose+ and +solve_adjoint+.
+    # With +conjugate+ false this solves <tt>A.transpose * m = b</tt>;
+    # with it true it solves <tt>A.adjoint * m = b</tt>.
+    #
+    # From <tt>L * U = P * A</tt> follows
+    # <tt>A.transpose = U.transpose * L.transpose * P</tt> (and the
+    # conjugated analogue for the adjoint), so the system is solved by
+    # forward substitution against +U+, back substitution against +L+,
+    # and finally undoing the row permutation +P+.
+
+    def transposed_solve b, conjugate
+      if (singular?)
+        raise Matrix::ErrNotRegular, "Matrix is singular."
+      end
+      n = @column_count
+      if b.is_a? Matrix
+        if (b.row_count != n)
+          raise Matrix::ErrDimensionMismatch
+        end
+
+        # Copy right hand side
+        nx = b.column_count
+        m = b.to_a.map(&:dup)
+
+        # Solve U.transpose (or U.adjoint) * Y = b by forward substitution
+        n.times do |k|
+          pivot = conjugate ? @lu[k][k].conj : @lu[k][k]
+          nx.times do |j|
+            m[k][j] = m[k][j].quo(pivot)
+          end
+          (k+1).upto(n-1) do |i|
+            factor = conjugate ? @lu[k][i].conj : @lu[k][i]
+            nx.times do |j|
+              m[i][j] -= m[k][j]*factor
+            end
+          end
+        end
+        # Solve L.transpose (or L.adjoint) * Z = Y by back substitution.
+        # L is unit lower triangular, so its diagonal entries are all 1.
+        (n-1).downto(0) do |k|
+          k.times do |i|
+            factor = conjugate ? @lu[k][i].conj : @lu[k][i]
+            nx.times do |j|
+              m[i][j] -= m[k][j]*factor
+            end
+          end
+        end
+        # Undo the permutation: m = P.transpose * Z
+        z = m
+        m = Array.new(n){Array.new(nx)}
+        n.times do |k|
+          m[@pivots[k]] = z[k]
+        end
+        Matrix.send :new, m, nx
+      else # same algorithm, specialized for simpler case of a vector
+        b = convert_to_array(b)
+        if (b.size != n)
+          raise Matrix::ErrDimensionMismatch
+        end
+
+        # Copy right hand side
+        m = b.dup
+
+        # Solve U.transpose (or U.adjoint) * Y = b by forward substitution
+        n.times do |k|
+          pivot = conjugate ? @lu[k][k].conj : @lu[k][k]
+          m[k] = m[k].quo(pivot)
+          (k+1).upto(n-1) do |i|
+            factor = conjugate ? @lu[k][i].conj : @lu[k][i]
+            m[i] -= m[k]*factor
+          end
+        end
+        # Solve L.transpose (or L.adjoint) * Z = Y by back substitution.
+        # L is unit lower triangular, so its diagonal entries are all 1.
+        (n-1).downto(0) do |k|
+          k.times do |i|
+            factor = conjugate ? @lu[k][i].conj : @lu[k][i]
+            m[i] -= m[k]*factor
+          end
+        end
+        # Undo the permutation: m = P.transpose * Z
+        z = m
+        m = Array.new(n)
+        n.times do |k|
+          m[@pivots[k]] = z[k]
+        end
+        Vector.elements(m, false)
+      end
+    end
+
     def initialize a
       raise TypeError, "Expected Matrix but got #{a.class}" unless a.is_a?(Matrix)
       # Use a "left-looking", dot-product, Crout/Doolittle algorithm.

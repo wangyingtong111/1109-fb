@@ -502,6 +502,80 @@ class TestMatrix < Test::Unit::TestCase
     assert_equal(m.lup.solve([2, 5]), Vector[1, Rational(1,2)])
   end
 
+  def test_lup_solve_transpose
+    # Upper triangular real matrix with a single column (vector) RHS
+    m = Matrix[[1, 3], [0, 2]]
+    b = Vector[4, 7]
+    m_before = m.to_a.map(&:dup)
+    b_before = b.to_a.dup
+    lu = m.lup
+    x = lu.solve_transpose(b)
+    assert_equal(b, m.transpose * x)
+    # Exact arithmetic: no floating point introduced
+    assert(x.all? { |e| e.is_a?(Rational) || e.is_a?(Integer) })
+    # Inputs are not modified
+    assert_equal(m_before, m.to_a)
+    assert_equal(b_before, b.to_a)
+    # A plain Array RHS follows the ordinary solve convention
+    assert_equal(x, lu.solve_transpose([4, 7]))
+    # For a real matrix the adjoint solve is the transpose solve
+    assert_equal(x, lu.solve_adjoint(b))
+  end
+
+  def test_lup_solve_transpose_and_adjoint
+    # Complex coefficients and several pivot row exchanges,
+    # with a two-column RHS shared by both transposed solves
+    m = Matrix[[0, Complex(1, 1), 2], [2, 1, 0], [3, 2, 1]]
+    b = Matrix[[Complex(1, 2), 0], [3, Complex(-1, 1)], [Complex(0, -2), 5]]
+    m_before = m.to_a.map(&:dup)
+    b_before = b.to_a.map(&:dup)
+
+    # A single factorization of the original matrix serves every solve
+    factorizations = 0
+    original_initialize = Matrix::LUPDecomposition.instance_method(:initialize)
+    Matrix::LUPDecomposition.send(:define_method, :initialize) do |a|
+      factorizations += 1
+      original_initialize.bind(self).call(a)
+    end
+    begin
+      lu = m.lup
+      lu.solve(b)
+      lu.solve_transpose(b)
+      lu.solve_adjoint(b)
+    ensure
+      Matrix::LUPDecomposition.send(:define_method, :initialize, original_initialize)
+    end
+    assert_equal(1, factorizations)
+
+    lu = m.lup
+    assert_not_predicate(lu, :singular?)
+
+    xt = lu.solve_transpose(b)
+    xh = lu.solve_adjoint(b)
+    # Both transposed solutions multiply back exactly to the same RHS
+    assert_equal(b, m.transpose * xt)
+    assert_equal(b, m.adjoint * xh)
+    # Exact arithmetic: no floating point introduced
+    assert((xt.to_a + xh.to_a).flatten.none? { |e| e.is_a?(Float) })
+    # Inputs are not modified
+    assert_equal(m_before, m.to_a)
+    assert_equal(b_before, b.to_a)
+
+    # Vector RHS conventions
+    v = b.column(0)
+    assert_equal(v, m.transpose * lu.solve_transpose(v))
+    assert_equal(v, m.adjoint * lu.solve_adjoint(v))
+
+    # Dimension and singular checks follow the ordinary solve conventions
+    assert_raise(Matrix::ErrDimensionMismatch) { lu.solve_transpose(Vector[1, 2]) }
+    assert_raise(Matrix::ErrDimensionMismatch) { lu.solve_adjoint(Matrix[[1, 2], [3, 4]]) }
+
+    singular = Matrix[[1, 2], [2, 4]].lup
+    assert_predicate(singular, :singular?)
+    assert_raise(Matrix::ErrNotRegular) { singular.solve_transpose(Vector[1, 2]) }
+    assert_raise(Matrix::ErrNotRegular) { singular.solve_adjoint(Vector[1, 2]) }
+  end
+
   def test_real
     assert_equal(Matrix[[1, 0, 0], [1, 2, 3]], @c1.real)
   end
