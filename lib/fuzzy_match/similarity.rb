@@ -2,7 +2,11 @@ class FuzzyMatch
   class Similarity
     attr_reader :record1
     attr_reader :record2
-    
+
+    # Set by FuzzyMatch#find when :identity_priority is on.
+    # One of :verified, :unknown or :conflict.
+    attr_accessor :identity_status
+
     def initialize(record1, record2)
       @record1 = record1
       @record2 = record2

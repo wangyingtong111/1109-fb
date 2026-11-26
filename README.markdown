@@ -88,6 +88,41 @@ Adding an identity like `/(f)-?(\d50)/i` ensures that "Ford F-150" and "Ford F-2
 
 Note that identities do not establish certainty. They just say whether two records **could** be identical... then string similarity takes over.
 
+### Identity priority (optional)
+
+By default a candidate that an identity rule *confirms* and one that no rule can judge are treated the same way by string similarity&mdash;the more similar-looking record wins either way. If your archive has records that are missing a number, though, you can ask for the confirmed ones explicitly.
+
+Pass `:identity_priority => true` (or `:identity_first`, `:verified_first`) to turn each identity rule's opinion into three states:
+
+* **verified**: at least one identity rule makes both records match with the same captures
+* **conflict**: any identity rule makes both records match but the captures disagree&mdash;the record is dropped, even if its name is the closest
+* **unknown**: no rule can confirm or contradict it (e.g. a record with no number at all)
+
+The word/grouping filters and the similarity `:threshold` keep their usual meaning, but the existing similarity order is only used *within* a class: verified records are ranked ahead of unknown ones, and every record keeps its original `find_all_with_score` numbers.
+
+    >> fz = FuzzyMatch.new ['oak', 'oak green 12', 'oak 13'], :identities => [/(\d+)/]
+    >> fz.find_all_with_score 'oak 12', :identity_priority => true
+    => [["oak green 12", 0.6, 0.5], ["oak", 0.8, 0.5]]   # "oak 13" was dropped as a conflict
+    >> fz.find_all_with_score 'oak 12'                     # ordinary find, unchanged
+    => [["oak", 0.8, 0.5], ["oak green 12", 0.6, 0.5]]
+
+With multiple rules, a candidate that conflicts with *any* rule is out, and at least one confirmation is enough to be verified:
+
+    >> rules = [/(\d+)/, /v(\w)/]
+    >> fz = FuzzyMatch.new ['oak', 'oak elm 12 vA', 'oak 12 vB', 'oak vC'], :identities => rules
+    >> fz.find_all_with_score('oak 12 vA', :identity_priority => true).map(&:first)
+    => ["oak elm 12 vA", "oak"]                           # "oak 12 vB" conflicts on version
+
+When `:identity_priority` is on and the `:threshold` leaves no verified candidate at all, unknown records are *not* returned unless you also pass `:identity_fallback => true` (`:allow_unknown`):
+
+    >> fz = FuzzyMatch.new ['oak', 'this one is far away 12'], :identities => [/(\d+)/]
+    >> fz.find 'oak 12', :threshold => 0.35, :identity_priority => true
+    => nil
+    >> fz.find 'oak 12', :threshold => 0.35, :identity_priority => true, :identity_fallback => true
+    => "oak"
+
+`:find_best` compares tie groups only inside the leading identity class. Both switches are off by default, so existing code keeps its original behaviour. Note that identity rules do not remove candidates on their own&mdash;`:identity_priority` is what turns their answers into ranking and rejection.
+
 ### Stop words
 
 Ignore common and/or meaningless words when doing string similarity.
@@ -101,6 +136,8 @@ Stop words are NOT removed when checking `:must_match_at_least_one_word` and whe
 * `read`: how to interpret each record in the 'haystack', either a Proc or a symbol
 * `must_match_grouping`: don't return a match unless the needle fits into one of the groupings you specified
 * `must_match_at_least_one_word`: don't return a match unless the needle shares at least one word with the match. Note that "Foo's" is treated like one word (so that it won't match "'s") and "Bolivia," is treated as just "bolivia"
+* `identity_priority`: after the word/grouping filters and the `threshold` run, rank candidates whose identity rules confirm them ahead of unknown ones and drop any that clearly conflict. Off by default
+* `identity_fallback`: with `identity_priority`, allow still-qualifying unknown records when the threshold leaves no verified candidate. Defaults to not returning them
 * `gather_last_result`: enable `last_result`
 
 ## Case sensitivity

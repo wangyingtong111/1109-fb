@@ -349,6 +349,74 @@ describe FuzzyMatch do
 
   end
 
+  describe 'the :identity_priority option' do
+    let(:number_rule) { /(\d+)/ }
+    let(:version_rule) { /v(\w)/ }
+
+    it %{ranks a verified candidate ahead of an unknown one while returning original scores} do
+      d = FuzzyMatch.new ['oak', 'oak green 12', 'oak 13'], :identities => [number_rule]
+      d.find_all_with_score('oak 12', :identity_priority => true).should ==
+        [['oak green 12', 0.6, 0.5], ['oak', 0.8, 0.5]]
+      d.find('oak 12', :identity_priority => true).should == 'oak green 12'
+      d.find_all('oak 12', :identity_priority => true).should == ['oak green 12', 'oak']
+      d.find_with_score('oak 12', :identity_priority => true).should == ['oak green 12', 0.6, 0.5]
+    end
+
+    it %{drops any candidate that clearly conflicts with an identity rule} do
+      d = FuzzyMatch.new ['oak', 'oak green 12', 'oak 13'], :identities => [number_rule]
+      d.find_all('oak 12', :identity_priority => true).should_not include('oak 13')
+    end
+
+    it %{leaves ordinary finds in their original order when the option is off} do
+      d = FuzzyMatch.new ['oak', 'oak green 12', 'oak 13'], :identities => [number_rule]
+      d.find_all_with_score('oak 12').map(&:first).should == ['oak', 'oak green 12']
+      d.find('oak 12').should == 'oak'
+    end
+
+    it %{excludes a version conflict even when the number agrees and the name is closest} do
+      d = FuzzyMatch.new ['oak', 'oak elm 12 vA', 'oak 12 vB', 'oak vC'],
+                         :identities => [number_rule, version_rule]
+      d.find_all_with_score('oak 12 vA', :identity_priority => true).map(&:first).should ==
+        ['oak elm 12 vA', 'oak']
+      d.find_all_with_score('oak 12 vA').map(&:first).should ==
+        ['oak elm 12 vA', 'oak']
+    end
+
+    it %{compares the best tie group only within the leading identity class} do
+      d = FuzzyMatch.new ['oak', 'oak elm 12 vA', 'oak 12 vB', 'oak vC'],
+                         :identities => [number_rule, version_rule]
+      d.find_best('oak 12 vA', :identity_priority => true).should == ['oak elm 12 vA']
+    end
+
+    it %{keeps unknown candidates out when no verified one survives, unless fallback is allowed} do
+      d = FuzzyMatch.new ['oak', 'this one is far away 12'], :identities => [number_rule]
+      d.find_all_with_score('oak 12', :threshold => 0.35, :identity_priority => true).should == []
+      d.find('oak 12', :threshold => 0.35, :identity_priority => true).should be_nil
+      d.find_all_with_score('oak 12', :threshold => 0.35,
+                            :identity_priority => true, :identity_fallback => true).map(&:first).should == ['oak']
+      d.find('oak 12', :threshold => 0.35,
+             :identity_priority => true, :identity_fallback => true).should == 'oak'
+    end
+
+    it %{still honors groupings and the shared-word requirement} do
+      d = FuzzyMatch.new ['oak green 12', 'oak 13', 'maple 12'],
+                         :groupings => [/oak/i], :must_match_grouping => true,
+                         :identities => [number_rule]
+      d.find_all('oak 12', :identity_priority => true).should == ['oak green 12']
+      d.find_all('oak 12', :identity_priority => true, :must_match_at_least_one_word => true).should ==
+        ['oak green 12']
+    end
+
+    it %{accepts the descriptive aliases for both switches} do
+      d = FuzzyMatch.new ['oak', 'oak green 12', 'oak 13'], :identities => [number_rule]
+      d.find_all('oak 12', :verified_first => true).should == ['oak green 12', 'oak']
+      d.find_all('oak 12', :identity_first => true).should == ['oak green 12', 'oak']
+      far = FuzzyMatch.new ['oak', 'this one is far away 12'], :identities => [number_rule]
+      far.find_all('oak 12', :threshold => 0.35,
+                   :identity_priority => true, :allow_unknown => true).should == ['oak']
+    end
+  end
+
   describe 'deprecations' do
     it %{takes :must_match_blocking as :must_match_grouping} do
       d = FuzzyMatch.new [], :must_match_blocking => :a

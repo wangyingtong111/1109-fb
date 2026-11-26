@@ -35,6 +35,22 @@ class FuzzyMatch
           proc.call record1.original, record2.original
         end
       end
+
+      # Tri-state form of #identical?, used by the :identity_priority option.
+      #
+      # * <tt>:verified</tt> - both records match this rule and the captures agree
+      # * <tt>:conflict</tt> - both records match this rule but the captures disagree
+      # * <tt>:unknown</tt>  - at least one record doesn't match, so this rule says nothing
+      #
+      # Proc identities are simply translated from their true/false/nil answers.
+      def status(record1, record2)
+        case identical?(record1, record2)
+        when true then :verified
+        when false then :conflict
+        else :unknown
+        end
+      end
+      alias_method :identity_status, :status
     end
   end
 end

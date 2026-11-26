@@ -1,3 +1,11 @@
+Unreleased
+
+* Enhancements
+
+  * New `:identity_priority` find option (aliases `:identity_first`, `:verified_first`): tri-state identity rules (verified / conflict / unknown) re-rank the threshold-qualified candidates so verified records come before unknown ones, conflicts are dropped, and the usual similarity order (and original `find_all_with_score` numbers) is kept inside each class. `find_best` ties are compared only within the leading class
+  * New `:identity_fallback` find option (alias `:allow_unknown`): with `:identity_priority`, permits still-qualifying unknown records when the threshold leaves no verified candidate. Both switches are off by default, so ordinary finds are unchanged
+  * `FuzzyMatch::Rule::Identity#status` exposes the verified/conflict/unknown tri-state (`#identical?` is unchanged)
+
 2.1.0 / 2014-07-14
 
 * Breaking changes
