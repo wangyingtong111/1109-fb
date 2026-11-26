@@ -15,46 +15,128 @@ class MiniFTS
     # string, which can never be an edge label (edge labels are non-empty).
     LEAF = ""
 
-    # @internal the raw nested-Hash tree
-    attr_reader :tree
+    # Option names accepted for an explicitly bound live prefix view.
+    LIVE_VIEW_OPTIONS = %i[live online active dynamic persistent root_bound shared].freeze
 
     # @internal the prefix this (possibly derived) view is rooted at
     attr_reader :prefix
 
     # Normally called without arguments to create an empty map. The arguments are
     # for internal use, when building a derived view at a prefix (see {#at_prefix}).
-    def initialize(tree = {}, prefix = "")
+    #
+    # +root+ binds a prefix view to the dictionary that owns the radix tree. Such
+    # a view resolves every relative key through that root, so it survives the
+    # edge splits, merges, and pruning caused by later writes and deletes.
+    def initialize(tree = {}, prefix = "", options = nil, **keyword_options)
+      opts = options.is_a?(Hash) ? options.dup : {}
+      opts[:live] = true if options == true
+      opts.merge!(keyword_options)
+
       @tree = tree
       @prefix = prefix
+      @root = opts[:root]
+      @live = live_option?(opts)
+      @relative_keys = opts[:relative_keys] || opts[:relative] || false
       @size = nil
     end
 
-    # Returns a mutable view of this map containing only entries whose keys start
-    # with +prefix+.
-    def at_prefix(prefix)
+    # @internal whether this view stays bound to its owning root dictionary
+    def live?
+      @live ? true : false
+    end
+    alias online? live?
+
+    # Returns a view containing entries whose keys start with +prefix+.
+    #
+    # Prefix views are live by default: +get+, +set+, +delete+, and their
+    # variants use relative keys while always reading and writing the owning
+    # root dictionary. This remains true after compressed radix edges are split,
+    # merged, or pruned. Pass <tt>live: false</tt> for the historical node-bound
+    # view. Enumeration keeps the established +at_prefix+ convention of yielding
+    # full keys; use {#relative_view} for an enumerable relative-key projection.
+    def at_prefix(prefix, options = nil, **keyword_options)
       raise Error, "Mismatched prefix" unless prefix.start_with?(@prefix)
 
-      node, path = track_down(@tree, tail(prefix, @prefix.length))
+      opts = {}
+      case options
+      when Hash
+        opts.merge!(options)
+      when true, false
+        opts[:live] = options
+      when :live, :online
+        opts[:live] = true
+      end
+      opts.merge!(keyword_options)
 
-      if node.nil?
-        parent_node, key = path.last
-        parent_node.each_key do |k|
-          next unless k != LEAF && k.start_with?(key)
+      live = true
+      LIVE_VIEW_OPTIONS.each do |option_key|
+        next unless opts.key?(option_key)
 
-          child = {}
-          child[tail(k, key.length)] = parent_node[k]
-          return SearchableMap.new(child, prefix)
-        end
+        live = opts[option_key]
+        break
       end
 
-      # When no subtree matches, MiniSearch relies on the constructor's default
-      # (`tree = new Map()`) to yield an empty, still-iterable view.
-      SearchableMap.new(node.nil? ? {} : node, prefix)
+      relative_keys = opts[:relative_keys] || opts[:relative] || false
+
+      if live
+        return SearchableMap.new(
+          {},
+          prefix,
+          root: root_map,
+          live: true,
+          relative_keys: relative_keys ? true : false
+        )
+      end
+
+      prefix_snapshot(prefix)
+    end
+
+    # A live prefix view whose enumeration methods also yield keys relative to
+    # +prefix+. Reads, writes, and deletes have always used relative keys.
+    #
+    # Unlike {#at_prefix}, this convenience method accepts either an absolute
+    # prefix or a prefix relative to the current view.
+    def relative_view(prefix = "")
+      absolute_prefix = if prefix.start_with?(@prefix)
+                          prefix
+                        else
+                          @prefix + prefix
+                        end
+      at_prefix(absolute_prefix, live: true, relative_keys: true)
+    end
+    alias prefix_view relative_view
+    alias view relative_view
+    alias live_view relative_view
+    alias online_view relative_view
+    alias view_at_prefix relative_view
+
+    # A live {#at_prefix} view; provided as an explicit, intention-revealing
+    # entry point alongside <tt>at_prefix(prefix, live: true)</tt>.
+    def live_prefix(prefix)
+      at_prefix(prefix, live: true)
+    end
+    alias online_prefix live_prefix
+
+    # @internal the raw nested-Hash tree. For a live view this is resolved from
+    # the root on every access, so callers never observe a detached compressed
+    # edge after the parent tree changes shape.
+    def tree
+      return @tree unless @live
+
+      @tree = root_map.at_prefix(@prefix, live: false).tree
     end
 
     # Removes all entries.
     def clear
       @size = nil
+
+      if @live
+        root_map.at_prefix(@prefix, live: false).keys.each do |full_key|
+          root_map.delete(full_key)
+        end
+        return nil
+      end
+
       @tree.clear
       nil
     end
@@ -62,7 +144,13 @@ class MiniFTS
     # Deletes the entry at +key+, if present.
     def delete(key)
       @size = nil
-      remove(@tree, key)
+
+      if @live
+        root_map.delete(full_key(key))
+      else
+        remove(@tree, key)
+      end
+
       nil
     end
 
@@ -72,7 +160,14 @@ class MiniFTS
     def each(&block)
       return enum_for(:each) unless block_given?
 
-      dfs(@tree, @prefix, &block)
+      if @live
+        snapshot = root_map.at_prefix(@prefix, live: false)
+        enumeration_prefix = @relative_keys ? "" : @prefix
+        dfs(snapshot.tree, enumeration_prefix, &block)
+      else
+        dfs(@tree, @prefix, &block)
+      end
+
       self
     end
 
@@ -94,19 +189,28 @@ class MiniFTS
     # Returns a Hash mapping each matching key to a +[value, edit_distance]+ pair,
     # for every key within +max_edit_distance+ (Levenshtein) of +key+.
     def fuzzy_get(key, max_edit_distance)
-      fuzzy_search(@tree, key, max_edit_distance)
+      tree = @live ? root_map.at_prefix(@prefix, live: false).tree : @tree
+      fuzzy_search(tree, key, max_edit_distance)
     end
 
     # @return [Object, nil] the value at +key+, or +nil+ if absent
     def get(key)
-      node = lookup(@tree, key)
-      node.nil? ? nil : node[LEAF]
+      if @live
+        root_map.get(full_key(key))
+      else
+        node = lookup(@tree, key)
+        node.nil? ? nil : node[LEAF]
+      end
     end
 
     # @return [Boolean] whether +key+ is present
     def has?(key)
-      node = lookup(@tree, key)
-      !node.nil? && node.key?(LEAF)
+      if @live
+        root_map.has?(full_key(key))
+      else
+        node = lookup(@tree, key)
+        !node.nil? && node.key?(LEAF)
+      end
     end
 
     # Sets +key+ to +value+. Returns self, to allow chaining.
@@ -114,6 +218,12 @@ class MiniFTS
       raise Error, "key must be a string" unless key.is_a?(String)
 
       @size = nil
+
+      if @live
+        root_map.set(full_key(key), value)
+        return self
+      end
+
       node = create_path(@tree, key)
       node[LEAF] = value
       self
@@ -121,6 +231,12 @@ class MiniFTS
 
     # @return [Integer] the number of entries
     def size
+      if @live
+        count = 0
+        each { count += 1 }
+        return count
+      end
+
       return @size unless @size.nil?
 
       @size = 0
@@ -130,10 +246,16 @@ class MiniFTS
 
     # Updates the value at +key+ using the given block, which receives the current
     # value (or +nil+). Returns self.
-    def update(key)
+    def update(key, &block)
       raise Error, "key must be a string" unless key.is_a?(String)
 
       @size = nil
+
+      if @live
+        root_map.update(full_key(key), &block)
+        return self
+      end
+
       node = create_path(@tree, key)
       node[LEAF] = yield(node[LEAF])
       self
@@ -141,10 +263,13 @@ class MiniFTS
 
     # Fetches the value at +key+, calling the block to create and store it if
     # absent. Returns the existing or newly created value.
-    def fetch(key)
+    def fetch(key, &block)
       raise Error, "key must be a string" unless key.is_a?(String)
 
       @size = nil
+
+      return root_map.fetch(full_key(key), &block) if @live
+
       node = create_path(@tree, key)
       node[LEAF] = yield unless node.key?(LEAF)
       node[LEAF]
@@ -163,6 +288,46 @@ class MiniFTS
     end
 
     private
+
+    # The dictionary that owns the radix tree. Root dictionaries own themselves;
+    # live prefix views retain this reference even when their captured node is
+    # detached by later tree compression.
+    def root_map
+      @root || self
+    end
+
+    def live_option?(options)
+      LIVE_VIEW_OPTIONS.each do |option_key|
+        return !!options[option_key] if options.key?(option_key)
+      end
+      false
+    end
+
+    def full_key(key)
+      @prefix + key
+    end
+
+    # The historical node-bound prefix projection. It shares the currently
+    # reachable subtree when the prefix aligns, and otherwise materializes the
+    # single truncated edge needed by iteration and relative reads.
+    def prefix_snapshot(prefix)
+      node, path = track_down(@tree, tail(prefix, @prefix.length))
+
+      if node.nil?
+        parent_node, key = path.last
+        parent_node.each_key do |k|
+          next unless k != LEAF && k.start_with?(key)
+
+          child = {}
+          child[tail(k, key.length)] = parent_node[k]
+          return SearchableMap.new(child, prefix, root: root_map)
+        end
+      end
+
+      # When no subtree matches, MiniSearch relies on the constructor's default
+      # (`tree = new Map()`) to yield an empty, still-iterable view.
+      SearchableMap.new(node.nil? ? {} : node, prefix, root: root_map)
+    end
 
     # Depth-first traversal matching MiniSearch's TreeIterator: within each node,
     # keys are visited in reverse insertion order, diving fully into each child

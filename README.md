@@ -212,7 +212,19 @@ map = MiniFTS::SearchableMap.new
 map.set("motorcycle", 1).set("motor", 2)
 map.at_prefix("moto").keys       # => ["motor", "motorcycle"]
 map.fuzzy_get("moter", 1)        # => { "motor" => [2, 1] }
+
+view = map.at_prefix("moto", live: true)
+view.set("rboat", 3)             # writes the full key "motorboat"
+view.get("rboat")                # => 3
+map.get("motorboat")             # => 3
 ```
+
+Prefix views stay bound to the root dictionary, so views created before radix
+edges split, merge, or are pruned continue to read and write the current tree.
+`at_prefix` keeps its established enumeration convention of yielding full keys;
+`map.prefix_view("moto")` returns the same live behavior while yielding keys
+relative to the prefix. Pass `live: false` for the historical node-bound
+projection.
 
 ## Performance
 
