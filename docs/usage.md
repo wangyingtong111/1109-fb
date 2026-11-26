@@ -116,6 +116,57 @@ wer=88.89%
 
 Note that it also possible to visualize the character-level alignment, simply use the output of `jiwer.process_characters()` instead. 
 
+## Recording regions and line attribution
+
+When lines are arbitrary exports from one or more recordings, line boundaries
+should not force sentence-by-sentence alignment. Use
+[`jiwer.process_words_with_regions`][jiwer.process_words_with_regions] to merge
+lines within each recording region, align each region independently, and retain
+the original line/word coordinate of every transformed word.
+
+```python3
+import jiwer
+
+regions = [
+    (
+        "A",
+        [("ref-line-a", "go now")],
+        [("hyp-line-a1", "go")],
+    ),
+    (
+        "B",
+        [("ref-line-b", "next")],
+        [("hyp-line-b1", "now next")],
+    ),
+]
+
+out = jiwer.process_words_with_regions(regions)
+
+print(out.deletions, out.insertions)
+# 1 1
+
+print(out.details)
+# (
+#     ("A", "delete", (("ref-line-a", 1),), ()),
+#     ("B", "insert", (), (("hyp-line-b1", 0),)),
+# )
+```
+
+Consecutive words of the same error type can still be represented by one
+`AlignmentChunk`; its `ref_positions` and `hyp_positions` contain one
+`(line_id, word_index)` coordinate for each word in the interval. The same
+coordinates are available as `ref_origins`/`hyp_origins` and
+`ref_sources`/`hyp_sources`.
+
+Different regions are never aligned with each other. Thus `"now"` deleted in
+region A and inserted in region B remains one deletion and one insertion even
+though the concatenated cross-region reference and hypothesis word sequences
+are equal. Plain string lines are accepted too and receive their global
+zero-based line index as their identifier.
+
+The historical `jiwer.process_words(reference, hypothesis)` behavior is
+unchanged when no region argument is supplied.
+
 ## Error frequencies
 
 You can list all the substitutions, insertions, and deletion, along with their frequencies:

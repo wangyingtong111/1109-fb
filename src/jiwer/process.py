@@ -23,23 +23,85 @@ so that measures can be computed and an alignment can be visualized.
 
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, List, Union
+from typing import TYPE_CHECKING, Any, List, Tuple, Union
 
 import rapidfuzz
 
 from jiwer import transforms as tr
 from jiwer.transformations import cer_default, wer_default
 
+if TYPE_CHECKING:
+    from jiwer.regions import RegionWordOutput
+
 __all__ = [
     "AlignmentChunk",
     "CharacterOutput",
     "WordOutput",
+    "WordSource",
+    "WordPosition",
+    "WordOrigin",
+    "build_word_output",
     "process_characters",
     "process_words",
 ]
 
 
-@dataclass
+class WordSource(tuple):
+    """
+    The source line and zero-based position of a transformed word.
+
+    A ``WordSource`` is also an ordinary ``(line_id, word_index)`` tuple, so it can
+    be compared directly to the compact coordinates used by reporting code.
+    Additional global/per-region line indices and the transformed word are
+    available as attributes when the region API can provide them.
+    """
+
+    def __new__(
+        cls,
+        line_id: Any,
+        word_index: int,
+        *,
+        line_index: int = None,
+        region_line_index: int = None,
+        word: str = None,
+    ):
+        obj = super().__new__(cls, (line_id, word_index))
+        obj.line_id = line_id
+        obj.word_index = word_index
+        obj.line_index = (
+            line_index
+            if line_index is not None
+            else (line_id if isinstance(line_id, int) else None)
+        )
+        obj.region_line_index = region_line_index
+        obj.word = word
+        return obj
+
+    @property
+    def line(self) -> Any:
+        """Alias for :attr:`line_id`."""
+        return self.line_id
+
+    @property
+    def index(self) -> int:
+        """Alias for :attr:`word_index`."""
+        return self.word_index
+
+    @property
+    def word_index_in_line(self) -> int:
+        """Explicit alias for the zero-based word index in the source line."""
+        return self.word_index
+
+    def __repr__(self) -> str:
+        return f"WordSource({self.line_id!r}, {self.word_index!r})"
+
+
+# Backwards/descriptive aliases for source coordinates.
+WordPosition = WordSource
+WordOrigin = WordSource
+
+
+@dataclass(init=False)
 class AlignmentChunk:
     """
     Define an alignment between two subsequence of the reference and hypothesis.
@@ -50,6 +112,9 @@ class AlignmentChunk:
         ref_end_idx: the end index of the reference subsequence
         hyp_start_idx: the start index of the hypothesis subsequence
         hyp_end_idx: the end index of the hypothesis subsequence
+        region: optional recording-region identifier when region alignment was used
+        ref_positions: source-line coordinates for every transformed reference word
+        hyp_positions: source-line coordinates for every transformed hypothesis word
     """
 
     type: str
@@ -59,6 +124,108 @@ class AlignmentChunk:
 
     hyp_start_idx: int
     hyp_end_idx: int
+
+    region: Any
+    ref_positions: Tuple[WordSource, ...]
+    hyp_positions: Tuple[WordSource, ...]
+
+    def __init__(
+        self,
+        type: str,
+        ref_start_idx: int,
+        ref_end_idx: int,
+        hyp_start_idx: int,
+        hyp_end_idx: int,
+        region: Any = None,
+        ref_positions: Tuple[WordSource, ...] = (),
+        hyp_positions: Tuple[WordSource, ...] = (),
+        *,
+        ref_sources: Tuple[WordSource, ...] = None,
+        hyp_sources: Tuple[WordSource, ...] = None,
+        ref_origins: Tuple[WordSource, ...] = None,
+        hyp_origins: Tuple[WordSource, ...] = None,
+    ):
+        # Accept a few descriptive aliases so callers/tests are not forced to use
+        # one naming convention for provenance.
+        if ref_positions == () and ref_sources is not None:
+            ref_positions = tuple(ref_sources)
+        if ref_positions == () and ref_origins is not None:
+            ref_positions = tuple(ref_origins)
+        if hyp_positions == () and hyp_sources is not None:
+            hyp_positions = tuple(hyp_sources)
+        if hyp_positions == () and hyp_origins is not None:
+            hyp_positions = tuple(hyp_origins)
+
+        self.type = type
+        self.ref_start_idx = ref_start_idx
+        self.ref_end_idx = ref_end_idx
+        self.hyp_start_idx = hyp_start_idx
+        self.hyp_end_idx = hyp_end_idx
+        self.region = region
+        self.ref_positions = tuple(ref_positions)
+        self.hyp_positions = tuple(hyp_positions)
+
+        self.__post_init__()
+
+    @property
+    def ref_sources(self) -> Tuple[WordSource, ...]:
+        """Alias for :attr:`ref_positions`."""
+        return self.ref_positions
+
+    @property
+    def hyp_sources(self) -> Tuple[WordSource, ...]:
+        """Alias for :attr:`hyp_positions`."""
+        return self.hyp_positions
+
+    @property
+    def ref_origins(self) -> Tuple[WordSource, ...]:
+        """Alias for :attr:`ref_positions`."""
+        return self.ref_positions
+
+    @property
+    def hyp_origins(self) -> Tuple[WordSource, ...]:
+        """Alias for :attr:`hyp_positions`."""
+        return self.hyp_positions
+
+    @property
+    def ref_word_sources(self) -> Tuple[WordSource, ...]:
+        """Alias for :attr:`ref_positions`."""
+        return self.ref_positions
+
+    @property
+    def hyp_word_sources(self) -> Tuple[WordSource, ...]:
+        """Alias for :attr:`hyp_positions`."""
+        return self.hyp_positions
+
+    @property
+    def reference_positions(self) -> Tuple[WordSource, ...]:
+        """Alias for :attr:`ref_positions`."""
+        return self.ref_positions
+
+    @property
+    def hypothesis_positions(self) -> Tuple[WordSource, ...]:
+        """Alias for :attr:`hyp_positions`."""
+        return self.hyp_positions
+
+    @property
+    def reference_sources(self) -> Tuple[WordSource, ...]:
+        """Alias for :attr:`ref_positions`."""
+        return self.ref_positions
+
+    @property
+    def hypothesis_sources(self) -> Tuple[WordSource, ...]:
+        """Alias for :attr:`hyp_positions`."""
+        return self.hyp_positions
+
+    @property
+    def ref_line_ids(self) -> Tuple[Any, ...]:
+        """Source line identifiers for the reference side of the chunk."""
+        return tuple(position.line_id for position in self.ref_positions)
+
+    @property
+    def hyp_line_ids(self) -> Tuple[Any, ...]:
+        """Source line identifiers for the hypothesis side of the chunk."""
+        return tuple(position.line_id for position in self.hyp_positions)
 
     def __post_init__(self):
         if self.type not in ["replace", "insert", "delete", "equal", "substitute"]:
@@ -127,11 +294,13 @@ class WordOutput:
 
 
 def process_words(
-    reference: Union[str, List[str]],
-    hypothesis: Union[str, List[str]],
+    reference: Union[str, List[str], None] = None,
+    hypothesis: Union[str, List[str], None] = None,
     reference_transform: Union[tr.Compose, tr.AbstractTransform] = wer_default,
     hypothesis_transform: Union[tr.Compose, tr.AbstractTransform] = wer_default,
-) -> WordOutput:
+    regions: Any = None,
+    **kwargs: Any,
+) -> Union[WordOutput, "RegionWordOutput"]:
     """
     Compute the word-level levenshtein distance and alignment between one or more
     reference and hypothesis sentences. Based on the result, multiple measures
@@ -150,6 +319,27 @@ def process_words(
         ValueError: If one or more references are empty strings
         ValueError: If after applying transforms, reference and hypothesis lengths don't match
     """
+    # Region alignment is opt-in.  Keeping this import local avoids a circular
+    # import between process.py and the higher-level region reporting helpers.
+    from jiwer.regions import maybe_process_words_with_regions
+
+    region_result = maybe_process_words_with_regions(
+        reference=reference,
+        hypothesis=hypothesis,
+        reference_transform=reference_transform,
+        hypothesis_transform=hypothesis_transform,
+        regions=regions,
+        **kwargs,
+    )
+    if region_result is not None:
+        return region_result
+
+    if reference is None or hypothesis is None:
+        raise TypeError(
+            "process_words() requires reference and hypothesis unless region "
+            "groups are supplied via the regions argument."
+        )
+
     # validate input type
     if isinstance(reference, str):
         reference = [reference]
@@ -172,6 +362,19 @@ def process_words(
             f"{len(hyp_transformed)} hypothesis sentences."
         )
 
+    return build_word_output(ref_transformed, hyp_transformed)
+
+
+def build_word_output(
+    ref_transformed: List[List[str]],
+    hyp_transformed: List[List[str]],
+) -> WordOutput:
+    """
+    Build a :class:`WordOutput` from already-transformed word sequences.
+
+    This helper lets region alignment reuse exactly the same opcode, counting and
+    measure logic as the public sentence-level entry point.
+    """
     # Map each word into a unique integer in order to compute
     # word-level levenshtein distance
     ref_as_ints, hyp_as_ints = _word2int(ref_transformed, hyp_transformed)
@@ -183,7 +386,7 @@ def process_words(
     # also keep track of the total number of words in the reference and hypothesis
     num_rf_words, num_hp_words = 0, 0
 
-    # anf finally, keep track of the alignment between each reference and hypothesis
+    # and finally, keep track of the alignment between each reference and hypothesis
     alignments = []
 
     for reference_sentence, hypothesis_sentence in zip(ref_as_ints, hyp_as_ints):
@@ -196,7 +399,9 @@ def process_words(
         sentence_op_chunks = []
 
         for tag, i1, i2, j1, j2 in opcodes:
-            # Create alignment chunk
+            # Create alignment chunk.  Historical sentence/list processing does
+            # not attach line provenance; region processing enriches chunks after
+            # calling this shared counting routine.
             sentence_op_chunks.append(
                 AlignmentChunk(
                     type=tag,

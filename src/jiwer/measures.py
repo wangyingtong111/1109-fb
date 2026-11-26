@@ -42,7 +42,7 @@ results from the
 classes.
 """
 
-from typing import List, Union
+from typing import Any, List, Union
 
 from jiwer import transforms as tr
 from jiwer.process import process_characters, process_words
@@ -65,6 +65,7 @@ def wer(
     hypothesis: Union[str, List[str]] = None,
     reference_transform: Union[tr.Compose, tr.AbstractTransform] = wer_default,
     hypothesis_transform: Union[tr.Compose, tr.AbstractTransform] = wer_default,
+    **kwargs: Any,
 ) -> float:
     """
     Calculate the word error rate (WER) between one or more reference and
@@ -81,7 +82,11 @@ def wer(
                  hypothesis sentence(s).
     """
     output = process_words(
-        reference, hypothesis, reference_transform, hypothesis_transform
+        reference,
+        hypothesis,
+        reference_transform,
+        hypothesis_transform,
+        **kwargs,
     )
 
     return output.wer
@@ -92,6 +97,7 @@ def mer(
     hypothesis: Union[str, List[str]] = None,
     reference_transform: Union[tr.Compose, tr.AbstractTransform] = wer_default,
     hypothesis_transform: Union[tr.Compose, tr.AbstractTransform] = wer_default,
+    **kwargs: Any,
 ) -> float:
     """
     Calculate the match error rate (MER) between one or more reference and
@@ -108,7 +114,11 @@ def mer(
                  hypothesis sentence(s).
     """
     output = process_words(
-        reference, hypothesis, reference_transform, hypothesis_transform
+        reference,
+        hypothesis,
+        reference_transform,
+        hypothesis_transform,
+        **kwargs,
     )
 
     return output.mer
@@ -119,6 +129,7 @@ def wip(
     hypothesis: Union[str, List[str]] = None,
     reference_transform: Union[tr.Compose, tr.AbstractTransform] = wer_default,
     hypothesis_transform: Union[tr.Compose, tr.AbstractTransform] = wer_default,
+    **kwargs: Any,
 ) -> float:
     """
     Calculate the word information preserved (WIP) between one or more reference and
@@ -135,7 +146,11 @@ def wip(
                  hypothesis sentence(s).
     """
     output = process_words(
-        reference, hypothesis, reference_transform, hypothesis_transform
+        reference,
+        hypothesis,
+        reference_transform,
+        hypothesis_transform,
+        **kwargs,
     )
 
     return output.wip
@@ -146,6 +161,7 @@ def wil(
     hypothesis: Union[str, List[str]] = None,
     reference_transform: Union[tr.Compose, tr.AbstractTransform] = wer_default,
     hypothesis_transform: Union[tr.Compose, tr.AbstractTransform] = wer_default,
+    **kwargs: Any,
 ) -> float:
     """
     Calculate the word information lost (WIL) between one or more reference and
@@ -162,7 +178,11 @@ def wil(
                  hypothesis sentence(s).
     """
     output = process_words(
-        reference, hypothesis, reference_transform, hypothesis_transform
+        reference,
+        hypothesis,
+        reference_transform,
+        hypothesis_transform,
+        **kwargs,
     )
 
     return output.wil
