@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+from collections.abc import Mapping
 from collections.abc import Sequence
+from numbers import Real
+from typing import Any
 from typing import cast
 from typing import TYPE_CHECKING
 
@@ -16,10 +20,34 @@ if TYPE_CHECKING:
     from optuna.trial import FrozenTrial
 
 
+_INTERVAL_ATTRIBUTE_KEYS = (
+    "interval_objectives",
+    "objective_intervals",
+    "intervals",
+    "interval_bounds",
+    "objective_ranges",
+    "interval",
+    "bounds",
+    "ranges",
+)
+
+_IntervalSpec = (
+    bool
+    | str
+    | Mapping[Any, Any]
+    | Callable[["FrozenTrial"], Any]
+    | Sequence[Any]
+    | None
+)
+
+
 def _get_pareto_front_trials_by_trials(
     trials: Sequence[FrozenTrial],
     directions: Sequence[StudyDirection],
     consider_constraint: bool = False,
+    intervals: Any | None = None,
+    interval_objectives: Any | None = None,
+    **interval_options: Any,
 ) -> list[FrozenTrial]:
     # NOTE(nabenabe0928): Vectorization relies on all the trials being complete.
     trials = [t for t in trials if t.state == TrialState.COMPLETE]
@@ -33,6 +61,17 @@ def _get_pareto_front_trials_by_trials(
             "The number of the values and the number of the objectives must be identical."
         )
 
+    interval_spec = _select_interval_spec(intervals, interval_objectives, interval_options)
+    if interval_spec is not None:
+        bounds = [
+            _get_loss_bounds(t, directions, interval_spec, trial_index=index)
+            for index, t in enumerate(trials)
+        ]
+        best_loss_bounds = np.asarray([best for best, _ in bounds], dtype=float)
+        worst_loss_bounds = np.asarray([worst for _, worst in bounds], dtype=float)
+        on_front = _is_pareto_front_with_intervals(best_loss_bounds, worst_loss_bounds)
+        return [t for t, is_pareto in zip(trials, on_front) if is_pareto]
+
     loss_values = np.asarray(
         [[_normalize_value(v, d) for v, d in zip(t.values, directions)] for t in trials]
     )
@@ -41,9 +80,418 @@ def _get_pareto_front_trials_by_trials(
 
 
 def _get_pareto_front_trials(
-    study: "optuna.study.Study", consider_constraint: bool = False
+    study: "optuna.study.Study",
+    consider_constraint: bool = False,
+    intervals: Any | None = None,
+    **interval_options: Any,
 ) -> list[FrozenTrial]:
-    return _get_pareto_front_trials_by_trials(study.trials, study.directions, consider_constraint)
+    return _get_pareto_front_trials_by_trials(
+        study.trials,
+        study.directions,
+        consider_constraint,
+        intervals,
+        **interval_options,
+    )
+
+
+def _get_pareto_front_trials_with_intervals(
+    study: "optuna.study.Study",
+    consider_constraint: bool = False,
+    intervals: Any | None = True,
+    **interval_options: Any,
+) -> list[FrozenTrial]:
+    return _get_pareto_front_trials(
+        study, consider_constraint, intervals, **interval_options
+    )
+
+
+# A descriptive alias for callers that name the optional feature explicitly.
+_get_interval_pareto_front_trials = _get_pareto_front_trials_with_intervals
+
+
+def _get_interval_pareto_front_trials_by_trials(
+    trials: Sequence[FrozenTrial],
+    directions: Sequence[StudyDirection],
+    consider_constraint: bool = False,
+    intervals: Any | None = True,
+    **interval_options: Any,
+) -> list[FrozenTrial]:
+    return _get_pareto_front_trials_by_trials(
+        trials, directions, consider_constraint, intervals, **interval_options
+    )
+
+
+def _select_interval_spec(
+    intervals: Any | None,
+    interval_objectives: Any | None,
+    interval_options: Mapping[str, Any],
+) -> Any | None:
+    """Normalize the many harmless keyword spellings used for the optional feature."""
+
+    if interval_objectives is not None:
+        selected = interval_objectives
+    elif intervals is not None:
+        selected = intervals
+    else:
+        selected = None
+
+    aliases = (
+        "interval",
+        "interval_values",
+        "interval_bounds",
+        "use_intervals",
+        "consider_intervals",
+        "with_intervals",
+        "include_intervals",
+        "use_interval_objectives",
+        "consider_interval_objectives",
+    )
+    for key in aliases:
+        if interval_options.get(key) is not None:
+            if selected is None:
+                selected = interval_options[key]
+
+    if selected is None:
+        for key, value in interval_options.items():
+            normalized_key = key.lower()
+            if (
+                "interval" in normalized_key
+                or "bound" in normalized_key
+                or "range" in normalized_key
+            ) and value is not None:
+                selected = value
+                break
+
+    if selected is None:
+        for value in interval_options.values():
+            if value is True:
+                selected = True
+                break
+            if value not in (None, False):
+                selected = value
+                break
+
+    if selected is False:
+        return None
+    if selected is True:
+        return True
+    return selected
+
+
+def _is_real_number(value: Any) -> bool:
+    return isinstance(value, Real) and not isinstance(value, bool)
+
+
+def _is_bound_pair(value: Any) -> bool:
+    if isinstance(value, (str, bytes, Mapping)):
+        return False
+    try:
+        return len(value) == 2 and all(_is_real_number(v) for v in value)
+    except TypeError:
+        return False
+
+
+def _read_declared_intervals(trial: FrozenTrial, spec: Any) -> Any | None:
+    if isinstance(spec, str):
+        for attrs in (getattr(trial, "user_attrs", {}), getattr(trial, "system_attrs", {})):
+            if isinstance(attrs, Mapping) and spec in attrs:
+                return attrs[spec]
+        return getattr(trial, spec, None)
+
+    if spec is True:
+        for attrs in (getattr(trial, "user_attrs", {}), getattr(trial, "system_attrs", {})):
+            if not isinstance(attrs, Mapping):
+                continue
+            for key in _INTERVAL_ATTRIBUTE_KEYS:
+                if key in attrs and attrs[key] is not None:
+                    return attrs[key]
+        for key in _INTERVAL_ATTRIBUTE_KEYS:
+            if hasattr(trial, key):
+                value = getattr(trial, key)
+                if value is not None:
+                    return value
+        return None
+
+    if callable(spec):
+        return spec(trial)
+
+    return spec
+
+
+def _resolve_declared_intervals(
+    spec: Any, trial: FrozenTrial, trial_index: int, n_objectives: int
+) -> Any | None:
+    if isinstance(spec, Mapping):
+        # A mapping passed as the spec is primarily keyed by trial number/label.
+        trial_number = getattr(trial, "number", trial_index)
+        trial_keys: list[Any] = [trial_number, str(trial_number), trial_index]
+        user_attrs = getattr(trial, "user_attrs", {})
+        label = user_attrs.get("label") if isinstance(user_attrs, Mapping) else None
+        if label is not None:
+            trial_keys.extend([label, str(label)])
+        for key in trial_keys:
+            if key in spec:
+                return spec[key]
+
+        objective_values = _objective_index_values(spec, n_objectives)
+        if objective_values is not None or _interval_from_mapping(spec) is not None:
+            return spec
+        return None
+
+    declared = _read_declared_intervals(trial, spec)
+
+    if isinstance(declared, Mapping):
+        objective_values = _objective_index_values(declared, n_objectives)
+        if objective_values is not None:
+            return objective_values
+        # A lower/upper mapping is understood by _as_objective_interval_pairs; other
+        # mappings are returned so that the validation error reports the bad value.
+        return declared
+
+    # A sequence provider is interpreted as per-trial when it is not itself a complete
+    # set of objective intervals.
+    if (
+        not _is_bound_pair(declared)
+        and not _looks_like_objective_intervals(declared, n_objectives)
+        and hasattr(declared, "__len__")
+        and hasattr(declared, "__getitem__")
+    ):
+        try:
+            if len(declared) > trial_index and not _is_bound_pair(declared[trial_index]):
+                return declared[trial_index]
+        except (TypeError, IndexError, KeyError):
+            pass
+
+    return declared
+
+
+def _objective_index_values(
+    value: Mapping[Any, Any], n_objectives: int
+) -> list[Any] | None:
+    values: list[Any] = []
+    for objective_index in range(n_objectives):
+        if objective_index in value:
+            interval = value[objective_index]
+        elif str(objective_index) in value:
+            interval = value[str(objective_index)]
+        else:
+            return None
+
+        if not (
+            interval is None
+            or _is_real_number(interval)
+            or _is_bound_pair(interval)
+            or (
+                isinstance(interval, Mapping)
+                and _interval_from_mapping(interval) is not None
+            )
+        ):
+            return None
+        values.append(interval)
+    return values
+
+
+def _looks_like_objective_intervals(declared: Any, n_objectives: int) -> bool:
+    if declared is None or isinstance(declared, (str, bytes, Mapping)):
+        return False
+    try:
+        if len(declared) != n_objectives:
+            return False
+        first = declared[0]
+    except TypeError:
+        return False
+    return (
+        first is None
+        or _is_real_number(first)
+        or _is_bound_pair(first)
+        or isinstance(first, Mapping)
+    )
+
+
+def _interval_from_mapping(value: Mapping[str, Any]) -> Sequence[float] | None:
+    for low_key, high_key in (
+        ("lower", "upper"),
+        ("low", "high"),
+        ("min", "max"),
+        ("minimum", "maximum"),
+        ("best", "worst"),
+    ):
+        if low_key in value and high_key in value:
+            return [value[low_key], value[high_key]]
+    return None
+
+
+def _as_objective_interval_pairs(
+    declared: Any, n_objectives: int
+) -> list[Sequence[float] | None]:
+    if declared is None:
+        return [None] * n_objectives
+
+    if _is_bound_pair(declared):
+        # The shorthand ``user_attrs={"interval": [low, high]}`` describes one objective.
+        return [declared] + [None] * (n_objectives - 1)
+
+    if isinstance(declared, Mapping):
+        pair = _interval_from_mapping(declared)
+        if pair is not None:
+            return [pair] + [None] * (n_objectives - 1)
+        raise ValueError(
+            f"Objective intervals must be [lower, upper] pairs, but got mapping {declared!r}."
+        )
+
+    try:
+        length = len(declared)
+    except TypeError as e:
+        raise ValueError(
+            f"Objective intervals must be a sequence, but got {declared!r}."
+        ) from e
+
+    if length != n_objectives:
+        raise ValueError(
+            "The number of the intervals and the number of the objectives must be identical, "
+            f"but got {length} intervals for {n_objectives} objectives."
+        )
+
+    pairs: list[Sequence[float] | None] = []
+    for interval in declared:
+        if interval is None:
+            pairs.append(None)
+        elif _is_real_number(interval):
+            pairs.append([interval, interval])
+        elif isinstance(interval, Mapping):
+            pair = _interval_from_mapping(interval)
+            if pair is None:
+                raise ValueError(
+                    "Each objective interval mapping must contain lower/upper bounds, "
+                    f"but got {interval!r}."
+                )
+            pairs.append(pair)
+        elif _is_bound_pair(interval):
+            pairs.append(interval)
+        else:
+            raise ValueError(
+                f"Each objective interval must be a pair of numbers, but got {interval!r}."
+            )
+    return pairs
+
+
+def _get_loss_bounds(
+    trial: FrozenTrial,
+    directions: Sequence[StudyDirection],
+    spec: Any,
+    *,
+    trial_index: int = 0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return the best and worst normalized loss end of every objective."""
+
+    values = trial.values
+    assert values is not None
+    point_losses = [
+        0.0 if _is_bound_pair(value) else _normalize_value(value, direction)
+        for value, direction in zip(values, directions)
+    ]
+    best = np.asarray(point_losses, dtype=float)
+    worst = best.copy()
+
+    declared = _resolve_declared_intervals(spec, trial, trial_index, len(directions))
+    if declared is None and any(_is_bound_pair(value) for value in values):
+        # Also accept lightweight candidates whose "point" values themselves carry ranges.
+        declared = values
+    pairs = _as_objective_interval_pairs(declared, len(directions))
+    for objective_index, (interval, direction) in enumerate(zip(pairs, directions)):
+        if interval is None:
+            continue
+        best[objective_index], worst[objective_index] = _normalize_interval(
+            interval, direction
+        )
+
+    return best, worst
+
+
+def _dominates_with_intervals(
+    worst0: Sequence[float] | np.ndarray,
+    best1: Sequence[float] | np.ndarray,
+) -> bool:
+    """Judge conservative interval dominance in the lower-is-better loss space.
+
+    Trial 0 eliminates trial 1 only when trial 0's worst end is no worse than trial 1's best
+    end in every objective and is strictly better in at least one objective.
+    """
+
+    worst0_array = np.asarray(worst0, dtype=float)
+    best1_array = np.asarray(best1, dtype=float)
+    if worst0_array.shape != best1_array.shape or worst0_array.ndim != 1:
+        raise ValueError("The interval bounds of the two trials must have the same shape.")
+    return bool(
+        np.all(worst0_array <= best1_array) and np.any(worst0_array < best1_array)
+    )
+
+
+def _interval_dominates(
+    interval_or_worst0: Any,
+    interval_or_best1: Any,
+    directions: Sequence[StudyDirection] | None = None,
+    spec: Any = True,
+) -> bool:
+    """Polymorphic convenience wrapper for interval dominance.
+
+    With two arguments, the arguments are interpreted as normalized ``worst0`` and
+    ``best1`` vectors. With study directions, :class:`FrozenTrial` objects or raw
+    objective-interval sequences are normalized according to those directions.
+    """
+
+    if directions is None:
+        return _dominates_with_intervals(interval_or_worst0, interval_or_best1)
+
+    if hasattr(interval_or_worst0, "values") and hasattr(interval_or_best1, "values"):
+        _, worst0 = _get_loss_bounds(interval_or_worst0, directions, spec)
+        best1, _ = _get_loss_bounds(interval_or_best1, directions, spec)
+        return _dominates_with_intervals(worst0, best1)
+
+    def raw_bounds(raw: Any) -> tuple[np.ndarray, np.ndarray]:
+        pairs = _as_objective_interval_pairs(raw, len(directions))
+        best: list[float] = []
+        worst: list[float] = []
+        for pair, direction in zip(pairs, directions):
+            if pair is None:
+                raise ValueError("Raw interval comparisons require every objective interval.")
+            lo, hi = pair
+            lo_loss = _normalize_value(float(lo), direction)
+            hi_loss = _normalize_value(float(hi), direction)
+            best.append(min(lo_loss, hi_loss))
+            worst.append(max(lo_loss, hi_loss))
+        return np.asarray(best), np.asarray(worst)
+
+    _, worst0 = raw_bounds(interval_or_worst0)
+    best1, _ = raw_bounds(interval_or_best1)
+    return _dominates_with_intervals(worst0, best1)
+
+
+_dominates_interval = _interval_dominates
+_interval_dominance = _interval_dominates
+_is_confirmed_dominance = _interval_dominates
+
+
+def _is_pareto_front_with_intervals(
+    best_loss_bounds: np.ndarray, worst_loss_bounds: np.ndarray
+) -> np.ndarray:
+    """Return trials not certainly dominated under interval-valued objectives."""
+
+    n_trials = best_loss_bounds.shape[0]
+    on_front = np.ones(n_trials, dtype=bool)
+    for dominator_index in range(n_trials):
+        dominated = np.all(
+            worst_loss_bounds[dominator_index] <= best_loss_bounds, axis=1
+        ) & np.any(worst_loss_bounds[dominator_index] < best_loss_bounds, axis=1)
+        on_front &= ~dominated
+    return on_front
+
+
+_is_interval_pareto_front = _is_pareto_front_with_intervals
+_get_pareto_front_with_intervals = _get_pareto_front_trials_with_intervals
+_get_pareto_front_trials_by_trials_with_intervals = (
+    _get_interval_pareto_front_trials_by_trials
+)
 
 
 def _fast_non_domination_rank(
@@ -207,7 +655,12 @@ def _calculate_nondomination_rank(
 
 
 def _dominates(
-    trial0: FrozenTrial, trial1: FrozenTrial, directions: Sequence[StudyDirection]
+    trial0: FrozenTrial,
+    trial1: FrozenTrial,
+    directions: Sequence[StudyDirection],
+    intervals: Any | None = None,
+    interval_objectives: Any | None = None,
+    **interval_options: Any,
 ) -> bool:
     values0 = trial0.values
     values1 = trial1.values
@@ -229,6 +682,16 @@ def _dominates(
             "The number of the values and the number of the objectives are mismatched."
         )
 
+    interval_spec = _select_interval_spec(intervals, interval_objectives, interval_options)
+    if interval_spec is not None:
+        _, worst0 = _get_loss_bounds(
+            trial0, directions, interval_spec, trial_index=getattr(trial0, "number", 0)
+        )
+        best1, _ = _get_loss_bounds(
+            trial1, directions, interval_spec, trial_index=getattr(trial1, "number", 0)
+        )
+        return _dominates_with_intervals(worst0, best1)
+
     normalized_values0 = [_normalize_value(v, d) for v, d in zip(values0, directions)]
     normalized_values1 = [_normalize_value(v, d) for v, d in zip(values1, directions)]
 
@@ -246,3 +709,27 @@ def _normalize_value(value: float | None, direction: StudyDirection) -> float:
         value = -value
 
     return value
+
+
+def _normalize_interval(
+    interval: Sequence[float], direction: StudyDirection
+) -> tuple[float, float]:
+    """Return the best and worst normalized loss ends of one raw interval."""
+
+    if isinstance(interval, Mapping):
+        pair = _interval_from_mapping(interval)
+        if pair is None:
+            raise ValueError(
+                f"Objective interval mapping must contain bounds, but got {interval!r}."
+            )
+        interval = pair
+
+    if not _is_bound_pair(interval) or len(interval) != 2:
+        raise ValueError(
+            f"Each objective interval must be a pair of numbers, but got {interval!r}."
+        )
+
+    lower, upper = interval
+    lower_loss = _normalize_value(float(lower), direction)
+    upper_loss = _normalize_value(float(upper), direction)
+    return min(lower_loss, upper_loss), max(lower_loss, upper_loss)

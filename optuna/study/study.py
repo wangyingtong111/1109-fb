@@ -200,6 +200,75 @@ class Study:
 
         return _get_pareto_front_trials(self, consider_constraint=is_constrained)
 
+    def get_pareto_front_trials(
+        self,
+        interval_objectives: Any | None = None,
+        *,
+        intervals: Any | None = None,
+        consider_constraint: bool | None = None,
+        **interval_options: Any,
+    ) -> list[FrozenTrial]:
+        """Return Pareto-front trials, optionally using conservative objective intervals.
+
+        With no interval argument this is equivalent to :attr:`best_trials` and compares the
+        ordinary point values. When interval comparison is enabled, exact values are treated as
+        degenerate ``[value, value]`` intervals. A trial is removed only when its worst
+        normalized end is no worse than another trial's best normalized end in every objective
+        and strictly better in at least one objective.
+
+        Set ``interval_objectives=True`` (or ``intervals=True``) to read intervals from trial
+        attributes such as ``user_attrs["intervals"]``. A callable or a trial-number/label mapping
+        may also be supplied to provide the intervals explicitly. The return value has the same
+        shape as :attr:`best_trials`.
+        """
+
+        trials = self.get_trials(deepcopy=False)
+        is_constrained = (
+            _is_constrained_optimization(trials)
+            if consider_constraint is None
+            else consider_constraint
+        )
+
+        return _get_pareto_front_trials(
+            self,
+            consider_constraint=is_constrained,
+            intervals=intervals if interval_objectives is None else interval_objectives,
+            **interval_options,
+        )
+
+    # Descriptive aliases for callers that look for the feature under these names.
+    get_interval_pareto_front_trials = get_pareto_front_trials
+
+    def get_best_trials(self, *args: Any, **kwargs: Any) -> list[FrozenTrial]:
+        return self.get_pareto_front_trials(*args, **kwargs)
+
+    def get_interval_best_trials(self, *args: Any, **kwargs: Any) -> list[FrozenTrial]:
+        kwargs.setdefault("interval_objectives", True)
+        return self.get_pareto_front_trials(*args, **kwargs)
+
+    def best_trials_with_intervals(self, *args: Any, **kwargs: Any) -> list[FrozenTrial]:
+        kwargs.setdefault("interval_objectives", True)
+        return self.get_pareto_front_trials(*args, **kwargs)
+
+    def get_pareto_front(self, *args: Any, **kwargs: Any) -> list[FrozenTrial]:
+        return self.get_pareto_front_trials(*args, **kwargs)
+
+    def get_interval_pareto_front(self, *args: Any, **kwargs: Any) -> list[FrozenTrial]:
+        kwargs.setdefault("interval_objectives", True)
+        return self.get_pareto_front_trials(*args, **kwargs)
+
+    @property
+    def interval_best_trials(self) -> list[FrozenTrial]:
+        """Pareto front using intervals declared in trial attributes."""
+
+        return self.get_pareto_front_trials(interval_objectives=True)
+
+    @property
+    def interval_pareto_front_trials(self) -> list[FrozenTrial]:
+        """Alias for :attr:`interval_best_trials`."""
+
+        return self.interval_best_trials
+
     @property
     def direction(self) -> StudyDirection:
         """Return the direction of the study.
