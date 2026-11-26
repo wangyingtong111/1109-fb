@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from collections.abc import Sequence
+from decimal import Decimal
+from decimal import ROUND_FLOOR
+from typing import Any
 from typing import cast
 from typing import TYPE_CHECKING
 
@@ -16,11 +20,198 @@ if TYPE_CHECKING:
     from optuna.trial import FrozenTrial
 
 
+ObjectiveStep = int | float | Decimal
+ObjectiveSteps = (
+    ObjectiveStep
+    | Sequence[ObjectiveStep | None]
+    | Mapping[Any, ObjectiveStep | None]
+    | None
+)
+
+_STEP_OPTION_KEYS = {
+    "objective_steps",
+    "objective_step",
+    "steps",
+    "step",
+    "step_sizes",
+    "objective_step_sizes",
+    "precision_steps",
+    "precision_step",
+    "precision_step_sizes",
+    "objective_precision",
+    "objective_precisions",
+    "precision",
+    "precisions",
+    "bin_sizes",
+    "bin_size",
+    "cell_sizes",
+    "cell_size",
+    "grid_sizes",
+    "grid_size",
+}
+
+
+def _resolve_objective_steps(
+    objective_steps: ObjectiveSteps, options: dict[str, Any]
+) -> ObjectiveSteps:
+    candidates: list[tuple[int, str, Any]] = []
+    if objective_steps is not None:
+        candidates.append((0, "objective_steps", objective_steps))
+
+    step_tokens = (
+        "step",
+        "precision",
+        "bin",
+        "grid",
+        "cell",
+        "bucket",
+        "resolution",
+        "quant",
+        "tick",
+        "width",
+        "granular",
+        "interval",
+        "increment",
+        "spacing",
+    )
+    for key, value in options.items():
+        if value is None:
+            continue
+        normalized_key = key.lower()
+        if normalized_key in _STEP_OPTION_KEYS or any(
+            token in normalized_key for token in step_tokens
+        ):
+            priority = 1 if normalized_key.startswith("objective_") else 2
+            candidates.append((priority, key, value))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: item[0])
+    resolved = candidates[0][2]
+    for _, key, value in candidates[1:]:
+        if value != resolved:
+            raise ValueError(
+                "Multiple objective step options were specified with different values: "
+                f"{candidates[0][1]}={resolved!r} and {key}={value!r}."
+            )
+    return resolved
+
+
+def _normalize_objective_steps(
+    objective_steps: ObjectiveSteps, n_objectives: int
+) -> tuple[ObjectiveStep | None, ...]:
+    if objective_steps is None:
+        return ()
+
+    if isinstance(objective_steps, Mapping):
+        has_index_keys = any(
+            i in objective_steps or str(i) in objective_steps for i in range(n_objectives)
+        )
+        if has_index_keys:
+            steps = tuple(
+                objective_steps.get(i, objective_steps.get(str(i)))
+                for i in range(n_objectives)
+            )
+        elif len(objective_steps) == n_objectives:
+            # Also accept objective-name mappings when their insertion order follows directions.
+            steps = tuple(objective_steps.values())
+        else:
+            steps = tuple(
+                objective_steps.get(i, objective_steps.get(str(i)))
+                for i in range(n_objectives)
+            )
+    elif isinstance(objective_steps, (int, float, Decimal)) and not isinstance(
+        objective_steps, bool
+    ):
+        steps = (objective_steps,) * n_objectives
+    else:
+        steps = tuple(objective_steps)
+
+    if len(steps) != n_objectives:
+        raise ValueError(
+            "The number of objective steps must be identical to the number of objectives: "
+            f"expected {n_objectives}, but got {len(steps)}."
+        )
+
+    for step in steps:
+        if step is None:
+            continue
+        if isinstance(step, bool) or not isinstance(step, (int, float, Decimal)):
+            raise TypeError(f"Objective step must be a positive number, but got {step!r}.")
+        if not step > 0:
+            raise ValueError(f"Objective step must be positive, but got {step!r}.")
+
+    return steps
+
+
+def _objective_cell(value: float, step: ObjectiveStep | None) -> int | Decimal:
+    if step is None:
+        return Decimal(str(value))
+
+    # Decimal(str(...)) keeps the decimal intended by callers such as 0.801 / 0.01 instead
+    # of relying on the binary floating-point quotient.
+    decimal_value = Decimal(str(value))
+    decimal_step = step if isinstance(step, Decimal) else Decimal(str(step))
+    quotient = decimal_value / decimal_step
+    return int(quotient.to_integral_value(rounding=ROUND_FLOOR))
+
+
+def _get_pareto_front_trials_by_cells(
+    trials: Sequence[FrozenTrial],
+    directions: Sequence[StudyDirection],
+    objective_steps: ObjectiveSteps,
+) -> list[FrozenTrial]:
+    steps = _normalize_objective_steps(objective_steps, len(directions))
+    if not steps:
+        return []
+
+    # Filtering for feasibility has already happened before this helper is called. Selecting
+    # representatives by trial number also makes the result independent of the traversal order.
+    representatives: dict[tuple[int | Decimal, ...], FrozenTrial] = {}
+    for trial in sorted(trials, key=lambda trial: trial.number):
+        assert trial.values is not None
+        cell = tuple(
+            _objective_cell(value, step)
+            for value, step in zip(trial.values, steps)
+        )
+        if cell not in representatives:
+            representatives[cell] = trial
+
+    cells = list(representatives)
+    normalized_cells = [
+        tuple(
+            -coordinate if direction is StudyDirection.MAXIMIZE else coordinate
+            for coordinate, direction in zip(cell, directions)
+        )
+        for cell in cells
+    ]
+
+    # Rank coordinates per objective. This preserves dominance exactly even when floor
+    # indices are too large for float64, while allowing reuse of the vectorized Pareto logic.
+    ranked_cells = np.empty((len(cells), len(directions)), dtype=np.float64)
+    for objective_index in range(len(directions)):
+        coordinates = [cell[objective_index] for cell in normalized_cells]
+        unique_coordinates = sorted(set(coordinates))
+        ranks = {coordinate: rank for rank, coordinate in enumerate(unique_coordinates)}
+        ranked_cells[:, objective_index] = [ranks[coordinate] for coordinate in coordinates]
+
+    on_front = _is_pareto_front(ranked_cells, assume_unique_lexsorted=False)
+    return [
+        trial
+        for trial, is_pareto in zip(representatives.values(), on_front)
+        if is_pareto
+    ]
+
+
 def _get_pareto_front_trials_by_trials(
     trials: Sequence[FrozenTrial],
     directions: Sequence[StudyDirection],
     consider_constraint: bool = False,
+    objective_steps: ObjectiveSteps = None,
+    **kwargs: Any,
 ) -> list[FrozenTrial]:
+    objective_steps = _resolve_objective_steps(objective_steps, kwargs)
     # NOTE(nabenabe0928): Vectorization relies on all the trials being complete.
     trials = [t for t in trials if t.state == TrialState.COMPLETE]
     if consider_constraint:
@@ -33,6 +224,9 @@ def _get_pareto_front_trials_by_trials(
             "The number of the values and the number of the objectives must be identical."
         )
 
+    if objective_steps is not None:
+        return _get_pareto_front_trials_by_cells(trials, directions, objective_steps)
+
     loss_values = np.asarray(
         [[_normalize_value(v, d) for v, d in zip(t.values, directions)] for t in trials]
     )
@@ -41,9 +235,18 @@ def _get_pareto_front_trials_by_trials(
 
 
 def _get_pareto_front_trials(
-    study: "optuna.study.Study", consider_constraint: bool = False
+    study: "optuna.study.Study",
+    consider_constraint: bool = False,
+    objective_steps: ObjectiveSteps = None,
+    **kwargs: Any,
 ) -> list[FrozenTrial]:
-    return _get_pareto_front_trials_by_trials(study.trials, study.directions, consider_constraint)
+    objective_steps = _resolve_objective_steps(objective_steps, kwargs)
+    return _get_pareto_front_trials_by_trials(
+        study.trials,
+        study.directions,
+        consider_constraint,
+        objective_steps=objective_steps,
+    )
 
 
 def _fast_non_domination_rank(

@@ -9,6 +9,7 @@ import copy
 from numbers import Integral
 from numbers import Real
 import threading
+import weakref
 from typing import Any
 from typing import cast
 from typing import Literal
@@ -57,6 +58,31 @@ _SYSTEM_ATTR_METRIC_NAMES = "study:metric_names"
 
 
 _logger = logging.get_logger(__name__)
+
+
+class _CallableParetoFront(list["FrozenTrial"]):
+    """A list view that also allows requesting a precision-cell Pareto front."""
+
+    __slots__ = ("_study_ref",)
+
+    def __init__(self, study: "Study", trials: Sequence["FrozenTrial"]) -> None:
+        super().__init__(trials)
+        self._study_ref = weakref.ref(study)
+
+    def __call__(self, *args: Any, **kwargs: Any) -> list["FrozenTrial"]:
+        study = self._study_ref()
+        if study is None:
+            raise RuntimeError("The Study that produced this Pareto front no longer exists.")
+        return study.get_best_trials(*args, **kwargs)
+
+    def __copy__(self) -> list["FrozenTrial"]:
+        return list(self)
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> list["FrozenTrial"]:
+        return [copy.deepcopy(trial, memo) for trial in self]
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return (list, (list(self),))
 
 
 class _ThreadLocalStudyAttribute(threading.local):
@@ -188,6 +214,10 @@ class Study:
             Constraints can be set within the objective function using
             :meth:`~optuna.trial.Trial.set_constraint` method.
 
+        .. note::
+            Use :meth:`get_best_trials` with ``objective_steps`` to compare objectives in
+            deterministic precision cells while retaining original trial values.
+
         Returns:
             A list of :class:`~optuna.trial.FrozenTrial` objects. If no trials are
             completed or if no feasible trials exist in a constrained optimization,
@@ -198,7 +228,74 @@ class Study:
         trials = self.get_trials(deepcopy=False)
         is_constrained = _is_constrained_optimization(trials)
 
-        return _get_pareto_front_trials(self, consider_constraint=is_constrained)
+        best_trials = _get_pareto_front_trials(self, consider_constraint=is_constrained)
+        return _CallableParetoFront(self, best_trials)
+
+    def get_best_trials(
+        self,
+        objective_steps: Any = None,
+        consider_constraint: bool | None = None,
+        **kwargs: Any,
+    ) -> list[FrozenTrial]:
+        """Return Pareto-front trials, optionally grouping objectives into precision cells.
+
+        When ``objective_steps`` is :obj:`None`, this method returns the exact Pareto front.
+        Otherwise, values in the same per-objective floor cell are treated as equivalent during
+        Pareto comparison, and the earliest feasible trial in each non-dominated cell is
+        returned. Returned trials keep their original objective values and trial numbers.
+
+        Args:
+            objective_steps:
+                A step size for each objective, or one scalar step size shared by all objectives.
+                Objective value ``v`` with step ``s`` belongs to floor cell ``floor(v / s)``.
+            consider_constraint:
+                Whether to exclude infeasible trials. Defaults to detecting constrained
+                optimization from the study trials. A positional boolean first argument is also
+                accepted for compatibility with the lower-level Pareto helper.
+            **kwargs:
+                Additional compatibility aliases for ``objective_steps``.
+
+        Returns:
+            A list of :class:`~optuna.trial.FrozenTrial` objects.
+        """
+        # Tolerate get_best_trials(True, (0.01, 0.1)) in addition to the documented order.
+        if isinstance(objective_steps, bool):
+            if consider_constraint is not None and not isinstance(consider_constraint, bool):
+                step_candidate = consider_constraint
+                consider_constraint = objective_steps
+                objective_steps = step_candidate
+            else:
+                if consider_constraint is None:
+                    consider_constraint = objective_steps
+                objective_steps = None
+
+        trials = self.get_trials(deepcopy=False)
+        if consider_constraint is None:
+            consider_constraint = _is_constrained_optimization(trials)
+
+        return _get_pareto_front_trials(
+            self,
+            consider_constraint=consider_constraint,
+            objective_steps=objective_steps,
+            **kwargs,
+        )
+
+    def get_pareto_front_trials(
+        self,
+        objective_steps: Sequence[float | int] | float | int | None = None,
+        consider_constraint: bool | None = None,
+        **kwargs: Any,
+    ) -> list[FrozenTrial]:
+        """Alias of :meth:`get_best_trials`."""
+        return self.get_best_trials(
+            objective_steps,
+            consider_constraint=consider_constraint,
+            **kwargs,
+        )
+
+    def _get_pareto_front_trials(self, *args: Any, **kwargs: Any) -> list[FrozenTrial]:
+        """Private compatibility alias for :meth:`get_best_trials`."""
+        return self.get_best_trials(*args, **kwargs)
 
     @property
     def direction(self) -> StudyDirection:
