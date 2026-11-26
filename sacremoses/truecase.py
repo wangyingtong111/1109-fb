@@ -52,6 +52,17 @@ class MosesTruecaser(object):
             )
         )
 
+        # A complete XML/markup tag that may carry quoted attributes. A `>` or
+        # `<` inside a single- or double-quoted attribute value is part of the
+        # tag, so `<x note="a > b">` is one tag instead of being cut off at the
+        # first `>` (the old `<\S[^>]*>` truncated it and let the remainder be
+        # truecased as an ordinary word). The three branches are mutually
+        # exclusive at every position, so the engine has a single parse and no
+        # backtracking to exploit (CWE-1333).
+        self.XML_TAG_REGEX = re.compile(
+            r"<\S(?:[^\"'>]|\"[^\"]*\"|'[^']*')*>"
+        )
+
         self.XML_SPLIT_REGX = re.compile("(<.*(?<=>))(.*)((?=</)[^>]*>)")
 
         self.SENT_END = {".", ":", "?", "!"}
@@ -82,7 +93,7 @@ class MosesTruecaser(object):
         truecase_weights = []
         for i, token in enumerate(tokens):
             # Skip XML tags.
-            if re.search(r"(<\S[^>]*>)", token):
+            if self.XML_TAG_REGEX.search(token):
                 continue
             # Skip if sentence start symbols.
             elif token in self.DELAYED_SENT_START:
@@ -262,7 +273,7 @@ class MosesTruecaser(object):
         for i, token in enumerate(tokens):
 
             # Append XML tags and continue
-            if re.search(r"(<\S[^>]*>)", token):
+            if self.XML_TAG_REGEX.search(token):
                 truecased_tokens.append(token)
                 continue
 
@@ -321,46 +332,73 @@ class MosesTruecaser(object):
         :param line: Input string, should be tokenized, separated by space.
         :type line: str
         """
+        # Tags and their attributes are kept verbatim, including ``>`` / ``<``
+        # characters that sit inside a quoted attribute value: only the surface
+        # words outside tags are ever truecased. A tag that never closes (an
+        # unmatched ``<`` or an unterminated quoted attribute) is not a tag, so
+        # it is tokenised as ordinary text and tag recognition resumes at the
+        # next complete tag. Isolated ``<`` and ``>`` are preserved as text too.
         line = line.strip()
         tokens = []
-        while line:
-            # Assumes that xml tag is always separated by space.
-            has_xml = re.search(r"^\s*(<\S[^>]*>)(.*)$", line)
-            # non-XML test.
-            is_non_xml = re.search(r"^\s*([^\s<>]+)(.*)$", line)
-            # '<' or '>' occurs in word, but it's not an XML tag
-            xml_cognates = re.search(r"^\s*(\S+)(.*)$", line)
-            if has_xml:
-                potential_xml, line_next = has_xml.groups()
+        # One single-pass scanner instead of re-matching the whole remainder
+        # per loop iteration (which made an unclosed tag O(n**2)). The first
+        # alternative is a complete tag: ``<`` followed by a non-space, then
+        # any quoted attribute values or characters that are not quote / angle
+        # brackets, closed by ``>``; a ``>`` / ``<`` inside ``"..."`` or
+        # ``'...'`` stays part of the tag. The second alternative is a run of
+        # text containing no space or angle bracket. The third is any other
+        # non-space run (a fragment with a bare ``<`` or ``>``, e.g. an
+        # unclosed tag or an isolated bracket), kept as ordinary text.
+        scanner = re.compile(
+            r"""[ ]*(?:
+              (?P<tag><\S(?:[^\"'>]|\"[^\"]*\"|'[^']*')*>)
+            | (?P<word>[^\s<>]+)
+            | (?P<cognate>\S+)
+            )""",
+            re.VERBOSE,
+        )
+        # The factor tail that can follow a tag factor in a factored token,
+        # e.g. ``|N`` or ``|N|X``.
+        factor_tail_pattern = re.compile(r"(?:\|[^\s|]*)+")
+        whitespace_pattern = re.compile(r"\s+")
+        position = 0
+        while position < len(line):
+            match = scanner.match(line, position)
+            if match is None:
+                # The only thing the scanner cannot itself consume is
+                # whitespace; skip the whole run in one step and continue.
+                gap = whitespace_pattern.match(line, position)
+                if gap is None:  # pragma: no cover - defensive, unreachable
+                    raise Exception("ERROR: huh? {}".format(line[position:]))
+                position = gap.end()
+                continue
+            position = match.end()
+            if match.group("tag") is not None:
+                potential_xml = match.group("tag")
                 # exception for factor that is an XML tag
-                if (
-                    re.search(r"^\S", line)
-                    and len(tokens) > 0
-                    and re.search(r"\|$", tokens[-1])
-                ):
+                if tokens and re.search(r"\|$", tokens[-1]):
                     tokens[-1] += potential_xml
-                    # If it's a token with factors, join with the previous token.
-                    is_factor = re.search(r"^(\|+)(.*)$", line_next)
-                    if is_factor:
-                        tokens[-1] += is_factor.group(1)
-                        line_next = is_factor.group(2)
+                    # If it's a token with factors, join with the previous
+                    # token. Consume the whole tail, not just the leading
+                    # pipes, so the factor name stays attached to the word
+                    # instead of becoming its own token, and advance the scan
+                    # position past it so it is not emitted again.
+                    factor_tail = factor_tail_pattern.match(line, position)
+                    if factor_tail:
+                        tokens[-1] += factor_tail.group(0)
+                        position = factor_tail.end()
                 else:
                     tokens.append(
-                        potential_xml + " "
+                        potential_xml
                     )  # Token hack, unique to sacremoses.
-                line = line_next
-
-            elif is_non_xml:
-                tokens.append(is_non_xml.group(1))  # Token hack, unique to sacremoses.
-                line = is_non_xml.group(2)
-            elif xml_cognates:
+            elif match.group("word") is not None:
                 tokens.append(
-                    xml_cognates.group(1)
+                    match.group("word")
                 )  # Token hack, unique to sacremoses.
-                line = xml_cognates.group(2)
             else:
-                raise Exception("ERROR: huh? {}".format(line))
-            tokens[-1] = tokens[-1].strip()  # Token hack, unique to sacremoses.
+                tokens.append(
+                    match.group("cognate")
+                )  # Token hack, unique to sacremoses.
         return tokens
 
     def _casing_to_model(self, casing):
