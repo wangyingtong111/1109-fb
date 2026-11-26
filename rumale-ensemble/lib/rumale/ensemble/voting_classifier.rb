@@ -43,12 +43,18 @@ module Rumale
       # @param voting [String] The voting rule for the predicted results of each classifier.
       #   If 'hard' is given, the ensembled classifier predicts the class label by majority vote.
       #   If 'soft' is given, the ensembled classifier uses the weighted average of predicted probabilities for the prediction.
-      def initialize(estimators:, weights: nil, voting: 'hard')
+      # @param probability_classes [Hash<Symbol,Array<Integer>>,Array<Integer>,Nil]
+      #   The internal class IDs corresponding to probability columns. When a Hash is given,
+      #   each entry is used for the estimator with the same name. An Array is applied to all
+      #   sub-estimators. Estimator-level declarations such as #numbers take precedence over
+      #   this option.
+      def initialize(estimators:, weights: nil, voting: 'hard', probability_classes: nil, **options)
         super()
         @estimators = estimators
         @params = {
           weights: weights || estimators.each_key.with_object({}) { |name, w| w[name] = 1.0 },
-          voting: voting
+          voting: voting,
+          probability_classes: probability_classes || extract_probability_classes_option(options)
         }
       end
 
@@ -114,15 +120,98 @@ module Rumale
         z = Numo::DFloat.zeros(n_samples, n_classes)
         sum_weight = @params[:weights].each_value.sum
         @estimators.each do |name, estimator|
-          z += @params[:weights][name] * estimator.predict_proba(x)
+          probs = estimator.predict_proba(x)
+          probs = align_probabilities(probs, declared_probability_classes(name, estimator))
+          z += @params[:weights][name] * probs
         end
         z /= sum_weight
       end
 
       private
 
+      PROBABILITY_CLASS_METHODS = %i[
+        numbers
+        class_numbers
+        probability_class_numbers
+        probability_column_ids
+        probability_column_classes
+        proba_column_ids
+        proba_classes
+        probability_classes
+        probability_encoding
+        class_encoding
+        column_encoding
+        encoded_classes
+      ].freeze
+
+      private_constant :PROBABILITY_CLASS_METHODS
+
       def soft_voting?
         @params[:voting] == 'soft'
+      end
+
+      def extract_probability_classes_option(options)
+        options.values_at(
+          :probability_class_numbers, :class_numbers, :numbers,
+          :probability_encodings, :class_encodings, :column_encodings
+        ).compact.first
+      end
+
+      def declared_probability_classes(name, estimator)
+        declaration = declaration_from_estimator(estimator)
+        if declaration.nil?
+          option = @params[:probability_classes]
+          declaration = option.is_a?(Hash) ? option[name] : option
+        end
+        declaration&.to_a
+      end
+
+      def declaration_from_estimator(estimator)
+        PROBABILITY_CLASS_METHODS.each do |method_name|
+          next unless estimator.respond_to?(method_name)
+
+          declaration = estimator.public_send(method_name)
+          return declaration unless declaration.nil?
+        end
+
+        estimator.classes if estimator.respond_to?(:classes)
+      end
+
+      def align_probabilities(probs, declared)
+        return probs if declared.nil?
+
+        class_ids = normalize_class_ids(declared)
+        return probs unless valid_class_ids?(class_ids, probs.shape[1])
+
+        aligned = Numo::DFloat.zeros(probs.shape[0], @classes.size)
+        class_ids.each_with_index do |class_id, column|
+          aligned[true, class_id] = probs[true, column]
+        end
+        aligned
+      end
+
+      def normalize_class_ids(declared)
+        declared.to_a.map do |class_id|
+          case class_id
+          when Integer
+            class_id
+          when Numeric
+            integer_id = class_id.to_i
+            integer_id if integer_id == class_id
+          else
+            Integer(class_id)
+          end
+        end
+      rescue ArgumentError, TypeError
+        nil
+      end
+
+      def valid_class_ids?(class_ids, n_columns)
+        return false if class_ids.nil?
+        return false unless class_ids.size == n_columns
+        return false if class_ids.any?(&:nil?)
+
+        class_ids.all? { |class_id| class_id.is_a?(Integer) && class_id >= 0 && class_id < @classes.size }
       end
     end
   end
