@@ -45,6 +45,15 @@ classes.
 from typing import List, Union
 
 from jiwer import transforms as tr
+from jiwer.bootstrap import (
+    SpeakerBootstrapWER,
+    SpeakerWERConfidenceInterval,
+    SpeakerWERResult,
+    speaker_wer_ci,
+    speaker_wer_confidence_interval,
+    wer_ci,
+    wer_confidence_interval,
+)
 from jiwer.process import process_characters, process_words
 from jiwer.transformations import cer_default, wer_default
 
@@ -54,6 +63,13 @@ __all__ = [
     "wer",
     "wil",
     "wip",
+    "SpeakerBootstrapWER",
+    "SpeakerWERResult",
+    "SpeakerWERConfidenceInterval",
+    "speaker_wer_confidence_interval",
+    "wer_confidence_interval",
+    "speaker_wer_ci",
+    "wer_ci",
 ]
 
 ########################################################################################

@@ -43,6 +43,48 @@ hypothesis = ["hello duck", "i like python"]
 error = wer(reference, hypothesis)
 ```
 
+## Speaker bootstrap confidence intervals
+
+When several transcript pairs belong to the same speaker, resample whole
+speakers rather than individual utterances. `SpeakerBootstrapWER` aligns every
+transcript pair once and caches its error and reference-word counts. Repeated
+speakers in a draw contribute their counts with full multiplicity, and each
+draw's WER is pooled as `sum(errors) / sum(reference_words)`.
+
+```python
+import jiwer
+
+speakers = ["A", "A", "B"]
+references = ["red", "", "a b c"]
+hypotheses = ["blue", "oops", "a b c"]
+
+bootstrap = jiwer.SpeakerBootstrapWER(
+    speakers=speakers,
+    references=references,
+    hypotheses=hypotheses,
+)
+
+# Exact replay draws are useful for testing:
+assert bootstrap.wer_for_draw(["A", "B"]) == 0.5
+assert bootstrap.wer_for_draw(["A", "A"]) == 2.0
+assert bootstrap.wer_for_draw(["B", "B"]) == 0.0
+
+result = bootstrap.confidence_interval(
+    n_bootstrap=2000,
+    confidence_level=0.95,
+    seed=20261127,
+)
+print(result.wer, result.lower, result.upper)
+print(result.interval, result.bootstrap_wers)
+```
+
+The one-call form is also available as
+`jiwer.speaker_wer_confidence_interval(...)` and, in JiWER's usual
+reference/hypothesis argument order, `jiwer.wer_confidence_interval(...)`.
+Pass `draws=[...]` to either method/function to replay a fixed sequence of
+speaker draws. Empty references use JiWER's normal convention: inserted words
+are errors, while the reference-word denominator remains zero.
+
 ## Character error rate
 
 We also provide the character error rate:

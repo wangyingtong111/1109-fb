@@ -43,6 +43,30 @@ hypothesis = "hello duck"
 error = wer(reference, hypothesis)
 ```
 
+## Speaker bootstrap confidence intervals
+
+For clustered evaluation data, resample whole speakers and pool error and
+reference-word counts inside every draw:
+
+```python
+import jiwer
+
+bootstrap = jiwer.SpeakerBootstrapWER(
+    speakers=["A", "A", "B"],
+    references=["red", "", "a b c"],
+    hypotheses=["blue", "oops", "a b c"],
+)
+
+assert bootstrap.wer_for_draw(["A", "B"]) == 0.5
+assert bootstrap.wer_for_draw(["A", "A"]) == 2.0
+assert bootstrap.wer_for_draw(["B", "B"]) == 0.0
+
+result = bootstrap.confidence_interval(n_bootstrap=2000, seed=42)
+print(result.lower, result.upper)
+```
+
+Each transcript pair is aligned once when the object is created. Bootstrap
+iterations and repeated speaker draws only aggregate cached counts.
 
 ## A note on empty references
 
