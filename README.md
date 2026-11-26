@@ -95,13 +95,35 @@ ms.search(
 
 Supported search options: `:fields`, `:filter`, `:boost`, `:boost_term`,
 `:weights`, `:boost_document`, `:prefix`, `:fuzzy`, `:max_fuzzy`,
-`:combine_with`, `:tokenize`, `:process_term`, `:bm25`.
+`:combine_with`, `:tokenize`, `:process_term`, `:bm25`, `:gate_wildcard`.
 
 `:weights` scales non-exact matches — defaults `{ fuzzy: 0.45, prefix: 0.375 }`,
 so a fuzzy or prefix hit counts for less than an exact one. `:boost_term` takes a
 callable returning a per-*query-term* multiplier (default `1`). `:bm25` tunes the
 BM25+ parameters `k`, `b`, and `d` (defaults `{ k: 1.2, b: 0.7, d: 0.5 }`).
 Defaults can be set once via the constructor's `:search_options`.
+
+### Gating wildcard queries
+
+For ordinary term queries, `:boost_document` decides both a document's score and
+whether it stays a candidate: a falsy return (`nil`, `false`, `0`, `""`) excludes
+it. A wildcard query normally still matches *every* document — its
+`:boost_document` only supplies scores. Pass `gate_wildcard: true` to apply the
+same truthiness gate to the wildcard, which makes it useful as the subtraction
+side of an `AND_NOT` (documents whose wildcard boost is falsy are absent from the
+subtraction set, so they survive):
+
+```ruby
+# boost_document receives "" as the term for wildcard documents, and the
+# document's stored fields as its third argument, exactly as before.
+boost = ->(id, term, stored) { term == "" ? wildcard_returns[id] : 1 }
+ms.search({ combine_with: "AND_NOT", queries: ["oak", MiniFTS::WILDCARD] },
+          boost_document: boost, gate_wildcard: true)
+```
+
+The option is off by default, leaving wildcard results and ordering unchanged. It
+is a Ruby-side extension (the JavaScript library has no equivalent). A top-level
+`:filter` still runs afterwards, on the assembled final results.
 
 ## Auto-suggestions
 
@@ -280,6 +302,11 @@ The whole suite runs on **Ruby 2.4** (verified in a `ruby:2.4` container).
   async variants (`addAllAsync`, `loadJSONAsync`, batched `vacuum`) are omitted;
   `vacuum` cleans up immediately and `is_vacuuming` does not apply.
 - The wildcard is `MiniFTS::WILDCARD` (or `MiniFTS.wildcard`).
+- `gate_wildcard: true` is a Ruby-only search option: it lets a wildcard's
+  `:boost_document` return value also decide inclusion (same truthiness rule as
+  term queries), e.g. to build a gated `AND_NOT` subtraction set. It is off by
+  default and does not affect the index format, so serialized indexes stay
+  interchangeable.
 
 ## Development
 

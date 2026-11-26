@@ -144,6 +144,95 @@ class TestSearchOptions < Minitest::Test
     assert_equal([3, 1], results.map { |r| r[:id] })
   end
 
+  # Four documents sharing one term; the wildcard callback's per-document
+  # returns are 1, 0, nil, 2 in id order. A boost_document only ever sees the
+  # empty-string term for a wildcard query, so this callable returns 1 for the
+  # ordinary "oak" term and the scripted wildcard value otherwise.
+  OAK_WILDCARD_RETURNS = [1, 0, nil, 2].freeze
+
+  def oak_index
+    ms = MiniFTS.new(fields: ["text"], store_fields: ["text"])
+    ms.add_all((1..4).map { |id| { "id" => id, "text" => "oak" } })
+    ms
+  end
+
+  def oak_wildcard_boost(returns = OAK_WILDCARD_RETURNS)
+    ->(id, term, stored) { term == "" ? returns[id - 1] : 1 }
+  end
+
+  def oak_and_not_tree
+    { combine_with: "AND_NOT", queries: ["oak", MiniFTS::WILDCARD] }
+  end
+
+  def test_gate_wildcard_makes_boost_document_decide_wildcard_candidates_in_and_not
+    ms = oak_index
+    plain = ms.search("oak")
+
+    results = ms.search(oak_and_not_tree, boost_document: oak_wildcard_boost, gate_wildcard: true)
+    # Truthy wildcard returns keep the document in the subtraction set (1, 4);
+    # falsy ones (0, nil) spare it, so only documents 2 and 3 survive.
+    assert_equal([2, 3], results.map { |r| r[:id] })
+
+    results.each do |result|
+      reference = plain.find { |r| r[:id] == result[:id] }
+      assert_in_delta reference[:score], result[:score], 1e-9
+      assert_equal ["oak"], result[:terms]
+    end
+  end
+
+  def test_gate_wildcard_still_lets_the_top_level_filter_act_on_the_final_results
+    ms = oak_index
+    plain = ms.search("oak")
+
+    results = ms.search(
+      oak_and_not_tree,
+      boost_document: oak_wildcard_boost,
+      gate_wildcard: true,
+      filter: ->(result) { result[:id] < 3 }
+    )
+
+    assert_equal([2], results.map { |r| r[:id] })
+    assert_in_delta plain.find { |r| r[:id] == 2 }[:score], results.first[:score], 1e-9
+  end
+
+  def test_without_gate_wildcard_the_wildcard_return_values_only_set_scores
+    ms = oak_index
+    calls = []
+    boost = lambda do |id, term, stored|
+      calls << [id, term, stored]
+      oak_wildcard_boost.call(id, term, stored)
+    end
+
+    # Every document is in the wildcard subtraction set regardless of the 0/nil
+    # returns, so AND_NOT removes all of them — the pre-existing behaviour.
+    assert_equal [], ms.search(oak_and_not_tree, boost_document: boost)
+
+    # The wildcard callback keeps its empty-string term and stored-fields args.
+    (1..4).each do |id|
+      assert_includes calls, [id, "", { "text" => "oak" }]
+    end
+
+    # A standalone wildcard still matches every document, ordered by the
+    # returned boost; a falsy 0 does not exclude a document without the gate.
+    # (nil is the one pre-existing exception: it crashes later scoring, so the
+    # no-gate path is exercised with 0 here instead.)
+    zero_returns = [1, 0, 0, 2]
+    zero_boost = ->(id, term, _stored) { term == "" ? zero_returns[id - 1] : 1 }
+    results = ms.search(MiniFTS::WILDCARD, boost_document: zero_boost)
+    assert_equal([1, 2, 3, 4], results.map { |r| r[:id] }.sort)
+    assert_equal [4, 1], results.first(2).map { |r| r[:id] }
+  end
+
+  def test_gate_wildcard_also_filters_standalone_wildcard_queries
+    ms = oak_index
+    # The gate excludes the 0/nil entries (documents 2 and 3); the survivors are
+    # ordered by their returned boosts, document 4 (2) ahead of document 1 (1).
+    results = ms.search(MiniFTS::WILDCARD, boost_document: oak_wildcard_boost, gate_wildcard: true)
+
+    assert_equal([4, 1], results.map { |r| r[:id] })
+    assert_equal([2.0, 1.0], results.map { |r| r[:score] })
+  end
+
   # Reference "computes a meaningful score when fields are named liked default
   # properties of object" — trivially safe in Ruby (plain Hash), ported for
   # regression parity.

@@ -326,7 +326,11 @@ class MiniFTS
   #
   # @param query [String, Hash, Object] a query string, a combination Hash with a
   #   +:queries+ key, or {WILDCARD}
-  # @param search_options [Hash] per-search options overriding the defaults
+  # @param search_options [Hash] per-search options overriding the defaults.
+  #   +gate_wildcard: true+ (Ruby-only, off by default) makes a wildcard query
+  #   apply the same +boost_document+ truthiness gate term queries use, so a
+  #   falsy document boost excludes that document from the wildcard results
+  #   (useful when the wildcard is the subtraction side of an AND_NOT).
   # @return [Array<Hash>] results sorted by descending score. Each is a Hash with
   #   +:id+, +:score+, +:terms+ (matched document terms), +:query_terms+, +:match+,
   #   plus any stored fields (under their string keys).
@@ -774,9 +778,19 @@ class MiniFTS
     results = {}
     options = @options[:search_options].merge(search_options)
     boost_document = options[:boost_document]
+    # Opt-in, Ruby-only extension: when +:gate_wildcard+ is set, a wildcard's
+    # +boost_document+ return value decides inclusion with the same truthiness
+    # rule term results use (see #term_results), instead of only supplying the
+    # score. This makes the wildcard usable as an AND_NOT subtraction set: docs
+    # whose boost is falsy are absent from the wildcard results and therefore
+    # survive the subtraction. Off by default to preserve the upstream
+    # MiniSearch behaviour, where the wildcard always matches every document.
+    gate = options[:gate_wildcard] == true
 
     @document_ids.each do |short_id, id|
       score = boost_document ? boost_document.call(id, "", @stored_fields[short_id]) : 1
+      next if gate && !truthy?(score)
+
       results[short_id] = [score, [], {}]
     end
 

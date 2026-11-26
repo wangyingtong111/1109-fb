@@ -48,6 +48,28 @@ flowchart TD
 The three lookup branches all feed the same scorer, and every branch's cost is
 paid per *match*, not per document — the shape of the whole performance argument.
 
+# The wildcard query and the `gate_wildcard` option
+
+`WILDCARD` bypasses the radix tree entirely: `execute_wildcard_query` emits one
+record per document in `@document_ids` with empty `terms`/`match`, so its score
+is the raw `boost_document` return (or `1` when none is given) and `search` skips
+the sort when there is no document boost. The callback is invoked with the fixed
+empty-string term `""` and the document's stored fields — the same calling
+convention as term queries, only the term differs.
+
+Two roles of `boost_document` exist elsewhere but only one applies to the
+wildcard by default. In `term_results` the return is both the score multiplier
+*and* a candidate gate (`next unless truthy?(doc_boost)`); the wildcard
+historically kept only the scoring role, always matching every document. That is
+why a wildcard on the right of `AND_NOT` subtracts the whole positive set and
+returns nothing. The Ruby-only `gate_wildcard: true` search option restores the
+second role: a falsy return then keeps the document out of the wildcard result
+set, so an `AND_NOT` subtracts only truthily-boosted documents. It reuses the
+same `truthy?` predicate (nil/false/0/""/NaN falsy, mirroring JS), is query-time
+only — the serialized index is untouched — and defaults off to preserve upstream
+behaviour and ordering. The top-level `:filter` is downstream of all of this and
+still runs in `search` on the assembled, scored results.
+
 The per-document record accumulated as that pipeline runs — running score, matched
 query terms, per-term field hits — is carried as a **positional Array**
 `[score, terms, match]`, not a symbol-keyed Hash: it is transient (assembled per

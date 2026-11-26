@@ -48,7 +48,12 @@ which is idiomatic on purpose:
 - field names are strings, read with `doc[field]` by default;
 - vacuuming is **synchronous** (Ruby has no UI main thread to protect), so the
   async / batched variants are omitted;
-- the match-everything query is `MiniFTS::WILDCARD`.
+- the match-everything query is `MiniFTS::WILDCARD`;
+- `gate_wildcard: true` is a query-time-only, opt-in extension (no JS
+  counterpart): it applies the term-query truthiness gate to a wildcard's
+  `boost_document` return so a falsy value excludes the document — notably
+  letting a wildcard form a gated `AND_NOT` subtraction set. Default-off, it
+  changes neither scores nor the serialized bytes.
 
 # Citations
 
