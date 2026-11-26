@@ -60,7 +60,12 @@ class SubwordTokenizer(object):
             ('S', 'he', 'r', 'l', 'o', 'c', 'k')
         """
         first, second = pair
-        pair_str = "".join(pair).replace("\\", "\\\\")
+        # The merged symbol is stored in the vocabulary and looked up again by
+        # the incremental statistics, so it has to be the real concatenation of
+        # the two symbols. Escaping a backslash here (as the upstream
+        # subword-nmt port does for its regex replacement string) would store
+        # ``a\`` as ``a\\`` and the next round could no longer find it.
+        pair_str = "".join(pair)
         f = (
             lambda acc, e: acc[:-1] + (pair_str,)
             if acc[-1] == first and e == second
