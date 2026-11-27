@@ -114,13 +114,25 @@ module Discard
 
     # Discard the record in the database
     #
+    # The record is reloaded under a lock before writing, so a stale copy
+    # (e.g. read by a list page before a background job discarded the row)
+    # can't discard the record a second time. In that case no callbacks are
+    # run, the original discarded_at is kept, and false is returned, exactly
+    # as if the calls had been made serially.
+    #
     # @return [Boolean] true if successful, otherwise false
     def discard
       return false if discarded?
 
       with_transaction_returning_status do
-        run_callbacks(:discard) do
-          update_attribute(self.class.discard_column, Time.current)
+        lock! if persisted?
+
+        if discarded?
+          false
+        else
+          run_callbacks(:discard) do
+            update_attribute(self.class.discard_column, Time.current)
+          end
         end
       end
     end
@@ -139,13 +151,25 @@ module Discard
 
     # Undiscard the record in the database
     #
+    # The record is reloaded under a lock before writing, so a stale copy
+    # can't undiscard the record a second time or clobber a newer discard
+    # with an expired undiscard request. In those cases no callbacks are run
+    # and false is returned, exactly as if the calls had been made serially.
+    #
     # @return [Boolean] true if successful, otherwise false
     def undiscard
       return false unless discarded?
 
       with_transaction_returning_status do
-        run_callbacks(:undiscard) do
-          update_attribute(self.class.discard_column, nil)
+        previous = self[self.class.discard_column]
+        lock! if persisted?
+
+        if discarded? && (!persisted? || _discard_column_unchanged_since?(previous))
+          run_callbacks(:undiscard) do
+            update_attribute(self.class.discard_column, nil)
+          end
+        else
+          false
         end
       end
     end
@@ -163,6 +187,17 @@ module Discard
     end
 
     private
+
+    # True if the discard column in the database still holds the value this
+    # instance read, i.e. no other process has discarded or undiscarded the
+    # record since. The comparison is made database-side so the value is
+    # serialized exactly as it was when stored.
+    def _discard_column_unchanged_since?(previous)
+      self.class.unscoped.where(
+        self.class.primary_key => id,
+        self.class.discard_column => previous
+      ).exists?
+    end
 
     def _raise_record_not_discarded
       raise ::Discard::RecordNotDiscarded.new(discarded_fail_message, self)

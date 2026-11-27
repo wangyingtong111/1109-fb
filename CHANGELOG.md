@@ -1,3 +1,11 @@
+### Unreleased
+
+* Make `#discard` / `#undiscard` safe for stale instances: the record is
+  reloaded under a lock before writing, so racing copies behave like serial
+  repeated calls. The first write wins, callbacks (and their notifications)
+  run only once, and an expired undiscard request can't clobber a newer
+  discard.
+
 ### Version 2.0.0
 Release date: 2026-05-27
 

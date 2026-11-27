@@ -744,6 +744,94 @@ RSpec.describe Discard::Model do
     end
   end
 
+  describe 'racing instances of the same record' do
+    with_model :Post, scope: :all do
+      table do |t|
+        t.datetime :discarded_at
+        t.timestamps null: false
+      end
+
+      model do
+        include Discard::Model
+
+        cattr_accessor :notifications, default: []
+        after_discard { self.class.notifications << :discarded }
+        after_undiscard { self.class.notifications << :undiscarded }
+      end
+    end
+
+    before { Post.notifications = [] }
+
+    context 'discarding the same record twice' do
+      let!(:post) { Post.create! }
+      let!(:copy_a) { Post.find(post.id) }
+      let!(:copy_b) { Post.find(post.id) }
+
+      it "behaves like serial repeated calls" do
+        expect(copy_a.discard).to be true
+        expect(copy_b.discard).to be false
+      end
+
+      it "keeps the first discarded_at" do
+        copy_a.discard
+        expect {
+          copy_b.discard
+        }.not_to change { post.reload.discarded_at }
+      end
+
+      it "only runs discard callbacks once" do
+        copy_a.discard
+        copy_b.discard
+        expect(Post.notifications).to eq([:discarded])
+      end
+
+      it "raises RecordNotDiscarded from #discard! on the stale copy" do
+        copy_a.discard
+        expect {
+          copy_b.discard!
+        }.to raise_error(Discard::RecordNotDiscarded, "A discarded record cannot be discarded")
+      end
+    end
+
+    context 'undiscarding the same record twice' do
+      let!(:post) { Post.create!(discarded_at: Time.parse('2017-01-01')) }
+      let!(:copy_a) { Post.with_discarded.find(post.id) }
+      let!(:copy_b) { Post.with_discarded.find(post.id) }
+
+      it "behaves like serial repeated calls" do
+        expect(copy_a.undiscard).to be true
+        expect(copy_b.undiscard).to be false
+      end
+
+      it "only runs undiscard callbacks once" do
+        copy_a.undiscard
+        copy_b.undiscard
+        expect(Post.notifications).to eq([:undiscarded])
+      end
+
+      it "raises RecordNotUndiscarded from #undiscard! on the stale copy" do
+        copy_a.undiscard
+        expect {
+          copy_b.undiscard!
+        }.to raise_error(Discard::RecordNotUndiscarded, "An undiscarded record cannot be undiscarded")
+      end
+    end
+
+    context 'an expired undiscard request' do
+      let!(:post) { Post.create!(discarded_at: Time.parse('2017-01-01')) }
+
+      it "does not clobber a newer discard" do
+        stale_copy = Post.with_discarded.find(post.id)
+        post.undiscard
+        post.discard
+
+        expect(stale_copy.undiscard).to be false
+        expect(post.reload.discarded_at).to be_present
+        expect(Post.notifications).to eq([:undiscarded, :discarded])
+      end
+    end
+  end
+
   describe 'when a callback raises during discard' do
     with_model :Post, scope: :all do
       table do |t|
