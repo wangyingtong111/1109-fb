@@ -32,6 +32,26 @@ text = "\"I said, 'what're you? Crazy?'\" said Sandowsky. \"I can't afford to do
 PragmaticTokenizer::Tokenizer.new.tokenize(text)
 # => ["\"", "i", "said", ",", "'", "what're", "you", "?", "crazy", "?", "'", "\"", "said", "sandowsky", ".", "\"", "i", "can't", "afford", "to", "do", "that", ".", "\""]
 
+# One subtitle can also be sent as adjacent original fragments that carry a language
+# tag. The fragments are concatenated verbatim (surrounding whitespace included) and
+# tokenized as the single sentence they really form, so a fragment boundary is never
+# a tokenization boundary. When a word spans a boundary, the apostrophe rules of the
+# language declared at the word's first character apply to the whole word. Use nil
+# for an undeclared fragment; it follows the tokenizer's main language.
+fragments = [
+  [:fr, 'l'],
+  [nil, "'amour "],
+  [:en, "'can't' https:"],
+  [nil, '//a.test']
+]
+PragmaticTokenizer::Tokenizer.new(language: :en, filter_languages: [:fr]).tokenize(fragments)
+# => ["l'", "amour", "'", "can't", "'", "https://a.test"]
+
+# Passing a plain String (instead of a fragment array) keeps the original behaviour,
+# including the main language and filter_languages semantics.
+PragmaticTokenizer::Tokenizer.new(language: :en, filter_languages: [:fr]).tokenize("l'amour can't")
+# => ["l'amour", "can't"]
+
 # You can pass many different options to #initialize:
 options = {
   language:            :en, # the language of the string you are tokenizing

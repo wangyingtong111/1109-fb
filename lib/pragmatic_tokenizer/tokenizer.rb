@@ -1,5 +1,6 @@
 require 'set'
 require 'cgi'
+require 'strscan'
 require 'pragmatic_tokenizer/regex'
 require 'pragmatic_tokenizer/languages'
 require 'pragmatic_tokenizer/pre_processor'
@@ -17,6 +18,9 @@ module PragmaticTokenizer
     DOT                       = '.'.freeze
     SPACE                     = ' '.freeze
     SINGLE_QUOTE              = "'".freeze
+    # Same entity set that CGI.unescapeHTML decodes. Used to keep the per-character
+    # language index aligned while an entity shrinks to its decoded form.
+    HTML_ENTITY               = /&(?:apos|amp|quot|gt|lt|\#[0-9]+|\#[xX][0-9A-Fa-f]+);/.freeze
 
     # @param [Hash] opts optional arguments
 
@@ -98,11 +102,26 @@ module PragmaticTokenizer
       raise "In Pragmatic Tokenizer long_word_split must be an Integer" unless @long_word_split.class == integer_class || @long_word_split.nil?
     end
 
-    # @param [String] text to be tokenized
+    # @param [String, Array] text to be tokenized
+    #
+    # A plain String keeps the original behaviour exactly (main language and
+    # filter_languages semantics included).
+    #
+    # One subtitle may also be submitted as an Array of adjacent original fragments,
+    # each shaped `[language, text]`, where `language` is a two character ISO 639-1
+    # code (String or symbol) or nil when that fragment is not annotated. The
+    # fragments are concatenated verbatim (surrounding whitespace included) and are
+    # tokenized as the single sentence they really form: a fragment boundary is
+    # never a tokenization boundary. When a word crosses such a boundary, the
+    # apostrophe rules of the language declared at the word's first character apply
+    # to the whole word; an undeclared fragment uses the tokenizer's main language.
 
     def tokenize(text)
       return [] unless text
-      raise "In PragmaticTokenizer text must be a String or subclass of String" unless text.class <= String
+      unless text.class <= String || text.is_a?(Array)
+        raise "In PragmaticTokenizer text must be a String or subclass of String"
+      end
+      return tokenize_fragments(text) if text.is_a?(Array)
       CGI.unescapeHTML(text)
           .scan(Regex::CHUNK_LONG_INPUT_TEXT)
           .flat_map { |segment| process_segment(segment) }
@@ -110,17 +129,87 @@ module PragmaticTokenizer
 
     private
 
-      def process_segment(segment)
-        pre_processed = pre_process(segment)
+      # Concatenate the annotated fragments into the real sentence, then tokenize it
+      # exactly like a plain String while carrying the per-character language
+      # provenance through the preprocessing and chunking steps.
+      def tokenize_fragments(fragments)
+        fragments = fragments.map { |pair| normalize_fragment(pair) }
+        full_text = fragments.map { |_language, text| text }.join
+        return [] if full_text.empty?
+
+        segment_languages = fragment_languages(fragments)
+        segment_languages = unescape_language_index(full_text, segment_languages)
+        unescaped         = CGI.unescapeHTML(full_text)
+
+        offset = 0
+        unescaped.scan(Regex::CHUNK_LONG_INPUT_TEXT).flat_map do |segment|
+          # The chunking regex may swallow the whitespace that precedes a later chunk,
+          # so recover the true offset instead of assuming chunk adjacency.
+          start = unescaped.index(segment, offset) || offset
+          offset = start + segment.length
+          process_segment(segment, segment_languages[start, segment.length])
+        end
+      end
+
+      def process_segment(segment, languages = nil)
+        pre_processed = languages ? pre_process(segment, languages) : pre_process(segment)
         cased_segment = chosen_case(pre_processed)
         @tokens       = PostProcessor.new(text: cased_segment, abbreviations: @abbreviations, downcase: @downcase).call
         post_process_tokens
       end
 
-      def pre_process(segment)
-        segment
-            .extend(PragmaticTokenizer::PreProcessor)
-            .pre_process(language: @language_module)
+      def pre_process(segment, languages = nil)
+        extended = segment.extend(PragmaticTokenizer::PreProcessor)
+        if languages
+          extended.pre_process(language: @language_module, language_at: languages)
+        else
+          extended.pre_process(language: @language_module)
+        end
+      end
+
+      def normalize_fragment(pair)
+        unless pair.is_a?(Array) && pair.length == 2
+          raise "In PragmaticTokenizer each fragment must be a two element [language, text] array"
+        end
+        language, fragment = pair
+        unless fragment.class <= String
+          raise "In PragmaticTokenizer fragment text must be a String or subclass of String"
+        end
+        language = nil if language.nil? || (language.respond_to?(:empty?) && language.empty?)
+        [module_for_language(language), fragment]
+      end
+
+      def module_for_language(language)
+        language ? Languages.get_language_by_code(language) : nil
+      end
+
+      # One language module (or nil meaning "not declared") per character of the
+      # concatenated text. Undeclared fragments deliberately stay nil here: they
+      # fall back to the main language, which is resolved once, at use time.
+      def fragment_languages(fragments)
+        index = []
+        fragments.each { |language, text| index.concat(Array.new(text.length, language)) }
+        index
+      end
+
+      # CGI.unescapeHTML can shrink an entity ("&lt;" -> "<"), so a per-character
+      # index built on the raw text would drift. Rebuild the index for the decoded
+      # text; every decoded character inherits the language of the entity's or
+      # literal character's first position.
+      def unescape_language_index(text, languages)
+        index   = []
+        scanner = StringScanner.new(text)
+        until scanner.eos?
+          position = scanner.charpos
+          entity   = scanner.scan(HTML_ENTITY)
+          if entity
+            index.concat(Array.new(CGI.unescapeHTML(entity).length, languages[position]))
+          else
+            index << languages[position]
+            scanner.getch
+          end
+        end
+        index
       end
 
       def post_process_tokens
