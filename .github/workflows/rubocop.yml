@@ -1,0 +1,35 @@
+# frozen_string_literal: true
+
+# This file is synced from hanakai-rb/repo-sync
+
+name: RuboCop
+
+on:
+  push:
+    branches: ["main", "release-*", "ci/*"]
+    tags: ["v*"]
+  pull_request:
+    branches: ["main", "release-*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      BUNDLE_ONLY: tools
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Ruby 4.0
+        uses: ruby/setup-ruby@20eb24b0d509e2b9ed9b6d42ddfeb992915e0564 # v1.341.0 # zizmor: ignore[cache-poisoning]
+        with:
+          ruby-version: 4.0
+          bundler-cache: true
+
+      - name: Run RuboCop
+        run: bundle exec rubocop --parallel
