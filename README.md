@@ -79,6 +79,32 @@ def destroy
 end
 ```
 
+#### Records that are not backed by a row
+
+`#discard` and `#discard!` only act on records that are backed by a row in the
+database. For an unsaved record - including one that was manually given the
+primary key of an existing row - and for a record whose row has since been
+deleted (for example a stale object after a hard `delete`), they run no discard
+callbacks and issue no writes, so they never insert a row and never touch an
+unrelated row that happens to share the same key. `#discard` returns `false` and
+`#discard!` raises `Discard::RecordNotDiscarded`.
+
+```ruby
+draft = Post.new(title: "Draft")  # not saved
+draft.discard                     # => false
+draft.discard!                    # => Discard::RecordNotDiscarded: A new record cannot be discarded
+
+stale = Post.find(id)             # row is hard-deleted elsewhere
+stale.discard                     # => false
+stale.discard!                    # => Discard::RecordNotDiscarded: A deleted record cannot be discarded
+```
+
+Records loaded from the database keep the usual contract: the discard callbacks
+run, and if one of them aborts, `#discard` returns `false` and `#discard!` raises
+`Discard::RecordNotDiscarded` with `"Failed to discard the record"` - the same
+message used when a callback rejects a persisted record. `#undiscard` /
+`#undiscard!` behave the same way.
+
 
 #### Undiscard a record
 

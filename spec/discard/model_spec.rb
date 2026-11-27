@@ -817,4 +817,270 @@ RSpec.describe Discard::Model do
       expect(post.discarded_at_changed?).to be false
     end
   end
+
+  describe 'discarding a record that is not backed by a row' do
+    with_model :Post, scope: :all do
+      table do |t|
+        t.string :title
+        t.datetime :discarded_at
+        t.timestamps null: false
+      end
+
+      model do
+        include Discard::Model
+
+        class_attribute :reject_discard, default: false
+        class_attribute :discard_notifications, default: 0
+
+        before_discard :guard_business_rules
+        after_discard :notify_reviewers
+        before_undiscard :guard_undiscard_rules
+        after_undiscard :notify_reviewers
+
+        def guard_business_rules
+          throw :abort if self.class.reject_discard
+        end
+
+        def guard_undiscard_rules
+          throw :abort if self.class.reject_discard
+        end
+
+        def notify_reviewers
+          self.class.discard_notifications += 1
+        end
+      end
+    end
+
+    let!(:existing_post) { Post.create!(title: "the row that must survive") }
+
+    def table_rows
+      Post.unscoped.order(:id).map { |row| [row.id, row.title, row.discarded_at] }
+    end
+
+    context "an unsaved record manually given an existing row's primary key" do
+      let(:draft) { Post.new(title: "unsaved draft", id: existing_post.id) }
+
+      it "still looks like a new record" do
+        expect(draft).to be_new_record
+        expect(draft.id).to eq(existing_post.id)
+      end
+
+      describe '#discard' do
+        it "returns false" do
+          expect(draft.discard).to be false
+        end
+
+        it "runs no discard callbacks" do
+          expect(draft).not_to receive(:guard_business_rules)
+          expect(draft).not_to receive(:notify_reviewers)
+          draft.discard
+        end
+
+        it "does not insert a row" do
+          expect { draft.discard }.not_to change { Post.unscoped.count }
+        end
+
+        it "does not modify the existing row sharing its primary key" do
+          expect { draft.discard }.not_to change { table_rows }
+          expect(Post.find(existing_post.id)).to be_kept
+        end
+
+        it "leaves the object itself untouched" do
+          draft.discard
+          expect(draft).to be_new_record
+          expect(draft.discarded_at).to be_nil
+          expect(draft).not_to be_discarded
+        end
+      end
+
+      describe '#discard!' do
+        it "raises Discard::RecordNotDiscarded" do
+          expect { draft.discard! }
+            .to raise_error(Discard::RecordNotDiscarded, "A new record cannot be discarded")
+        end
+
+        it "reports the record that could not be discarded" do
+          draft.discard!
+        rescue Discard::RecordNotDiscarded => error
+          expect(error.record).to be(draft)
+        end
+
+        it "runs no discard callbacks" do
+          expect(draft).not_to receive(:guard_business_rules)
+          expect(draft).not_to receive(:notify_reviewers)
+          expect { draft.discard! }.to raise_error(Discard::RecordNotDiscarded)
+        end
+
+        it "neither inserts a row nor touches the row sharing its primary key" do
+          expect {
+            expect { draft.discard! }.to raise_error(Discard::RecordNotDiscarded)
+          }.not_to change { [Post.unscoped.count, table_rows, Post.find(existing_post.id).discarded?] }
+        end
+      end
+    end
+
+    context "an instance whose row was hard-deleted underneath it" do
+      let(:stale_post) { Post.create!(title: "about to vanish") }
+
+      before do
+        Post.unscoped.where(id: stale_post.id).delete_all
+        expect(Post.unscoped.where(id: stale_post.id)).to be_empty
+      end
+
+      it "does not consider itself a new or destroyed record" do
+        expect(stale_post).not_to be_new_record
+        expect(stale_post).not_to be_destroyed
+      end
+
+      describe '#discard' do
+        it "returns false instead of raising" do
+          expect(stale_post.discard).to be false
+        end
+
+        it "runs no discard callbacks" do
+          expect(stale_post).not_to receive(:guard_business_rules)
+          expect(stale_post).not_to receive(:notify_reviewers)
+          stale_post.discard
+        end
+
+        it "does not recreate the deleted row" do
+          expect { stale_post.discard }.not_to change { Post.unscoped.where(id: stale_post.id).count }
+          expect(Post.unscoped.where(id: stale_post.id)).to be_empty
+        end
+
+        it "does not insert any other row" do
+          expect { stale_post.discard }.not_to change { Post.unscoped.count }
+        end
+      end
+
+      describe '#discard!' do
+        it "raises Discard::RecordNotDiscarded" do
+          expect { stale_post.discard! }
+            .to raise_error(Discard::RecordNotDiscarded, "A deleted record cannot be discarded")
+        end
+
+        it "runs no discard callbacks" do
+          expect(stale_post).not_to receive(:guard_business_rules)
+          expect(stale_post).not_to receive(:notify_reviewers)
+          expect { stale_post.discard! }.to raise_error(Discard::RecordNotDiscarded)
+        end
+
+        it "does not recreate the deleted row" do
+          expect {
+            expect { stale_post.discard! }.to raise_error(Discard::RecordNotDiscarded)
+          }.not_to change { Post.unscoped.count }
+          expect(Post.unscoped.where(id: stale_post.id)).to be_empty
+        end
+      end
+    end
+
+    context "an instance hard-deleted through #delete" do
+      let(:deleted_post) { Post.create!(title: "hard deleted").tap(&:delete) }
+
+      it "is destroyed" do
+        expect(deleted_post).to be_destroyed
+      end
+
+      describe '#discard' do
+        it "returns false" do
+          expect(deleted_post.discard).to be false
+        end
+
+        it "runs no discard callbacks and writes nothing" do
+          expect(deleted_post).not_to receive(:guard_business_rules)
+          expect(deleted_post).not_to receive(:notify_reviewers)
+          expect { deleted_post.discard }.not_to change { Post.unscoped.count }
+        end
+      end
+
+      describe '#discard!' do
+        it "raises Discard::RecordNotDiscarded without writing" do
+          expect { deleted_post.discard! }
+            .to raise_error(Discard::RecordNotDiscarded, "A destroyed record cannot be discarded")
+          expect(Post.unscoped.where(id: deleted_post.id)).to be_empty
+        end
+      end
+    end
+
+    context "a record loaded from the database" do
+      let(:post) { Post.find(existing_post.id) }
+
+      before do
+        Post.reject_discard = false
+        Post.discard_notifications = 0
+      end
+
+      context "when a business callback refuses the discard" do
+        before { Post.reject_discard = true }
+
+        it "returns false and keeps the row" do
+          expect(post.discard).to be false
+          expect(post.reload).to be_kept
+        end
+
+        it "runs no after_discard callback and sends no notification" do
+          expect(post).not_to receive(:notify_reviewers)
+          expect { post.discard }.not_to change { Post.discard_notifications }.from(0)
+        end
+
+        describe '#discard!' do
+          it "preserves the real callback failure reason" do
+            expect { post.discard! }
+              .to raise_error(Discard::RecordNotDiscarded, "Failed to discard the record")
+          end
+
+          it "does not write, notify or run the success callback" do
+            expect(post).not_to receive(:notify_reviewers)
+            expect {
+              expect { post.discard! }.to raise_error(Discard::RecordNotDiscarded)
+            }.not_to change { [Post.unscoped.where(id: post.id).pick(:discarded_at), Post.discard_notifications] }
+            expect(post.reload).to be_kept
+          end
+        end
+      end
+
+      context "once the business callback allows the discard" do
+        it "changes state and notifies exactly once" do
+          expect { expect(post.discard).to be true }
+            .to change { Post.discard_notifications }.from(0).to(1)
+          expect(post).to be_discarded
+          expect(post.reload.discarded_at).to be_present
+        end
+
+        it "runs each discard callback exactly once" do
+          expect(post).to receive(:guard_business_rules).once.and_call_original
+          expect(post).to receive(:notify_reviewers).once.and_call_original
+          expect(post.discard).to be true
+        end
+
+        it "is a no-op when discarded a second time" do
+          expect(post.discard).to be true
+          discarded_at = post.reload.discarded_at
+
+          expect(post.discard).to be false
+          expect {
+            expect { post.discard! }
+              .to raise_error(Discard::RecordNotDiscarded, "A discarded record cannot be discarded")
+          }.not_to change { [post.reload.discarded_at, Post.discard_notifications] }
+          expect(post.reload.discarded_at).to eq(discarded_at)
+          expect(Post.discard_notifications).to eq 1
+        end
+      end
+    end
+
+    context "an unsaved record when undiscarding" do
+      let(:draft) { Post.new(title: "unsaved", id: existing_post.id, discarded_at: Time.current) }
+
+      it "returns false and runs no callbacks" do
+        expect(draft).not_to receive(:guard_undiscard_rules)
+        expect(draft.undiscard).to be false
+      end
+
+      it "raises Discard::RecordNotUndiscarded from #undiscard!" do
+        expect { draft.undiscard! }
+          .to raise_error(Discard::RecordNotUndiscarded, "A new record cannot be undiscarded")
+        expect(Post.find(existing_post.id)).to be_kept
+      end
+    end
+  end
 end

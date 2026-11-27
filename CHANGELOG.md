@@ -1,3 +1,12 @@
+### Unreleased
+
+* `#discard` / `#undiscard` now refuse records that are not backed by a row in
+  the database: unsaved records (including ones manually given an existing
+  row's primary key) and records whose row has been hard-deleted. They run no
+  callbacks and write nothing, so no new row is inserted and no other row
+  sharing the same key is updated. `#discard` returns false and `#discard!`
+  raises `Discard::RecordNotDiscarded` (likewise for undiscard).
+
 ### Version 2.0.0
 Release date: 2026-05-27
 
