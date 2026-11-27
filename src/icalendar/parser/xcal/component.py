@@ -1,0 +1,150 @@
+"""A parser for components."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from icalendar.error import InvalidToken, XCalParsingError
+from icalendar.parser.xcal.adapter import ElementAdapter
+from icalendar.parser.xcal.base import XCalParser
+from icalendar.parser.xcal.property import XCalPropertiesParser
+
+if TYPE_CHECKING:
+    from xml.etree.ElementTree import Element
+
+    from icalendar.cal.component import Component
+    from icalendar.cal.component_factory import ComponentFactory
+    from icalendar.prop.factory import TypesFactory
+
+
+class XCalComponentsParser(XCalParser):
+    r"""A parser of an :term:`iCalendar stream` or :term:`IC:components`
+    which contain :term:`component element`\ s that yields
+    :class:`~icalendar.cal.component.Component`\ s.
+
+    Parameters:
+        component_factory: The component factory to use.
+        element: The element to parse.
+        types_factory: The types factory to use.
+
+    Examples:
+
+        ``element`` can be an iCalendar stream that contains
+        one or more :term:`IC:vcalendar` components.
+
+        .. code-block:: xml
+
+            <icalendar xmlns="urn:ietf:params:xml:ns:icalendar-2.0">
+              <vcalendar>
+                ...
+              </vcalendar>
+            </icalendar>
+
+        Components can contain other components inside the :term:`IC:components` XML
+        element. The parameter ``element`` can be such an IC:components XML element.
+
+        .. code-block:: xml
+
+            <components>
+              <vevent>
+                ...
+              </vevent>
+            </components>
+    """
+
+    def __init__(
+        self,
+        element: Element | ElementAdapter,
+        component_factory: ComponentFactory,
+        types_factory: TypesFactory,
+    ) -> None:
+        element = ElementAdapter.with_element(element)
+        if element.tag not in ("icalendar", "components"):
+            # we are not in an icalendar/component stream. We need to wrap it.
+            # This only happens when you pass in a single component.
+            element = element.make_parent("icalendar")
+        super().__init__(element)
+        self._component_factory = component_factory
+        self._types_factory = types_factory
+
+    def parse_component(self) -> Component:
+        """Convert one child into a :class:`~icalendar.cal.component.Component`.
+
+        Returns:
+            The parsed component.
+
+        Raises:
+            ~icalendar.error.XCalParsingError: If there is an error in the child.
+            ~icalendar.parser.xcal.base.InvalidParserState:
+                If all components have been parsed or a property value type didn't
+                parse anything.
+
+        Example:
+
+            The XML below shows the structure of one :term:`component element`
+            element that gets parsed by this method.
+            ``vcalendar`` is the name of the component element.
+            The XML below shows the structure of one :term:`component element`
+            that gets parsed by this method.
+            ``vcalendar`` is the name of the component element.
+            Each component element can contain an :term:`IC:properties` and
+            an :term:`IC:components` element with more components.
+
+            .. code-block:: xml
+
+                <vcalendar>
+                  <properties>
+                    ...
+                  </properties>
+                  <components>
+                    <vevent>
+                    ...
+                    </vevent>
+                  </components>
+                </vcalendar>
+        """
+        component = self.parse_component_from_child()
+        self.done()
+        return component
+
+    def parse_component_from_child(self) -> Component:
+        """Parse a component from a child element.
+
+        Returns:
+            The parsed component.
+
+        Raises:
+            ~icalendar.error.XCalParsingError: If there is an error in the child.
+            ~icalendar.parser.xcal.base.InvalidParserState:
+                If all components have been parsed or a property value type didn't
+                parse anything.
+
+        """
+        try:
+            component_class = self._component_factory.get_component_class(
+                self.child.tag
+            )
+        except InvalidToken as error:
+            raise XCalParsingError(
+                "The component name must be a valid iCalendar token",
+                self.child.tag,
+                self.child,
+            ) from error
+        component = component_class()
+        properties = self.child.get_child_with_tag("properties")
+        if properties is not None:
+            properties_parser = XCalPropertiesParser(
+                properties, component, self._types_factory
+            )
+            properties_parser.parse_properties()
+        components = self.child.get_child_with_tag("components")
+        if components is not None:
+            components_parser = XCalComponentsParser(
+                components, self._component_factory, self._types_factory
+            )
+            while not components_parser.is_finished():
+                component.add_component(components_parser.parse_component())
+        return component
+
+
+__all__ = ["XCalComponentsParser"]
