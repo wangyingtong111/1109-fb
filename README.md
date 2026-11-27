@@ -54,6 +54,72 @@ ps.clean
 # => "This is a sentence cut off in the middle because pdf."
 ```
 
+### Segmenting a turn-delimited dialogue transcript
+
+When the transcript is already split into turns and each word carries its own
+start and end time, use the turn entry point. Every turn is a hard boundary, and
+each result also says which turn and speaker it came from, which words of the
+turn it covers and when those words were spoken.
+
+```ruby
+turns = [
+  ['A', [['at', 0.0, 0.4], ['10:30', 0.4, 1.0], ['we', 1.0, 1.3], ['met', 1.3, 1.7]]],
+  ['B', [['yes.', 2.0, 2.3], ['Then', 2.3, 2.6], ['left.', 2.6, 3.0]]]
+]
+
+sentences = PragmaticSegmenter.segment_turns(turns)
+# => [#<TurnSentence turn=0 speaker="A" sentence="at 10:30 we met" words=[0, 4] time=[0.0, 1.7]>,
+#     #<TurnSentence turn=1 speaker="B" sentence="yes." words=[0, 1] time=[2.0, 2.3]>,
+#     #<TurnSentence turn=1 speaker="B" sentence="Then left." words=[1, 3] time=[2.3, 3.0]>]
+
+sentences.map(&:sentence)      # => ["at 10:30 we met", "yes.", "Then left."]
+sentences.map(&:speaker)       # => ["A", "B", "B"]
+sentences[1].word_range        # => 0...1 (half-open over the words of turn 1)
+sentences[1].time_range        # => [2.0, 2.3] (start of first, end of last word)
+```
+
+`PragmaticSegmenter::TurnSegmenter.new(turns).segment` is the same entry point.
+
+Each result exposes `turn`, `speaker`, `sentence`, `word_range` (a
+`start...stop` pair over the original words of that turn), and
+`first_word_time` / `last_word_time` (the `[start, end]` of the first and last
+word that was actually spoken). `to_a` returns
+`[turn, speaker, sentence, word_range, time_range]` and `to_h` adds the named
+indices and times.
+
+Turns may also be hashes (`{ speaker:, words: }`) and words may be arrays, hashes
+(`{ text:, start:, end: }`) or objects with the same readers. Words without
+timings are allowed; their times come back as `nil`.
+
+A formatting marker that the cleaner erases entirely (for example `<em>`) is
+not a spoken word. It keeps its slot in the original numbering but is never
+reported as part of a sentence, so it can not take the word position of the
+sentence that follows it. Two identical sentences therefore still map back to
+their own word indices:
+
+```ruby
+turns = [
+  ['A', [['<em>', 0, 1], ['yes.', 1, 2], ['</em>', 2, 3],
+         ['<i>', 3, 4], ['yes.', 4, 5], ['</i>', 5, 6],
+         ['Then', 6, 7], ['left.', 7, 8]]],
+  ['A', [['yes.', 10, 11], ['Again.', 11, 12]]]
+]
+
+PragmaticSegmenter.segment_turns(turns).map(&:to_a)
+# => [[0, "A", "yes.",       1...2, [1, 2]],
+#     [0, "A", "yes.",       4...5, [4, 5]],
+#     [0, "A", "Then left.", 6...8, [6, 8]],
+#     [1, "A", "yes.",       0...1, [10, 11]],
+#     [1, "A", "Again.",     1...2, [11, 12]]]
+```
+
+The second turn keeps its own number and only cites its own words and times,
+even though the speaker is the same as before.
+
+The plain string entry point is unchanged and still returns only the sentence
+strings; speaker and timing information only shows up in the fields of the turn
+results.
+
 ## Live Demo
 
 Try out a [live demo](https://www.tm-town.com/natural-language-processing) of Pragmatic Segmenter in the browser.

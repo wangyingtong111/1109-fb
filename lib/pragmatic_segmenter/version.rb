@@ -1,5 +1,5 @@
 # frozen_string_literal: true
 
 module PragmaticSegmenter
-  VERSION = "0.3.24"
+  VERSION = "0.4.0"
 end

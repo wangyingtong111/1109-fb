@@ -1,3 +1,9 @@
+0.4.0 (2026-11-27):
+
+* Improvement: Add `PragmaticSegmenter.segment_turns`, a dialogue-aware entry point. It takes turns (`[speaker, words]`, a hash or an object) where each word has a text and start/end time, treats each turn as a hard sentence boundary, and returns sentences with the turn, speaker, a half-open range over the original turn words and the times of the first and last spoken word.
+* Improvement: Words that the cleaner erases entirely (pure formatting markers such as `<em>`) keep their slot in the original word numbering but are never cited by a sentence, so a duplicate sentence still maps back to its own word range and times instead of being advanced by a count of visible words. Tags split over several ASR words are joined before cleaning.
+* The plain string entry point (`Segmenter#segment`) is unchanged and still returns only sentence strings.
+
 0.3.24 (2024-08-12):
 
 * Bug Fix: Catastrophic backtracking in regular expression for numerical references
