@@ -1,3 +1,11 @@
+### Version 2.1.0
+Release date: 2026-11-28
+
+* Add `discard_all(result: true)` yielding a `Discard::BatchResult` that
+  classifies every enumerated row as `:discarded`, `:rejected` (a
+  `before_discard` callback aborted) or `:already_discarded`, keyed by record
+  id. The legacy array return of `discard_all` is unchanged.
+
 ### Version 2.0.0
 Release date: 2026-05-27
 

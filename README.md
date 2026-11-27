@@ -207,6 +207,41 @@ Some important things to note:
 - The discard column is also flipped *between* the `before_` and `after_` callbacks, so `before_discard` sees `discarded?` as `false` while `after_discard` sees it as `true` (and symmetrically for undiscard). Callbacks gated on `if: :discarded?` will fire accordingly, which is useful when a callback should only run on one side of the transition.
 
 
+#### Batch results
+
+`discard_all` keeps its historical return value: the collection of objects it
+enumerated and whose callbacks ran. Records that a `before_discard` callback
+aborted are part of that collection too, so it cannot tell a page which rows
+actually changed.
+
+Pass `result: true` when the caller needs a per-row outcome:
+
+```ruby
+result = Post.where(id: ids).discard_all(result: true)
+
+result.discarded          # => [entry, ...] rows this batch discarded
+result.rejected           # => [entry, ...] rows a callback refused
+result.already_discarded  # => [entry, ...] rows that were already discarded
+
+result[post.id].status    # => :discarded, :rejected or :already_discarded
+result[post.id].record    # => the record instance
+result.statuses           # => { post.id => :discarded, ... }
+```
+
+Each entry's status comes from the state the database actually holds once the
+batch is done, so a row a callback vetoed is never reported as discarded, and a
+row that was already discarded is reported as `:already_discarded` without
+running its callbacks again. A rejection does not stop the batch; the remaining
+rows are still attempted.
+
+The set of rows is the receiver's own enumeration. With a model that adds
+`default_scope -> { kept }`, use `with_discarded` if the already discarded rows
+should be part of the result:
+
+```ruby
+Post.with_discarded.where(id: ids).discard_all(result: true)
+```
+
 #### Performance tuning
 
 `discard_all` and `undiscard_all` is intended to behave like `destroy_all` which has callbacks, validations, and does one query per record. If performance is a big concern, you may consider replacing it with:

@@ -473,6 +473,171 @@ RSpec.describe Discard::Model do
     end
   end
 
+  describe '.discard_all with result: true' do
+    with_model :Product, scope: :all do
+      table do |t|
+        t.string :name
+        t.boolean :held, default: false
+        t.datetime :discarded_at
+        t.timestamps null: false
+      end
+
+      model do
+        include Discard::Model
+
+        before_discard :reject_when_held
+        after_discard :record_discard_call
+
+        def self.discard_calls
+          @discard_calls ||= []
+        end
+
+        def reject_when_held
+          throw :abort if held
+        end
+
+        def record_discard_call
+          self.class.discard_calls << name
+        end
+      end
+    end
+
+    let!(:a) { Product.create!(name: "A") }
+    let!(:b) { Product.create!(name: "B", held: true) }
+    let!(:c) { Product.create!(name: "C", discarded_at: Time.utc(2024, 1, 1)) }
+
+    before { Product.discard_calls.clear }
+
+    let(:result) { Product.order(:id).discard_all(result: true) }
+
+    it "classifies each row by what the database holds afterwards" do
+      result = Product.order(:id).discard_all(result: true)
+
+      expect(result.discarded.map(&:id)).to eq([a.id])
+      expect(result.rejected.map(&:id)).to eq([b.id])
+      expect(result.already_discarded.map(&:id)).to eq([c.id])
+
+      expect(Product.find(a.id)).to be_discarded
+      expect(Product.find(b.id)).not_to be_discarded
+      expect(Product.find(c.id)).to be_discarded
+    end
+
+    it "exposes one entry per enumerated row" do
+      result = Product.order(:id).discard_all(result: true)
+
+      expect(result.ids).to eq([a.id, b.id, c.id])
+      expect(result.size).to eq(3)
+      expect(result.map(&:status)).to eq([:discarded, :rejected, :already_discarded])
+    end
+
+    it "locates entries by record id" do
+      result = Product.order(:id).discard_all(result: true)
+
+      expect(result[a.id].status).to eq(:discarded)
+      expect(result[b.id].status).to eq(:rejected)
+      expect(result[c.id].status).to eq(:already_discarded)
+      expect(result[b.id].id).to eq(b.id)
+      expect(result[123456]).to be_nil
+    end
+
+    it "records the id of every entry" do
+      result = Product.order(:id).discard_all(result: true)
+
+      expect(result.entries.map(&:id)).to eq([a.id, b.id, c.id])
+      expect(result.statuses).to eq(
+        a.id => :discarded,
+        b.id => :rejected,
+        c.id => :already_discarded
+      )
+    end
+
+    it "does not run callbacks for rows that were already discarded" do
+      Product.order(:id).discard_all(result: true)
+
+      expect(Product.discard_calls).to eq(["A"])
+    end
+
+    it "keeps the rejected row saleable and continues the batch" do
+      result = Product.order(:id).discard_all(result: true)
+
+      expect(b.reload).not_to be_discarded
+      expect(b).to be_kept
+      expect(result.rejected.first.record.reload).to be_kept
+    end
+
+    it "does not re-stamp the discard time of an already discarded row" do
+      original = c.discarded_at
+
+      Product.order(:id).discard_all(result: true)
+
+      expect(Product.find(c.id).discarded_at).to eq(original)
+    end
+
+    it "runs the discard callbacks for the rows it changes" do
+      result = Product.order(:id).discard_all(result: true)
+
+      expect(Product.discard_calls).to eq(["A"])
+      expect(result.discarded.first.record).to be_discarded
+    end
+
+    it "returns an empty result when no rows match" do
+      result = Product.where(id: []).discard_all(result: true)
+
+      expect(result).to be_empty
+      expect(result.ids).to eq([])
+      expect(result.statuses).to eq({})
+    end
+
+    it "leaves the legacy return value unchanged" do
+      expect(Product.order(:id).discard_all.map(&:name)).to eq(["A", "B"])
+    end
+
+    it "classifies rejected rows as rejected rather than discarded when a save fails" do
+      Product.where(id: b.id).update_all(held: false)
+      allow_any_instance_of(Product).to receive(:update_attribute).and_return(false)
+
+      result = Product.order(:id).discard_all(result: true)
+
+      expect(result.map(&:status)).to eq([:rejected, :rejected, :already_discarded])
+      expect(Product.find(a.id)).not_to be_discarded
+    end
+
+    context "with rows hidden by a default scope" do
+      with_model :Archived, scope: :all do
+        table do |t|
+          t.string :name
+          t.datetime :discarded_at
+          t.timestamps null: false
+        end
+
+        model do
+          include Discard::Model
+          default_scope -> { kept }
+        end
+      end
+
+      it "reports rows hidden by a default scope when the caller opts in" do
+        hidden = Archived.create!(name: "archived", discarded_at: Time.utc(2024, 1, 1))
+        kept = Archived.create!(name: "kept")
+
+        result = Archived.with_discarded.discard_all(result: true)
+
+        expect(result.ids).to eq([hidden.id, kept.id])
+        expect(result[hidden.id].status).to eq(:already_discarded)
+        expect(result[kept.id].status).to eq(:discarded)
+      end
+
+      it "uses the receiver's own enumeration as the row set" do
+        hidden = Archived.create!(name: "archived", discarded_at: Time.utc(2024, 1, 1))
+
+        result = Archived.discard_all(result: true)
+
+        expect(result.ids).to eq([])
+        expect(Archived.with_discarded.find(hidden.id)).to be_discarded
+      end
+    end
+  end
+
   describe '.discard_all!' do
     with_model :Post, scope: :all do
       table do |t|
