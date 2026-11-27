@@ -1962,6 +1962,101 @@ class TestISOOutputFormatDurationField(FieldValues):
     field = serializers.DurationField(format='iso-8601')
 
 
+# A microsecond grid anchored at 1 microsecond with a 125000 microsecond step.
+DURATION_ORIGIN = datetime.timedelta(microseconds=1)
+DURATION_STEP = datetime.timedelta(microseconds=125000)
+STEP_ERROR = (
+    'Ensure this value is a multiple of 0:00:00.125000 '
+    'measured from 0:00:00.000001.'
+)
+
+
+class TestStepDurationField(FieldValues):
+    """
+    Valid and invalid values for `DurationField` with a microsecond `step`
+    and a business `origin`. Step validation uses the exact difference from
+    the origin, so both forward grid points and grid points on the other side
+    of the origin are accepted.
+    """
+    valid_inputs = {
+        # The third point above the origin is encoded twice and must be read
+        # as the very same duration.
+        'PT0.375001S': DURATION_ORIGIN + 3 * DURATION_STEP,
+        '00:00:00.375001': DURATION_ORIGIN + 3 * DURATION_STEP,
+        # A legal grid point lying on the other side of the origin.
+        '-1 23:59:59.875001': DURATION_ORIGIN - DURATION_STEP,
+        datetime.timedelta(microseconds=1): DURATION_ORIGIN,
+    }
+    invalid_inputs = {
+        # One microsecond away from the third point: a step mismatch.
+        'PT0.375S': [STEP_ERROR],
+        '00:00:00.375': [STEP_ERROR],
+    }
+    outputs = {}
+    field = serializers.DurationField(step=DURATION_STEP, origin=DURATION_ORIGIN)
+
+    def test_edge_duration_keeps_microsecond_precision(self):
+        # The closest grid point to the largest supported duration is still
+        # resolved with microsecond precision instead of drifting on floats.
+        edge = datetime.timedelta.max - (
+            datetime.timedelta.max - self.field.origin
+        ) % self.field.step
+        assert self.field.run_validation(edge) == edge
+        assert (edge - self.field.origin) % self.field.step == datetime.timedelta(0)
+        # One microsecond further is no longer on the grid.
+        with pytest.raises(serializers.ValidationError) as exc_info:
+            self.field.run_validation(edge + datetime.timedelta(microseconds=1))
+        assert exc_info.value.detail == [STEP_ERROR]
+
+    def test_invalid_step_type(self):
+        with pytest.raises(TypeError) as exc_info:
+            serializers.DurationField(step=125000)
+        assert str(exc_info.value) == (
+            'duration step must be a datetime.timedelta instance, not int'
+        )
+
+    def test_non_positive_step(self):
+        with pytest.raises(ValueError) as exc_info:
+            serializers.DurationField(step=datetime.timedelta(0))
+        assert str(exc_info.value) == (
+            'duration step must be greater than zero, got datetime.timedelta(0).'
+        )
+
+    def test_invalid_origin_type(self):
+        with pytest.raises(TypeError) as exc_info:
+            serializers.DurationField(step=DURATION_STEP, origin=1)
+        assert str(exc_info.value) == (
+            'duration origin must be a datetime.timedelta instance, not int'
+        )
+
+
+class TestStepMinMaxDurationField(FieldValues):
+    """
+    `step`/`origin` validation coexists with the existing min/max limits.
+    A real grid point beyond the field range still reports the original range
+    error, while an in-range value off the grid reports the step error.
+    """
+    valid_inputs = {
+        DURATION_ORIGIN + 3 * DURATION_STEP:
+            DURATION_ORIGIN + 3 * DURATION_STEP,
+        DURATION_ORIGIN + 7 * DURATION_STEP:
+            DURATION_ORIGIN + 7 * DURATION_STEP,
+    }
+    invalid_inputs = {
+        # On the grid, but above `max_value`: the range error is unchanged.
+        DURATION_ORIGIN + 8 * DURATION_STEP:
+            ['Ensure this value is less than or equal to 0:00:01.'],
+        # Inside the range, but one microsecond off the grid.
+        datetime.timedelta(microseconds=375000): [STEP_ERROR],
+    }
+    outputs = {}
+    field = serializers.DurationField(
+        step=DURATION_STEP, origin=DURATION_ORIGIN,
+        min_value=datetime.timedelta(0),
+        max_value=datetime.timedelta(seconds=1),
+    )
+
+
 # Choice types...
 class TestChoiceField(FieldValues):
     """

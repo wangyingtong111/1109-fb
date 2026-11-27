@@ -1377,17 +1377,86 @@ class TimeField(Field):
         return value.strftime(output_format)
 
 
+class DurationStepValidator:
+    """
+    Validate that a `datetime.timedelta` lies on a fixed microsecond grid.
+
+    The grid is anchored at `origin` (a duration marking the business
+    zero-point) and spaced by `step`. A duration is valid when its exact
+    difference from `origin` is an integer multiple of `step`. The check is
+    performed with integer microsecond arithmetic so that precision is kept
+    even for durations close to `datetime.timedelta.max`.
+    """
+    message = _(
+        'Ensure this value is a multiple of {step} measured from {origin}.'
+    )
+    code = 'step'
+
+    def __init__(self, step, origin=datetime.timedelta(0), message=None):
+        self.step = step
+        self.origin = origin
+        self.message = message or self.message
+
+    def __call__(self, value):
+        if (value - self.origin) % self.step:
+            raise ValidationError(
+                lazy_format(self.message, step=self.step, origin=self.origin),
+                code=self.code,
+            )
+
+    def __eq__(self, other):
+        return (
+            isinstance(other, DurationStepValidator)
+            and self.step == other.step
+            and self.origin == other.origin
+            and self.message == other.message
+        )
+
+    def __repr__(self):
+        return '<%s(step=%s, origin=%s)>' % (
+            self.__class__.__name__,
+            representation.smart_repr(self.step),
+            representation.smart_repr(self.origin),
+        )
+
+
 class DurationField(Field):
     default_error_messages = {
         'invalid': _('Duration has wrong format. Use one of these formats instead: {format}.'),
         'max_value': _('Ensure this value is less than or equal to {max_value}.'),
         'min_value': _('Ensure this value is greater than or equal to {min_value}.'),
         'overflow': _('The number of days must be between {min_days} and {max_days}.'),
+        'step': _('Ensure this value is a multiple of {step} measured from {origin}.'),
     }
 
-    def __init__(self, *, format=empty, **kwargs):
+    def __init__(
+        self, *, format=empty, step=None, origin=datetime.timedelta(0), **kwargs
+    ):
         self.max_value = kwargs.pop('max_value', None)
         self.min_value = kwargs.pop('min_value', None)
+        self.step = step
+        self.origin = origin
+        if step is not None:
+            if not isinstance(step, datetime.timedelta):
+                raise TypeError(
+                    'duration step must be a datetime.timedelta instance,'
+                    f' not {type(step).__name__}'
+                )
+            if step <= datetime.timedelta(0):
+                raise ValueError(
+                    'duration step must be greater than zero,'
+                    f' got {step!r}.'
+                )
+            if not isinstance(origin, datetime.timedelta):
+                raise TypeError(
+                    'duration origin must be a datetime.timedelta instance,'
+                    f' not {type(origin).__name__}'
+                )
+        elif not isinstance(origin, datetime.timedelta):
+            raise TypeError(
+                'duration origin must be a datetime.timedelta instance,'
+                f' not {type(origin).__name__}'
+            )
         if format is not empty:
             if format is None or (isinstance(format, str) and format.lower() in (ISO_8601, DJANGO_DURATION_FORMAT)):
                 self.format = format
@@ -1410,6 +1479,10 @@ class DurationField(Field):
             message = lazy_format(self.error_messages['min_value'], min_value=self.min_value)
             self.validators.append(
                 MinValueValidator(self.min_value, message=message))
+        if self.step is not None:
+            self.validators.append(
+                DurationStepValidator(
+                    self.step, self.origin, message=self.error_messages['step']))
 
     def to_internal_value(self, value):
         if isinstance(value, datetime.timedelta):
