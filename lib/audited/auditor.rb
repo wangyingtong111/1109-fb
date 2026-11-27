@@ -161,7 +161,11 @@ module Audited
       def revisions(from_version = 1)
         return [] unless audits.from_version(from_version).exists?
 
-        all_audits = audits.select([:audited_changes, :version, :action]).to_a
+        columns = [:audited_changes, :version, :action]
+        # The comment carries the fold bounds, which decide how merged changes
+        # are decoded. Some legacy tables have no comment column.
+        columns << :comment if Audited.audit_class.column_names.include?("comment")
+        all_audits = audits.select(columns).to_a
         targeted_audits = all_audits.select { |audit| audit.version >= from_version }
 
         previous_attributes = reconstruct_attributes(all_audits - targeted_audits)
@@ -181,10 +185,74 @@ module Audited
       end
 
       # Find the oldest revision recorded prior to the date/time provided.
+      #
+      # Dates that still have itemized audits keep the existing recovery rule.
+      # A date without any returns +nil+, exactly as before. Use #history_at to
+      # tell a date before the record was registered apart from a date whose
+      # audits were compacted away.
       def revision_at(date_or_time)
-        audits = self.audits.up_until(date_or_time)
-        revision_with Audited.audit_class.reconstruct_attributes(audits) unless audits.empty?
+        history = history_at(date_or_time)
+        history.found? ? history.revision : nil
       end
+
+      # What the record looked like at the date/time provided, and why a
+      # revision is or is not available.
+      #
+      # Returns an Audited::AuditHistory whose +status+ is one of:
+      #
+      # * <tt>:found</tt> - audits covering that moment are still stored one by
+      #   one, so +revision+ is the reconstructed record. This is the same
+      #   result as #revision_at and the other recovery rules are untouched.
+      # * <tt>:compacted</tt> - the record existed, but the audits covering that
+      #   moment were folded into a newer audit. +revision+ is nil, and
+      #   +effective_from+ / +effective_version+ point at the earliest point
+      #   that can still be read in detail.
+      # * <tt>:not_registered</tt> - the moment predates the record's history,
+      #   so nothing was ever recorded.
+      #
+      # A compacted moment never falls back to the current record or to a made
+      # up in-between snapshot.
+      def history_at(date_or_time)
+        requested = Audited.audit_class.parse_history_time(date_or_time)
+        return Audited::AuditHistory.not_registered(requested_at: date_or_time) if requested.nil?
+
+        organized = audits.ascending.to_a
+
+        return Audited::AuditHistory.not_registered(requested_at: requested) if organized.empty?
+
+        reconstructable = organized.select { |audit| audit.created_at && audit.created_at <= requested }
+        if reconstructable.any?
+          return Audited::AuditHistory.found(
+            requested_at: requested,
+            revision: revision_with(Audited.audit_class.reconstruct_attributes(reconstructable)),
+            history_started_at: organized.first.history_started_at
+          )
+        end
+
+        oldest = organized.first
+
+        # Only a compacted prefix can hide audits from us. Without one, an
+        # earlier moment simply was not registered.
+        marker = oldest.history_marker
+        unless marker
+          return Audited::AuditHistory.not_registered(requested_at: requested, history_started_at: oldest.created_at)
+        end
+
+        recorded_start = marker["started_at"]
+        if recorded_start && requested < recorded_start
+          return Audited::AuditHistory.not_registered(requested_at: requested, history_started_at: recorded_start)
+        end
+
+        Audited::AuditHistory.compacted(
+          requested_at: requested,
+          history_started_at: recorded_start || oldest.created_at,
+          earliest_readable_at: oldest.created_at,
+          earliest_readable_version: oldest.version,
+          folded_versions: oldest.folded_versions
+        )
+      end
+      alias_method :audit_history_at, :history_at
+      alias_method :revision_history_at, :history_at
 
       # List of attributes that are audited.
       def audited_attributes
@@ -202,15 +270,36 @@ module Audited
       end
 
       # Combine multiple audits into one.
+      #
+      # The surviving audit gets every change, and because the folded audits are
+      # deleted it also records the boundaries of the window they covered: when
+      # the record's history started and which versions were folded together.
+      # Their individual values and timestamps are gone and are not recreated.
       def combine_audits(audits_to_combine)
-        combine_target = audits_to_combine.last
-        combine_target.audited_changes = audits_to_combine.pluck(:audited_changes).reduce(&:merge)
-        combine_target.comment = "#{combine_target.comment}\nThis audit is the result of multiple audits being combined."
+        folded = audits_to_combine.to_a
+        combine_target = folded.last
+
+        # A single audit has nothing to absorb; leave it exactly as it is.
+        if folded.size > 1
+          changes = folded.map { |audit| Audited.audit_class.mergeable_changes(audit) }.reduce(&:merge) || {}
+          combine_target.audited_changes = changes
+          # The fresh marker carries forward any fold the target already had,
+          # because those versions are gone too, and records that its changes
+          # are now stored as pairs.
+          combine_target.comment = [
+            Audited.audit_class.comment_without_history_marker(combine_target.comment),
+            Audited.audit_class::COMBINED_COMMENT,
+            Audited.audit_class.compaction_marker_for(folded, combine_target)
+          ].reject { |part| part.blank? }.join("\n")
+        end
 
         transaction do
           begin
             combine_target.save!
             audits_to_combine.unscope(:limit).where("version < ?", combine_target.version).delete_all
+            # The folded audits are gone from the database, so drop any cached
+            # copy of the list that still contains them.
+            audits.reset
           rescue ActiveRecord::Deadlocked
             # Ignore Deadlocks, if the same record is getting its old audits combined more than once at the same time then
             # both combining operations will be the same. Ignoring this error allows one of the combines to go through successfully.

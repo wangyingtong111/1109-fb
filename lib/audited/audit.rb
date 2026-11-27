@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "set"
+require "time"
 
 module Audited
   # Audit saves the changes to ActiveRecord models.  It has the following attributes:
@@ -65,6 +66,123 @@ module Audited
     scope :from_version, ->(version) { where("version >= ?", version) }
     scope :to_version, ->(version) { where("version <= ?", version) }
     scope :auditable_finder, ->(auditable_id, auditable_type) { where(auditable_id: auditable_id, auditable_type: auditable_type) }
+
+    # Wording appended to an audit whose changes absorbed older audits.
+    COMBINED_COMMENT = "This audit is the result of multiple audits being combined."
+
+    # Machine readable bounds of the window that was folded into an audit. It
+    # travels in the comment so the oldest surviving audit can still answer
+    # "when did this record's history start?" and "which versions are gone?".
+    # The versions are stored as one interval rather than a list so the marker
+    # stays short however many folds happen, and because the snapshots inside
+    # the window cannot be recovered - they are never invented back.
+    HISTORY_MARKER = /\[audited:history started_at=(\S+) folded=(\d+)-(\d+)( pairs)?\]/
+
+    # @private
+    def self.parse_history_time(value)
+      return nil if value.nil?
+
+      time = case value
+      when ::Time then value
+      when ::DateTime then value.to_time
+      when ::Date then start_of_day(value)
+      when ::String
+        value.strip.empty? ? nil : (::Time.zone ? ::Time.zone.parse(value) : ::Time.parse(value))
+      else
+        value.respond_to?(:to_time) ? value.to_time : nil
+      end
+
+      zone = ::Time.zone
+      (zone && time) ? time.in_time_zone(zone) : time
+    rescue ::ArgumentError, ::TypeError
+      nil
+    end
+
+    # Midnight at the start of +date+ in the application zone, falling back to
+    # UTC when no zone data is available.
+    # @private
+    def self.start_of_day(date)
+      zone = ::Time.zone
+      return ::Time.utc(date.year, date.month, date.day) if zone.nil?
+
+      begin
+        zone.local(date.year, date.month, date.day)
+      rescue ::StandardError
+        ::Time.utc(date.year, date.month, date.day)
+      end
+    end
+
+    # Bounds recorded on an audit's comment, or +nil+ when nothing was folded.
+    # @private
+    def self.history_marker(comment)
+      match = HISTORY_MARKER.match(comment.to_s)
+      return nil unless match
+
+      first = match[2].to_i
+      last = match[3].to_i
+      return nil if first > last
+
+      {
+        "started_at" => parse_history_time(match[1]),
+        "folded_range" => (first..last),
+        "pairs" => !match[4].nil?
+      }
+    end
+
+    # @private
+    def self.format_history_marker(started_at, folded_range, pairs: true)
+      return nil if started_at.nil? || folded_range.nil?
+
+      first = folded_range.first
+      last = folded_range.last
+      return nil if first.nil? || last.nil? || first > last
+
+      "[audited:history started_at=#{started_at.utc.iso8601(6)} " \
+        "folded=#{first}-#{last}#{" pairs" if pairs}]"
+    end
+
+    # @private
+    # Changes of an audit normalized so that merging them keeps the [old, new]
+    # shape. Creates and destroys store one value per attribute while updates
+    # store the pair, so a fold has to wrap single values or the merged audit
+    # would read a bare value as if it were a pair.
+    def self.mergeable_changes(audit)
+      changes = audit.audited_changes || {}
+      return changes if audit.action == "update" || audit.pair_values?
+
+      changes.each_with_object({}) { |(attr, value), out| out[attr] = [value, value] }
+    end
+
+    # Comment with any earlier fold marker removed, so a further fold can write
+    # the accumulated bounds instead of stacking stale ones.
+    # @private
+    def self.comment_without_history_marker(comment)
+      comment.to_s.sub(HISTORY_MARKER, "").strip
+    end
+
+    # Marker describing the window left behind by folding +audits+ into
+    # +target+. It keeps the earliest known start of the history and widens the
+    # folded interval, so repeated compactions still point back to the true
+    # beginning. Returns +nil+ when nothing below the target is being removed.
+    # @private
+    def self.compaction_marker_for(audits, target)
+      audits = Array(audits)
+      markers = audits.map(&:history_marker).compact
+
+      starts = markers.map { |marker| marker["started_at"] }.compact
+      starts.concat(audits.map(&:created_at).compact)
+      start = starts.min
+
+      removed = (audits.map(&:version) - [target.version]).compact
+      firsts = markers.map { |marker| marker["folded_range"].first }
+      lasts = markers.map { |marker| marker["folded_range"].last }
+      first = (firsts + removed).compact.min
+      last = (lasts + removed).compact.max
+      return nil if first.nil? || last.nil? || first > last
+
+      format_history_marker(start, first..last)
+    end
+
     # Return all audits older than the current one.
     def ancestors
       self.class.ascending.auditable_finder(auditable_id, auditable_type).to_version(version)
@@ -79,17 +197,71 @@ module Audited
       end
     end
 
+    # True when the attribute of this audit stores an <tt>[old, new]</tt> pair.
+    #
+    # Updates always store pairs; creates and destroys store a single value.
+    # An audit that absorbed older audits keeps the pair shape for every
+    # attribute (merging normalizes bare values into pairs) and says so with
+    # the +pairs+ flag in its marker, so its decoding does not depend on which
+    # action it happens to carry.
+    def change_pair?(values)
+      return false unless values.is_a?(Array) && values.length == 2
+
+      action == "update" || pair_values?
+    end
+
+    # True when every attribute of this audit is stored as an <tt>[old, new]</tt>
+    # pair, whatever the action is.
+    def pair_values?
+      marker = history_marker
+      !marker.nil? && marker["pairs"]
+    end
+
+    # Bounds of the window folded into this audit, or +nil+ when nothing was.
+    def history_marker
+      self.class.history_marker(history_comment)
+    end
+
+    # The recorded comment, or +nil+ when the audit class has no comment column
+    # or the column was not selected.
+    # @private
+    def history_comment
+      return nil unless has_attribute?(:comment)
+
+      comment
+    rescue ::ActiveModel::MissingAttributeError
+      nil
+    end
+
+    # True when older audits were folded into this one.
+    def compacted_history?
+      !history_marker.nil?
+    end
+
+    # When the auditable record first appeared in the audit log. Earlier than
+    # this audit's own +created_at+ once a compaction folded the beginning.
+    def history_started_at
+      marker = history_marker
+      (marker && marker["started_at"]) || created_at
+    end
+
+    # Versions whose individual audits were folded away.
+    def folded_versions
+      marker = history_marker
+      marker ? marker["folded_range"].to_a : []
+    end
+
     # Returns a hash of the changed attributes with the new values
     def new_attributes
       (audited_changes || {}).each_with_object({}.with_indifferent_access) do |(attr, values), attrs|
-        attrs[attr] = (action == "update") ? values.last : values
+        attrs[attr] = change_pair?(values) ? values.last : values
       end
     end
 
     # Returns a hash of the changed attributes with the old values
     def old_attributes
       (audited_changes || {}).each_with_object({}.with_indifferent_access) do |(attr, values), attrs|
-        attrs[attr] = (action == "update") ? values.first : values
+        attrs[attr] = change_pair?(values) ? values.first : values
       end
     end
 
@@ -101,10 +273,10 @@ module Audited
         auditable.destroy!
       when "destroy"
         # creates a new record with the destroyed record attributes
-        auditable_type.constantize.create!(audited_changes)
+        auditable_type.constantize.create!(new_attributes.to_h)
       when "update"
         # changes back attributes
-        auditable.update!(audited_changes.transform_values(&:first))
+        auditable.update!(old_attributes.to_h)
       else
         raise StandardError, "invalid action given #{action}"
       end

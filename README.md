@@ -113,6 +113,36 @@ user.revision(1)
 user.revision_at(Date.parse("2016-01-01"))
 ```
 
+### Telling "not registered yet" apart from "compacted"
+
+A date lookup cannot always rebuild a revision. There are two very different
+reasons, and `history_at` reports which one applies:
+
+```ruby
+history = user.history_at(Date.parse("2025-05-15"))
+
+history.status        # => :found, :compacted or :not_registered
+history.found?        # audits covering that date are still stored one by one
+history.revision      # the reconstructed record when :found, otherwise nil
+history.compacted?    # the record existed, but that window was folded away
+history.not_registered? # the date is before the record's history even began
+
+# For :compacted, the earliest point that can still be read in detail:
+history.effective_from     # => Time
+history.effective_version  # => Integer
+history.folded_versions    # => [1, 2] versions whose detail is gone
+history.history_started_at # => when the record first appeared in the log
+```
+
+`revision_at` keeps returning the reconstructed record for dates that still
+have itemized audits, and returns the same `Audited::AuditHistory` object when
+there are none, so a plain `nil` no longer hides why the lookup came up empty.
+
+Compaction (`max_audits` / `combine_audits`) records the bounds of the folded
+window on the surviving audit. A compacted window is never backfilled: the
+individual values and their timestamps are gone, so the API reports the window
+and its readable start rather than inventing an intermediate snapshot.
+
 ### Specifying columns
 
 By default, a new audit is created for any attribute changes. You can, however, limit the columns to be considered.

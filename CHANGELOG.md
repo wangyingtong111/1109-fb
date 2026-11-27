@@ -1,5 +1,19 @@
 # Audited ChangeLog
 
+### Unreleased
+
+- Add `Audited::Auditor::AuditedInstanceMethods#history_at`, which reports why
+  a date lookup has no revision: `:not_registered` when the date predates the
+  record's history, `:compacted` when audits covering that date were folded into
+  a newer audit, and `:found` when the usual reconstruction applies. Compacted
+  results expose `effective_from` / `effective_version` for the earliest point
+  still readable in detail and never fabricate in-between snapshots.
+  `revision_at` now returns that object instead of a bare `nil` when no audit
+  covers the date, while keeping its old return value for dates that do.
+- `combine_audits` / `max_audits` now record the bounds of the folded window on
+  the surviving audit, and merge changes without changing their `[old, new]`
+  shape.
+
 ### 5.8.0 (2024-11-08)
 - Allow calling audited multiple times - @mohammednasser-32
   [734](https://github.com/collectiveidea/audited/pull/734)  

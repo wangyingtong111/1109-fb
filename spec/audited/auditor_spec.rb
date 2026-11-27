@@ -916,6 +916,14 @@ describe Audited::Auditor do
     it "should be nil if given a time before audits" do
       expect(user.revision_at(1.week.ago)).to be_nil
     end
+
+    it "should say why a time before audits has no revision" do
+      history = user.history_at(1.week.ago)
+      expect(history).to be_a(Audited::AuditHistory)
+      expect(history).to be_not_registered
+      expect(history.revision).to be_nil
+      expect(history.history_started_at).to eq(user.audits.first.created_at)
+    end
   end
 
   describe "own_and_associated_audits" do

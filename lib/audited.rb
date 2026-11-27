@@ -48,6 +48,7 @@ module Audited
 end
 
 require "audited/auditor"
+require "audited/audit_history"
 
 ActiveSupport.on_load :active_record do
   require "audited/audit"
