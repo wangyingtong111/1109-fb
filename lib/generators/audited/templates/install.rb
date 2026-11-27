@@ -16,6 +16,7 @@ class <%= migration_class_name %> < <%= migration_parent %>
       t.column :comment, :string
       t.column :remote_address, :string
       t.column :request_uuid, :string
+      t.column :enum_mapping_version, :string
       t.column :created_at, :datetime
     end
 

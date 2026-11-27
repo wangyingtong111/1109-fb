@@ -1,5 +1,13 @@
 # Audited ChangeLog
 
+### Unreleased
+- Add historical enum mappings for audits. `Audited.register_enum_mapping` records
+  the business names that were valid for a mapping version, new audits store the
+  version they were written under, and `audit.audited_changes_with_enum_names`
+  reads old codes with those names. Codes with no matching version are reported
+  as `Audited::UnknownEnumCode`; stored audit evidence is never rewritten.
+  Run `rails generate audited:upgrade` to add the `enum_mapping_version` column.
+
 ### 5.8.0 (2024-11-08)
 - Allow calling audited multiple times - @mohammednasser-32
   [734](https://github.com/collectiveidea/audited/pull/734)  

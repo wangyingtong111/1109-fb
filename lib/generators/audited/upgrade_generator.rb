@@ -43,6 +43,10 @@ module Audited
           yield :add_request_uuid_to_audits
         end
 
+        unless columns.include?("enum_mapping_version")
+          yield :add_enum_mapping_version_to_audits
+        end
+
         unless columns.include?("association_id")
           if columns.include?("auditable_parent_id")
             yield :rename_parent_to_association

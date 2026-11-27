@@ -85,6 +85,24 @@ class UpgradeGeneratorTest < Rails::Generators::TestCase
     end
   end
 
+  test "should add 'enum_mapping_version' to audits table" do
+    load_schema 6
+
+    run_generator %w[upgrade]
+
+    assert_migration "db/migrate/add_enum_mapping_version_to_audits.rb" do |content|
+      assert_match(/add_column :audits, :enum_mapping_version, :string/, content)
+    end
+  end
+
+  test "should not add 'enum_mapping_version' when the column already exists" do
+    load_schema 7
+
+    run_generator %w[upgrade]
+
+    assert_no_migration "db/migrate/add_enum_mapping_version_to_audits.rb"
+  end
+
   test "generate migration with correct AR migration parent" do
     load_schema 1
 

@@ -435,6 +435,79 @@ In 4.10, the default behavior for enums changed from storing the value synthesiz
 Audited.store_synthesized_enums = true
 ```
 
+### Historical enum mappings
+
+Audits store the enum code that was written at the time, for example `1`.
+When the business later changes what that code means (`1` used to be `ready`
+and is now `archived`), translating old audits with today's enum would show
+the wrong status. Register the mappings that were in effect for each version
+and tell Audited which version is current for new audits:
+
+```ruby
+# config/initializers/audited.rb
+
+Audited.register_enum_mapping("2023-05", "Case",
+  status: {0 => "new", 1 => "ready", 2 => "done"})
+Audited.register_enum_mapping("2024-01", "Case",
+  status: {0 => "draft", 1 => "archived", 2 => "live"})
+
+# New audits record this version. A model can override it with
+# `audited enum_mapping_version: "2023-05"`.
+Audited.enum_mapping_version = "2024-01"
+```
+
+The version an audit was written under is stored in the
+`enum_mapping_version` column. Existing installations get it from
+`rails generate audited:upgrade`; without the column the version is still
+available on the just-created audit in memory.
+
+Read old audits with the names that were valid back then:
+
+```ruby
+audit = Case.find(1).audits.find_by(version: 2)
+
+audit.audited_changes                      # => {"status" => [1, 2]}
+audit.audited_changes_with_enum_names      # => {"status" => ["ready", "done"]}
+
+# Or select a version explicitly.
+audit.audited_changes_with_enum_names(version: "2023-05")
+audit.old_attributes_with_enum_names       # => {"status" => "ready"}
+audit.new_attributes_with_enum_names       # => {"status" => "done"}
+
+# Follow today's enum when that is what you want.
+audit.audited_changes_with_enum_names(version: :current)
+
+# Find audits written under a particular version.
+Case.find(1).audits.merge(Audited::Audit.with_enum_mapping_version("2023-05"))
+```
+
+A code that the selected version does not define comes back as an
+`Audited::UnknownEnumCode` (it renders as `"unknown code 1"` and responds to
+`#unknown?` and `#raw`), rather than being silently relabelled with the
+current enum:
+
+```ruby
+audit.audited_changes_with_enum_names(version: "2019-01")
+# => {"status" => [Audited::UnknownEnumCode(1), Audited::UnknownEnumCode(2)]}
+audit.unknown_enum_codes? # => true
+```
+
+Enum reading never writes to the audit. `audited_changes` always keeps the
+original codes, and `audit.enum_export` returns the evidence and its
+interpretation side by side:
+
+```ruby
+audit.enum_export
+# => {enum_mapping_version: "2023-05",
+#     audited_changes: {"status" => [1, 2]},
+#     display_audited_changes: {"status" => ["ready", "done"]},
+#     unknown_enum_codes: []}
+```
+
+Reading a model's own attributes (`case.status`) keeps using the model's
+current enum definition; historical mappings only affect how audits are
+displayed.
+
 ## Support
 
 You can find documentation at: https://www.rubydoc.info/gems/audited

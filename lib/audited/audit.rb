@@ -40,6 +40,8 @@ module Audited
   end
 
   class Audit < ::ActiveRecord::Base
+    include EnumMappingReader
+
     belongs_to :auditable, polymorphic: true
     belongs_to :user, polymorphic: true
     belongs_to :associated, polymorphic: true

@@ -58,6 +58,14 @@ module Audited
       #       end
       #     end
       #
+      # * +enum_mapping_version+ - Records which enum mapping version new
+      #   audits belong to, so codes written before an enum migration can be
+      #   read with the names that were valid at the time.
+      #
+      #     class Case < ActiveRecord::Base
+      #       audited enum_mapping_version: "2023-05"
+      #     end
+      #
       def audited(options = {})
         audited? ? update_audited_options(options) : set_audit(options)
       end
