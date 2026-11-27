@@ -132,6 +132,28 @@ Some holidays may be only present in parts of a country:
     '2018-01-06' in us_holidays     # False
     '2018-01-06' in us_pr_holidays  # True
 
+Several calendars can be combined with the ``+`` operator. The result keeps the
+joined holiday dates, and its ``source_configs`` attribute records the actual
+country (or market), subdivision, observance, language and categories of every
+calendar that went into it, in first-occurrence order. Identical calendars are
+reported once, as the same source:
+
+.. code-block:: python
+
+    us_ca = holidays.country_holidays('US', subdiv='CA', observed=False, years=2024)
+    ca_on = holidays.country_holidays('CA', subdiv='ON', years=2024)
+    us_ca_observed = holidays.country_holidays('US', subdiv='CA', observed=True, years=2024)
+
+    combined = (us_ca + ca_on) + (us_ca_observed + ca_on)
+    for config in combined.source_configs:
+        print(config.country, config.subdiv, config.observed)
+    # US CA False
+    # CA ON True
+    # US CA True
+
+    # Rebuild the very same calendars from the recorded configuration:
+    rebuilt = holidays.HolidayBase.from_source_configs(combined.source_configs, years=2024)
+
 .. _python-holidays documentation: https://python-holidays.readthedocs.io/
 
 Please see the `python-holidays documentation`_ for additional examples and

@@ -33,7 +33,7 @@ class TestHolidaysImports(TestCase):
             self.assertImport(name)
 
     def test_holidays_base(self):
-        for name in ("DateLike", "HolidayBase", "HolidaySum"):
+        for name in ("DateLike", "HolidayBase", "HolidaySourceConfig", "HolidaySum"):
             self.assertImport(name)
 
     def test_utils(self):

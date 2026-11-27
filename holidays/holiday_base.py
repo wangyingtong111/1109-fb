@@ -10,7 +10,7 @@
 #  Website: https://github.com/vacanza/python-holidays
 #  License: MIT (see LICENSE file)
 
-__all__ = ("DateLike", "HolidayBase", "HolidaySum")
+__all__ = ("DateLike", "HolidayBase", "HolidaySourceConfig", "HolidaySum")
 
 import copy
 import re
@@ -20,7 +20,20 @@ from datetime import date, datetime, timedelta, timezone
 from functools import cached_property
 from gettext import gettext, translation
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union, cast
+from typing import (
+    Any,
+    ClassVar,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+    cast,
+    final,
+)
 
 from dateutil.parser import parse
 
@@ -48,6 +61,175 @@ SubstitutedHoliday = Union[
     Tuple[Union[Tuple[int, int, int, int], Tuple[int, int, int, int, int]], ...],
 ]
 YearArg = Union[int, Iterable[int]]
+
+
+@final
+class HolidaySourceConfig(dict):
+    """
+    The parameters a single holiday calendar was created with.
+
+    A configuration keeps the country (or financial market), subdivision,
+    observance (``observed``), language and holiday categories together, so the
+    exact calendar can be re-created later. It behaves like a read-only
+    :class:`dict` (so it is JSON-serializable and comparable to a plain dict)
+    while also exposing its fields as attributes (``config.country``).
+
+    Two configuration objects compare equal when all of these parameters are
+    equal. That is what makes "the same source" detectable in a
+    :class:`HolidaySum` receipt: a calendar added twice with identical
+    parameters is reported as one configuration.
+    """
+
+    __slots__ = ()
+
+    _FIELDS: ClassVar[Tuple[str, ...]] = (
+        "country",
+        "market",
+        "subdiv",
+        "observed",
+        "language",
+        "categories",
+    )
+
+    def __init__(
+        self,
+        country: Optional[str] = None,
+        market: Optional[str] = None,
+        subdiv: Optional[str] = None,
+        observed: bool = True,
+        language: Optional[str] = None,
+        categories: Iterable[str] = (),
+    ) -> None:
+        super().__init__(
+            country=country,
+            market=market,
+            subdiv=subdiv,
+            observed=observed,
+            language=language,
+            categories=tuple(sorted(categories or ())),
+        )
+
+    # Immutable value semantics: block accidental in-place changes so that a
+    # configuration kept in a receipt always describes the calendar it names.
+    def _immutable(self, *args, **kwargs):
+        raise TypeError("HolidaySourceConfig is immutable.")
+
+    __setitem__ = __delitem__ = clear = pop = popitem = setdefault = update = _immutable
+
+    @property
+    def country(self) -> Optional[str]:
+        """The country's ISO 3166-1 alpha-2 code, if this is a country calendar."""
+        return self["country"]
+
+    @property
+    def market(self) -> Optional[str]:
+        """The market's ISO 3166-1 alpha-2 code, if this is a financial calendar."""
+        return self["market"]
+
+    @property
+    def subdiv(self) -> Optional[str]:
+        """The subdivision (as passed in) or None for a whole country/market."""
+        return self["subdiv"]
+
+    @property
+    def observed(self) -> bool:
+        """Whether observed holiday dates were requested."""
+        return self["observed"]
+
+    @property
+    def language(self) -> Optional[str]:
+        """The explicitly requested language or None for the entity default."""
+        return self["language"]
+
+    @property
+    def categories(self) -> Tuple[str, ...]:
+        """The requested holiday categories, sorted for stable comparisons."""
+        return self["categories"]
+
+    @property
+    def entity_code(self) -> Optional[str]:
+        """The country or market code this configuration points at."""
+        return self["country"] or self["market"]
+
+    @property
+    def identity(self) -> Tuple[Any, ...]:
+        """A hashable value identifying this configuration as a source."""
+        return tuple(self[field] for field in self._FIELDS)
+
+    def __hash__(self) -> int:
+        return hash(self.identity)
+
+    def as_dict(self) -> Dict[str, Any]:
+        """Return the configuration as a plain, JSON-serializable dictionary."""
+        # A plain dict view: equal to the config itself, and `json` encodes
+        # the `categories` tuple as an array.
+        return dict(self)
+
+    # Alias kept for convenience/parity with common (de)serialization code.
+    to_dict = as_dict
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}({self.as_dict()})"
+
+    def __reduce__(self):
+        # Support pickling despite the immutable dict interface.
+        return (
+            self.__class__,
+            (
+                self.country,
+                self.market,
+                self.subdiv,
+                self.observed,
+                self.language,
+                self.categories,
+            ),
+        )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "HolidaySourceConfig":
+        """Rebuild a configuration from :meth:`as_dict` output."""
+        return cls(
+            country=data.get("country"),
+            market=data.get("market"),
+            subdiv=data.get("subdiv"),
+            observed=data.get("observed", True),
+            language=data.get("language"),
+            categories=tuple(data.get("categories") or ()),
+        )
+
+    def create(self, years: Optional[YearArg] = None, expand: bool = True) -> "HolidayBase":
+        """
+        Create a fresh holiday calendar matching this configuration.
+
+        :param years:
+            The year(s) to pre-calculate public holidays for.
+
+        :param expand:
+            Whether the entire year is calculated when one date from that year
+            is requested.
+
+        :return:
+            A new :class:`HolidayBase` object.
+        """
+        # Imported lazily to avoid a circular import: holidays.utils imports
+        # HolidayBase from this module.
+        from holidays.utils import country_holidays, financial_holidays
+
+        kwargs: Dict[str, Any] = {
+            "subdiv": self.subdiv,
+            "years": years,
+            "expand": expand,
+            "observed": self.observed,
+            "language": self.language,
+        }
+        if self.market:
+            return financial_holidays(self.market, **kwargs)
+        if self.country:
+            return country_holidays(self.country, categories=self.categories or None, **kwargs)
+        raise ValueError(
+            "Cannot create a holiday calendar: the source configuration has "
+            "neither a country nor a market code."
+        )
 
 
 class HolidayBase(Dict[date, str]):
@@ -680,6 +862,92 @@ class HolidayBase(Dict[date, str]):
     def _sorted_categories(self):
         return sorted(self.categories)
 
+    def _get_source_config(self) -> Optional[HolidaySourceConfig]:
+        """Build the source configuration describing this single calendar."""
+        country = getattr(self, "country", None)
+        market = getattr(self, "market", None)
+        if not isinstance(country, str):
+            country = None
+        if not isinstance(market, str):
+            market = None
+        if not country and not market:
+            return None
+
+        subdiv = self.subdiv if isinstance(self.subdiv, str) else None
+        if subdiv is not None:
+            # Report the actual subdivision, not a spelling alias of it.
+            subdiv = self.subdivisions_aliases.get(subdiv, subdiv)
+        return HolidaySourceConfig(
+            country=country,
+            market=market,
+            subdiv=subdiv,
+            observed=bool(self.observed),
+            language=self.language,
+            categories=tuple(self.categories),
+        )
+
+    @property
+    def source_config(self) -> Optional[HolidaySourceConfig]:
+        """The configuration this single calendar was created with.
+
+        Returns None for a bare :class:`HolidayBase` without an entity code.
+        """
+        return self._get_source_config()
+
+    @property
+    def source_configs(self) -> Tuple[HolidaySourceConfig, ...]:
+        """The source configuration(s) of this calendar.
+
+        A regular calendar always has exactly one configuration (or none for a
+        bare :class:`HolidayBase`). :class:`HolidaySum` overrides this to
+        report every source it was built from.
+        """
+        config = self._get_source_config()
+        return (config,) if config is not None else ()
+
+    @classmethod
+    def from_source_configs(
+        cls,
+        configs: Union["HolidayBase", Iterable[Union[HolidaySourceConfig, Mapping[str, Any]]]],
+        years: Optional[YearArg] = None,
+        expand: bool = True,
+    ) -> "HolidayBase":
+        """Rebuild a calendar (or a sum of calendars) from source configurations.
+
+        :param configs:
+            The source configurations to re-create, e.g. read back from
+            :attr:`HolidaySum.source_configs`. Plain dictionaries (as produced
+            by :meth:`HolidaySourceConfig.as_dict`) are accepted too, so a
+            receipt can round-trip through JSON.
+
+        :param years:
+            The year(s) to pre-calculate public holidays for.
+
+        :param expand:
+            Whether the entire year is calculated when one date from that year
+            is requested.
+
+        :return:
+            A single :class:`HolidayBase` object for one configuration, or a
+            :class:`HolidaySum` joining them when there is more than one.
+        """
+        if isinstance(configs, HolidayBase):
+            configs = configs.source_configs
+
+        calendars = []
+        for config in configs:
+            if not isinstance(config, HolidaySourceConfig):
+                config = HolidaySourceConfig.from_dict(config)
+            calendars.append(config.create(years=years, expand=expand))
+
+        if not calendars:
+            return cls(years=years, expand=expand)
+
+        combined = calendars[0]
+        for calendar in calendars[1:]:
+            combined = combined + calendar
+        return combined
+
     @classmethod
     def get_subdivision_aliases(cls) -> Dict[str, List]:
         """Get subdivision aliases."""
@@ -1031,6 +1299,13 @@ class HolidaySum(HolidayBase):
     :attr:`country` and :attr:`subdiv` attributes are added
     together and could become :class:`list` s. Holiday names, when different,
     are merged. All years are calculated (expanded) for all operands.
+
+    The flattened :attr:`country` and :attr:`subdiv` attributes lose the
+    correspondence between a country and its subdivision (``US`` + ``CA`` +
+    ``ON`` cannot tell a US/ON pair from a CA/ON one). Use
+    :attr:`source_configs` to recover the actual configuration of every
+    calendar that was added, in first-occurrence order. Identical calendars are
+    reported once, as the same source.
     """
 
     country: Union[str, List[str]]  # type: ignore[assignment]
@@ -1121,7 +1396,49 @@ country_holidays('CA') + country_holidays('MX')
 
         HolidayBase.__init__(self, **kwargs)
 
+    def _get_source_config(self) -> Optional[HolidaySourceConfig]:
+        # A HolidaySum has no single country/subdivision of its own: its
+        # flattened `country`/`subdiv` attributes are unions of unrelated
+        # values and must never be turned back into a made-up configuration.
+        return None
+
+    @property
+    def source_config(self) -> Optional[HolidaySourceConfig]:
+        """The single source configuration, or None if there isn't exactly one."""
+        configs = self.source_configs
+        return configs[0] if len(configs) == 1 else None
+
+    @property
+    def source_configs(self) -> Tuple[HolidaySourceConfig, ...]:
+        """The distinct source configurations, in first-occurrence order.
+
+        Each entry keeps the country (or market), subdivision, language and
+        observance rules of one actual calendar. A calendar added more than
+        once with identical parameters is reported only once, as the same
+        source.
+        """
+        configs: List[HolidaySourceConfig] = []
+        seen: Set[HolidaySourceConfig] = set()
+        for operand in self.holidays:
+            for config in operand.source_configs:
+                if config in seen:
+                    continue
+                seen.add(config)
+                configs.append(config)
+        return tuple(configs)
+
     def _populate(self, year):
         for operand in self.holidays:
-            operand._populate(year)
-            self.update(cast("Dict[DateLike, str]", operand))
+            # Each operand may already have populated this year (e.g. when it
+            # was created with `years`), keep that work instead of re-adding
+            # its holidays to the sum.
+            if year not in operand.years:
+                operand.years.add(year)
+                operand._populate(year)
+            # Merge one holiday name at a time: `HolidayBase.__setitem__`
+            # deduplicates names, so re-adding the same source (or another
+            # source sharing a holiday name) never duplicates it.
+            for dt, holiday_names in cast("Dict[date, str]", operand).items():
+                for holiday_name in holiday_names.split(HOLIDAY_NAME_DELIMITER):
+                    if holiday_name:
+                        self[dt] = holiday_name

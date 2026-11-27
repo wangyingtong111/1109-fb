@@ -18,7 +18,8 @@ from datetime import timedelta as td
 from holidays.calendars.gregorian import JAN, FEB, OCT, DEC, MON, TUE, SAT, SUN
 from holidays.constants import HOLIDAY_NAME_DELIMITER, OPTIONAL, PUBLIC, SCHOOL
 from holidays.groups.custom import StaticHolidays
-from holidays.holiday_base import HolidayBase
+from holidays.holiday_base import HolidayBase, HolidaySourceConfig
+from holidays.utils import country_holidays
 
 
 class EntityStubStaticHolidays:
@@ -638,6 +639,144 @@ class TestHolidaySum(unittest.TestCase):
         self.hb_combined = sum(CountryStub1(subdiv=subdiv) for subdiv in CountryStub1.subdivisions)
         self.assertEqual(self.hb_combined.country, CountryStub1.country)
         self.assertEqual(self.hb_combined.subdiv, list(CountryStub1.subdivisions))
+
+
+class TestSourceConfigs(unittest.TestCase):
+    """The configuration receipt of single calendars and their sums."""
+
+    def test_single_calendar(self):
+        config = CountryStub1(years=2021, subdiv="Subdiv 1", observed=False).source_config
+
+        self.assertIsNotNone(config)
+        self.assertEqual(config.country, "CS1")
+        self.assertIsNone(config.market)
+        self.assertEqual(config.subdiv, "Subdiv 1")
+        self.assertFalse(config.observed)
+        self.assertIsNone(config.language)
+        self.assertEqual(config.categories, (PUBLIC,))
+
+        # A configuration behaves both as an attribute holder and a mapping.
+        self.assertEqual(config["country"], "CS1")
+        self.assertEqual(config["subdiv"], "Subdiv 1")
+        self.assertEqual(dict(config)["observed"], False)
+
+        # Reading the receipt twice yields the same configuration.
+        hb = CountryStub1(subdiv="Subdiv 1", observed=False)
+        self.assertEqual(hb.source_config, hb.source_config)
+        self.assertTupleEqual(hb.source_configs, (hb.source_config,))
+
+    def test_bare_holiday_base_has_no_source(self):
+        self.assertIsNone(HolidayBase().source_config)
+        self.assertTupleEqual(HolidayBase().source_configs, ())
+
+    def test_aliases_are_normalized(self):
+        # "S1" is an alias of "Subdiv 1": both describe the same source.
+        self.assertEqual(
+            CountryStub1(subdiv="S1").source_config,
+            CountryStub1(subdiv="Subdiv 1").source_config,
+        )
+
+    def test_market_calendar(self):
+        config = MarketStub1(years=2021).source_config
+        self.assertIsNone(config.country)
+        self.assertEqual(config.market, "MS1")
+        self.assertEqual(config.entity_code, "MS1")
+
+    def test_sum_keeps_actual_pairs(self):
+        # One subdivision can be used with more than one rules configuration.
+        plain = country_holidays("US", subdiv="CA", observed=False, years=2021)
+        other = country_holidays("CA", subdiv="ON", years=2021)
+        observed = country_holidays("US", subdiv="CA", observed=True, years=2021)
+
+        combined = (plain + other) + observed
+        configs = combined.source_configs
+
+        self.assertEqual(len(configs), 3)
+        self.assertTupleEqual(
+            tuple((c.country, c.subdiv, c.observed) for c in configs),
+            (
+                ("US", "CA", False),
+                ("CA", "ON", True),
+                ("US", "CA", True),
+            ),
+        )
+        # Both configurations of the same subdivision are kept apart.
+        self.assertNotEqual(configs[0], configs[2])
+
+        # The flattened fields must not be recombined into invented sources.
+        pairs = {(c.country, c.subdiv) for c in configs}
+        self.assertSetEqual(pairs, {("US", "CA"), ("CA", "ON")})
+        self.assertNotIn(("US", "ON"), pairs)
+        self.assertNotIn(("CA", "CA"), pairs)
+
+        # A sum of distinct sources has no single configuration.
+        self.assertIsNone(combined.source_config)
+
+    def test_identical_sources_collapse(self):
+        plain = country_holidays("US", subdiv="CA", observed=False, years=2021)
+        same_content = country_holidays("US", subdiv="CA", observed=False, years=2021)
+        other = country_holidays("CA", subdiv="ON", years=2021)
+
+        configs = ((plain + other) + (same_content + other)).source_configs
+
+        self.assertEqual(len(configs), 2)
+        self.assertTupleEqual(
+            tuple((c.country, c.subdiv, c.observed) for c in configs),
+            (("US", "CA", False), ("CA", "ON", True)),
+        )
+        # Identical entries point at the same configuration value.
+        self.assertEqual(configs[0], plain.source_config)
+        self.assertEqual(configs[1], other.source_config)
+
+    def test_sum_of_identical_sources(self):
+        hb = country_holidays("US", subdiv="CA", observed=False, years=2021)
+        combined = hb + hb
+
+        self.assertEqual(len(combined.source_configs), 1)
+        self.assertEqual(combined.source_configs[0], hb.source_config)
+        # A single distinct source is exposed as the sum's configuration.
+        self.assertEqual(combined.source_config, hb.source_config)
+
+    def test_rebuild_from_receipt(self):
+        plain = country_holidays("US", subdiv="CA", observed=False, years=2021)
+        other = country_holidays("CA", subdiv="ON", years=2021)
+        observed = country_holidays("US", subdiv="CA", observed=True, years=2021)
+        combined = (plain + other) + (observed + other)
+
+        # Make sure the holidays are actually materialized before rebuilding.
+        combined.get("2021-12-31")
+        rebuilt = HolidayBase.from_source_configs(combined.source_configs, years=2021)
+
+        self.assertDictEqual(dict(combined), dict(rebuilt))
+        self.assertTupleEqual(rebuilt.source_configs, combined.source_configs)
+
+    def test_rebuild_from_sum(self):
+        plain = country_holidays("US", subdiv="CA", observed=False, years=2021)
+        combined = plain + country_holidays("CA", subdiv="ON", years=2021)
+
+        rebuilt = HolidayBase.from_source_configs(combined, years=2021)
+        self.assertDictEqual(dict(combined), dict(rebuilt))
+
+    def test_dict_round_trip(self):
+        plain = country_holidays("US", subdiv="CA", observed=False, years=2021)
+        observed = country_holidays("US", subdiv="CA", observed=True, years=2021)
+        combined = plain + observed
+
+        receipt = [config.as_dict() for config in combined.source_configs]
+        rebuilt = HolidayBase.from_source_configs(receipt, years=2021)
+
+        self.assertDictEqual(dict(combined), dict(rebuilt))
+        self.assertListEqual([config.as_dict() for config in rebuilt.source_configs], receipt)
+
+    def test_configuration_is_immutable(self):
+        config = CountryStub1(subdiv="Subdiv 1").source_config
+        self.assertRaises(TypeError, lambda: config.update({"observed": False}))
+        self.assertRaises(TypeError, lambda: config.__setitem__("observed", False))
+
+    def test_invalid_configuration(self):
+        self.assertRaises(
+            ValueError, lambda: HolidaySourceConfig(observed=False).create()
+        )
 
 
 class TestInheritance(unittest.TestCase):
