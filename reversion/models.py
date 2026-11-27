@@ -188,12 +188,18 @@ class VersionQuerySet(models.QuerySet):
         return self.get_for_model(model, model_db=model_db).filter(pk__in=subquery)
 
     def get_unique(self):
-        last_key = None
+        # Collapse consecutive unchanged snapshots independently for each object.
+        # Versions of different objects (or the same object in different source
+        # databases) may be interleaved, so duplicates are only collapsed when
+        # the immediately preceding version of the *same* object has identical
+        # serialized fields. The queryset's ordering is preserved.
+        last_field_dict_by_object = {}
         for version in self.iterator():
-            key = (version.object_id, version.content_type_id, version.db, version._local_field_dict)
-            if last_key != key:
+            object_key = (version.object_id, version.content_type_id, version.db)
+            field_dict = version._local_field_dict
+            if last_field_dict_by_object.get(object_key) != field_dict:
                 yield version
-            last_key = key
+            last_field_dict_by_object[object_key] = field_dict
 
 
 class Version(models.Model):

@@ -3,6 +3,12 @@
 django-reversion changelog
 ==========================
 
+6.5.3 - 2026-11-28
+------------------
+
+- Fixed ``Version.objects.get_unique()`` so that consecutive unchanged snapshots are collapsed independently per object. Interleaved records for different objects no longer interfere with each other, the queryset ordering is preserved, values that return after a change are shown again, and the same primary key in different source databases is compared separately.
+
+
 6.5.2 - 2026-11-12
 ------------------
 

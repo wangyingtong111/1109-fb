@@ -387,6 +387,8 @@ A ``QuerySet`` of :ref:`Version`. The results are ordered with the most recent :
 
     Returns an iterable of :ref:`Version`, where each version is unique for a given database, model instance, and set of serialized fields.
 
+    Consecutive versions with identical serialized fields for the *same* object are collapsed into the first version of the run. Versions of different objects may be interleaved: each object's history is collapsed independently, without re-ordering the queryset. A value that returns after being changed is always shown again, even if it appeared earlier. The same primary key stored in a different source database is treated as a separate object and compared independently.
+
 
 .. _Version:
 

@@ -106,6 +106,106 @@ class GetForObjectUniqueTest(TestModelMixin, TestBase):
         self.assertEqual(len(list(Version.objects.get_for_object(obj).get_unique())), 2)
 
 
+class GetUniqueInterleavedTest(TestModelMixin, TestBase):
+
+    def _get_unique_names(self):
+        # Version.Meta orders by -pk, so re-order chronologically (oldest first)
+        # to describe the timeline in the order the snapshots were created.
+        versions = Version.objects.get_for_model(TestModel).order_by("pk").get_unique()
+        return [
+            (version.object_id, version.field_dict["name"])
+            for version in versions
+        ]
+
+    def testGetUniqueOnlyCollapsesConsecutiveVersionsOfSameObject(self):
+        # Timeline: A:x, B:y, A:x, A:z, A:x
+        # Only the second A:x (consecutive to the first A:x for object A) is
+        # collapsed. The final return to x is still shown, and records are not
+        # re-ordered by object.
+        with reversion.create_revision():
+            obj_a = TestModel.objects.create(name="x")
+        with reversion.create_revision():
+            obj_b = TestModel.objects.create(name="y")
+        with reversion.create_revision():
+            obj_a.save()
+        with reversion.create_revision():
+            obj_a.name = "z"
+            obj_a.save()
+        with reversion.create_revision():
+            obj_a.name = "x"
+            obj_a.save()
+        self.assertEqual(self._get_unique_names(), [
+            (str(obj_a.pk), "x"),
+            (str(obj_b.pk), "y"),
+            (str(obj_a.pk), "z"),
+            (str(obj_a.pk), "x"),
+        ])
+
+    def testGetUniqueDoesNotCollapseAcrossDifferentObjects(self):
+        # An interleaved object must never reset or trigger the collapse for
+        # another object, and equal field values on different objects are kept.
+        with reversion.create_revision():
+            obj_a = TestModel.objects.create(name="x")
+        with reversion.create_revision():
+            obj_b = TestModel.objects.create(name="x")
+        with reversion.create_revision():
+            obj_a.save()
+        with reversion.create_revision():
+            obj_b.save()
+        self.assertEqual(self._get_unique_names(), [
+            (str(obj_a.pk), "x"),
+            (str(obj_b.pk), "x"),
+        ])
+
+    def testGetUniquePreservesQuerysetOrdering(self):
+        with reversion.create_revision():
+            obj_a = TestModel.objects.create(name="x")
+        with reversion.create_revision():
+            obj_b = TestModel.objects.create(name="y")
+        with reversion.create_revision():
+            obj_a.save()
+        versions = list(Version.objects.get_for_model(TestModel).order_by("-pk").get_unique())
+        self.assertEqual(
+            [version.pk for version in versions],
+            sorted((version.pk for version in versions), reverse=True),
+        )
+
+
+class GetUniqueDatabaseTest(TestModelMixin, TestBase):
+    databases = {"default", "postgres"}
+
+    def testGetUniqueTreatsSameObjectInDifferentDatabasesSeparately(self):
+        # The same primary key in a different source database is a distinct
+        # history: consecutive matching snapshots are compared per (object, db),
+        # never merged across databases.
+        with reversion.create_revision(using="default"):
+            obj = TestModel.objects.using("default").create(name="x")
+        with reversion.create_revision(using="postgres"):
+            obj_pg = TestModel.objects.using("postgres").create(name="x")
+        with reversion.create_revision(using="default"):
+            obj.save()
+        with reversion.create_revision(using="postgres"):
+            obj_pg.save()
+        default_versions = list(
+            Version.objects.using("default").get_for_model(TestModel).order_by("pk").get_unique()
+        )
+        postgres_versions = list(
+            Version.objects.using("postgres").get_for_model(
+                TestModel, model_db="postgres"
+            ).order_by("pk").get_unique()
+        )
+        # Each database collapses its own consecutive duplicate.
+        self.assertEqual(len(default_versions), 1)
+        self.assertEqual(default_versions[0].db, "default")
+        self.assertEqual(len(postgres_versions), 1)
+        self.assertEqual(postgres_versions[0].db, "postgres")
+        # But the two histories remain independently identifiable.
+        self.assertNotEqual(
+            default_versions[0].db,
+            postgres_versions[0].db,
+        )
+
+
 class GetForObjectReferenceTest(TestModelMixin, TestBase):
 
     def testGetForObjectReference(self):
