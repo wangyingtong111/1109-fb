@@ -19,6 +19,12 @@ from holidays.calendars.gregorian import JAN, FEB, OCT, DEC, MON, TUE, SAT, SUN
 from holidays.constants import HOLIDAY_NAME_DELIMITER, OPTIONAL, PUBLIC, SCHOOL
 from holidays.groups.custom import StaticHolidays
 from holidays.holiday_base import HolidayBase
+from holidays.observed_holiday_base import (
+    SAT_TO_PREV_WORKDAY,
+    SUN_TO_NEXT_MON,
+    SUN_TO_NEXT_WORKDAY,
+    ObservedHolidayBase,
+)
 
 
 class EntityStubStaticHolidays:
@@ -1092,3 +1098,165 @@ class TestSubstitutedHolidays(unittest.TestCase):
             substituted_date_format = "%d/%m/%Y"
 
         self.assertRaises(ValueError, lambda: self.CountryStub(SubstitutedHolidays))
+
+
+class CrossYearClosingHolidays(ObservedHolidayBase):
+    """Sunday closing days are moved to the next available workday,
+    possibly into the next calendar year."""
+
+    country = "CY"
+    observed_label = "%s (observed)"
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("observed_rule", SUN_TO_NEXT_WORKDAY)
+        kwargs.setdefault("cross_year", True)
+        super().__init__(*args, **kwargs)
+
+    def _populate(self, year: int) -> None:
+        super()._populate(year)
+        # January 1 is always a closing day.
+        self._add_holiday("New Year's Day", JAN, 1)
+        # December 31 is a closing day that is observed when it falls on Sunday.
+        self._add_observed(self._add_holiday("Year-end Closing Day", DEC, 31))
+
+
+class SameYearClosingHolidays(CrossYearClosingHolidays):
+    """The historical non-cross-year variant for backward-compatibility checks."""
+
+    country = "CY0"
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("observed_rule", SUN_TO_NEXT_MON)
+        kwargs["cross_year"] = False
+        ObservedHolidayBase.__init__(self, *args, **kwargs)
+
+
+class TestCrossYearObservedHolidays(unittest.TestCase):
+    """A closing day on a weekend is postponed to the next workday even when
+    that workday is in the next calendar year."""
+
+    # 2023-12-31 is Sunday and 2024-01-01 is a closing day, so the observed
+    # date must be Tuesday 2024-01-02.
+    def test_observed_crosses_year_boundary(self):
+        old_year = CrossYearClosingHolidays(years=2023)
+
+        self.assertIn(date(2023, 12, 31), old_year)
+        self.assertIn(date(2024, 1, 2), old_year)
+        self.assertEqual(
+            old_year.get(date(2024, 1, 2)), "Year-end Closing Day (observed)"
+        )
+
+    def test_new_year_calendar_contains_back_filled_observed(self):
+        new_year = CrossYearClosingHolidays(years=2024)
+
+        self.assertIn(date(2024, 1, 1), new_year)
+        self.assertIn(date(2024, 1, 2), new_year)
+        self.assertEqual(
+            new_year.get(date(2024, 1, 2)), "Year-end Closing Day (observed)"
+        )
+
+    def test_querying_either_year_gives_the_same_result(self):
+        old_year = CrossYearClosingHolidays(years=2023)
+        new_year = CrossYearClosingHolidays(years=2024)
+
+        self.assertEqual(
+            old_year.get(date(2024, 1, 2)), new_year.get(date(2024, 1, 2))
+        )
+
+    def test_original_closing_day_is_traceable(self):
+        old_year = CrossYearClosingHolidays(years=2023)
+
+        self.assertEqual(old_year.get(date(2023, 12, 31)), "Year-end Closing Day")
+        self.assertIn(
+            "Year-end Closing Day (observed)", old_year.get_list(date(2024, 1, 2))
+        )
+
+    def test_lazy_expansion_old_then_new_year(self):
+        holidays = CrossYearClosingHolidays()
+
+        self.assertIn(date(2023, 12, 31), holidays)
+        self.assertIn(date(2024, 1, 2), holidays)
+
+    def test_lazy_expansion_new_then_old_year(self):
+        holidays = CrossYearClosingHolidays()
+
+        self.assertIn(date(2024, 1, 2), holidays)
+        self.assertIn(date(2023, 12, 31), holidays)
+
+    def test_multi_year_instance(self):
+        holidays = CrossYearClosingHolidays(years=(2023, 2024))
+
+        self.assertIn(date(2023, 12, 31), holidays)
+        self.assertIn(date(2024, 1, 2), holidays)
+        self.assertEqual(
+            holidays.get(date(2024, 1, 2)), "Year-end Closing Day (observed)"
+        )
+
+    def test_observed_disabled(self):
+        holidays = CrossYearClosingHolidays(years=2023, observed=False)
+
+        self.assertNotIn(date(2024, 1, 2), holidays)
+        self.assertIn(date(2023, 12, 31), holidays)
+
+    def test_non_cross_year_mode_keeps_historical_behavior(self):
+        holidays = SameYearClosingHolidays(years=2023)
+
+        # The observed date would be 2024-01-01 but must be dropped: only
+        # dates of the populated year are kept.
+        self.assertEqual({2023}, {dt.year for dt in dict.keys(holidays)})
+        self.assertNotIn(date(2024, 1, 1), dict.keys(holidays))
+        self.assertNotIn(date(2024, 1, 2), dict.keys(holidays))
+
+    def test_consecutive_closing_days_are_skipped(self):
+        class TwoClosingDays(CrossYearClosingHolidays):
+            def _populate(self, year: int) -> None:
+                ObservedHolidayBase._populate(self, year)
+                self._add_holiday("New Year's Day", JAN, 1)
+                self._add_holiday("Second Closing Day", JAN, 2)
+                self._add_observed(
+                    self._add_holiday("Year-end Closing Day", DEC, 31)
+                )
+
+        holidays = TwoClosingDays(years=2023)
+
+        self.assertIn(date(2024, 1, 3), holidays)
+        self.assertEqual(
+            holidays.get(date(2024, 1, 3)), "Year-end Closing Day (observed)"
+        )
+
+    def test_pickle_round_trip(self):
+        holidays = CrossYearClosingHolidays(years=2023, expand=False)
+        restored = pickle.loads(pickle.dumps(holidays))
+
+        self.assertEqual(holidays, restored)
+        self.assertEqual(
+            restored.get(date(2024, 1, 2)), "Year-end Closing Day (observed)"
+        )
+
+    def test_backward_observed_crosses_year_boundary(self):
+        class BackwardClosingHolidays(ObservedHolidayBase):
+            country = "CYB"
+            observed_label = "%s (observed)"
+
+            def __init__(self, *args, **kwargs):
+                kwargs.setdefault("observed_rule", SAT_TO_PREV_WORKDAY)
+                kwargs.setdefault("cross_year", True)
+                super().__init__(*args, **kwargs)
+
+            def _populate(self, year: int) -> None:
+                super()._populate(year)
+                # January 1 is observed on the previous workday when Saturday.
+                self._add_observed(self._add_holiday("New Year's Day", JAN, 1))
+
+        # 2022-01-01 is Saturday, so it is observed on Friday 2021-12-31.
+        current = BackwardClosingHolidays(years=2022)
+        previous = BackwardClosingHolidays(years=2021)
+
+        self.assertIn(date(2021, 12, 31), current)
+        self.assertIn(date(2021, 12, 31), previous)
+        self.assertEqual(
+            current.get(date(2021, 12, 31)), "New Year's Day (observed)"
+        )
+        self.assertEqual(
+            current.get(date(2021, 12, 31)), previous.get(date(2021, 12, 31))
+        )
