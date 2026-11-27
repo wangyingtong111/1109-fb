@@ -351,7 +351,8 @@ def as_serializer_error(exc):
 
 class Serializer(BaseSerializer, metaclass=SerializerMetaclass):
     default_error_messages = {
-        'invalid': _('Invalid data. Expected a dictionary, but got {datatype}.')
+        'invalid': _('Invalid data. Expected a dictionary, but got {datatype}.'),
+        'conflict': _('Received conflicting values for "{source}".')
     }
 
     def set_value(self, dictionary, keys, value):
@@ -490,6 +491,150 @@ class Serializer(BaseSerializer, metaclass=SerializerMetaclass):
             to_validate = value
         super().run_validators(to_validate)
 
+    @staticmethod
+    def _iter_source_leaves(value, path=()):
+        """
+        Yield `(path, value)` pairs for validated input data.
+
+        Mappings are expanded so that a field targeting a nested source (for
+        example `source='location'`) and a field targeting a leaf of that
+        source (for example `source='location.name'`) are reconciled at the
+        same level. Non-mapping values, and empty mappings, are treated as
+        leaves.
+
+        A `source='*'` field has an empty path and receives the entire
+        object, so its value is kept whole and merged as before.
+        """
+        stack = [(path, value)]
+        while stack:
+            current_path, current = stack.pop()
+            if current_path and isinstance(current, Mapping) and current:
+                stack.extend(
+                    (current_path + (key,), item)
+                    for key, item in reversed(list(current.items()))
+                )
+            else:
+                yield current_path, current
+
+    def _reconcile_source_values(self, contributions):
+        """
+        Combine validated values from fields that map onto the same source.
+
+        `contributions` is a list of `(field, path, value, explicit)` tuples,
+        where `explicit` is False when the value came from a field default
+        rather than from the submitted representation. Values targeting the
+        same path are written once when they agree, and are reported as a
+        conflict on every field involved when they disagree. A value that was
+        actually submitted always wins over an omitted field's default.
+
+        Returns a tuple of `(validated_data, conflict_errors)`. The outcome
+        does not depend on the order in which fields were declared, or on the
+        order in which they were validated.
+        """
+        leaves = defaultdict(list)
+        for field, path, value, explicit in contributions:
+            if path:
+                leaves[path].append((field, value, explicit))
+
+        # A default only fills in a representation that the input omitted, so
+        # it never competes with a value the caller actually submitted.
+        for path, entries in list(leaves.items()):
+            submitted = [entry for entry in entries if entry[2]]
+            if submitted:
+                leaves[path] = submitted
+
+        def descendant_paths(current_leaves):
+            found = defaultdict(set)
+            for path in current_leaves:
+                for index in range(len(path)):
+                    found[path[:index]].add(path)
+            return found
+
+        descendants = descendant_paths(leaves)
+
+        # A default for a parent path defers to children that were submitted,
+        # for example a nested `location` default alongside `site`.
+        for path in list(leaves):
+            if path in descendants and not any(
+                explicit for _, _, explicit in leaves[path]
+            ):
+                del leaves[path]
+
+        descendants = descendant_paths(leaves)
+        conflicting_paths = set()
+
+        # Values written to the very same path must agree.
+        for path, entries in leaves.items():
+            first = entries[0][1]
+            if any(value != first for _, value, _ in entries[1:]):
+                conflicting_paths.add(path)
+
+        # A field that submits a non-mapping value cannot coexist with fields
+        # writing beneath that path. An empty mapping is not a value of its
+        # own, so it defers to the fields targeting its children.
+        for path in leaves.keys() & descendants.keys():
+            if any(
+                explicit and not isinstance(value, Mapping)
+                for _, value, explicit in leaves[path]
+            ):
+                conflicting_paths.add(path)
+
+        conflict_errors = {}
+        for path in sorted(
+            conflicting_paths,
+            key=lambda item: tuple(str(key) for key in item),
+        ):
+            source = '.'.join(str(key) for key in path)
+            message = self.error_messages['conflict'].format(source=source)
+            detail = ErrorDetail(message, code='conflict')
+
+            involved = [path]
+            involved.extend(
+                path[:index]
+                for index in range(len(path))
+                if path[:index] in leaves
+            )
+            involved.extend(sorted(
+                descendants.get(path, ()),
+                key=lambda item: tuple(str(key) for key in item),
+            ))
+
+            for involved_path in involved:
+                for field, _, _ in leaves[involved_path]:
+                    field_errors = conflict_errors.setdefault(
+                        field.field_name, []
+                    )
+                    if detail not in field_errors:
+                        field_errors.append(detail)
+
+        # Decide what each reconciled path writes. A path nested below another
+        # write, or below a conflict, is covered by its ancestor.
+        resolved = {}
+        for path, entries in leaves.items():
+            if any(
+                path[:index] in conflicting_paths
+                for index in range(len(path) + 1)
+            ):
+                continue
+            value = entries[0][1]
+            if isinstance(value, Mapping) and not value and path in descendants:
+                # The children of an empty mapping define the value instead.
+                continue
+            resolved[path] = value
+
+        # Write in declaration order, so that `source='*'` fields keep their
+        # established merge behaviour alongside the reconciled paths.
+        ret = {}
+        written = set()
+        for _, path, value, _ in contributions:
+            if not path:
+                self.set_value(ret, [], value)
+            elif path in resolved and path not in written:
+                self.set_value(ret, list(path), resolved[path])
+                written.add(path)
+
+        return ret, conflict_errors
+
     def to_internal_value(self, data):
         """
         Dict of native values <- Dict of primitive datatypes.
@@ -502,9 +647,9 @@ class Serializer(BaseSerializer, metaclass=SerializerMetaclass):
                 api_settings.NON_FIELD_ERRORS_KEY: [message]
             }, code='invalid')
 
-        ret = {}
         errors = {}
         fields = self._writable_fields
+        contributions = []
 
         for field in fields:
             validate_method = getattr(self, 'validate_' + field.field_name, None)
@@ -520,7 +665,17 @@ class Serializer(BaseSerializer, metaclass=SerializerMetaclass):
             except SkipField:
                 pass
             else:
-                self.set_value(ret, field.source_attrs, validated_value)
+                explicit = primitive_value is not empty
+                contributions.extend(
+                    (field, path, value, explicit)
+                    for path, value in self._iter_source_leaves(
+                        validated_value, tuple(field.source_attrs)
+                    )
+                )
+
+        ret, conflict_errors = self._reconcile_source_values(contributions)
+        for field_name, details in conflict_errors.items():
+            errors.setdefault(field_name, []).extend(details)
 
         if errors:
             raise ValidationError(errors)

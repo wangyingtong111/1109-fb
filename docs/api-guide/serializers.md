@@ -279,11 +279,32 @@ By default, serializers must be passed values for all required fields or they wi
     # Update `comment` with partial data
     serializer = CommentSerializer(comment, data={'content': 'foo bar'}, partial=True)
 
+### Fields sharing a source
+
+More than one writable field may map onto the same source, for example a flat alias alongside a nested representation:
+
+    class LocationSerializer(serializers.Serializer):
+        name = serializers.CharField()
+        room = serializers.CharField(required=False)
+
+    class BookingSerializer(serializers.Serializer):
+        site = serializers.CharField(source='location.name')
+        location = LocationSerializer()
+
+When input overlaps, the values are merged rather than overwriting each other, and the result does not depend on the order the fields were declared in:
+
+* If every field writing the same source agrees on the value, it is written once. With `site='East'` and `location={'name': 'East', 'room': '7'}`, the validated data is `{'location': {'name': 'East', 'room': '7'}}`.
+* If the values disagree, a `conflict` error is raised on **each** of the fields involved, so `site='East'` with `location={'name': 'West'}` reports an error on both `site` and `location`.
+* A non-mapping value cannot be combined with a value written beneath the same source.
+
+Supplying only one of the representations follows the usual input rules, including `required`, and on a partial update any representation that is omitted is left untouched.
+
 ### Dealing with nested objects
 
 The previous examples are fine for dealing with objects that only have simple datatypes, but sometimes we also need to be able to represent more complex objects, where some of the attributes of an object might not be simple datatypes such as strings, dates or integers.
 
 The `Serializer` class is itself a type of `Field`, and can be used to represent relationships where one object type is nested inside another.
+
 
     class UserSerializer(serializers.Serializer):
         email = serializers.EmailField()

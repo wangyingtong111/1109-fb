@@ -799,6 +799,131 @@ class TestSetValueMethod:
         assert ret == {'a': 1, 'x': {'y': 2}}
 
 
+class TestSameSourceReconciliation:
+    """
+    Two fields may legitimately map onto the same source, for example a flat
+    `site` alias and a nested `location` representation both writing
+    `location.name`. Overlapping input needs a single, order-independent
+    contract.
+    """
+
+    def make_serializers(self):
+        class LocationSerializer(serializers.Serializer):
+            name = serializers.CharField()
+            room = serializers.CharField(required=False)
+
+        class FlatFirstSerializer(serializers.Serializer):
+            site = serializers.CharField(source='location.name')
+            location = LocationSerializer()
+
+        class NestedFirstSerializer(serializers.Serializer):
+            location = LocationSerializer()
+            site = serializers.CharField(source='location.name')
+
+        return FlatFirstSerializer, NestedFirstSerializer
+
+    def test_conflicting_values_report_both_fields(self):
+        FlatFirst, NestedFirst = self.make_serializers()
+        data = {'site': 'East', 'location': {'name': 'West', 'room': '7'}}
+
+        for serializer_class in (FlatFirst, NestedFirst):
+            serializer = serializer_class(data=data)
+            assert not serializer.is_valid()
+            assert set(serializer.errors) == {'site', 'location'}
+
+    def test_conflict_is_order_independent(self):
+        FlatFirst, NestedFirst = self.make_serializers()
+        data = {'site': 'East', 'location': {'name': 'West', 'room': '7'}}
+
+        flat = FlatFirst(data=data)
+        nested = NestedFirst(data=data)
+        assert not flat.is_valid()
+        assert not nested.is_valid()
+        assert flat.errors == nested.errors
+
+    def test_agreeing_values_write_a_single_canonical_value(self):
+        FlatFirst, NestedFirst = self.make_serializers()
+        data = {'site': 'East', 'location': {'name': 'East', 'room': '7'}}
+
+        for serializer_class in (FlatFirst, NestedFirst):
+            serializer = serializer_class(data=data)
+            assert serializer.is_valid()
+            assert serializer.validated_data == {
+                'location': {'name': 'East', 'room': '7'}
+            }
+
+    def test_single_flat_representation_keeps_input_rules(self):
+        FlatFirst, NestedFirst = self.make_serializers()
+
+        flat = FlatFirst(data={'site': 'East'})
+        assert not flat.is_valid()
+        assert flat.errors == {'location': ['This field is required.']}
+
+        nested = NestedFirst(data={'site': 'East'})
+        assert not nested.is_valid()
+        assert nested.errors == {'location': ['This field is required.']}
+
+    def test_single_nested_representation_keeps_input_rules(self):
+        FlatFirst, NestedFirst = self.make_serializers()
+        data = {'location': {'name': 'West', 'room': '7'}}
+
+        for serializer_class in (FlatFirst, NestedFirst):
+            serializer = serializer_class(data=data)
+            assert not serializer.is_valid()
+            assert serializer.errors == {'site': ['This field is required.']}
+
+    def test_partial_update_omitting_a_representation(self):
+        FlatFirst, NestedFirst = self.make_serializers()
+        instance = {'location': {'name': 'Old', 'room': '2'}}
+
+        nested_only = FlatFirst(instance, data={'location': {'room': '7'}}, partial=True)
+        assert nested_only.is_valid()
+        assert nested_only.validated_data == {'location': {'room': '7'}}
+
+        flat_only = NestedFirst(instance, data={'site': 'East'}, partial=True)
+        assert flat_only.is_valid()
+        assert flat_only.validated_data == {'location': {'name': 'East'}}
+
+    def test_partial_update_with_conflicting_values(self):
+        FlatFirst, NestedFirst = self.make_serializers()
+        instance = {'location': {'name': 'Old', 'room': '2'}}
+        data = {'site': 'East', 'location': {'name': 'West'}}
+
+        for serializer_class in (FlatFirst, NestedFirst):
+            serializer = serializer_class(instance, data=data, partial=True)
+            assert not serializer.is_valid()
+            assert set(serializer.errors) == {'site', 'location'}
+
+    def test_conflict_does_not_write_partial_data(self):
+        FlatFirst, NestedFirst = self.make_serializers()
+        data = {'site': 'East', 'location': {'name': 'West', 'room': '7'}}
+
+        for serializer_class in (FlatFirst, NestedFirst):
+            serializer = serializer_class(data=data)
+            assert not serializer.is_valid()
+            assert serializer.validated_data == {}
+
+    def test_non_mapping_value_cannot_share_a_parent_path(self):
+        class FlatSourceSerializer(serializers.Serializer):
+            location = serializers.CharField()
+            site = serializers.CharField(source='location.name')
+
+        serializer = FlatSourceSerializer(data={'location': 'East', 'site': 'East'})
+        assert not serializer.is_valid()
+        assert set(serializer.errors) == {'location', 'site'}
+
+    def test_unrelated_sources_are_untouched(self):
+        class PairSerializer(serializers.Serializer):
+            site = serializers.CharField(source='location.name')
+            city = serializers.CharField(source='location.city')
+
+        serializer = PairSerializer(data={'site': 'East', 'city': 'Paris'})
+        assert serializer.is_valid()
+        assert serializer.validated_data == {
+            'location': {'name': 'East', 'city': 'Paris'}
+        }
+
+
 class TestWarningManyToMany(TestCase):
     def test_warning_many_to_many(self):
         """Tests that using a PrimaryKeyRelatedField for a ManyToMany field breaks with default=None."""
