@@ -65,6 +65,13 @@ ActiveRecord::Schema.define do
     t.column :title, :string
   end
 
+  create_table :restorable_items do |t|
+    t.column :title, :string
+    t.column :required_ref, :string
+  end
+
+  add_index :restorable_items, :required_ref, unique: true
+
   create_table :audits do |t|
     t.column :auditable_id, :integer
     t.column :auditable_type, :string

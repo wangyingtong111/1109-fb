@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "set"
+require "audited/restoration"
 
 module Audited
   # Audit saves the changes to ActiveRecord models.  It has the following attributes:
@@ -93,6 +94,64 @@ module Audited
       end
     end
 
+    # Rebuilds a candidate record from the audit history up to (and including)
+    # this audit without writing anything to the database.
+    #
+    # Attributes that were never audited - for example a column added after the
+    # history was recorded or an attribute excluded from auditing - can be
+    # supplied through +provided_attributes+. Those values are only used to
+    # fill gaps in the historical evidence; an attempt to override an attribute
+    # whose value *is* known from the audits is rejected as a conflict rather
+    # than silently rewriting history.
+    #
+    # Returns an Audited::Restoration describing the candidate, where each
+    # value came from, any conflicts and the result of validating against the
+    # model's current constraints. No record and no audit is created.
+    def restore_preview(provided_attributes = nil)
+      provided = normalize_attributes(provided_attributes)
+
+      historical = self.class.reconstruct_attributes(ancestors)
+      historical = historical.except(*Audited::Restoration::META_ATTRIBUTE_KEYS)
+
+      audit_sourced = {}
+      conflicts = {}
+
+      historical.each do |attr, value|
+        normalized_attr = attr.to_s
+        if provided.key?(normalized_attr) && provided[normalized_attr] != value
+          conflicts[normalized_attr] = [value, provided[normalized_attr]]
+        end
+        audit_sourced[normalized_attr] = value
+      end
+
+      # Operator supplied values may only fill attributes the audits never
+      # recorded; conflicting values are never written onto the candidate.
+      supplied = provided.except(*audit_sourced.keys)
+
+      candidate = build_restoration_candidate(audit_sourced.merge(supplied))
+
+      Audited::Restoration.new(
+        record: candidate,
+        audit: self,
+        audit_sourced_attributes: audit_sourced,
+        provided_attributes: supplied,
+        conflicts: conflicts
+      )
+    end
+
+    # Validates and, when every current constraint passes, restores the record
+    # described by this audit. Accepts the same operator supplied values as
+    # #restore_preview for attributes missing from the audit history.
+    #
+    # Returns the same Audited::Restoration object as a preview would; inspect
+    # +committed?+ or +valid?+ to see what happened. A rejected restore leaves
+    # the original state untouched and creates no audit, while a successful one
+    # saves the record through the normal callbacks and therefore records
+    # exactly one new audit.
+    def restore(provided_attributes = nil)
+      restore_preview(provided_attributes).tap(&:commit)
+    end
+
     # Allows user to undo changes
     def undo
       case action
@@ -173,6 +232,21 @@ module Audited
     end
 
     private
+
+    def normalize_attributes(attributes)
+      return {} if attributes.nil?
+
+      attributes = attributes.to_unsafe_h if attributes.respond_to?(:to_unsafe_h)
+      attributes.each_with_object({}) do |(attr, value), normalized|
+        normalized[attr.to_s] = value
+      end
+    end
+
+    def build_restoration_candidate(attributes)
+      auditable_type.constantize.new.tap do |candidate|
+        self.class.assign_revision_attributes(candidate, attributes)
+      end
+    end
 
     def set_version_number
       if action == "create"

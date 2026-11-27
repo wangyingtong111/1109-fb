@@ -1,5 +1,15 @@
 # Audited ChangeLog
 
+### Unreleased
+
+- Add `Audited::Audit#restore_preview` and `Audited::Audit#restore` for
+  rebuilding a destroyed record from audit history. Values missing from the
+  audits (for example a column that was never audited) can be supplied by the
+  operator, are validated against the model's current constraints in both
+  preview and commit modes, and their provenance is exposed on the returned
+  `Audited::Restoration`. Supplied values that conflict with audited evidence
+  are rejected instead of silently rewriting history.
+
 ### 5.8.0 (2024-11-08)
 - Allow calling audited multiple times - @mohammednasser-32
   [734](https://github.com/collectiveidea/audited/pull/734)  

@@ -113,6 +113,35 @@ user.revision(1)
 user.revision_at(Date.parse("2016-01-01"))
 ```
 
+### Restoring from history
+
+A destroyed record can be rebuilt from its audits. `restore_preview` assembles
+the candidate and validates it against the model's **current** constraints
+without writing anything, while `restore` repeats the same validation inside a
+transaction and only saves when every check passes, producing exactly one new
+audit on success.
+
+```ruby
+audit = item.audits.destroys.last
+
+# Preview first: nothing is created.
+restoration = audit.restore_preview(required_ref: "R7")
+restoration.valid?                   # => true / false, via the model validations
+restoration.errors
+restoration.audit_sourced_attributes # => {"title" => "A"}  replayed from audits
+restoration.provided_attributes      # => {"required_ref" => "R7"}  human supplied
+restoration.attribute_sources        # => {"title" => :audit, "required_ref" => :provided}
+restoration.conflicts                # => {} unless supplied values clash with history
+
+# Commit when the candidate is acceptable.
+restoration = audit.restore(required_ref: "R7")
+restoration.committed? # => false leaves the original state untouched and writes no audit
+```
+
+Operator supplied values only fill attributes the audits never recorded. If a
+supplied value contradicts an audited value it is reported as a conflict and
+the historical value is kept, so history can never be silently rewritten.
+
 ### Specifying columns
 
 By default, a new audit is created for any attribute changes. You can, however, limit the columns to be considered.

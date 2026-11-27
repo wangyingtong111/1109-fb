@@ -194,5 +194,25 @@ module Models
       self.table_name = "users"
       audited on: [:touch]
     end
+
+    # Simulates a record whose required +required_ref+ column was never audited
+    # (it may predate the column or be excluded from auditing). Restoring a
+    # destroyed instance therefore needs an operator supplied reference.
+    class RestorableItem < ::ActiveRecord::Base
+      audited except: :required_ref
+
+      validates :title, presence: true
+      validates :required_ref, presence: true, uniqueness: true
+    end
+
+    # Same table with every column audited, so a full history restores without
+    # any operator supplied values.
+    class FullyAuditedRestorableItem < ::ActiveRecord::Base
+      self.table_name = "restorable_items"
+      audited
+
+      validates :title, presence: true
+      validates :required_ref, presence: true, uniqueness: true
+    end
   end
 end
