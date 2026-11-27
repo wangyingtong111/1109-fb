@@ -137,13 +137,15 @@ module AASM::Core
 
       if to_state == ::AASM::NO_VALUE
         to_state = nil
-      elsif !(to_state.respond_to?(:to_sym) && transitions.map(&:to).flatten.include?(to_state.to_sym))
+      elsif explicit_to_state?(to_state)
+        # an explicitly requested target state: strings and symbols are
+        # equivalent, and the target is never passed on as an argument
+        to_state = to_state.to_sym
+      else
         # to_state is an argument
         args.unshift(to_state)
         to_state = nil
       end
-      
-      # nop, to_state is a valid to-state
 
       transitions.each do |transition|
         next if to_state and !Array(transition.to).include?(to_state)
@@ -162,6 +164,16 @@ module AASM::Core
         end
       end
       result
+    end
+
+    # an explicitly given target state has to name one of the states this
+    # event can transition to (no matter from which source state), so an
+    # explicit target which is not reachable from the current state is
+    # rejected instead of being mistaken for a business argument. Strings
+    # and symbols are treated equally.
+    def explicit_to_state?(to_state)
+      to_state.respond_to?(:to_sym) &&
+        @transitions.map(&:to).flatten.include?(to_state.to_sym)
     end
 
     def clear_failed_callbacks

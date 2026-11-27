@@ -229,8 +229,10 @@ You can pass parameters to events:
 All guards and after callbacks will receive these parameters. In this case `set_process` would be called with
 `:defragmentation` argument.
 
-If the first argument to the event is a state (e.g. `:running` or `:finished`), the first argument is consumed and
-the state machine will attempt to transition to that state. Add comma separated parameter for guards and callbacks
+If the first argument to the event is a state the event can transition to (e.g. `:running` or `:finished`),
+the first argument is consumed as the explicit target state and the state machine will attempt to transition
+to that state. The target state can be given as a symbol or a string – both are equivalent. Add comma
+separated parameter for guards and callbacks
 
 ```ruby
   job = Job.new
@@ -238,6 +240,12 @@ the state machine will attempt to transition to that state. Add comma separated 
 ```
 In this case `set_process` won't be called, job will transition to running state and callback will receive
 `:defragmentation` as parameter
+
+The same contract is used everywhere: an explicit target state is never passed on to guards or callbacks as
+a parameter, no matter if it was given as a string or a symbol. If the explicitly given target state is not
+reachable from the current state, the event does not fire at all (`may_...?` returns `false` and firing the
+event fails) instead of running another transition. A first argument which does not name a target state of
+the event is still passed on to guards and callbacks as a regular parameter.
 
 #### Error Handling
 In case of an error during the event processing the error is rescued and passed to `:error`

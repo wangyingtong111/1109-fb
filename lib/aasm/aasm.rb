@@ -80,15 +80,18 @@ module AASM
 
 private
 
-  # Takes args and a from state and removes the first
-  # element from args if it is a valid to_state for
-  # the event given the from_state
-  def process_args(event, from_state, *args)
+  # Takes the event and the given args and removes the first
+  # element from args if it is an explicit to_state for the
+  # event. This uses the same contract as the target selection
+  # when firing the event: strings and symbols are equivalent,
+  # and an explicit target state is never passed on to guards
+  # or callbacks as a business argument.
+  def process_args(event, *args)
     # If the first arg doesn't respond to to_sym then
     # it isn't a symbol or string so it can't be a state
     # name anyway
     return args unless args.first.respond_to?(:to_sym)
-    if event.transitions_from_state(from_state).map(&:to).flatten.include?(args.first)
+    if event.transitions.map(&:to).flatten.include?(args.first.to_sym)
       return args[1..-1]
     end
     return args
@@ -99,10 +102,10 @@ private
     begin
       old_state = aasm(state_machine_name).state_object_for_name(aasm(state_machine_name).current_state)
 
-      fire_default_callbacks(event, *process_args(event, aasm(state_machine_name).current_state, *args))
+      fire_default_callbacks(event, *process_args(event, *args))
 
       if may_fire_to = event.may_fire?(self, *args)
-        fire_exit_callbacks(old_state, *process_args(event, aasm(state_machine_name).current_state, *args))
+        fire_exit_callbacks(old_state, *process_args(event, *args))
         if new_state_name = event.fire(self, {:may_fire => may_fire_to}, *args)
           aasm_fired(state_machine_name, event, old_state, new_state_name, options, *args, &block)
         else
@@ -112,13 +115,13 @@ private
         aasm_failed(state_machine_name, event_name, old_state, event.failed_callbacks)
       end
     rescue StandardError => e
-      event.fire_callbacks(:error, self, e, *process_args(event, aasm(state_machine_name).current_state, *args)) ||
-      event.fire_global_callbacks(:error_on_all_events, self, e, *process_args(event, aasm(state_machine_name).current_state, *args)) ||
+      event.fire_callbacks(:error, self, e, *process_args(event, *args)) ||
+      event.fire_global_callbacks(:error_on_all_events, self, e, *process_args(event, *args)) ||
       raise(e)
       false
     ensure
-      event.fire_callbacks(:ensure, self, *process_args(event, aasm(state_machine_name).current_state, *args))
-      event.fire_global_callbacks(:ensure_on_all_events, self, *process_args(event, aasm(state_machine_name).current_state, *args))
+      event.fire_callbacks(:ensure, self, *process_args(event, *args))
+      event.fire_global_callbacks(:ensure_on_all_events, self, *process_args(event, *args))
     end
   end
 
@@ -146,7 +149,7 @@ private
     persist = options[:persist]
 
     new_state = aasm(state_machine_name).state_object_for_name(new_state_name)
-    callback_args = process_args(event, aasm(state_machine_name).current_state, *args)
+    callback_args = process_args(event, *args)
 
     new_state.fire_callbacks(:before_enter, self, *callback_args)
 
@@ -158,7 +161,7 @@ private
       if persist_successful
         yield if block_given?
         event.fire_callbacks(:before_success, self, *callback_args)
-        event.fire_transition_callbacks(self, *process_args(event, old_state.name, *args))
+        event.fire_transition_callbacks(self, *process_args(event, *args))
         event.fire_callbacks(:success, self, *callback_args)
       end
     else
@@ -177,12 +180,12 @@ private
       event.fire_callbacks(
         :after,
         self,
-        *process_args(event, old_state.name, *args)
+        *process_args(event, *args)
       )
       event.fire_global_callbacks(
         :after_all_events,
         self,
-        *process_args(event, old_state.name, *args)
+        *process_args(event, *args)
       )
 
       self.aasm_event_fired(event.name, old_state.name, aasm(state_machine_name).current_state) if self.respond_to?(:aasm_event_fired)

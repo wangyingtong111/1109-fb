@@ -2,6 +2,7 @@
 
 ## unreleased
 * typo fixes, thanks @kumar-mithlesh [#870](https://github.com/aasm/aasm/pull/870)
+* Treat explicit target states given as strings and symbols equally, and use one contract for target selection and the arguments passed to guards and callbacks: an explicit target is never forwarded as a business argument, and an explicit target which is not reachable from the current state no longer fires another transition
 
 ## 6.0.0 (5 July 2026)
 * Let `whiny_persistence: true` be the default now [#378](https://github.com/aasm/aasm/pull/378)
