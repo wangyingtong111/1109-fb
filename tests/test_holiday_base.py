@@ -107,6 +107,23 @@ class CountryStub4(HolidayBase):
     supported_categories = ("CUSTOM_1", "CUSTOM_2")
 
 
+class FailingAfterFirstHolidayStub(EntityStub):
+    """A calendar whose 2025 population raises after producing its first
+    holiday, emulating a trial run that fails halfway through a year."""
+
+    country = "CS5"
+
+    def __init__(self, *args, **kwargs) -> None:
+        # An instance-level switch so a failed run can be retried successfully.
+        self.raise_during_2025_population = True
+        super().__init__(*args, **kwargs)
+
+    def _populate(self, year: int) -> None:
+        super()._populate(year)
+        if year == 2025 and self.raise_during_2025_population:
+            raise RuntimeError("Trial population failed after the first holiday.")
+
+
 class MarketStub1(EntityStub):
     market = "MS1"
 
@@ -908,6 +925,47 @@ class TestStandardMethods(unittest.TestCase):
         self.assertNotEqual(hb, hb_xx)
         self.assertNotEqual(hb.copy(), hb_xx.copy())
 
+    def test_copy_independent_state(self):
+        # A copy carries the existing holidays but shares no mutable state, so
+        # each side lazily fills additional years on its own.
+        hb = CountryStub1(years=2024)
+        hb["2024-02-10"] = "Manual Holiday"
+
+        copied = hb.copy()
+        self.assertIsNot(copied, hb)
+        self.assertIsNot(copied.years, hb.years)
+        self.assertIsNot(copied.categories, hb.categories)
+        self.assertIsNot(copied._populating_years, hb._populating_years)
+        self.assertEqual(dict(copied), dict(hb))
+
+        # Lazy expansion on the copy never reaches the original. Note that the
+        # raw dict storage is inspected directly: a regular `in` query against
+        # `hb` would legitimately trigger its own lazy expansion.
+        self.assertIn("2015-01-01", copied)
+        self.assertSetEqual(copied.years, {2015, 2024})
+        self.assertSetEqual(hb.years, {2024})
+        self.assertFalse(any(day.year == 2015 for day in dict.keys(hb)))
+
+        # And the reverse: expansion on the original stays local.
+        self.assertIn("2016-01-01", hb)
+        self.assertSetEqual(hb.years, {2016, 2024})
+        self.assertSetEqual(copied.years, {2015, 2024})
+        self.assertFalse(any(day.year == 2016 for day in dict.keys(copied)))
+
+        # Manual entries are independent as well: replacing a value on one
+        # side leaves the other side's own value untouched.
+        copied.pop("2024-02-10")
+        copied["2024-02-10"] = "Copied Manual Holiday"
+        self.assertEqual(copied["2024-02-10"], "Copied Manual Holiday")
+        self.assertEqual(hb["2024-02-10"], "Manual Holiday")
+
+    def test_copy_holiday_sum_independent_operands(self):
+        hb_combined = CountryStub1(years=2024) + CountryStub2(years=2024)
+        copied = hb_combined.copy()
+
+        self.assertIsNot(copied.holidays, hb_combined.holidays)
+        self.assertEqual(copied, hb_combined)
+
     def test_get(self):
         self.assertEqual(self.hb.get("2014-01-01"), "New Year's Day")
         self.assertIsNone(self.hb.get("2014-01-03"))
@@ -999,6 +1057,147 @@ class TestStandardMethods(unittest.TestCase):
         self.assertIn(date(2015, 1, 11), self.hb)
         self.assertEqual(self.hb["2015-01-10"], "Custom Holiday; New Holiday")
         self.assertEqual(self.hb["2015-01-11"], "Custom Holiday; New Holiday")
+
+
+class TestAtomicPopulation(unittest.TestCase):
+    def test_failed_population_is_rolled_back_and_retryable(self):
+        hb = FailingAfterFirstHolidayStub(years=2024)
+        self.assertSetEqual(hb.years, {2024})
+        self.assertIn("2024-01-01", hb)
+
+        # A lazy 2025 query raises after the first holiday has been generated.
+        with self.assertRaises(RuntimeError):
+            _ = date(2025, 6, 1) in hb
+
+        # The year must not be marked as calculated ...
+        self.assertSetEqual(hb.years, {2024})
+        # ... and none of the half-generated 2025 dates may stay behind.
+        self.assertFalse(any(day.year == 2025 for day in hb))
+        # The already-calculated years remain untouched.
+        self.assertIn("2024-01-01", hb)
+
+        # A retry succeeds and fills the whole year.
+        hb.raise_during_2025_population = False
+        self.assertNotIn("2025-06-01", hb)
+        self.assertSetEqual(hb.years, {2024, 2025})
+        self.assertIn("2025-01-01", hb)
+        self.assertIn("2025-07-04", hb)
+        self.assertIn("2025-12-25", hb)
+
+    def test_failed_population_keeps_manual_entries_of_other_years(self):
+        hb = FailingAfterFirstHolidayStub(years=2024)
+        hb["2024-02-10"] = "Manual Holiday"
+
+        with self.assertRaises(RuntimeError):
+            _ = date(2025, 6, 1) in hb
+
+        # Rollback must not discard manually entered holidays of other years.
+        self.assertEqual(hb["2024-02-10"], "Manual Holiday")
+        self.assertIn("2024-01-01", hb)
+        self.assertFalse(any(day.year == 2025 for day in hb))
+
+    def test_failed_population_during_construction(self):
+        with self.assertRaises(RuntimeError):
+            FailingAfterFirstHolidayStub(years=(2024, 2025))
+
+        hb = FailingAfterFirstHolidayStub()
+        # The failed construction must not leave a half-populated year behind.
+        self.assertSetEqual(hb.years, set())
+        self.assertEqual(len(hb), 0)
+
+        hb.raise_during_2025_population = False
+        self.assertIn("2025-01-01", hb)
+        self.assertSetEqual(hb.years, {2025})
+
+    def test_successful_population_marks_year_once(self):
+        hb = FailingAfterFirstHolidayStub()
+        hb.raise_during_2025_population = False
+
+        self.assertIn("2025-01-01", hb)
+        first_snapshot = dict(hb)
+        # Re-querying the same year does not re-run the population.
+        self.assertIn("2025-07-04", hb)
+        self.assertEqual(dict(hb), first_snapshot)
+        self.assertSetEqual(hb.years, {2025})
+
+
+class TestOfficePreviewCopy(unittest.TestCase):
+    """The office preview is built as a copy of the official country calendar;
+    both tables lazily fill years independently and a failed trial run must
+    never leak half-generated data anywhere."""
+
+    def test_preview_and_official_tables(self):
+        # The official table loads only 2024, plus a manual entry.
+        official = FailingAfterFirstHolidayStub(years=2024)
+        official["2024-02-10"] = "Manual Official Holiday"
+        self.assertSetEqual(official.years, {2024})
+
+        # The preview is a copy of the existing country calendar.
+        preview = official.copy()
+        self.assertIsNot(preview, official)
+        self.assertIsNot(preview.years, official.years)
+        self.assertEqual(dict(preview), dict(official))
+        self.assertIn("2024-01-01", preview)
+        self.assertIn("2024-02-10", preview)
+
+        # The preview queries 2025 first; the test rule raises after the first
+        # holiday has been produced.
+        with self.assertRaises(RuntimeError):
+            _ = date(2025, 6, 1) in preview
+
+        # The official table never loaded 2025 and the preview published no
+        # half-year results.
+        self.assertSetEqual(official.years, {2024})
+        self.assertSetEqual(preview.years, {2024})
+        self.assertFalse(any(day.year == 2025 for day in preview))
+        self.assertFalse(any(day.year == 2025 for day in official))
+        # Previously available data stays intact on both tables.
+        self.assertIn("2024-01-01", preview)
+        self.assertIn("2024-02-10", preview)
+        self.assertIn("2024-01-01", official)
+
+        # The preview retries and succeeds.
+        preview.raise_during_2025_population = False
+        self.assertNotIn("2025-06-01", preview)
+        self.assertSetEqual(preview.years, {2024, 2025})
+        self.assertIn("2025-01-01", preview)
+        self.assertIn("2025-07-04", preview)
+
+        # Afterwards the official table independently fills the same year.
+        self.assertSetEqual(official.years, {2024})
+        official.raise_during_2025_population = False
+        self.assertIn("2025-01-01", official)
+        self.assertIn("2025-07-04", official)
+        self.assertSetEqual(official.years, {2024, 2025})
+
+        # Changing a manually added date on one side leaves the other side's
+        # own value untouched.
+        preview.pop("2024-02-10")
+        preview["2024-02-10"] = "Manual Preview Holiday"
+        self.assertEqual(preview["2024-02-10"], "Manual Preview Holiday")
+        self.assertEqual(official["2024-02-10"], "Manual Official Holiday")
+
+        official["2025-03-03"] = "Official Only Holiday"
+        # Inspect the raw storage: a regular `in` query would trigger the
+        # preview's own lazy expansion of 2025.
+        self.assertNotIn(date(2025, 3, 3), dict.keys(preview))
+
+    def test_existing_query_rules_still_work_alongside_copies(self):
+        # Manual entries keep working.
+        hb = CountryStub1(years=2024)
+        hb.update({"2024-06-15": "Manual Holiday"})
+        hb.append("2024-06-16")
+        self.assertEqual(hb["2024-06-15"], "Manual Holiday")
+        self.assertEqual(hb["2024-06-16"], "Holiday")
+        self.assertIn("2024-06-15", hb.copy())
+
+        # Same-kind calendar (HolidaySum) query rules keep working, including
+        # lazy expansion across the operands and copying.
+        combined = CountryStub1(years=2024) + CountryStub2(years=2024)
+        self.assertIn("2024-01-01", combined)
+        self.assertIn("2024-03-01", combined)
+        self.assertIn("2014-01-01", combined)
+        self.assertEqual(combined.copy(), combined)
 
 
 class TestStr(unittest.TestCase):

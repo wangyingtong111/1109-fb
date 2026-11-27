@@ -366,8 +366,15 @@ class HolidayBase(Dict[date, str]):
             else gettext
         )
         self.years = _normalize_arguments(int, years)
+        # The years whose population is currently in progress. It is used as a
+        # re-entrancy guard by `_populate_year` (a holiday being added must not
+        # trigger another population of the same year) and as a rollback marker
+        # when a population fails midway.
+        self._populating_years: Set[int] = set()
 
-        # Populate holidays.
+        # Populate holidays. The years are already part of `self.years`, so the
+        # `__keytransform__` hook never re-enters population while they are
+        # being generated.
         for year in self.years:
             self._populate(year)
 
@@ -577,8 +584,7 @@ class HolidayBase(Dict[date, str]):
 
         # Automatically expand for `expand=True` cases.
         if self.expand and dt.year not in self.years:
-            self.years.add(dt.year)
-            self._populate(dt.year)
+            self._populate_year(dt.year)
 
         return dt
 
@@ -621,6 +627,9 @@ class HolidayBase(Dict[date, str]):
 
         if self and key in {"categories", "observed"}:
             self.clear()
+            # The years are already part of `self.years`, so repopulating them
+            # directly (instead of through `_populate_year`) avoids tripping the
+            # lazy-population re-entrancy guard.
             for year in self.years:  # Re-populate holidays for each year.
                 self._populate(year)
 
@@ -793,6 +802,37 @@ class HolidayBase(Dict[date, str]):
         self._populate_common_holidays()
         self._populate_subdiv_holidays()
 
+    def _populate_year(self, year: int) -> None:
+        """Populate the holidays for a single year atomically.
+
+        The year is counted among the calculated :attr:`years` only after the
+        population finishes successfully. If the population raises, any holiday
+        dates added in the meantime are rolled back so that no half-generated
+        year is ever visible, and the year stays eligible for a later retry.
+
+        :param year:
+            The year to populate with holidays.
+        """
+        if year in self.years or year in self._populating_years:
+            # Already calculated, or currently being generated (a holiday added
+            # during the population must not trigger a nested one).
+            return None
+
+        self._populating_years.add(year)
+        snapshot = dict(self)
+        try:
+            self._populate(year)
+        except BaseException:
+            # Restore the exact pre-population state: drop the half-generated
+            # dates without touching holidays of other years.
+            dict.clear(self)
+            dict.update(self, snapshot)
+            raise
+        else:
+            self.years.add(year)
+        finally:
+            self._populating_years.discard(year)
+
     def _populate_common_holidays(self):
         """Populate entity common holidays."""
         for category in self._sorted_categories:
@@ -828,8 +868,22 @@ class HolidayBase(Dict[date, str]):
         return self.update(*args)
 
     def copy(self):
-        """Return a copy of the object."""
-        return copy.copy(self)
+        """Return a copy of the object.
+
+        The copy shares no mutable per-instance state with the original: its
+        holiday dates and its calculated-year bookkeeping are independent, so
+        lazily populating an additional year on either object never leaks into
+        the other.
+        """
+        copied = copy.copy(self)
+        # The dict storage is already duplicated by `copy.copy`; detach the
+        # remaining mutable per-instance attributes as well. Assign through the
+        # base `object.__setattr__` so the `categories`/`observed` re-population
+        # hook in `__setattr__` does not wipe the freshly copied holiday dates.
+        object.__setattr__(copied, "years", self.years.copy())
+        object.__setattr__(copied, "categories", self.categories.copy())
+        object.__setattr__(copied, "_populating_years", self._populating_years.copy())
+        return copied
 
     def get(self, key: DateLike, default: Union[str, Any] = None) -> Union[str, Any]:
         """Return the holiday name for a date if date is a holiday, else
@@ -1125,3 +1179,9 @@ country_holidays('CA') + country_holidays('MX')
         for operand in self.holidays:
             operand._populate(year)
             self.update(cast("Dict[DateLike, str]", operand))
+
+    def copy(self):
+        """Return a copy of the object with an independent operand list."""
+        copied = super().copy()
+        copied.holidays = list(self.holidays)
+        return copied
