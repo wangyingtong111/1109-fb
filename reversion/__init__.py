@@ -30,3 +30,12 @@ from reversion.revisions import (  # noqa
 )
 
 __version__ = VERSION = (6, 5, 2)
+
+
+def __getattr__(name):
+    # Lazily expose revert_group without importing reversion.models (which
+    # requires the app registry to be ready) at package import time.
+    if name == "revert_group":
+        from reversion.models import revert_group
+        return revert_group
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

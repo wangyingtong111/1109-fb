@@ -1,6 +1,8 @@
 from collections import defaultdict
 from itertools import chain, groupby
+from uuid import uuid4
 import logging
+import random
 
 from django.apps import apps
 from django.conf import settings
@@ -40,6 +42,162 @@ def _safe_revert(versions):
         })
     if unreverted_versions:
         _safe_revert(unreverted_versions)
+
+
+def _get_unique_field_sets(model):
+    """
+    Returns a set of tuples of field attnames that, together, must be unique
+    for the given model. Primary keys are excluded, since reverting a version
+    never changes them.
+    """
+    opts = model._meta
+    unique_field_sets = set()
+    for field in opts.fields:
+        if field.unique and not field.primary_key:
+            unique_field_sets.add((field.attname,))
+    for unique_together in opts.unique_together:
+        unique_field_sets.add(tuple(
+            opts.get_field(field_name).attname
+            for field_name in unique_together
+        ))
+    for constraint in opts.constraints:
+        if (
+            isinstance(constraint, models.UniqueConstraint) and
+            constraint.fields and
+            constraint.condition is None
+        ):
+            unique_field_sets.add(tuple(
+                opts.get_field(field_name).attname
+                for field_name in constraint.fields
+            ))
+    return unique_field_sets
+
+
+def _temporary_unique_value(model, field, db):
+    """
+    Generates a throwaway value for a unique field, used to move aside values
+    that are swapped between members of a group being reverted.
+    """
+    for _ in range(100):
+        if isinstance(field, (models.CharField, models.TextField)):
+            value = uuid4().hex
+            if field.max_length:
+                value = value[:field.max_length]
+        elif isinstance(field, models.UUIDField):
+            value = uuid4()
+        elif isinstance(field, models.IntegerField):
+            value = -random.randint(1, 2 ** 31 - 1)
+        else:
+            raise RevertError(gettext(
+                "Could not revert group - cannot generate a temporary value for unique field %(field)s."
+            ) % {
+                "field": field.name,
+            })
+        if not model._base_manager.using(db).filter(**{field.attname: value}).exists():
+            return value
+    raise RevertError(gettext(
+        "Could not revert group - cannot generate a temporary value for unique field %(field)s."
+    ) % {
+        "field": field.name,
+    })
+
+
+def _resolve_group_unique_conflicts(versions):
+    """
+    Prepares a group of versions, all stored in the same database, to be
+    reverted as a single atomic unit.
+
+    If a historical unique value is currently used by an object outside the
+    group, a RevertError explaining the conflict is raised and the group is
+    left unchanged. Unique values that are swapped between members of the
+    group (for example, two objects that exchanged identifiers) are moved
+    aside to temporary values, so that every member can return to its
+    historical value.
+    """
+    versions_by_model = defaultdict(list)
+    for version in versions:
+        versions_by_model[version._model].append(version)
+    for model, model_versions in versions_by_model.items():
+        version_options = _get_options(model)
+        object_id_field = version_options.object_id_field
+        db = model_versions[0].db
+        group_object_ids = {version.object_id for version in model_versions}
+        # Deserialize the target field values. Raises RevertError on bad data.
+        target_field_dicts = [
+            (version, version._local_field_dict)
+            for version in model_versions
+        ]
+        swaps = defaultdict(set)  # object_id -> set of field attnames to move aside.
+        for unique_fields in _get_unique_field_sets(model):
+            targets = []
+            for version, field_dict in target_field_dicts:
+                if not all(field in field_dict for field in unique_fields):
+                    # The constraint is not fully versioned, so it cannot be checked.
+                    targets = None
+                    break
+                values = tuple(field_dict[field] for field in unique_fields)
+                # NULL values do not take part in unique conflicts.
+                if not any(value is None for value in values):
+                    targets.append((version, values))
+            if not targets:
+                continue
+            # Load the current holders of the target values.
+            query = models.Q()
+            for version, values in targets:
+                query |= models.Q(**dict(zip(unique_fields, values)))
+            holders = defaultdict(list)
+            for holder in model._base_manager.using(db).filter(query).iterator():
+                holder_values = tuple(getattr(holder, field) for field in unique_fields)
+                holders[holder_values].append(holder)
+            # Check the targets against the current holders.
+            for version, values in targets:
+                for holder in holders.get(values, ()):
+                    holder_object_id = force_str(getattr(holder, object_id_field))
+                    if holder_object_id == version.object_id:
+                        continue  # The object already holds its own target value.
+                    if holder_object_id not in group_object_ids:
+                        raise RevertError(gettext(
+                            "Could not revert %(object_repr)s - %(field_names)s value %(values)s "
+                            "is already used by %(holder_repr)s, which is not part of the group "
+                            "being reverted."
+                        ) % {
+                            "object_repr": version.object_repr,
+                            "field_names": ", ".join(unique_fields),
+                            "values": ", ".join(force_str(value) for value in values),
+                            "holder_repr": force_str(holder),
+                        })
+                    # The target value is held by another member of the group, so
+                    # move it aside before reverting (e.g. swapped identifiers).
+                    swaps[holder_object_id].update(unique_fields)
+        # Move aside unique values that are swapped within the group.
+        attname_to_field = {field.attname: field for field in model._meta.fields}
+        for holder_object_id, field_attnames in swaps.items():
+            updates = {
+                field_attname: _temporary_unique_value(model, attname_to_field[field_attname], db)
+                for field_attname in field_attnames
+            }
+            model._base_manager.using(db).filter(**{object_id_field: holder_object_id}).update(**updates)
+
+
+def revert_group(versions):
+    """
+    Reverts a group of versions as a single atomic unit.
+
+    All members of the group are restored to their historical values
+    together, even if they currently hold each other's unique values (for
+    example, two objects that swapped identifiers). If a historical value is
+    currently used by an object outside the group, a RevertError explaining
+    the conflict is raised and the whole group is left unchanged.
+    """
+    # Group the versions by the database of the serialized model.
+    versions_by_db = defaultdict(list)
+    for version in versions:
+        versions_by_db[version.db].append(version)
+    # For each db, perform a separate atomic revert.
+    for version_db, db_versions in versions_by_db.items():
+        with transaction.atomic(using=version_db):
+            _resolve_group_unique_conflicts(db_versions)
+            _safe_revert(db_versions)
 
 
 class Revision(models.Model):
@@ -108,7 +266,11 @@ class Revision(models.Model):
                     for model, group in groupby(new_objs, type):
                         collector.collect(list(group))
                     collector.delete()
-                # Attempt to revert all revisions.
+                # Attempt to revert all revisions as a single group, moving
+                # aside unique values swapped within the group and raising a
+                # RevertError if a historical value is used by an object
+                # outside the group.
+                _resolve_group_unique_conflicts(versions)
                 _safe_revert(versions)
 
     def __str__(self):
@@ -194,6 +356,14 @@ class VersionQuerySet(models.QuerySet):
             if last_key != key:
                 yield version
             last_key = key
+
+    def revert_group(self):
+        """
+        Reverts this queryset of versions as a single atomic group.
+
+        See revert_group() for details.
+        """
+        revert_group(list(self))
 
 
 class Version(models.Model):

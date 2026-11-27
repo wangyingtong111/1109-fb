@@ -3,6 +3,12 @@
 django-reversion changelog
 ==========================
 
+Unreleased
+----------
+
+- Reverting a revision now restores its versions as a single atomic group: unique identifiers that were swapped between objects in the group are moved aside while reverting, and a ``RevertError`` explaining the conflict is raised (leaving the group unchanged) if a historical unique value is used by an object outside the group. Added ``reversion.revert_group()`` to revert an arbitrary group of versions together.
+
+
 6.5.2 - 2026-11-12
 ------------------
 

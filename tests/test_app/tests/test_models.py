@@ -447,6 +447,103 @@ class NaturalKeyTest(TestBase):
         })
 
 
+class RevisionRevertUniqueSwapTest(TestBase):
+
+    def setUp(self):
+        super().setUp()
+        reversion.register(TestModelWithUniqueConstraint)
+
+    def createSwappedPair(self):
+        with reversion.create_revision():
+            obj_1 = TestModelWithUniqueConstraint.objects.create(name="甲")
+            obj_2 = TestModelWithUniqueConstraint.objects.create(name="乙")
+        # Swap the identifiers in a single revision.
+        with reversion.create_revision():
+            obj_1.name = "tmp"
+            obj_1.save()
+            obj_2.name = "甲"
+            obj_2.save()
+            obj_1.name = "乙"
+            obj_1.save()
+        return obj_1, obj_2
+
+    def testRevertSwappedRevision(self):
+        obj_1, obj_2 = self.createSwappedPair()
+        # Reverting the historical combination restores both original identifiers.
+        Version.objects.get_for_object(obj_1)[1].revision.revert()
+        obj_1.refresh_from_db()
+        obj_2.refresh_from_db()
+        self.assertEqual(obj_1.name, "甲")
+        self.assertEqual(obj_2.name, "乙")
+
+    def testRevertSwappedRevisionConflictOutsideGroup(self):
+        obj_1, obj_2 = self.createSwappedPair()
+        # An object outside the group takes over the historical identifier of obj_1.
+        with reversion.create_revision():
+            obj_2.name = "丙"
+            obj_2.save()
+            obj_3 = TestModelWithUniqueConstraint.objects.create(name="甲")
+        with self.assertRaises(reversion.RevertError):
+            Version.objects.get_for_object(obj_1)[1].revision.revert()
+        # The whole group is left unchanged.
+        obj_1.refresh_from_db()
+        obj_2.refresh_from_db()
+        obj_3.refresh_from_db()
+        self.assertEqual(obj_1.name, "乙")
+        self.assertEqual(obj_2.name, "丙")
+        self.assertEqual(obj_3.name, "甲")
+
+    def testRevertGroup(self):
+        obj_1, obj_2 = self.createSwappedPair()
+        # The histories P and Q of the two objects can be reverted as a group.
+        version_p = Version.objects.get_for_object(obj_1)[1]
+        version_q = Version.objects.get_for_object(obj_2)[1]
+        reversion.revert_group([version_p, version_q])
+        obj_1.refresh_from_db()
+        obj_2.refresh_from_db()
+        self.assertEqual(obj_1.name, "甲")
+        self.assertEqual(obj_2.name, "乙")
+
+    def testRevertGroupConflictOutsideGroup(self):
+        obj_1, obj_2 = self.createSwappedPair()
+        with reversion.create_revision():
+            obj_2.name = "丙"
+            obj_2.save()
+            obj_3 = TestModelWithUniqueConstraint.objects.create(name="甲")
+        version_p = Version.objects.get_for_object(obj_1)[1]
+        version_q = Version.objects.get_for_object(obj_2)[1]
+        with self.assertRaises(reversion.RevertError):
+            reversion.revert_group([version_p, version_q])
+        # The whole group is left unchanged.
+        obj_1.refresh_from_db()
+        obj_2.refresh_from_db()
+        obj_3.refresh_from_db()
+        self.assertEqual(obj_1.name, "乙")
+        self.assertEqual(obj_2.name, "丙")
+        self.assertEqual(obj_3.name, "甲")
+
+    def testRevertGroupQuerySet(self):
+        obj_1, obj_2 = self.createSwappedPair()
+        versions = Version.objects.get_for_model(TestModelWithUniqueConstraint).filter(
+            revision=Version.objects.get_for_object(obj_1)[1].revision,
+        )
+        versions.revert_group()
+        obj_1.refresh_from_db()
+        obj_2.refresh_from_db()
+        self.assertEqual(obj_1.name, "甲")
+        self.assertEqual(obj_2.name, "乙")
+
+    def testRevertSingleStillWorks(self):
+        with reversion.create_revision():
+            obj = TestModelWithUniqueConstraint.objects.create(name="v1")
+        with reversion.create_revision():
+            obj.name = "v2"
+            obj.save()
+        Version.objects.get_for_object(obj)[1].revert()
+        obj.refresh_from_db()
+        self.assertEqual(obj.name, "v1")
+
+
 class TransactionRollbackTest(TestBase):
 
     def setUp(self):

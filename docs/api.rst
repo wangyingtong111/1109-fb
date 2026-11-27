@@ -127,6 +127,21 @@ Revert a :ref:`Revision` to restore the serialized model instances.
     assert obj.name == "version 2"
 
 
+Reverting a group of versions
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Reverting a :ref:`Revision` restores all of its versions as a single atomic group. If two objects swapped a unique identifier (for example, a code or slug) in a later revision, reverting the earlier revision moves the swapped values aside while the group is restored, so both objects return to their historical identifiers.
+
+Versions from different revisions can also be reverted together as a group using ``reversion.revert_group()``.
+
+.. code:: python
+
+    # Revert the historical versions P and Q of two objects as one group.
+    reversion.revert_group([version_p, version_q])
+
+If a historical unique value is currently used by an object that is not part of the group being reverted, a :ref:`RevertError` explaining the conflict is raised and the whole group is left unchanged.
+
+
 Restoring deleted model instances
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
@@ -481,9 +496,18 @@ Contains metadata about a revision, and groups together all :ref:`Version` insta
 
 ``Revision.revert(delete=False)``
 
-    Restores all contained serialized model instances to the database.
+    Restores all contained serialized model instances to the database as a single atomic group. Unique values that are swapped between members of the group are moved aside while the group is restored. If a historical unique value is used by an object outside the group, a :ref:`RevertError` explaining the conflict is raised and the group is left unchanged.
 
     .. include:: /_include/throws-revert-error.rst
 
     ``delete``
         If ``True``, any model instances which have been created and are reachable by the ``follow`` clause of any model instances in this revision will be deleted. This effectively restores a group of related models to the state they were in when the revision was created.
+
+
+.. _revert-group:
+
+``reversion.revert_group(versions)``
+
+    Reverts an arbitrary group of :ref:`Version` instances (for example, historical versions of several objects, taken from different revisions) as a single atomic unit, with the same swap handling and conflict checking as :ref:`Revision.revert() <Revision-revert>`.
+
+    .. include:: /_include/throws-revert-error.rst
