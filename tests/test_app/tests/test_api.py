@@ -2,10 +2,11 @@ from datetime import timedelta
 from unittest.mock import MagicMock
 
 from django.contrib.auth.models import User
-from django.db import models
+from django.db import models, transaction
 from django.db.transaction import get_connection
 from django.utils import timezone
 import reversion
+from reversion.models import Revision, Version
 from test_app.models import TestModel, TestModelRelated, TestModelThrough, TestModelParent, TestMeta
 from test_app.tests.base import TestBase, TestBaseTransaction, TestModelMixin, UserMixin
 
@@ -126,6 +127,156 @@ class CreateRevisionTest(TestModelMixin, TestBase):
         with reversion.create_revision():
             TestModel.objects.create()
         self.assertEqual(_callback.call_count, 1)
+
+
+class CreateRevisionNestedRollbackTest(TestModelMixin, TestBase):
+
+    databases = {"default", "mysql", "postgres"}
+
+    def testNestedRollbackKeepsOuterRevision(self):
+        with reversion.create_revision():
+            obj = TestModel.objects.create(name="Saved")
+            reversion.set_comment("outer")
+            try:
+                with reversion.create_revision():
+                    obj.name = "Draft"
+                    obj.save()
+                    reversion.set_comment("inner")
+                    raise Exception("Boom!")
+            except Exception:
+                pass
+        # The rolled-back edit never reaches the database.
+        obj.refresh_from_db()
+        self.assertEqual(obj.name, "Saved")
+        # A single revision survives, describing the outer edit only.
+        self.assertSingleRevision((obj,), comment="outer")
+        version = Version.objects.get_for_object(obj).get()
+        self.assertEqual(version.field_dict["name"], "Saved")
+
+    def testNestedRollbackDoesNotLeakInnerComment(self):
+        with reversion.create_revision():
+            obj = TestModel.objects.create(name="Saved")
+            reversion.set_comment("outer")
+            try:
+                with reversion.create_revision():
+                    reversion.set_comment("inner")
+                    raise Exception("Boom!")
+            except Exception:
+                pass
+        self.assertSingleRevision((obj,), comment="outer")
+
+    def testNestedRollbackThreeLevelsDeep(self):
+        with reversion.create_revision():
+            obj = TestModel.objects.create(name="Saved")
+            reversion.set_comment("outer")
+            try:
+                with reversion.create_revision():
+                    reversion.set_comment("middle")
+                    with reversion.create_revision():
+                        obj.name = "Draft"
+                        obj.save()
+                        reversion.set_comment("inner")
+                        raise Exception("Boom!")
+            except Exception:
+                pass
+        self.assertSingleRevision((obj,), comment="outer")
+        version = Version.objects.get_for_object(obj).get()
+        self.assertEqual(version.field_dict["name"], "Saved")
+
+    def testOuterExceptionAfterNestedRollbackCreatesNoRevision(self):
+        with self.assertRaises(Exception):
+            with reversion.create_revision():
+                obj = TestModel.objects.create(name="Saved")
+                try:
+                    with reversion.create_revision():
+                        obj.name = "Draft"
+                        obj.save()
+                        raise Exception("Boom inner!")
+                except Exception:
+                    pass
+                raise Exception("Boom outer!")
+        self.assertNoRevision()
+
+    def testNestedRollbackNonAtomic(self):
+        with reversion.create_revision():
+            obj = TestModel.objects.create(name="Saved")
+            reversion.set_comment("outer")
+            with self.assertRaises(Exception):
+                with reversion.create_revision(atomic=False):
+                    obj.name = "Draft"
+                    obj.save()
+                    reversion.set_comment("inner")
+                    raise Exception("Boom!")
+        self.assertSingleRevision((obj,), comment="outer")
+
+    def testNestedRollbackInManualAtomicBlock(self):
+        with reversion.create_revision():
+            obj = TestModel.objects.create(name="Saved")
+            reversion.set_comment("outer")
+            try:
+                with transaction.atomic():
+                    with reversion.create_revision():
+                        obj.name = "Draft"
+                        obj.save()
+                        reversion.set_comment("inner")
+                        raise Exception("Boom!")
+            except Exception:
+                pass
+        # The inner revision's transaction is doomed, so it must not be saved.
+        self.assertSingleRevision((obj,), comment="outer")
+
+    def testNestedSuccessStillMergesIntoOuterRevision(self):
+        with reversion.create_revision():
+            first = TestModel.objects.create(name="Saved")
+            reversion.set_comment("outer")
+            with reversion.create_revision():
+                second = TestModel.objects.create(name="Other")
+                reversion.set_comment("inner")
+        self.assertEqual(Revision.objects.count(), 1)
+        revision = Revision.objects.get()
+        self.assertEqual(revision.comment, "inner")
+        self.assertEqual(revision.version_set.count(), 2)
+        self.assertTrue(Version.objects.get_for_object(first).filter(revision=revision).exists())
+        self.assertTrue(Version.objects.get_for_object(second).filter(revision=revision).exists())
+
+    def testNestedRollbackMultiDb(self):
+        with reversion.create_revision(using="mysql"), reversion.create_revision(using="postgres"):
+            obj = TestModel.objects.create(name="Saved")
+            reversion.set_comment("outer")
+            try:
+                with reversion.create_revision(using="mysql"), reversion.create_revision(using="postgres"):
+                    obj.name = "Draft"
+                    obj.save()
+                    reversion.set_comment("inner")
+                    raise Exception("Boom!")
+            except Exception:
+                pass
+        self.assertNoRevision()
+        for using in ("mysql", "postgres"):
+            self.assertSingleRevision((obj,), comment="outer", using=using)
+            version = Version.objects.using(using).get_for_object(obj).get()
+            self.assertEqual(version.field_dict["name"], "Saved")
+
+
+class CreateRevisionNestedRollbackTransactionTest(TestModelMixin, TestBaseTransaction):
+
+    def testNestedRollbackKeepsOuterRevision(self):
+        with reversion.create_revision():
+            obj = TestModel.objects.create(name="Saved")
+            reversion.set_comment("outer")
+            try:
+                with reversion.create_revision():
+                    obj.name = "Draft"
+                    obj.save()
+                    reversion.set_comment("inner")
+                    raise Exception("Boom!")
+            except Exception:
+                pass
+        obj.refresh_from_db()
+        self.assertEqual(obj.name, "Saved")
+        self.assertSingleRevision((obj,), comment="outer")
+        version = Version.objects.get_for_object(obj).get()
+        self.assertEqual(version.field_dict["name"], "Saved")
 
 
 class CreateRevisionAtomicTest(TestModelMixin, TestBaseTransaction):

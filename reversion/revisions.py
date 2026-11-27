@@ -32,6 +32,7 @@ _StackFrame = namedtuple("StackFrame", (
     "date_created",
     "db_versions",
     "meta",
+    "failed",
 ))
 
 
@@ -64,6 +65,7 @@ def _push_frame(manage_manually, using):
         stack_frame = current_frame._replace(
             manage_manually=manage_manually,
             db_versions=db_versions,
+            failed=False,
         )
     else:
         stack_frame = _StackFrame(
@@ -73,6 +75,7 @@ def _push_frame(manage_manually, using):
             date_created=timezone.now(),
             db_versions={using: {}},
             meta=(),
+            failed=False,
         )
     _stack.set(_stack.get() + [stack_frame])
 
@@ -85,7 +88,11 @@ def _pop_frame():
     prev_frame = _current_frame()
     stack = _stack.get()
     del stack[-1]
-    if is_active():
+    # A failed frame has already had its database changes rolled back. Its
+    # versions, comment and metadata must not be merged back into the parent
+    # frame, otherwise the surviving revision would describe changes that were
+    # never committed.
+    if is_active() and not prev_frame.failed:
         current_frame = _current_frame()
         db_versions = {
             db: prev_frame.db_versions[db]
@@ -291,15 +298,25 @@ def _create_revision_context(manage_manually, using, atomic):
         _push_frame(manage_manually, using)
         try:
             yield
+        except BaseException:
+            # The changes made in this frame are being rolled back. Flag the
+            # frame so its state is neither saved as a revision nor merged
+            # into a parent frame.
+            _update_frame(failed=True)
+            raise
+        else:
             if transaction.get_connection(using).in_atomic_block and transaction.get_rollback(using):
                 # Transaction is in invalid state due to catched exception within yield statement.
                 # Do not try to create Revision, otherwise it would lead to the transaction management error.
                 #
                 # Atomic block could be called manually around `create_revision` context manager.
                 # That's why we have to check connection flag instead of `atomic` variable value.
-                return
-            # Only save for a db if that's the last stack frame for that db.
-            if not any(using in frame.db_versions for frame in _stack.get()[:-1]):
+                #
+                # Flag the frame as failed so a parent frame does not inherit the
+                # versions of changes that are going to be rolled back.
+                _update_frame(failed=True)
+            elif not any(using in frame.db_versions for frame in _stack.get()[:-1]):
+                # Only save for a db if that's the last stack frame for that db.
                 current_frame = _current_frame()
                 _save_revision(
                     versions=current_frame.db_versions[using].values(),

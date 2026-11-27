@@ -3,6 +3,11 @@
 django-reversion changelog
 ==========================
 
+Unreleased
+----------
+
+- Fixed a nested ``create_revision()`` block that raised an exception (which was caught by an outer block) leaking its rolled-back versions, comment and metadata into the outer revision. A failed frame is no longer saved as a revision or merged into its parent, so the surviving revision only describes changes that were actually committed.
+
 6.5.2 - 2026-11-12
 ------------------
 
