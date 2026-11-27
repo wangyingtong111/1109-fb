@@ -1,0 +1,195 @@
+# frozen_string_literal: true
+
+module Grape
+  module Validations
+    # Frozen value object holding everything {ParamsScope#validates} needs to
+    # know about a single +requires+/+optional+ declaration. Built once from
+    # the raw validations hash supplied by the DSL; the raw hash is never
+    # mutated.
+    #
+    # Splits the raw entries into three logical buckets:
+    #
+    # * Spec-consumed keys (type/types/coerce*, presence/message, fail_fast,
+    #   doc keys) — never handed to validator dispatch.
+    # * Shared opts (allow_blank, fail_fast) — read by every validator at
+    #   construction time via {#shared_opts}.
+    # * Validator entries (everything else, e.g. +regexp+, +length+, +values+,
+    #   +allow_blank+, custom validators) — exposed via {#validator_entries}
+    #   for the dispatch loop.
+    #
+    # Same key can land in more than one bucket (e.g. +allow_blank+ is both a
+    # shared opt and a validator entry; +length+ is both a doc source and a
+    # validator entry).
+    class ValidationsSpec
+      # Keys consumed by the spec itself; must NOT be dispatched as validators
+      # by the caller. Documentation-only keys are filtered through a separate
+      # set so that dual-purpose keys (length, default, values, except_values)
+      # aren't accidentally swallowed.
+      SPEC_CONSUMED_KEYS = %i[
+        type types coerce coerce_with coerce_message
+        presence message
+        fail_fast
+        desc description documentation
+      ].freeze
+
+      BOOLEAN_VALUES = [true, false].freeze
+      private_constant :BOOLEAN_VALUES
+
+      attr_reader :raw, :coerce_type, :coerce_method, :coerce_message, :presence_options, :values, :except_values, :default, :allow_blank, :fail_fast, :shared_opts, :validator_entries
+
+      def self.from(validations)
+        new(validations)
+      end
+
+      def initialize(raw)
+        raise ArgumentError, ':type may not be supplied with :types' if raw.key?(:type) && raw.key?(:types)
+
+        @raw = raw
+        @coerce_type, @coerce_message, @coerce_method = parse_coerce(raw)
+        read_values(raw)
+        @presence_options = raw[:presence]
+        read_shared_opts(raw)
+
+        @guessed_coerce_type = guess_coerce_type(declared_coerce_type, @values, @except_values)
+        @validator_entries = build_validator_entries(raw)
+
+        validate!
+
+        freeze
+      end
+
+      def required?
+        !@presence_options.nil? && @presence_options != false
+      end
+
+      def coerce_options
+        CoerceOptions.new(type: @coerce_type, coerce_method: @coerce_method, message: @coerce_message)
+      end
+
+      private
+
+      # The values the declaration accepts, rejects and defaults to.
+      def read_values(raw)
+        @values = resolve_value(raw[:values])
+        @except_values = resolve_value(raw[:except_values])
+        @default = raw[:default]
+      end
+
+      # What every validator of the declaration reads (see #shared_opts).
+      def read_shared_opts(raw)
+        @allow_blank = resolve_value(raw[:allow_blank])
+        @fail_fast = raw[:fail_fast] || false
+        @shared_opts = { allow_blank: @allow_blank, fail_fast: @fail_fast }.freeze
+      end
+
+      # Cross-field consistency checks on the parsed declaration. Run at
+      # construction so an incoherent spec (e.g. a +default+ outside +values+,
+      # or +values+ whose elements don't match +type+) can never exist —
+      # callers no longer have to remember to invoke these separately.
+      #
+      # NB. +@guessed_coerce_type+ is used only for this check, never for
+      # +coerce_options+ — a bare +type: Array+ combined with scalar
+      # +values:+ must still coerce to +Array+ at runtime (only the elements
+      # are scalar), so the real +@coerce_type+ is never overwritten by it.
+      def validate!
+        check_incompatible_option_values(@default, @values, @except_values)
+        validate_value_coercion(@guessed_coerce_type, @values, @except_values)
+      end
+
+      def check_incompatible_option_values(default, values, except_values)
+        return if default.nil? || default.is_a?(Proc)
+
+        defaults = Array(default)
+        raise Grape::Exceptions::IncompatibleOptionValues.new(:default, default, :values, values) if any_outside?(defaults, values)
+        raise Grape::Exceptions::IncompatibleOptionValues.new(:default, default, :except, except_values) if any_among?(defaults, except_values)
+      end
+
+      # Whether one of +defaults+ is outside +values+, known now (see #fixed_values?).
+      def any_outside?(defaults, values)
+        fixed_values?(values) && defaults.any? { |default| !values.include?(default) }
+      end
+
+      # Whether one of +defaults+ is among +values+, known now (see #fixed_values?).
+      def any_among?(defaults, values)
+        fixed_values?(values) && defaults.any? { |default| values.include?(default) }
+      end
+
+      # A +values+ or +except_values+ list known at definition time: given,
+      # and not a Proc called on every request.
+      def fixed_values?(values)
+        values && !values.is_a?(Proc)
+      end
+
+      def validate_value_coercion(coerce_type, *values_list)
+        return unless coerce_type
+
+        element_type = coerce_type.is_a?(Enumerable) ? coerce_type.first : coerce_type
+        values_list.each do |values|
+          next unless fixed_values?(values)
+
+          value_types = values.is_a?(Range) ? [values.begin, values.end].compact : values
+          raise Grape::Exceptions::IncompatibleOptionValues.new(:type, element_type, :values, values) unless all_of_type?(value_types, element_type)
+        end
+      end
+
+      def all_of_type?(values, type)
+        return values.all? { |value| BOOLEAN_VALUES.include?(value) } if type == Grape::API::Boolean
+
+        values.all?(type)
+      end
+
+      def build_validator_entries(raw)
+        raw.reject do |k, _|
+          SPEC_CONSUMED_KEYS.include?(k) || ParamsScope::RESERVED_DOCUMENTATION_KEYWORDS.include?(k)
+        end.freeze
+      end
+
+      def parse_coerce(raw)
+        coerce_with = raw[:coerce_with]
+        if raw.key?(:type)
+          coerce, coerce_message = extract_value_and_message(raw[:type])
+          return [Types::VariantCollectionCoercer.new(coerce, coerce_with), coerce_message, nil] if Types.multiple?(coerce)
+        elsif raw.key?(:types)
+          coerce, coerce_message = extract_value_and_message(raw[:types])
+        else
+          coerce, message = extract_value_and_message(raw[:coerce])
+          coerce_message = raw[:coerce_message] || message
+        end
+
+        [coerce, coerce_message, coerce_with]
+      end
+
+      def extract_value_and_message(opt)
+        return [opt, nil] unless opt.is_a?(Hash)
+
+        [opt[:value], opt[:message]]
+      end
+
+      def resolve_value(opt)
+        opt.is_a?(Hash) ? opt[:value] : opt
+      end
+
+      # The type as written in the DSL. Identical to +@coerce_type+ except for
+      # a multiple-type declaration (+type: [Integer, String]+), where
+      # {#parse_coerce} wraps the declared list in a
+      # {Types::VariantCollectionCoercer} for runtime coercion — the
+      # definition-time coherence checks need the list back, since the wrapper
+      # matches nothing under +===+.
+      def declared_coerce_type
+        @coerce_type.is_a?(Types::VariantCollectionCoercer) ? @coerce_type.types : @coerce_type
+      end
+
+      def guess_coerce_type(coerce_type, *values_list)
+        return coerce_type unless coerce_type == Array
+
+        values_list.each do |values|
+          next unless fixed_values?(values)
+          # A beginless Range has no first element to ask.
+          return (values.begin || values.end).class if values.is_a?(Range)
+          return values.first.class unless values.empty?
+        end
+        coerce_type
+      end
+    end
+  end
+end

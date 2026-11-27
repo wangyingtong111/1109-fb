@@ -1,0 +1,135 @@
+# frozen_string_literal: true
+
+describe Grape::Exceptions::ValidationErrors do
+  let(:validation_message) { 'FooBar is invalid' }
+  let(:validation_error) do
+    instance_double(Grape::Exceptions::Validation, params: [validation_message], message: '').tap do |dbl|
+      allow(dbl).to receive(:errors).and_return(dbl)
+    end
+  end
+
+  context 'initialize' do
+    subject do
+      described_class.new(exceptions: [validation_error], headers:)
+    end
+
+    let(:headers) do
+      {
+        'A-Header-Key' => 'A-Header-Value'
+      }
+    end
+
+    it 'assigns headers through base class' do
+      expect(subject.headers).to eq(headers)
+    end
+  end
+
+  context 'message' do
+    context 'is not repeated' do
+      subject(:message) { error.message.split(',').map(&:strip) }
+
+      let(:error) do
+        described_class.new(exceptions: [validation_error, validation_error])
+      end
+
+      it { expect(message).to include validation_message }
+      it { expect(message.size).to eq 1 }
+    end
+  end
+
+  describe '#to_json' do
+    it 'returns the JSON representation of #as_json' do
+      error = described_class.new(exceptions: [validation_error])
+      expect(error.to_json).to eq(error.as_json.to_json)
+    end
+  end
+
+  describe '#full_messages' do
+    context 'with errors' do
+      subject { described_class.new(exceptions: [id_error, name_error]).full_messages }
+
+      let(:id_error) { Grape::Exceptions::Validation.new(params: ['id'], message: :presence) }
+      let(:name_error) { Grape::Exceptions::Validation.new(params: ['name'], message: :presence) }
+
+      it 'returns an array with each errors full message' do
+        expect(subject).to contain_exactly('id is missing', 'name is missing')
+      end
+    end
+
+    context 'when attributes is an array of symbols' do
+      subject { described_class.new(exceptions: [validation_error]).full_messages }
+
+      let(:validation_error) { Grape::Exceptions::Validation.new(params: [:admin_field], message: 'Can not set admin-only field') }
+
+      it 'returns an array with an error full message' do
+        expect(subject.first).to eq('admin_field Can not set admin-only field')
+      end
+    end
+
+    context 'with a translated format and attribute names' do
+      subject { described_class.new(exceptions: [id_missing, id_invalid, name_missing]).full_messages }
+
+      let(:id_missing) { Grape::Exceptions::Validation.new(params: ['id'], message: :presence) }
+      let(:id_invalid) { Grape::Exceptions::Validation.new(params: ['id'], message: 'is invalid') }
+      let(:name_missing) { Grape::Exceptions::Validation.new(params: ['name'], message: :presence) }
+
+      around do |example|
+        # Stored before en.yml loads, the format would be overwritten by its
+        # default. Not eager_load!: it leaves the backend reloading eagerly on
+        # every later I18n.reload!, under whatever locales a spec has set then.
+        I18n.backend.translations(do_init: true)
+        I18n.backend.store_translations(:en, grape: { errors: { format: '%<message>s (%<attributes>s)', attributes: { id: 'Identifier' } } })
+        example.run
+      ensure
+        I18n.reload!
+      end
+
+      it 'formats every message, each with its own attribute names' do
+        expect(subject).to eq(['is missing (Identifier)', 'is invalid (Identifier)', 'is missing (name)'])
+      end
+    end
+
+    context 'when the caller changes the array it was given' do
+      subject(:error) { described_class.new(exceptions: [Grape::Exceptions::Validation.new(params: ['id'], message: :presence)]) }
+
+      it 'returns the same messages the next time' do
+        error.full_messages << 'name is missing'
+        expect(error.full_messages).to eq(['id is missing'])
+      end
+    end
+  end
+
+  context 'api' do
+    subject { Class.new(Grape::API) }
+
+    def app
+      subject
+    end
+
+    it 'can return structured json with separate fields' do
+      subject.format :json
+      subject.rescue_from described_class do |e|
+        error!(e, 400)
+      end
+      subject.params do
+        optional :beer
+        optional :wine
+        optional :juice
+        exactly_one_of :beer, :wine, :juice
+      end
+      subject.get '/exactly_one_of' do
+        'exactly_one_of works!'
+      end
+      get '/exactly_one_of', beer: 'string', wine: 'anotherstring'
+      expect(last_response).to be_bad_request
+      expect(JSON.parse(last_response.body)).to eq(
+        [
+          {
+            'params' => %w[beer wine],
+            'messages' => ['are mutually exclusive']
+          }
+        ]
+      )
+    end
+  end
+end

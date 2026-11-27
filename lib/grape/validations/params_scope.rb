@@ -1,0 +1,599 @@
+# frozen_string_literal: true
+
+module Grape
+  module Validations
+    class ParamsScope
+      attr_reader :parent, :type, :nearest_array_ancestor, :array_depth, :full_path
+
+      # The elements a +given+ scope narrowed its Array params down to during
+      # this request (see #meets_dependency?). Only a scope with a dependency
+      # ever stores any, so every other scope answers without the fiber-storage
+      # and tracker lookups -- which #params pays on each nested resolution,
+      # twice per validator, on every request.
+      def qualifying_params
+        return unless @dependent_on
+
+        ParamScopeTracker.current&.qualifying_params(self)
+      end
+
+      # @param params [Hash] initial hash of parameters
+      # @return hash of parameters relevant for the current scope
+      # @api private
+      # Only a +given+ scope ever stores qualifying params, and a scope on an
+      # independent chain has none above it (see #independent?), so the
+      # lookup and the +presence+ test that follows it are skipped -- both of
+      # them, at every level, on every call.
+      def params(params)
+        scoped = if @parent.nil?
+                   params
+                 elsif @independent
+                   @parent.params(params)
+                 else
+                   @parent.qualifying_params.presence || @parent.params(params)
+                 end
+        @element ? map_params(scoped, @element) : scoped
+      end
+
+      include Grape::DSL::Parameters
+      include Grape::Validations::ParamsDocumentation
+
+      # There are a number of documentation options on entities that don't have
+      # corresponding validators. Since there is nowhere that enumerates them all,
+      # we maintain a list of them here and skip looking up validators for them.
+      RESERVED_DOCUMENTATION_KEYWORDS = %i[as required param_type is_array format example].freeze
+
+      SPECIAL_JSON = [JSON, [JSON].freeze].freeze
+
+      # What {#validated_params} returns for a scope that should not be
+      # validated. A plain +false+ would be indistinguishable from params of
+      # that value, which +map_params+ can hand back for an element a request
+      # set to +false+.
+      NOT_VALIDATED = Object.new.freeze
+      private_constant :NOT_VALIDATED
+
+      # What {#params} hands back for an element of an Array that left an
+      # optional scope out, in place of that scope's params. Dropping the
+      # element instead would shift the indices the errors name, so it stays,
+      # and AttributesIterator and the validators pass over it.
+      EmptyOptionalValue = Object.new.freeze
+
+      class Attr
+        attr_reader :key, :scope
+
+        # Open up a new ParamsScope::Attr
+        # @param key [Hash, Symbol] key of attr
+        # @param scope [Grape::Validations::ParamsScope] scope of attr
+        def initialize(key, scope)
+          @key = key
+          @scope = scope
+        end
+
+        # @return Array[Symbol, Hash[Symbol => Array]] declared_params with symbol instead of Attr
+        def self.attrs_keys(declared_params)
+          declared_params.map do |declared_param_attr|
+            attr_key(declared_param_attr)
+          end
+        end
+
+        def self.attr_key(declared_param_attr)
+          case declared_param_attr
+          when self
+            attr_key(declared_param_attr.key)
+          when Hash
+            declared_param_attr.transform_values { |value| attrs_keys(value) }
+          else
+            declared_param_attr
+          end
+        end
+      end
+
+      # Open up a new ParamsScope, allowing parameter definitions per
+      #   Grape::DSL::Parameters.
+      # @param api [API] the API endpoint to modify
+      # @param element [Symbol] the element that contains this scope; for
+      #   this to be relevant, parent must be set
+      # @param element_renamed [Symbol, nil] whenever this scope should
+      #   be renamed and to what, given +nil+ no renaming is done
+      # @param parent [ParamsScope] the scope containing this scope
+      # @param optional [Boolean] whether or not this scope needs to have
+      #   any parameters set or not
+      # @param type [Class] a type meant to govern this scope
+      # @param group [Hash] group options for this scope
+      # @param dependent_on [Array<Symbol, Hash>] if present, this scope should
+      #   only validate if these params are present in the parent scope
+      # @yield the instance context, open for parameter definitions
+      def initialize(api:, element: nil, element_renamed: nil, parent: nil, optional: false, type: nil, group: nil, dependent_on: nil, &block)
+        @element          = element
+        @element_renamed  = element_renamed
+        @parent           = parent
+        @api              = api
+        @optional         = optional
+        @type             = type
+        @group            = group
+        @dependent_on     = dependent_on
+        # See #independent?. Settled here because a scope's block may declare
+        # children, and each of them asks its parent.
+        @independent      = !dependent_on && (parent.nil? || parent.independent?)
+        # Must be an ivar: push_declared_params is dispatched on self during
+        # instance_eval, so local variables from initialize are unreachable.
+        # configure_declared_params consumes it and clears @declared_params to nil.
+        @declared_params = []
+        @full_path = build_full_path
+        # Read by the validators instantiated from the block below, so it has to
+        # be settled before the instance_eval.
+        @array_depth = find_array_depth
+
+        instance_eval(&block) if block
+
+        configure_declared_params
+        @nearest_array_ancestor = find_nearest_array_ancestor
+        freeze
+      end
+
+      def configuration
+        config = @api.configuration
+        config.is_a?(Grape::Util::Lazy::Base) ? config.evaluate : config
+      end
+
+      # @return [Boolean] whether or not this entire scope needs to be
+      #   validated
+      def should_validate?(parameters)
+        return !NOT_VALIDATED.equal?(validated_params(parameters)) if @independent
+
+        scoped_params = params(parameters)
+
+        return false if @optional && (Grape::Util::Scrub.blank?(scoped_params) || all_element_blank?(scoped_params))
+        return false unless meets_dependency?(scoped_params, parameters)
+
+        # Past the +@independent+ return, this scope or one above it is a
+        # +given+ scope, and a +given+ scope is always nested: there is a parent.
+        @parent.should_validate?(parameters)
+      end
+
+      # Whether this scope and every scope above it declare no dependency, so
+      # #should_validate? has nothing to ask but whether each of them was given
+      # params -- and +qualifying_params+, which only a +given+ scope ever
+      # stores, cannot stand in for any of them.
+      # @return [Boolean]
+      def independent?
+        @independent
+      end
+
+      def meets_dependency?(params, request_params)
+        return true unless @dependent_on
+        return false if @parent && !@parent.meets_dependency?(@parent.params(request_params), request_params)
+
+        if params.is_a?(Array)
+          qualifying = qualifying_elements(params, request_params)
+          ParamScopeTracker.current&.store_qualifying_params(self, qualifying)
+          return qualifying.flatten.any? { |param| !EmptyOptionalValue.equal?(param) }
+        end
+
+        meets_hash_dependency?(params)
+      end
+
+      def attr_meets_dependency?(params)
+        return true unless @dependent_on
+        return false if @parent && !@parent.attr_meets_dependency?(params)
+
+        meets_hash_dependency?(params)
+      end
+
+      def meets_hash_dependency?(params)
+        # params might be anything what looks like a hash, so it must implement a `key?` method
+        return false unless params.respond_to?(:key?)
+
+        @dependent_on.all? do |dependency|
+          if dependency.is_a?(Hash)
+            key, callable = dependency.first
+            callable.call(params[key])
+          else
+            !Grape::Util::Scrub.blank?(params[dependency])
+          end
+        end
+      end
+
+      # @return [String] the proper attribute name, with nesting considered.
+      def full_name(name, index: nil)
+        tracker = ParamScopeTracker.current
+        if nested?
+          # Find our containing element's name, and append ours.
+          resolved_index = index || tracker&.index_for(self)
+          "#{@parent.full_name(@element)}#{brackets(resolved_index)}#{brackets(name)}"
+        elsif lateral?
+          # Find the name of the element as if it was at the same nesting level
+          # as our parent. We need to forward our index upward to achieve this.
+          @parent.full_name(name, index: tracker&.index_for(self))
+        else
+          # We must be the root scope, so no prefix needed.
+          name.to_s
+        end
+      end
+
+      def brackets(val)
+        "[#{val}]" if val
+      end
+
+      # Whether #should_validate? answers true for every request: this scope
+      # and each of its ancestors is required and depends on nothing, so
+      # neither the params nor the parent chain have anything to say.
+      # @return [Boolean]
+      def always_validated?
+        !@optional && validated_when_given?
+      end
+
+      # Whether #should_validate? has nothing to ask but whether this scope's
+      # own params were given: it depends on no other param, and every scope
+      # above it is always validated. A required scope like that is then
+      # always validated, an optional one whenever its params are there.
+      # @return [Boolean]
+      def validated_when_given?
+        !@dependent_on && (@parent.nil? || @parent.always_validated?)
+      end
+
+      # A nested scope is contained in one of its parent's elements.
+      # @return [Boolean] whether or not this scope is nested
+      def nested?
+        @parent && @element
+      end
+
+      # Whether this scope's params resolve to one entry per element, which is
+      # what makes both an element index and a nesting level meaningful.
+      #
+      # +type: Array[JSON]+ counts as much as +type: Array+ does. It is easy to
+      # miss because it evaluates to the Array *instance* +[JSON]+ rather than
+      # the Array class, so an +== Array+ test quietly excluded it.
+      # @return [Boolean]
+      def iterates_elements?
+        @type == Array || @type == SPECIAL_JSON.last
+      end
+
+      # A lateral scope is subordinate to its parent, but its keys are at the
+      # same level as its parent and thus is not contained within an element.
+      # @return [Boolean] whether or not this scope is lateral
+      def lateral?
+        @parent && !@element
+      end
+
+      # @return [Boolean] whether or not this scope needs to be present, or can
+      #   be blank
+      def required?
+        !@optional
+      end
+
+      protected
+
+      # This scope's params, once it and every scope above it has been found
+      # worth validating; NOT_VALIDATED as soon as one of them is not.
+      #
+      # Only for an independent chain (see #independent?), where every scope
+      # answers from its own params alone: each one is then resolved from the
+      # one above rather than from the root, so the walk costs one +map_params+
+      # per scope instead of one per scope per level. Nothing here has a side
+      # effect, so checking from the root down rather than from here up reaches
+      # the same answer.
+      def validated_params(parameters)
+        if @parent
+          scoped = @parent.validated_params(parameters)
+          return scoped if NOT_VALIDATED.equal?(scoped)
+
+          scoped = map_params(scoped, @element) if @element
+        else
+          scoped = parameters
+        end
+        return NOT_VALIDATED if @optional && (Grape::Util::Scrub.blank?(scoped) || all_element_blank?(scoped))
+
+        scoped
+      end
+
+      # Adds a parameter declaration to our list of validations.
+      # @param attrs [Array] (see Grape::DSL::Parameters#requires)
+      # +declared_params_scope+ is the scope an attribute is recorded against.
+      # It defaults to the receiver and is forwarded unchanged when a lateral
+      # scope hands the push to its parent, so an attribute declared inside a
+      # +given+ block stays attributed to the lateral scope that declared it
+      # rather than to the parent that stores it.
+      def push_declared_params(attrs, as: nil, declared_params_scope: self)
+        return @parent.push_declared_params(attrs, as:, declared_params_scope:) if lateral?
+
+        push_renamed_param(full_path + [attrs.first], as) if as
+        @declared_params.concat(attrs.map { |attr| ::Grape::Validations::ParamsScope::Attr.new(attr, declared_params_scope) })
+      end
+
+      private
+
+      def map_params(params, element, is_array: false)
+        case params
+        when Array
+          params.map do |el|
+            map_params(el, element, is_array: true)
+          end
+        when Hash
+          params[element] || missing_element(is_array)
+        when EmptyOptionalValue
+          EmptyOptionalValue
+        else
+          {}
+        end
+      end
+
+      # What a Hash without the element maps to: EmptyOptionalValue for an
+      # optional scope's element of an Array, which the validators pass over,
+      # and an empty Hash otherwise.
+      def missing_element(is_array)
+        @optional && is_array ? EmptyOptionalValue : {}
+      end
+
+      # The scopes below a +given+ read its Array params from here (see
+      # #params). An element that does not meet the dependency becomes
+      # EmptyOptionalValue, which they pass over, rather than being dropped:
+      # the ones that do then keep the index the request sent them at, which
+      # is the one their errors name.
+      def qualifying_elements(params, request_params)
+        params.map do |param|
+          next qualifying_elements(param, request_params) if param.is_a?(Array)
+
+          meets_dependency?(param, request_params) ? param : EmptyOptionalValue
+        end
+      end
+
+      def build_full_path
+        return @parent.full_path + [@element] if nested?
+        return @parent.full_path if lateral?
+
+        []
+      end
+
+      # Add a new parameter which should be renamed when using the +#declared+
+      # method.
+      #
+      # @param path [Array<String, Symbol>] the full path of the parameter
+      #   (including the parameter name as last array element)
+      # @param new_name [String, Symbol] the new name of the parameter (the
+      #   renamed name, with the +as: ...+ semantic)
+      def push_renamed_param(path, new_name)
+        @api.inheritable_setting.add_route_renamed_param(Array(path).map(&:to_s), new_name.to_s)
+      end
+
+      def require_required_and_optional_fields(context, using:, except: nil)
+        except_fields = Array.wrap(except)
+        using_fields = using.keys.delete_if { |f| except_fields.include?(f) }
+
+        if context == :all
+          optional_fields = except_fields
+          required_fields = using_fields
+        else # context == :none
+          required_fields = except_fields
+          optional_fields = using_fields
+        end
+        required_fields.each do |field|
+          field_opts = using[field]
+          raise ArgumentError, "required field not exist: `#{field}`" unless field_opts
+
+          requires(field, **field_opts)
+        end
+        declare_optional_fields(optional_fields, using)
+      end
+
+      def require_optional_fields(context, using:, except: nil)
+        optional_fields = using.keys
+        unless context == :all
+          except_fields = Array.wrap(except)
+          optional_fields.delete_if { |f| except_fields.include?(f) }
+        end
+        declare_optional_fields(optional_fields, using)
+      end
+
+      # Each of +fields+ as optional, with its options in +using+; one +using+
+      # does not hold is left out.
+      def declare_optional_fields(fields, using)
+        fields.each do |field|
+          field_opts = using[field]
+          optional(field, **field_opts) if field_opts
+        end
+      end
+
+      # Returns a new parameter scope, subordinate to the current one and nested
+      # under the given element.
+      # @param element [Symbol] the parameter name under which this scope is nested
+      # @param type [Class] the type governing this scope
+      # @param as [Symbol, nil] optional renamed name for the element
+      # @param optional [Boolean] whether the parameter this scope is nested under
+      #   is optional or not (and hence, whether this block's params will be).
+      # @yield parameter scope
+      def new_scope(element, type:, as:, optional: false, &)
+        # A group needs a type: it says whether the nested params sit under one
+        # object or repeat in a list, and nothing else could decide it. Checked
+        # here for `requires` and `optional` alike — `new_scope` is only reached
+        # from their block branch.
+        raise Grape::Exceptions::MissingGroupType if type.nil?
+        raise Grape::Exceptions::UnsupportedGroupType unless Grape::Validations::Types.group?(type)
+
+        # The block declares the keys of each element, so an element has to be
+        # a Hash. +Array[JSON]+ checks that when it parses the elements.
+        validate('hash_elements', {}, [element], false, {}) if type == Array
+
+        self.class.new(
+          api: @api,
+          element:,
+          element_renamed: as,
+          parent: self,
+          optional:,
+          type:,
+          group: @group,
+          &
+        )
+      end
+
+      # Returns a new parameter scope, not nested under any current-level param
+      # but instead at the same level as the current scope.
+      # @param dependent_on [Array<Symbol, Hash>] if given, this scope only
+      #   validates if these parameters from the above scope are present
+      # @yield parameter scope
+      def new_lateral_scope(dependent_on:, &)
+        self.class.new(
+          api: @api,
+          parent: self,
+          optional: @optional,
+          type: type == Array ? Array : Hash,
+          dependent_on:,
+          &
+        )
+      end
+
+      # Returns a new parameter scope, subordinate to the current one, sharing
+      # the given group options with all parameters defined within.
+      # @param group [Hash] common options to merge into each parameter in the scope
+      # @yield parameter scope
+      def new_group_scope(group, &)
+        self.class.new(api: @api, parent: self, group:, &)
+      end
+
+      # Pushes declared params to parent or settings, then clears @declared_params.
+      # Clearing here (rather than in initialize) keeps the lifecycle ownership in
+      # one place: this method both consumes and invalidates the ivar so that
+      # push_declared_params cannot be called on the frozen scope later.
+      def configure_declared_params
+        push_renamed_param(full_path, @element_renamed) if @element_renamed
+        return @parent.push_declared_params [{ @element => @declared_params }] if nested?
+
+        @api.inheritable_setting.add_declared_params(@declared_params)
+      ensure
+        @declared_params = nil
+      end
+
+      def find_nearest_array_ancestor
+        scope = @parent
+        scope = scope.parent while scope && !scope.iterates_elements?
+        scope
+      end
+
+      # Every element-iterating scope on the chain adds one level of nesting to
+      # what {#params} returns, because +map_params+ maps over the array it
+      # resolved from the parent. Counting them tells {AttributesIterator} how
+      # deep the declaration says the params for this scope may legitimately be.
+      #
+      # A lateral scope adds none: it has no element to map, so its params are
+      # its parent's. A +given+ in an Array scope still iterates their elements
+      # (see #new_lateral_scope), but counting it put every element it reads one
+      # level short of where the iterator looks for the elements a request sent.
+      def find_array_depth
+        return @parent.array_depth if lateral?
+
+        (iterates_elements? ? 1 : 0) + (@parent&.array_depth || 0)
+      end
+
+      def validates(attrs, validations, required: false)
+        spec = ValidationsSpec.from(declared_validations(validations, required))
+
+        document_params(attrs, spec)
+
+        # Presence runs first — `required` is forwarded to every subsequent
+        # validator (some short-circuit on it).
+        validate_presence(spec, attrs)
+
+        # Coerce runs second — later validators see the typed value.
+        validate_coerce(spec, attrs)
+
+        spec.validator_entries.each do |type, options|
+          validate(type, options, attrs, spec.required?, spec.shared_opts)
+        end
+      end
+
+      # +required+ is the DSL's own signal — +requires+ passes true, +optional+
+      # false. It used to travel as a +:presence+ key that +requires+ wrote into
+      # the caller's option Hash, which is why a user-supplied +presence:+ was
+      # silently overwritten there and silently honoured by +optional+, where
+      # nothing overwrote it. The key is built here from the flag instead, after
+      # the caller has merged in any enclosing +with+ attributes, so a
+      # group-level +message:+ reaches the presence validator.
+      #
+      # A +presence:+ supplied by an API still decides the outcome exactly as it
+      # used to — deprecated rather than dropped, so nothing changes under an
+      # API that relies on it until the key is ignored outright.
+      def declared_validations(validations, required)
+        if validations.key?(:presence)
+          Grape.deprecator.warn('Passing a `presence` option is deprecated and it will be ignored in a future release. Declare the parameter with `requires` to make it required, `optional` to make it optional.')
+        end
+
+        declared = required ? validations.merge(presence: { value: true, message: validations[:message] }) : validations
+        return declared unless declared.key?(:oneof)
+
+        declared.merge(oneof: collected_oneof(declared))
+      end
+
+      # Enforce correct usage of :coerce_with on a CoerceOptions.
+      # We do not allow coercion without a type, nor with +JSON+ as a type
+      # since that defines its own coercion method.
+      def check_coerce_with(coerce_options)
+        return unless coerce_options.coerce_method
+        raise ArgumentError, 'must supply type for coerce_with' unless coerce_options.type
+        return unless SPECIAL_JSON.include?(coerce_options.type)
+
+        raise ArgumentError, 'coerce_with disallowed for type: JSON'
+      end
+
+      def validate_presence(spec, attrs)
+        return unless spec.required?
+
+        validate('presence', spec.presence_options, attrs, true, spec.shared_opts)
+      end
+
+      def validate_coerce(spec, attrs)
+        coerce_options = spec.coerce_options
+        check_coerce_with(coerce_options)
+        # Falsy check is intentional: when a remountable API is first evaluated
+        # on its base instance (no configuration supplied yet),
+        # configuration[:some_type] evaluates to nil. Skipping instantiation
+        # here is correct — the real mounted instance will replay this step
+        # with the actual type value.
+        return unless coerce_options.type
+
+        validate('coerce', coerce_options, attrs, spec.required?, spec.shared_opts)
+      end
+
+      # Translate a `oneof: [proc, proc, ...]` declaration into a list of
+      # captured validator arrays — one array per variant. Each variant's
+      # block is evaluated in its own +ParamsScope+ backed by an
+      # {OneofCollector} so the full params DSL is available inside variants
+      # and the resulting validators are kept out of the real API's
+      # registration list.
+      # Returns the collected variants rather than writing them back into
+      # +validations+, which is the options Hash the +requires+/+optional+ call
+      # site built.
+      def collected_oneof(validations)
+        raise ArgumentError, 'oneof: requires type: Hash' unless validations[:type] == Hash
+
+        variants = validations[:oneof]
+        raise ArgumentError, 'oneof: must be a non-empty Array of blocks' if !variants.is_a?(Array) || variants.empty?
+        raise ArgumentError, 'oneof: each variant must be a Proc' unless variants.all?(Proc)
+
+        variants.map { |block| OneofCollector.collect(block) }
+      end
+
+      def validate(type, options, attrs, required, opts)
+        validator_class = Validations.require_validator(type)
+        validator_instance = validator_class.new(
+          attrs,
+          options,
+          required,
+          self,
+          opts
+        )
+        @api.inheritable_setting.add_validation(validator_instance)
+      end
+
+      # Only ever asked about params that are not blank (see #should_validate?
+      # and #validated_params), and a Hash that is not blank is never all
+      # blank: what +all?+ yields for it is a [key, value] pair, an Array of
+      # two, which +blank?+ is false for. Asking anyway walked the Hash and
+      # built one of those Arrays per entry, for every optional Hash scope of
+      # every request.
+      def all_element_blank?(scoped_params)
+        return false if scoped_params.is_a?(::Hash)
+
+        scoped_params.respond_to?(:all?) && scoped_params.all? { |element| Grape::Util::Scrub.blank?(element) }
+      end
+    end
+  end
+end

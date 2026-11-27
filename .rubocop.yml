@@ -1,0 +1,94 @@
+AllCops:
+  NewCops: enable
+  TargetRubyVersion: 3.3
+  SuggestExtensions: false
+  Include:
+    - .duel.rb
+  Exclude:
+    - vendor/**/*
+    - bin/**/*
+    - benchmark/**/*
+    - tmp/**/*
+
+inherit_mode:
+  merge:
+    - Include
+
+plugins:
+  - rubocop-exception_messages
+  - rubocop-performance
+  - rubocop-rspec
+
+Layout/LineLength:
+  Max: 213
+
+Lint/EmptyBlock:
+  Exclude:
+    - spec/**/*_spec.rb
+
+Style/Documentation:
+  Enabled: false
+
+Style/HashSyntax:
+  EnforcedShorthandSyntax: always
+
+Style/MultilineIfModifier:
+  Enabled: false
+
+Style/MutableConstant:
+  Recursive: true
+
+Style/OneClassPerFile:
+  Exclude:
+    - duel/**/*.rb
+
+Style/RaiseArgs:
+  Enabled: false
+
+Style/RedundantArrayConstructor:
+  Enabled: false  # doesn't work well with params definition
+
+Style/OptionalBooleanParameter:
+  AllowedMethods:
+    - respond_to?
+
+Style/Send:
+  Enabled: true
+
+Metrics/ClassLength:
+  Max: 365
+
+Metrics/ParameterLists:
+  CountKeywordArgs: false
+  MaxOptionalParameters: 4
+
+Metrics/MethodLength:
+  Max: 17
+  CountAsOne: [array, hash, heredoc, method_call]
+
+RSpec/ExampleLength:
+  Max: 60
+
+RSpec/NestedGroups:
+  Max: 6
+
+RSpec/SpecFilePathFormat:
+  Enabled: false
+
+RSpec/SpecFilePathSuffix:
+  Enabled: true
+
+RSpec/MultipleExpectations:
+  Enabled: false
+
+RSpec/NamedSubject:
+  Enabled: false
+
+RSpec/MultipleMemoizedHelpers:
+  Max: 11
+
+RSpec/ContextWording:
+  Enabled: false
+
+RSpec/MessageSpies:
+  EnforcedStyle: receive

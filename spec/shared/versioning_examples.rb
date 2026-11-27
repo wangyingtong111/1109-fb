@@ -1,0 +1,243 @@
+# frozen_string_literal: true
+
+shared_examples_for 'versioning' do
+  it 'sets the API version' do
+    subject.format :txt
+    subject.version 'v1', **macro_options.except(:format)
+    subject.get :hello do
+      "Version: #{request.env[Grape::Env::API_VERSION]}"
+    end
+    versioned_get '/hello', 'v1', macro_options
+    expect(last_response.body).to eql 'Version: v1'
+  end
+
+  it 'sets the API version for the root route' do
+    subject.format :txt
+    subject.version 'v1', **macro_options.except(:format)
+    subject.get do
+      "Version: #{request.env[Grape::Env::API_VERSION]}"
+    end
+    versioned_get '/', 'v1', macro_options
+    expect(last_response.body).to eql 'Version: v1'
+  end
+
+  it 'adds the prefix before the API version' do
+    subject.format :txt
+    subject.prefix 'api'
+    subject.version 'v1', **macro_options.except(:format)
+    subject.get :hello do
+      "Version: #{request.env[Grape::Env::API_VERSION]}"
+    end
+    versioned_get '/hello', 'v1', macro_options.merge(prefix: 'api')
+    expect(last_response.body).to eql 'Version: v1'
+  end
+
+  it 'is able to specify version as a nesting' do
+    subject.version 'v2', **macro_options.except(:format)
+    subject.get '/awesome' do
+      'Radical'
+    end
+
+    subject.version 'v1', **macro_options.except(:format) do
+      get '/legacy' do
+        'Totally'
+      end
+    end
+
+    versioned_get '/awesome', 'v1', macro_options
+    expect(last_response.status).to be 404
+
+    versioned_get '/awesome', 'v2', macro_options
+    expect(last_response.status).to be 200
+    versioned_get '/legacy', 'v1', macro_options
+    expect(last_response.status).to be 200
+    versioned_get '/legacy', 'v2', macro_options
+    expect(last_response.status).to be 404
+  end
+
+  it 'is able to specify multiple versions' do
+    subject.version 'v1', 'v2', **macro_options.except(:format)
+    subject.get 'awesome' do
+      'I exist'
+    end
+
+    versioned_get '/awesome', 'v1', macro_options
+    expect(last_response.status).to be 200
+    versioned_get '/awesome', 'v2', macro_options
+    expect(last_response.status).to be 200
+    versioned_get '/awesome', 'v3', macro_options
+    expect(last_response.status).to be 404
+  end
+
+  context 'with different versions for the same endpoint' do
+    context 'without a prefix' do
+      it 'allows the same endpoint to be implemented' do
+        subject.format :txt
+        subject.version 'v2', **macro_options.except(:format)
+        subject.get 'version' do
+          request.env[Grape::Env::API_VERSION]
+        end
+
+        subject.version 'v1', **macro_options.except(:format) do
+          get 'version' do
+            "version #{request.env[Grape::Env::API_VERSION]}"
+          end
+        end
+
+        versioned_get '/version', 'v2', macro_options
+        expect(last_response.status).to eq(200)
+        expect(last_response.body).to eq('v2')
+        versioned_get '/version', 'v1', macro_options
+        expect(last_response.status).to eq(200)
+        expect(last_response.body).to eq('version v1')
+      end
+    end
+
+    context 'with a prefix' do
+      it 'allows the same endpoint to be implemented' do
+        subject.format :txt
+        subject.prefix 'api'
+        subject.version 'v2', **macro_options.except(:format)
+        subject.get 'version' do
+          request.env[Grape::Env::API_VERSION]
+        end
+
+        subject.version 'v1', **macro_options.except(:format) do
+          get 'version' do
+            "version #{request.env[Grape::Env::API_VERSION]}"
+          end
+        end
+
+        versioned_get '/version', 'v1', macro_options.merge(prefix: subject.prefix)
+        expect(last_response.status).to eq(200)
+        expect(last_response.body).to eq('version v1')
+
+        versioned_get '/version', 'v2', macro_options.merge(prefix: subject.prefix)
+        expect(last_response.status).to eq(200)
+        expect(last_response.body).to eq('v2')
+      end
+    end
+  end
+
+  context 'with before block defined within a version block' do
+    it 'calls before block that is defined within the version block' do
+      subject.format :txt
+      subject.prefix 'api'
+      subject.version 'v2', **macro_options.except(:format) do
+        before do
+          @output ||= 'v2-'
+        end
+
+        get 'version' do
+          @output += 'version'
+        end
+      end
+
+      subject.version 'v1', **macro_options.except(:format) do
+        before do
+          @output ||= 'v1-'
+        end
+
+        get 'version' do
+          @output += 'version'
+        end
+      end
+
+      versioned_get '/version', 'v1', macro_options.merge(prefix: subject.prefix)
+      expect(last_response.status).to eq(200)
+      expect(last_response.body).to eq('v1-version')
+
+      versioned_get '/version', 'v2', macro_options.merge(prefix: subject.prefix)
+      expect(last_response.status).to eq(200)
+      expect(last_response.body).to eq('v2-version')
+    end
+  end
+
+  it 'does not overwrite version parameter with API version' do
+    subject.format :txt
+    subject.version 'v1', **macro_options.except(:format)
+    subject.params { requires :version }
+    subject.get :api_version_with_version_param do
+      params[:version]
+    end
+    versioned_get '/api_version_with_version_param?version=1', 'v1', macro_options
+    expect(last_response.body).to eql '1'
+  end
+
+  context 'with catch-all' do
+    let(:options) { macro_options }
+    # A third version makes v2 a *middle* version: reachable neither as the
+    # first route matched nor as the last one, which is what regressed when a
+    # cascading route handed straight over to the catch-all.
+    let(:version_apis) do
+      %w[v1 v2 v3].map do |version|
+        klass = Class.new(Grape::API)
+        klass.version version, **options.except(:format)
+        klass.get 'version' do
+          version
+        end
+        klass
+      end
+    end
+
+    before do
+      subject.format :txt
+
+      version_apis.each { |api| subject.mount api }
+
+      subject.route :any, '*path' do
+        params[:path]
+      end
+    end
+
+    context 'v1' do
+      it 'finds endpoint' do
+        versioned_get '/version', 'v1', macro_options
+        expect(last_response.status).to eq(200)
+        expect(last_response.body).to eq('v1')
+      end
+
+      it 'finds catch all' do
+        versioned_get '/whatever', 'v1', macro_options
+        expect(last_response.status).to eq(200)
+        expect(last_response.body).to end_with 'whatever'
+      end
+    end
+
+    context 'v2' do
+      it 'finds endpoint' do
+        versioned_get '/version', 'v2', macro_options
+        expect(last_response.status).to eq(200)
+        expect(last_response.body).to eq('v2')
+      end
+
+      it 'finds catch all' do
+        versioned_get '/whatever', 'v2', macro_options
+        expect(last_response.status).to eq(200)
+        expect(last_response.body).to end_with 'whatever'
+      end
+    end
+
+    context 'v3' do
+      it 'finds endpoint' do
+        versioned_get '/version', 'v3', macro_options
+        expect(last_response.status).to eq(200)
+        expect(last_response.body).to eq('v3')
+      end
+
+      it 'finds catch all' do
+        versioned_get '/whatever', 'v3', macro_options
+        expect(last_response.status).to eq(200)
+        expect(last_response.body).to end_with 'whatever'
+      end
+    end
+
+    context 'with an unknown version' do
+      it 'falls through to the catch-all' do
+        versioned_get '/version', 'v999', macro_options
+        expect(last_response.status).to eq(200)
+        expect(last_response.body).to end_with 'version'
+      end
+    end
+  end
+end

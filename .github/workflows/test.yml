@@ -1,0 +1,97 @@
+name: test
+
+# On pushes to master and on pull requests: a branch with a pull request
+# would otherwise run the whole matrix twice for each push.
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: RuboCop
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - name: Set up Ruby
+      uses: ruby/setup-ruby@be3c7df29b3349ec6bcfc6b4792f1cf9f5237d18 # v1.343.0
+      with:
+        ruby-version: 3.4
+        bundler-cache: true
+        rubygems: latest
+
+    - name: Run RuboCop
+      run: bundle exec rubocop
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        ruby: ['3.3', '3.4', '4.0']
+        gemfile:
+          - Gemfile
+          - gemfiles/rack_3_1.gemfile
+          - gemfiles/rack_3_2.gemfile
+          - gemfiles/rails_8_0.gemfile
+          - gemfiles/rails_8_1.gemfile
+        specs: ['spec --exclude-pattern=spec/integration/{grape_entity,grape_swagger,hashie,dry_validation,multi_*}/*_spec.rb']
+        include:
+          - ruby: '4.0'
+            gemfile: gemfiles/grape_entity.gemfile
+            specs: 'spec/integration/grape_entity'
+          - ruby: '4.0'
+            gemfile: gemfiles/grape_swagger.gemfile
+            specs: 'spec/integration/grape_swagger'
+          - ruby: '4.0'
+            gemfile: gemfiles/hashie.gemfile
+            specs: 'spec/integration/hashie'
+          - ruby: '4.0'
+            gemfile: gemfiles/dry_validation.gemfile
+            specs: 'spec/integration/dry_validation'
+          - ruby: '4.0'
+            gemfile: gemfiles/multi_json.gemfile
+            specs: 'spec/integration/multi_json'
+          - ruby: '4.0'
+            gemfile: gemfiles/multi_json_1_20.gemfile
+            specs: 'spec/integration/multi_json'
+          - ruby: '4.0'
+            gemfile: gemfiles/multi_xml.gemfile
+            specs: 'spec/integration/multi_xml'
+          - ruby: '4.0'
+            gemfile: gemfiles/multi_xml_0_8.gemfile
+            specs: 'spec/integration/multi_xml'
+    runs-on: ubuntu-latest
+    env:
+      BUNDLE_GEMFILE: ${{ github.workspace }}/${{ matrix.gemfile }}
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - name: Set up Ruby
+      uses: ruby/setup-ruby@be3c7df29b3349ec6bcfc6b4792f1cf9f5237d18 # v1.343.0
+      with:
+        ruby-version: ${{ matrix.ruby }}
+        bundler-cache: true
+
+    - name: Run Tests (${{ matrix.specs }})
+      run: "RUBYOPT='--enable=frozen-string-literal' bundle exec rspec ${{ matrix.specs }}"
+
+    - name: Coveralls
+      uses: coverallsapp/github-action@8d6379e14d29928660c4ba802d8e85393440b329 # v2.3.8
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        flag-name: run-${{ matrix.ruby }}-${{ matrix.gemfile }}
+        parallel: true
+
+  finish:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+    - name: Coveralls Finished
+      uses: coverallsapp/github-action@8d6379e14d29928660c4ba802d8e85393440b329 # v2.3.8
+      with:
+        github-token: ${{ secrets.github_token }}
+        parallel-finished: true

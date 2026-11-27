@@ -1,0 +1,1196 @@
+# frozen_string_literal: true
+
+describe Grape::Validations::Validators::ValuesValidator do
+  let(:values_model) do
+    Class.new do
+      class << self
+        def values
+          @values ||= []
+          [default_values + @values].flatten.uniq
+        end
+
+        def add_value(value)
+          @values ||= []
+          @values << value
+        end
+
+        def excepts
+          @excepts ||= []
+          [default_excepts + @excepts].flatten.uniq
+        end
+
+        def add_except(except)
+          @excepts ||= []
+          @excepts << except
+        end
+
+        def include?(value)
+          values.include?(value)
+        end
+
+        def even?(value)
+          value.to_i.even?
+        end
+
+        private
+
+        def default_values
+          %w[valid-type1 valid-type2 valid-type3].freeze
+        end
+
+        def default_excepts
+          %w[invalid-type1 invalid-type2 invalid-type3].freeze
+        end
+      end
+    end
+  end
+
+  before do
+    stub_const('ValuesModel', values_model)
+  end
+
+  describe '#bad encoding' do
+    let(:app) do
+      Class.new(Grape::API) do
+        default_format :json
+
+        params do
+          requires :type, type: String, values: %w[a b]
+        end
+        get '/bad_encoding'
+      end
+    end
+
+    context 'when value as bad encoding' do
+      it 'does not raise an error' do
+        expect { get '/bad_encoding', type: "Hello \x80" }.not_to raise_error
+      end
+    end
+  end
+
+  describe '/custom_message' do
+    let(:app) do
+      Class.new(Grape::API) do
+        default_format :json
+
+        resources :custom_message do
+          params do
+            requires :type, values: { value: ValuesModel.values, message: 'value does not include in values' }
+          end
+          get '/' do
+            { type: params[:type] }
+          end
+
+          params do
+            optional :type, values: { value: -> { ValuesModel.values }, message: 'value does not include in values' }, default: 'valid-type2'
+          end
+          get '/lambda' do
+            { type: params[:type] }
+          end
+        end
+      end
+    end
+
+    it 'allows a valid value for a parameter' do
+      get('/custom_message', type: 'valid-type1')
+      expect(last_response.status).to eq 200
+      expect(last_response.body).to eq({ type: 'valid-type1' }.to_json)
+    end
+
+    it 'does not allow an invalid value for a parameter' do
+      get('/custom_message', type: 'invalid-type')
+      expect(last_response.status).to eq 400
+      expect(last_response.body).to eq({ error: 'type value does not include in values' }.to_json)
+    end
+
+    it 'validates against values in a proc' do
+      ValuesModel.add_value('valid-type4')
+
+      get('/custom_message/lambda', type: 'valid-type4')
+      expect(last_response.status).to eq 200
+      expect(last_response.body).to eq({ type: 'valid-type4' }.to_json)
+    end
+
+    it 'does not allow an invalid value for a parameter using lambda' do
+      get('/custom_message/lambda', type: 'invalid-type')
+      expect(last_response.status).to eq 400
+      expect(last_response.body).to eq({ error: 'type value does not include in values' }.to_json)
+    end
+  end
+
+  describe '/' do
+    let(:app) do
+      Class.new(Grape::API) do
+        default_format :json
+
+        params do
+          requires :type, values: ValuesModel.values
+        end
+        get '/' do
+          { type: params[:type] }
+        end
+      end
+    end
+
+    it 'allows a valid value for a parameter' do
+      get('/', type: 'valid-type1')
+      expect(last_response.status).to eq 200
+      expect(last_response.body).to eq({ type: 'valid-type1' }.to_json)
+    end
+
+    it 'does not allow an invalid value for a parameter' do
+      get('/', type: 'invalid-type')
+      expect(last_response.status).to eq 400
+      expect(last_response.body).to eq({ error: 'type does not have a valid value' }.to_json)
+    end
+
+    context 'nil value for a parameter' do
+      it 'does not allow for root params scope' do
+        get('/', type: nil)
+        expect(last_response.status).to eq 400
+        expect(last_response.body).to eq({ error: 'type does not have a valid value' }.to_json)
+      end
+    end
+
+    it 'does not validate updated values without proc' do
+      app # Instantiate with the existing values.
+      ValuesModel.add_value('valid-type4')
+      get('/', type: 'valid-type4')
+      expect(last_response.status).to eq 400
+      expect(last_response.body).to eq({ error: 'type does not have a valid value' }.to_json)
+    end
+  end
+
+  describe '/empty' do
+    let(:app) do
+      Class.new(Grape::API) do
+        default_format :json
+
+        params do
+          requires :type, values: []
+        end
+        get '/empty'
+      end
+    end
+
+    it 'rejects all values if values is an empty array' do
+      get('/empty', type: 'invalid-type')
+      expect(last_response.status).to eq 400
+      expect(last_response.body).to eq({ error: 'type does not have a valid value' }.to_json)
+    end
+  end
+
+  describe '/optional_with_required_values' do
+    let(:app) do
+      Class.new(Grape::API) do
+        default_format :json
+
+        params do
+          optional :optional, type: Array do
+            requires :type, values: %w[a b]
+          end
+        end
+        get '/optional_with_required_values'
+      end
+    end
+
+    it 'does not validate a required param in child scope when its optional parent is absent' do
+      get('/optional_with_required_values')
+      expect(last_response.status).to eq 200
+    end
+  end
+
+  describe 'nil value for a required param in a nested scope' do
+    let(:app) do
+      Class.new(Grape::API) do
+        default_format :json
+
+        params do
+          requires :lines, type: Array do
+            requires :qty, type: Integer, values: 1..99
+          end
+        end
+        post('/lines') { { total: params[:lines].sum { |line| line[:qty] } } }
+
+        params do
+          requires :address, type: Hash do
+            requires :country, type: String, values: %w[US CA]
+          end
+        end
+        post('/address') { { country: params[:address][:country].downcase } }
+
+        params do
+          requires :kind, type: String
+          given kind: ->(kind) { kind == 'physical' } do
+            requires :size, type: String, values: %w[S M L]
+          end
+        end
+        post('/given') { { size: params[:size] } }
+      end
+    end
+
+    def post_json(path, body)
+      post path, body.to_json, 'CONTENT_TYPE' => 'application/json'
+    end
+
+    it 'does not allow nil in an array scope' do
+      post_json '/lines', lines: [{ qty: 5 }, { qty: nil }]
+      expect(last_response.status).to eq 400
+      expect(last_response.body).to eq({ error: 'lines[1][qty] does not have a valid value' }.to_json)
+    end
+
+    it 'does not allow a value that coerces to nil in an array scope' do
+      post_json '/lines', lines: [{ qty: '' }]
+      expect(last_response.status).to eq 400
+      expect(last_response.body).to eq({ error: 'lines[0][qty] does not have a valid value' }.to_json)
+    end
+
+    it 'does not allow nil in a hash scope' do
+      post_json '/address', address: { country: nil }
+      expect(last_response.status).to eq 400
+      expect(last_response.body).to eq({ error: 'address[country] does not have a valid value' }.to_json)
+    end
+
+    it 'reports a missing param the way the root scope does' do
+      post_json '/address', address: {}
+      expect(last_response.status).to eq 400
+      expect(last_response.body).to eq({ error: 'address[country] is missing' }.to_json)
+    end
+
+    it 'does not allow nil in a given block whose dependency is met' do
+      post_json '/given', kind: 'physical', size: nil
+      expect(last_response.status).to eq 400
+      expect(last_response.body).to eq({ error: 'size does not have a valid value' }.to_json)
+    end
+
+    it 'does not validate a given block whose dependency is not met' do
+      post_json '/given', kind: 'digital'
+      expect(last_response.status).to eq 201
+    end
+
+    it 'accepts a valid value' do
+      post_json '/lines', lines: [{ qty: 5 }, { qty: 7 }]
+      expect(last_response.status).to eq 201
+      expect(last_response.body).to eq({ total: 12 }.to_json)
+    end
+  end
+
+  describe '/optional_with_array_of_string_values' do
+    let(:app) do
+      Class.new(Grape::API) do
+        default_format :json
+
+        params do
+          optional :optional, type: Array[String], values: %w[a b c]
+        end
+        put '/optional_with_array_of_string_values'
+      end
+    end
+
+    it 'accepts nil for an optional param with a list of values' do
+      put('/optional_with_array_of_string_values', optional: nil)
+      expect(last_response.status).to eq 200
+    end
+  end
+
+  describe '/default/valid' do
+    let(:app) do
+      Class.new(Grape::API) do
+        default_format :json
+
+        params do
+          optional :type, values: ValuesModel.values, default: 'valid-type2'
+        end
+        get '/default/valid' do
+          { type: params[:type] }
+        end
+      end
+    end
+
+    it 'allows a valid default value' do
+      get('/default/valid')
+      expect(last_response.status).to eq 200
+      expect(last_response.body).to eq({ type: 'valid-type2' }.to_json)
+    end
+  end
+
+  describe '/default/hash/valid' do
+    let(:app) do
+      Class.new(Grape::API) do
+        default_format :json
+
+        params do
+          optional :type, values: { value: ValuesModel.values }, default: 'valid-type2'
+        end
+        get '/default/hash/valid' do
+          { type: params[:type] }
+        end
+      end
+    end
+
+    it 'allows a valid default value' do
+      get('/default/hash/valid')
+      expect(last_response.status).to eq 200
+      expect(last_response.body).to eq({ type: 'valid-type2' }.to_json)
+    end
+  end
+
+  describe '/lambda' do
+    let(:app) do
+      Class.new(Grape::API) do
+        default_format :json
+
+        params do
+          optional :type, values: -> { ValuesModel.values }, default: 'valid-type2'
+        end
+        get '/lambda' do
+          { type: params[:type] }
+        end
+      end
+    end
+
+    it 'allows a proc for values' do
+      get('/lambda', type: 'valid-type1')
+      expect(last_response.status).to eq 200
+      expect(last_response.body).to eq({ type: 'valid-type1' }.to_json)
+    end
+
+    it 'validates against values in a proc' do
+      ValuesModel.add_value('valid-type4')
+
+      get('/lambda', type: 'valid-type4')
+      expect(last_response.status).to eq 200
+      expect(last_response.body).to eq({ type: 'valid-type4' }.to_json)
+    end
+
+    it 'does not allow an invalid value for a parameter using lambda' do
+      get('/lambda', type: 'invalid-type')
+      expect(last_response.status).to eq 400
+      expect(last_response.body).to eq({ error: 'type does not have a valid value' }.to_json)
+    end
+
+    it 'evaluates the proc per-request, not at definition time (e.g. for DB-backed values)' do
+      app # instantiate at definition time, before the new value is added
+      ValuesModel.add_value('valid-type4')
+      get('/lambda', type: 'valid-type4')
+      expect(last_response.status).to eq 200
+      expect(last_response.body).to eq({ type: 'valid-type4' }.to_json)
+    end
+  end
+
+  describe '/endless' do
+    let(:app) do
+      Class.new(Grape::API) do
+        default_format :json
+
+        params do
+          optional :type, type: Integer, values: 1..
+        end
+        get '/endless' do
+          { type: params[:type] }
+        end
+      end
+    end
+
+    it 'validates against values in an endless range' do
+      get('/endless', type: 10)
+      expect(last_response.status).to eq 200
+      expect(last_response.body).to eq({ type: 10 }.to_json)
+    end
+
+    it 'does not allow an invalid value for a parameter using an endless range' do
+      get('/endless', type: 0)
+      expect(last_response.status).to eq 400
+      expect(last_response.body).to eq({ error: 'type does not have a valid value' }.to_json)
+    end
+  end
+
+  describe '/beginless' do
+    let(:app) do
+      Class.new(Grape::API) do
+        default_format :json
+
+        params do
+          optional :type, type: Integer, values: ..10
+        end
+        get '/beginless' do
+          { type: params[:type] }
+        end
+      end
+    end
+
+    it 'validates against values in a beginless range' do
+      get('/beginless', type: 5)
+      expect(last_response.status).to eq 200
+      expect(last_response.body).to eq({ type: 5 }.to_json)
+    end
+
+    it 'does not allow an invalid value for a parameter using a beginless range' do
+      get('/beginless', type: 11)
+      expect(last_response.status).to eq 400
+      expect(last_response.body).to eq({ error: 'type does not have a valid value' }.to_json)
+    end
+  end
+
+  # Ruby's `...` range excludes its upper bound; there is no equivalent for an exclusive
+  # lower bound, so that is achieved by combining `values:` with `except_values:`.
+  describe '/exclusive_bounds' do
+    let(:app) do
+      Class.new(Grape::API) do
+        default_format :json
+
+        resources :exclusive_bounds do
+          params do
+            requires :score, type: Float, values: 0.0...5.0
+          end
+          get '/exclusive_end' do
+            { score: params[:score] }
+          end
+
+          params do
+            requires :amount, type: Float, values: 0.0.., except_values: [0.0]
+          end
+          get '/exclusive_start' do
+            { amount: params[:amount] }
+          end
+
+          params do
+            requires :amount, type: Float, values: ->(v) { v > 0.0 }
+          end
+          get '/exclusive_start_predicate' do
+            { amount: params[:amount] }
+          end
+        end
+      end
+    end
+
+    context 'with an exclusive upper bound (0.0...5.0)' do
+      it 'allows a value just below the upper bound' do
+        get('/exclusive_bounds/exclusive_end', score: 4.9999)
+        expect(last_response.status).to eq 200
+        expect(last_response.body).to eq({ score: 4.9999 }.to_json)
+      end
+
+      it 'rejects the upper bound itself' do
+        get('/exclusive_bounds/exclusive_end', score: 5.0)
+        expect(last_response.status).to eq 400
+        expect(last_response.body).to eq({ error: 'score does not have a valid value' }.to_json)
+      end
+
+      it 'allows the lower bound (inclusive)' do
+        get('/exclusive_bounds/exclusive_end', score: 0.0)
+        expect(last_response.status).to eq 200
+        expect(last_response.body).to eq({ score: 0.0 }.to_json)
+      end
+    end
+
+    context 'with an exclusive lower bound (via values: 0.0.. + except_values: [0.0])' do
+      it 'allows a value just above the lower bound' do
+        get('/exclusive_bounds/exclusive_start', amount: 0.0001)
+        expect(last_response.status).to eq 200
+        expect(last_response.body).to eq({ amount: 0.0001 }.to_json)
+      end
+
+      it 'rejects exactly the excluded lower bound' do
+        get('/exclusive_bounds/exclusive_start', amount: 0.0)
+        expect(last_response.status).to eq 400
+        expect(last_response.body).to eq({ error: 'amount has a value not allowed' }.to_json)
+      end
+
+      it 'rejects a value below the lower bound' do
+        get('/exclusive_bounds/exclusive_start', amount: -1.0)
+        expect(last_response.status).to eq 400
+        expect(last_response.body).to eq({ error: 'amount does not have a valid value' }.to_json)
+      end
+    end
+
+    context 'with an exclusive lower bound (via values: ->(v) { v > 0.0 }, the cleaner alternative)' do
+      it 'allows a value just above the lower bound' do
+        get('/exclusive_bounds/exclusive_start_predicate', amount: 0.0001)
+        expect(last_response.status).to eq 200
+        expect(last_response.body).to eq({ amount: 0.0001 }.to_json)
+      end
+
+      it 'rejects exactly the lower bound' do
+        get('/exclusive_bounds/exclusive_start_predicate', amount: 0.0)
+        expect(last_response.status).to eq 400
+        expect(last_response.body).to eq({ error: 'amount does not have a valid value' }.to_json)
+      end
+
+      it 'rejects a value below the lower bound' do
+        get('/exclusive_bounds/exclusive_start_predicate', amount: -1.0)
+        expect(last_response.status).to eq 400
+        expect(last_response.body).to eq({ error: 'amount does not have a valid value' }.to_json)
+      end
+    end
+  end
+
+  # Open (beginless/endless) ranges cover the common numeric-bounding needs (positive
+  # numbers, percentages, exact values) without a dedicated `numericality` validator, since
+  # `values:` already accepts a `Range` and checks it with `Range#include?`.
+  # See https://github.com/ruby-grape/grape/pull/2822#issuecomment-5084586238
+  describe '/open_ranges' do
+    let(:app) do
+      Class.new(Grape::API) do
+        default_format :json
+
+        resources :open_ranges do
+          params do
+            requires :quantity, type: Integer, values: 1..
+          end
+          get '/quantity' do
+            { quantity: params[:quantity] }
+          end
+
+          params do
+            requires :discount, type: Float, values: 0.0..100.0
+          end
+          get '/discount' do
+            { discount: params[:discount] }
+          end
+
+          params do
+            requires :rating, type: Integer, values: 5..5
+          end
+          get '/rating' do
+            { rating: params[:rating] }
+          end
+
+          params do
+            requires :page, type: Integer, values: 1..
+          end
+          get '/page' do
+            { page: params[:page] }
+          end
+
+          params do
+            requires :numbers, type: [Integer], values: 1..
+          end
+          get '/numbers' do
+            { numbers: params[:numbers] }
+          end
+        end
+      end
+    end
+
+    context 'when a positive quantity is required (greater_than: 0)' do
+      it 'allows a positive value' do
+        get('/open_ranges/quantity', quantity: 1)
+        expect(last_response.status).to eq 200
+        expect(last_response.body).to eq({ quantity: 1 }.to_json)
+      end
+
+      it 'rejects zero' do
+        get('/open_ranges/quantity', quantity: 0)
+        expect(last_response.status).to eq 400
+        expect(last_response.body).to eq({ error: 'quantity does not have a valid value' }.to_json)
+      end
+
+      it 'rejects a negative value' do
+        get('/open_ranges/quantity', quantity: -1)
+        expect(last_response.status).to eq 400
+        expect(last_response.body).to eq({ error: 'quantity does not have a valid value' }.to_json)
+      end
+    end
+
+    context 'when a percentage is required (greater_than_or_equal_to: 0, less_than_or_equal_to: 100)' do
+      it 'allows a value within range' do
+        get('/open_ranges/discount', discount: 50)
+        expect(last_response.status).to eq 200
+        expect(last_response.body).to eq({ discount: 50.0 }.to_json)
+      end
+
+      it 'allows the lower bound' do
+        get('/open_ranges/discount', discount: 0)
+        expect(last_response.status).to eq 200
+        expect(last_response.body).to eq({ discount: 0.0 }.to_json)
+      end
+
+      it 'allows the upper bound' do
+        get('/open_ranges/discount', discount: 100)
+        expect(last_response.status).to eq 200
+        expect(last_response.body).to eq({ discount: 100.0 }.to_json)
+      end
+
+      it 'rejects a value below the range' do
+        get('/open_ranges/discount', discount: -1)
+        expect(last_response.status).to eq 400
+        expect(last_response.body).to eq({ error: 'discount does not have a valid value' }.to_json)
+      end
+
+      it 'rejects a value above the range' do
+        get('/open_ranges/discount', discount: 101)
+        expect(last_response.status).to eq 400
+        expect(last_response.body).to eq({ error: 'discount does not have a valid value' }.to_json)
+      end
+    end
+
+    context 'when an exact value is required (equal_to: 5)' do
+      it 'allows the exact value' do
+        get('/open_ranges/rating', rating: 5)
+        expect(last_response.status).to eq 200
+        expect(last_response.body).to eq({ rating: 5 }.to_json)
+      end
+
+      it 'rejects any other value' do
+        get('/open_ranges/rating', rating: 4)
+        expect(last_response.status).to eq 400
+        expect(last_response.body).to eq({ error: 'rating does not have a valid value' }.to_json)
+      end
+    end
+
+    context 'when a positive integer is required (greater_than: 0, only_integer: true)' do
+      it 'allows a positive integer' do
+        get('/open_ranges/page', page: 1)
+        expect(last_response.status).to eq 200
+        expect(last_response.body).to eq({ page: 1 }.to_json)
+      end
+
+      it 'rejects a non-integer value' do
+        get('/open_ranges/page', page: 1.5)
+        expect(last_response.status).to eq 400
+        expect(last_response.body).to eq({ error: 'page is invalid, page does not have a valid value' }.to_json)
+      end
+
+      it 'rejects zero' do
+        get('/open_ranges/page', page: 0)
+        expect(last_response.status).to eq 400
+        expect(last_response.body).to eq({ error: 'page does not have a valid value' }.to_json)
+      end
+    end
+
+    context 'when every array element must satisfy the constraint (greater_than: 0)' do
+      it 'allows an array whose elements all satisfy the constraint' do
+        get('/open_ranges/numbers', numbers: [1, 2, 3])
+        expect(last_response.status).to eq 200
+        expect(last_response.body).to eq({ numbers: [1, 2, 3] }.to_json)
+      end
+
+      it 'rejects an array with an element violating the constraint' do
+        get('/open_ranges/numbers', numbers: [1, 0, 3])
+        expect(last_response.status).to eq 400
+        expect(last_response.body).to eq({ error: 'numbers does not have a valid value' }.to_json)
+      end
+    end
+  end
+
+  describe '/lambda_val' do
+    let(:app) do
+      Class.new(Grape::API) do
+        default_format :json
+
+        params do
+          requires :type, values: ->(v) { ValuesModel.include? v }
+        end
+        get '/lambda_val' do
+          { type: params[:type] }
+        end
+      end
+    end
+
+    it 'allows value using lambda' do
+      get('/lambda_val', type: 'valid-type1')
+      expect(last_response.status).to eq 200
+      expect(last_response.body).to eq({ type: 'valid-type1' }.to_json)
+    end
+
+    it 'does not allow invalid value using lambda' do
+      get('/lambda_val', type: 'invalid-type')
+      expect(last_response.status).to eq 400
+      expect(last_response.body).to eq({ error: 'type does not have a valid value' }.to_json)
+    end
+  end
+
+  describe '/lambda_int_val' do
+    let(:app) do
+      Class.new(Grape::API) do
+        default_format :json
+
+        params do
+          requires :number, type: Integer, values: ->(v) { v > 0 }
+        end
+        get '/lambda_int_val' do
+          { number: params[:number] }
+        end
+      end
+    end
+
+    it 'does not allow non-numeric string value for int value using lambda' do
+      get('/lambda_int_val', number: 'foo')
+      expect(last_response.status).to eq 400
+      expect(last_response.body).to eq({ error: 'number is invalid, number does not have a valid value' }.to_json)
+    end
+
+    it 'does not allow nil for int value using lambda' do
+      get('/lambda_int_val', number: nil)
+      expect(last_response.status).to eq 400
+      expect(last_response.body).to eq({ error: 'number does not have a valid value' }.to_json)
+    end
+
+    it 'allows numeric string for int value using lambda' do
+      get('/lambda_int_val', number: '3')
+      expect(last_response.status).to eq 200
+      expect(last_response.body).to eq({ number: 3 }.to_json)
+    end
+  end
+
+  describe '/empty_lambda' do
+    let(:app) do
+      Class.new(Grape::API) do
+        default_format :json
+
+        params do
+          requires :type, values: -> { [] }
+        end
+        get '/empty_lambda'
+      end
+    end
+
+    it 'validates against an empty array in a proc' do
+      get('/empty_lambda', type: 'any')
+      expect(last_response.status).to eq 400
+      expect(last_response.body).to eq({ error: 'type does not have a valid value' }.to_json)
+    end
+  end
+
+  # Unlike an empty list, no list at all constrains nothing.
+  describe '/nil_lambda' do
+    let(:app) do
+      Class.new(Grape::API) do
+        default_format :json
+
+        params do
+          requires :type, values: -> {}
+        end
+        get '/nil_lambda' do
+          { type: params[:type] }
+        end
+      end
+    end
+
+    it 'accepts any value when the proc hands back no list' do
+      get('/nil_lambda', type: 'any')
+      expect(last_response.status).to eq 200
+      expect(last_response.body).to eq({ type: 'any' }.to_json)
+    end
+  end
+
+  describe '/default_lambda' do
+    let(:app) do
+      Class.new(Grape::API) do
+        default_format :json
+
+        params do
+          optional :type, values: ValuesModel.values, default: -> { ValuesModel.values.sample }
+        end
+        get '/default_lambda' do
+          { type: params[:type] }
+        end
+      end
+    end
+
+    it 'validates default value from proc' do
+      get('/default_lambda')
+      expect(last_response.status).to eq 200
+    end
+  end
+
+  describe '/default_and_values_lambda' do
+    let(:app) do
+      Class.new(Grape::API) do
+        default_format :json
+
+        params do
+          optional :type, values: -> { ValuesModel.values }, default: -> { ValuesModel.values.sample }
+        end
+        get '/default_and_values_lambda' do
+          { type: params[:type] }
+        end
+      end
+    end
+
+    it 'validates default value from proc against values in a proc' do
+      get('/default_and_values_lambda')
+      expect(last_response.status).to eq 200
+    end
+  end
+
+  context 'IncompatibleOptionValues' do
+    it 'raises on an invalid default value from proc' do
+      subject = Class.new(Grape::API)
+      expect do
+        subject.params { optional :type, values: %w[valid-type1 valid-type2 valid-type3], default: "#{ValuesModel.values.sample}_invalid" }
+      end.to raise_error Grape::Exceptions::IncompatibleOptionValues
+    end
+
+    it 'raises on an invalid default value' do
+      subject = Class.new(Grape::API)
+      expect do
+        subject.params { optional :type, values: %w[valid-type1 valid-type2 valid-type3], default: 'invalid-type' }
+      end.to raise_error Grape::Exceptions::IncompatibleOptionValues
+    end
+
+    it 'raises when type is incompatible with values array' do
+      subject = Class.new(Grape::API)
+      expect do
+        subject.params { optional :type, values: %w[valid-type1 valid-type2 valid-type3], type: Symbol }
+      end.to raise_error Grape::Exceptions::IncompatibleOptionValues
+    end
+
+    it 'raises when values contains a value that is not a kind of the type' do
+      subject = Class.new(Grape::API)
+      expect do
+        subject.params { requires :type, values: [10.5, 11], type: Integer }
+      end.to raise_error Grape::Exceptions::IncompatibleOptionValues
+    end
+
+    it 'raises when except contains a value that is not a kind of the type' do
+      subject = Class.new(Grape::API)
+      expect do
+        subject.params { requires :type, except_values: [10.5, 11], type: Integer }
+      end.to raise_error Grape::Exceptions::IncompatibleOptionValues
+    end
+
+    it 'raises when a Boolean type has a non-boolean value' do
+      subject = Class.new(Grape::API)
+      expect do
+        subject.params { requires :type, values: [true, 'yes'], type: Grape::API::Boolean }
+      end.to raise_error Grape::Exceptions::IncompatibleOptionValues
+    end
+
+    it 'raises when an Array of Boolean has a non-boolean value' do
+      subject = Class.new(Grape::API)
+      expect do
+        subject.params { requires :type, values: [false, 1], type: [Grape::API::Boolean] }
+      end.to raise_error Grape::Exceptions::IncompatibleOptionValues
+    end
+  end
+
+  describe '/values/optional_boolean' do
+    let(:app) do
+      Class.new(Grape::API) do
+        default_format :json
+
+        params do
+          optional :type, type: Grape::API::Boolean, desc: 'A boolean', values: [true]
+        end
+        get '/values/optional_boolean' do
+          { type: params[:type] }
+        end
+      end
+    end
+
+    it 'allows a value from the list' do
+      get('/values/optional_boolean', type: true)
+
+      expect(last_response.status).to eq 200
+      expect(last_response.body).to eq({ type: true }.to_json)
+    end
+
+    it 'rejects a value which is not in the list' do
+      get('/values/optional_boolean', type: false)
+
+      expect(last_response.body).to eq({ error: 'type does not have a valid value' }.to_json)
+    end
+  end
+
+  describe '/values/coercion' do
+    let(:app) do
+      Class.new(Grape::API) do
+        default_format :json
+
+        params do
+          requires :type, type: Integer, desc: 'An integer', values: [10, 11], default: 10
+        end
+        get '/values/coercion' do
+          { type: params[:type] }
+        end
+      end
+    end
+
+    it 'allows values to be a kind of the coerced type not just an instance of it' do
+      get('/values/coercion', type: 10)
+      expect(last_response.status).to eq 200
+      expect(last_response.body).to eq({ type: 10 }.to_json)
+    end
+  end
+
+  describe '/values/array_coercion' do
+    let(:app) do
+      Class.new(Grape::API) do
+        default_format :json
+
+        params do
+          requires :type, type: Array[Integer], desc: 'An integer', values: [10, 11], default: 10
+        end
+        get '/values/array_coercion' do
+          { type: params[:type] }
+        end
+      end
+    end
+
+    it 'allows values to be a kind of the coerced type in an array' do
+      get('/values/array_coercion', type: [10])
+      expect(last_response.status).to eq 200
+      expect(last_response.body).to eq({ type: [10] }.to_json)
+    end
+  end
+
+  describe '/allow_blank' do
+    let(:app) do
+      Class.new(Grape::API) do
+        default_format :json
+
+        params do
+          optional :name, type: String, values: %w[a b], allow_blank: true
+          optional :flag, type: Grape::API::Boolean, values: [true], allow_blank: true
+        end
+        get '/allow_blank'
+      end
+    end
+
+    it 'allows a blank value when the allow_blank option is true' do
+      get 'allow_blank', name: nil
+      expect(last_response.status).to eq(200)
+
+      get 'allow_blank', name: ''
+      expect(last_response.status).to eq(200)
+    end
+
+    # ActiveSupport counts false as blank, but a Boolean false is a value.
+    it 'still checks false against the values' do
+      get 'allow_blank', flag: false
+      expect(last_response.status).to eq(400)
+      expect(last_response.body).to eq({ error: 'flag does not have a valid value' }.to_json)
+    end
+  end
+
+  context 'with a lambda values' do
+    subject do
+      Class.new(Grape::API) do
+        params do
+          optional :type, type: String, values: -> { [SecureRandom.uuid] }, default: -> { SecureRandom.uuid }
+        end
+        get '/random_values'
+      end
+    end
+
+    def app
+      subject
+    end
+
+    it 'only evaluates values dynamically with each request' do
+      expect(SecureRandom).to receive(:uuid).and_return('foo').once
+      get '/random_values', type: 'foo'
+      expect(last_response.status).to eq 200
+    end
+
+    it 'chooses default' do
+      expect(SecureRandom).to receive(:uuid).and_return('foo').once
+      get '/random_values'
+      expect(last_response.status).to eq 200
+    end
+  end
+
+  context 'with a range of values' do
+    subject(:app) do
+      Class.new(Grape::API) do
+        params do
+          optional :value, type: Float, values: 0.0..10.0
+        end
+        get '/value' do
+          { value: params[:value] }.to_json
+        end
+
+        params do
+          optional :values, type: Array[Float], values: 0.0..10.0
+        end
+        get '/values' do
+          { values: params[:values] }.to_json
+        end
+      end
+    end
+
+    it 'allows a single value inside of the range' do
+      get('/value', value: 5.2)
+      expect(last_response.status).to eq 200
+      expect(last_response.body).to eq({ value: 5.2 }.to_json)
+    end
+
+    it 'allows an array of values inside of the range' do
+      get('/values', values: [8.6, 7.5, 3, 0.9])
+      expect(last_response.status).to eq 200
+      expect(last_response.body).to eq({ values: [8.6, 7.5, 3.0, 0.9] }.to_json)
+    end
+
+    it 'rejects a single value outside the range' do
+      get('/value', value: 'a')
+      expect(last_response.status).to eq 400
+      expect(last_response.body).to eq('value is invalid, value does not have a valid value')
+    end
+
+    it 'rejects an array of values if any of them are outside the range' do
+      get('/values', values: [8.6, 75, 3, 0.9])
+      expect(last_response.status).to eq 400
+      expect(last_response.body).to eq('values does not have a valid value')
+    end
+  end
+
+  describe '/mixed/value/except' do
+    let(:app) do
+      Class.new(Grape::API) do
+        default_format :json
+
+        params do
+          requires :type, type: Integer, values: 1..5, except_values: [3]
+        end
+        get '/mixed/value/except' do
+          { type: params[:type] }
+        end
+      end
+    end
+
+    it 'allows value, but not in except' do
+      get '/mixed/value/except', type: 2
+      expect(last_response.status).to eq 200
+      expect(last_response.body).to eq({ type: 2 }.to_json)
+    end
+
+    it 'rejects except' do
+      get '/mixed/value/except', type: 3
+      expect(last_response.status).to eq 400
+      expect(last_response.body).to eq({ error: 'type has a value not allowed' }.to_json)
+    end
+
+    it 'rejects outside except and outside value' do
+      get '/mixed/value/except', type: 10
+      expect(last_response.status).to eq 400
+      expect(last_response.body).to eq({ error: 'type does not have a valid value' }.to_json)
+    end
+  end
+
+  describe '/proc' do
+    let(:app) do
+      Class.new(Grape::API) do
+        default_format :json
+
+        params do
+          requires :type, values: ->(v) { ValuesModel.include? v }
+        end
+        get '/proc' do
+          { type: params[:type] }
+        end
+      end
+    end
+
+    it 'accepts a single valid value' do
+      get '/proc', type: 'valid-type1'
+      expect(last_response.status).to eq 200
+      expect(last_response.body).to eq({ type: 'valid-type1' }.to_json)
+    end
+
+    it 'accepts multiple valid values' do
+      get '/proc', type: %w[valid-type1 valid-type3]
+      expect(last_response.status).to eq 200
+      expect(last_response.body).to eq({ type: %w[valid-type1 valid-type3] }.to_json)
+    end
+
+    it 'rejects a single invalid value' do
+      get '/proc', type: 'invalid-type1'
+      expect(last_response.status).to eq 400
+      expect(last_response.body).to eq({ error: 'type does not have a valid value' }.to_json)
+    end
+
+    it 'rejects an invalid value among valid ones' do
+      get '/proc', type: %w[valid-type1 invalid-type1 valid-type3]
+      expect(last_response.status).to eq 400
+      expect(last_response.body).to eq({ error: 'type does not have a valid value' }.to_json)
+    end
+  end
+
+  describe '/proc/message' do
+    let(:app) do
+      Class.new(Grape::API) do
+        default_format :json
+
+        params do
+          requires :type, values: { value: ->(v) { ValuesModel.include? v }, message: 'failed check' }
+        end
+        get '/proc/message'
+      end
+    end
+
+    it 'uses supplied message' do
+      get '/proc/message', type: 'invalid-type1'
+      expect(last_response.status).to eq 400
+      expect(last_response.body).to eq({ error: 'type failed check' }.to_json)
+    end
+  end
+
+  describe '/proc/custom_message' do
+    let(:app) do
+      Class.new(Grape::API) do
+        default_format :json
+
+        params do
+          requires :number, values: { value: ->(v) { ValuesModel.even? v }, message: 'must be even' }
+        end
+        get '/proc/custom_message' do
+          { message: 'success' }
+        end
+      end
+    end
+
+    it 'accepts a valid value' do
+      get '/proc/custom_message', number: 4
+      expect(last_response.status).to eq 200
+      expect(last_response.body).to eq({ message: 'success' }.to_json)
+    end
+
+    it 'rejects an invalid value' do
+      get '/proc/custom_message', number: 5
+      expect(last_response.status).to eq 400
+      expect(last_response.body).to eq({ error: 'number must be even' }.to_json)
+    end
+  end
+
+  describe '/proc/arity2' do
+    let(:app) do
+      Class.new(Grape::API) do
+        default_format :json
+
+        params do
+          requires :input_one, :input_two, values: { value: ->(v1, v2) { v1 + v2 > 10 } }
+        end
+        get '/proc/arity2'
+      end
+    end
+
+    it 'returns an error status code' do
+      get '/proc/arity2', input_one: 2, input_two: 3
+      expect(last_response.status).to eq 400
+    end
+  end
+
+  describe '/values_wrapped_by_with_block' do
+    let(:app) do
+      Class.new(Grape::API) do
+        default_format :json
+
+        params do
+          with(type: String) do
+            requires :type, values: ValuesModel.values
+          end
+        end
+        get 'values_wrapped_by_with_block'
+      end
+    end
+
+    it 'rejects an invalid value' do
+      get 'values_wrapped_by_with_block'
+
+      expect(last_response.status).to eq 400
+      expect(last_response.body).to eq({ error: 'type is missing' }.to_json)
+    end
+  end
+end

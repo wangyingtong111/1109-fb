@@ -1,0 +1,5 @@
+# frozen_string_literal: true
+
+gem 'multi_xml', '< 0.9'
+
+eval_gemfile '../Gemfile'

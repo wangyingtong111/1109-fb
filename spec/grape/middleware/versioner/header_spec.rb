@@ -1,0 +1,491 @@
+# frozen_string_literal: true
+
+describe Grape::Middleware::Versioner::Header do
+  subject { described_class.new(app, **options) }
+
+  let(:app) { ->(env) { [200, env, env] } }
+
+  let(:options) do
+    {
+      version_options: Grape::DSL::VersionOptions.new(using: :header, vendor: 'vendor')
+    }
+  end
+
+  context 'api.type and api.subtype' do
+    it 'sets type and subtype to first choice of content type if no preference given' do
+      status, _, env = subject.call('HTTP_ACCEPT' => '*/*')
+      expect(env[Grape::Env::API_TYPE]).to eql 'application'
+      expect(env[Grape::Env::API_SUBTYPE]).to eql 'vnd.vendor+xml'
+      expect(status).to eq(200)
+    end
+
+    it 'sets preferred type' do
+      status, _, env = subject.call('HTTP_ACCEPT' => 'application/*')
+      expect(env[Grape::Env::API_TYPE]).to eql 'application'
+      expect(env[Grape::Env::API_SUBTYPE]).to eql 'vnd.vendor+xml'
+      expect(status).to eq(200)
+    end
+
+    it 'sets preferred type and subtype' do
+      status, _, env = subject.call('HTTP_ACCEPT' => 'text/plain')
+      expect(env[Grape::Env::API_TYPE]).to eql 'text'
+      expect(env[Grape::Env::API_SUBTYPE]).to eql 'plain'
+      expect(status).to eq(200)
+    end
+  end
+
+  context 'api.format' do
+    it 'is set' do
+      status, _, env = subject.call('HTTP_ACCEPT' => 'application/vnd.vendor+json')
+      expect(env[Grape::Env::API_FORMAT]).to eql 'json'
+      expect(status).to eq(200)
+    end
+
+    it 'is nil if not provided' do
+      status, _, env = subject.call('HTTP_ACCEPT' => 'application/vnd.vendor')
+      expect(env[Grape::Env::API_FORMAT]).to be_nil
+      expect(status).to eq(200)
+    end
+
+    ['v1', :v1].each do |version|
+      context "when version is set to #{version}" do
+        before do
+          options[:versions] = [version]
+        end
+
+        it 'is set' do
+          status, _, env = subject.call('HTTP_ACCEPT' => 'application/vnd.vendor-v1+json')
+          expect(env[Grape::Env::API_FORMAT]).to eql 'json'
+          expect(status).to eq(200)
+        end
+
+        it 'is nil if not provided' do
+          status, _, env = subject.call('HTTP_ACCEPT' => 'application/vnd.vendor-v1')
+          expect(env[Grape::Env::API_FORMAT]).to be_nil
+          expect(status).to eq(200)
+        end
+      end
+    end
+  end
+
+  context 'api.vendor' do
+    it 'is set' do
+      status, _, env = subject.call('HTTP_ACCEPT' => 'application/vnd.vendor')
+      expect(env[Grape::Env::API_VENDOR]).to eql 'vendor'
+      expect(status).to eq(200)
+    end
+
+    it 'is set if format provided' do
+      status, _, env = subject.call('HTTP_ACCEPT' => 'application/vnd.vendor+json')
+      expect(env[Grape::Env::API_VENDOR]).to eql 'vendor'
+      expect(status).to eq(200)
+    end
+
+    it 'fails with 406 Not Acceptable if vendor is invalid' do
+      expect { subject.call('HTTP_ACCEPT' => 'application/vnd.othervendor+json').last }
+        .to raise_exception do |exception|
+          expect(exception).to be_a(Grape::Exceptions::InvalidAcceptHeader)
+          expect(exception.headers).to eql('x-cascade' => 'pass')
+          expect(exception.status).to be 406
+          expect(exception.message).to include 'API vendor not found'
+        end
+    end
+
+    context 'when version is set' do
+      before do
+        options[:versions] = ['v1']
+      end
+
+      it 'is set' do
+        status, _, env = subject.call('HTTP_ACCEPT' => 'application/vnd.vendor-v1')
+        expect(env[Grape::Env::API_VENDOR]).to eql 'vendor'
+        expect(status).to eq(200)
+      end
+
+      it 'is set if format provided' do
+        status, _, env = subject.call('HTTP_ACCEPT' => 'application/vnd.vendor-v1+json')
+        expect(env[Grape::Env::API_VENDOR]).to eql 'vendor'
+        expect(status).to eq(200)
+      end
+
+      it 'fails with 406 Not Acceptable if vendor is invalid' do
+        expect { subject.call('HTTP_ACCEPT' => 'application/vnd.othervendor-v1+json').last }
+          .to raise_exception do |exception|
+            expect(exception).to be_a(Grape::Exceptions::InvalidAcceptHeader)
+            expect(exception.headers).to eql('x-cascade' => 'pass')
+            expect(exception.status).to be 406
+            expect(exception.message).to include('API vendor not found')
+          end
+      end
+    end
+
+    context 'when the vendor is declared with capitals' do
+      before do
+        options[:version_options] = Grape::DSL::VersionOptions.new(using: :header, vendor: 'MyCompany')
+        options[:versions] = ['v1']
+      end
+
+      %w[application/vnd.MyCompany-v1+json application/vnd.mycompany-v1+json].each do |accept|
+        it "matches #{accept}" do
+          status, _, env = subject.call('HTTP_ACCEPT' => accept)
+          expect(status).to eq(200)
+          expect(env[Grape::Env::API_VENDOR]).to eql 'mycompany'
+          expect(env[Grape::Env::API_VERSION]).to eql 'v1'
+        end
+      end
+
+      it 'reports an unknown version rather than an unknown vendor' do
+        expect { subject.call('HTTP_ACCEPT' => 'application/vnd.MyCompany-v2+json') }
+          .to raise_exception(Grape::Exceptions::InvalidVersionHeader, /API version not found/)
+      end
+    end
+  end
+
+  context 'api.version' do
+    before do
+      options[:versions] = ['v1']
+    end
+
+    it 'is set' do
+      status, _, env = subject.call('HTTP_ACCEPT' => 'application/vnd.vendor-v1')
+      expect(env[Grape::Env::API_VERSION]).to eql 'v1'
+      expect(status).to eq(200)
+    end
+
+    it 'is set if format provided' do
+      status, _, env = subject.call('HTTP_ACCEPT' => 'application/vnd.vendor-v1+json')
+      expect(env[Grape::Env::API_VERSION]).to eql 'v1'
+      expect(status).to eq(200)
+    end
+
+    it 'fails with 406 Not Acceptable if version is invalid' do
+      expect { subject.call('HTTP_ACCEPT' => 'application/vnd.vendor-v2+json').last }.to raise_exception do |exception|
+        expect(exception).to be_a(Grape::Exceptions::InvalidVersionHeader)
+        expect(exception.headers).to eql('x-cascade' => 'pass')
+        expect(exception.status).to be 406
+        expect(exception.message).to include('API version not found')
+      end
+    end
+
+    # Requests sending the same Accept header are all answered from one parsed
+    # media type, so what a request is handed must not be alterable in place.
+    it 'cannot be altered by one request for the next' do
+      keys = [Grape::Env::API_TYPE, Grape::Env::API_SUBTYPE, Grape::Env::API_VENDOR, Grape::Env::API_VERSION, Grape::Env::API_FORMAT]
+      _, _, env = subject.call('HTTP_ACCEPT' => 'application/vnd.vendor-v1+json')
+      keys.each { |key| expect { env[key] << '-altered' }.to raise_error(FrozenError) }
+
+      _, _, env = subject.call('HTTP_ACCEPT' => 'application/vnd.vendor-v1+json')
+      expect(env.values_at(*keys)).to eq(%w[application vnd.vendor-v1+json vendor v1 json])
+    end
+
+    context 'when the version is declared with capitals' do
+      before do
+        options[:versions] = ['V1']
+      end
+
+      %w[application/vnd.vendor-V1+json application/vnd.vendor-v1+json].each do |accept|
+        it "matches #{accept}" do
+          status, _, env = subject.call('HTTP_ACCEPT' => accept)
+          expect(status).to eq(200)
+          expect(env[Grape::Env::API_VERSION]).to eql 'v1'
+        end
+      end
+
+      it 'does not report it as not found when the format is unsupported' do
+        expect(subject.call('HTTP_ACCEPT' => 'application/vnd.vendor-V1+yaml').first).to eq(200)
+      end
+    end
+  end
+
+  context 'when a content type is declared with capitals' do
+    before do
+      options[:content_types] = { csv: 'Text/CSV' }
+    end
+
+    it 'matches it' do
+      status, _, env = subject.call('HTTP_ACCEPT' => 'text/csv')
+      expect(status).to eq(200)
+      expect(env.values_at(Grape::Env::API_TYPE, Grape::Env::API_SUBTYPE)).to eq(%w[text csv])
+    end
+  end
+
+  it 'succeeds if :strict is not set' do
+    expect(subject.call('HTTP_ACCEPT' => '').first).to eq(200)
+    expect(subject.call({}).first).to eq(200)
+  end
+
+  it 'succeeds if :strict is set to false' do
+    options[:version_options] = options[:version_options].with(strict: false)
+    expect(subject.call('HTTP_ACCEPT' => '').first).to eq(200)
+    expect(subject.call({}).first).to eq(200)
+  end
+
+  it 'succeeds if :strict is set to false and given an invalid header' do
+    options[:version_options] = options[:version_options].with(strict: false)
+    expect(subject.call('HTTP_ACCEPT' => 'yaml').first).to eq(200)
+    expect(subject.call({}).first).to eq(200)
+  end
+
+  it 'succeeds without a vendor if :strict is not set and the header holds an invalid byte sequence' do
+    status, _, env = subject.call('HTTP_ACCEPT' => "\xFF")
+    expect(status).to eq(200)
+    expect(env[Grape::Env::API_VENDOR]).to be_nil
+  end
+
+  context 'when :strict is set' do
+    before do
+      options[:versions] = ['v1']
+      options[:version_options] = options[:version_options].with(strict: true)
+    end
+
+    it 'fails with 406 Not Acceptable if header is not set' do
+      expect { subject.call({}).last }.to raise_exception do |exception|
+        expect(exception).to be_a(Grape::Exceptions::InvalidAcceptHeader)
+        expect(exception.headers).to eql('x-cascade' => 'pass')
+        expect(exception.status).to be 406
+        expect(exception.message).to include('Accept header must be set.')
+      end
+    end
+
+    it 'fails with 406 Not Acceptable if header is empty' do
+      expect { subject.call('HTTP_ACCEPT' => '').last }.to raise_exception do |exception|
+        expect(exception).to be_a(Grape::Exceptions::InvalidAcceptHeader)
+        expect(exception.headers).to eql('x-cascade' => 'pass')
+        expect(exception.status).to be 406
+        expect(exception.message).to include('Accept header must be set.')
+      end
+    end
+
+    it 'fails with 406 Not Acceptable if header holds an invalid byte sequence' do
+      expect { subject.call('HTTP_ACCEPT' => "\xFF").last }.to raise_exception do |exception|
+        expect(exception).to be_a(Grape::Exceptions::InvalidAcceptHeader)
+        expect(exception.status).to be 406
+        expect(exception.message).to include('API vendor or version not found.')
+      end
+    end
+
+    it 'succeeds if proper header is set' do
+      expect(subject.call('HTTP_ACCEPT' => 'application/vnd.vendor-v1+json').first).to eq(200)
+    end
+  end
+
+  context 'when :strict and cascade: false' do
+    before do
+      options[:versions] = ['v1']
+      options[:version_options] = options[:version_options].with(strict: true, cascade: false)
+    end
+
+    it 'fails with 406 Not Acceptable if header is not set' do
+      expect { subject.call({}).last }.to raise_exception do |exception|
+        expect(exception).to be_a(Grape::Exceptions::InvalidAcceptHeader)
+        expect(exception.headers).to eql({})
+        expect(exception.status).to be 406
+        expect(exception.message).to include('Accept header must be set.')
+      end
+    end
+
+    it 'fails with 406 Not Acceptable if header is application/xml' do
+      expect { subject.call('HTTP_ACCEPT' => 'application/xml').last }
+        .to raise_exception do |exception|
+        expect(exception).to be_a(Grape::Exceptions::InvalidAcceptHeader)
+        expect(exception.headers).to eql({})
+        expect(exception.status).to be 406
+        expect(exception.message).to include('API vendor or version not found.')
+      end
+    end
+
+    it 'fails with 406 Not Acceptable if header is empty' do
+      expect { subject.call('HTTP_ACCEPT' => '').last }.to raise_exception do |exception|
+        expect(exception).to be_a(Grape::Exceptions::InvalidAcceptHeader)
+        expect(exception.headers).to eql({})
+        expect(exception.status).to be 406
+        expect(exception.message).to include('Accept header must be set.')
+      end
+    end
+
+    it 'fails with 406 Not Acceptable if header contains a single invalid accept' do
+      expect { subject.call('HTTP_ACCEPT' => 'application/json;application/vnd.vendor-v1+json').first }
+        .to raise_exception do |exception|
+        expect(exception).to be_a(Grape::Exceptions::InvalidAcceptHeader)
+        expect(exception.headers).to eql({})
+        expect(exception.status).to be 406
+        expect(exception.message).to include('API vendor or version not found.')
+      end
+    end
+
+    it 'succeeds if proper header is set' do
+      expect(subject.call('HTTP_ACCEPT' => 'application/vnd.vendor-v1+json').first).to eq(200)
+    end
+  end
+
+  context 'when multiple versions are specified' do
+    before do
+      options[:versions] = %w[v1 v2]
+    end
+
+    it 'succeeds with v1' do
+      expect(subject.call('HTTP_ACCEPT' => 'application/vnd.vendor-v1+json').first).to eq(200)
+    end
+
+    it 'succeeds with v2' do
+      expect(subject.call('HTTP_ACCEPT' => 'application/vnd.vendor-v2+json').first).to eq(200)
+    end
+
+    it 'fails with another version' do
+      expect { subject.call('HTTP_ACCEPT' => 'application/vnd.vendor-v3+json') }.to raise_exception do |exception|
+        expect(exception).to be_a(Grape::Exceptions::InvalidVersionHeader)
+        expect(exception.headers).to eql('x-cascade' => 'pass')
+        expect(exception.status).to be 406
+        expect(exception.message).to include('API version not found')
+      end
+    end
+  end
+
+  context 'when a version holds a hyphen' do
+    before do
+      options[:versions] = %w[2024-01-01 2.0-beta]
+    end
+
+    %w[2024-01-01 2.0-beta].each do |version|
+      it "sets the vendor and version for #{version}" do
+        status, _, env = subject.call('HTTP_ACCEPT' => "application/vnd.vendor-#{version}+json")
+        expect(status).to eq(200)
+        expect(env.values_at(Grape::Env::API_VENDOR, Grape::Env::API_VERSION, Grape::Env::API_FORMAT)).to eq(['vendor', version, 'json'])
+      end
+    end
+
+    it 'sets the version without a format' do
+      _, _, env = subject.call('HTTP_ACCEPT' => 'application/vnd.vendor-2024-01-01')
+      expect(env[Grape::Env::API_VERSION]).to eq('2024-01-01')
+    end
+
+    it 'sets the version out of a q-value list' do
+      _, _, env = subject.call('HTTP_ACCEPT' => 'text/html;q=0.1, application/vnd.vendor-2024-01-01+json')
+      expect(env[Grape::Env::API_VERSION]).to eq('2024-01-01')
+    end
+
+    it 'fails another version as a version not found' do
+      expect { subject.call('HTTP_ACCEPT' => 'application/vnd.vendor-2023-01-01+json') }.to raise_exception do |exception|
+        expect(exception).to be_a(Grape::Exceptions::InvalidVersionHeader)
+        expect(exception.message).to include('API version not found')
+      end
+    end
+
+    it 'fails another vendor as a vendor not found' do
+      expect { subject.call('HTTP_ACCEPT' => 'application/vnd.other-2024-01-01+json') }.to raise_exception do |exception|
+        expect(exception).to be_a(Grape::Exceptions::InvalidAcceptHeader)
+        expect(exception.message).to include('API vendor not found')
+      end
+    end
+  end
+
+  context 'when the vendor holds a hyphen' do
+    before do
+      options[:versions] = ['v1']
+      options[:version_options] = Grape::DSL::VersionOptions.new(using: :header, vendor: 'my-vendor')
+    end
+
+    it 'sets the vendor and version' do
+      _, _, env = subject.call('HTTP_ACCEPT' => 'application/vnd.my-vendor-v1+json')
+      expect(env.values_at(Grape::Env::API_VENDOR, Grape::Env::API_VERSION)).to eq(%w[my-vendor v1])
+    end
+  end
+
+  context 'when there are multiple versions with complex vendor specified with rescue_from :all' do
+    subject do
+      Class.new(Grape::API) do
+        rescue_from :all
+      end
+    end
+
+    let(:v1_app) do
+      Class.new(Grape::API) do
+        version 'v1', using: :header, vendor: 'test.a-cool_resource', cascade: false, strict: true
+        content_type :v1_test, 'application/vnd.test.a-cool_resource-v1+json'
+        formatter :v1_test, ->(object, _) { object }
+        format :v1_test
+
+        resources :users do
+          get :hello do
+            'one'
+          end
+        end
+      end
+    end
+
+    let(:v2_app) do
+      Class.new(Grape::API) do
+        version 'v2', using: :header, vendor: 'test.a-cool_resource', strict: true
+        content_type :v2_test, 'application/vnd.test.a-cool_resource-v2+json'
+        formatter :v2_test, ->(object, _) { object }
+        format :v2_test
+
+        resources :users do
+          get :hello do
+            'two'
+          end
+        end
+      end
+    end
+
+    def app
+      subject.mount v2_app
+      subject.mount v1_app
+      subject
+    end
+
+    context 'with header versioned endpoints and a rescue_all block defined' do
+      it 'responds correctly to a v1 request' do
+        versioned_get '/users/hello', 'v1', using: :header, vendor: 'test.a-cool_resource'
+        expect(last_response.body).to eq('one')
+        expect(last_response.body).not_to include('API vendor or version not found')
+      end
+
+      it 'responds correctly to a v2 request' do
+        versioned_get '/users/hello', 'v2', using: :header, vendor: 'test.a-cool_resource'
+        expect(last_response.body).to eq('two')
+        expect(last_response.body).not_to include('API vendor or version not found')
+      end
+    end
+  end
+
+  context 'with missing vendor option' do
+    subject do
+      Class.new(Grape::API) do
+        version 'v1', using: :header
+      end
+    end
+
+    def app
+      subject
+    end
+
+    it 'fails' do
+      expect { versioned_get '/', 'v1', using: :header }.to raise_error Grape::Exceptions::MissingVendorOption
+    end
+  end
+
+  # Through the DSL a header-versioned API always declares its versions; the
+  # middleware used on its own need not.
+  context 'when no versions are declared on the middleware directly' do
+    it 'passes a request naming a version through' do
+      status, _, env = subject.call('HTTP_ACCEPT' => 'application/vnd.vendor-v1+json')
+      expect(status).to eq(200)
+      expect(env[Grape::Env::API_VERSION]).to be_nil
+    end
+  end
+
+  context 'when the vendor option is not set on the middleware directly' do
+    subject { described_class.new(app, version_options: Grape::DSL::VersionOptions.new(using: :header, vendor: nil)) }
+
+    it 'skips the best-quality-media-type match entirely' do
+      status, = subject.call('HTTP_ACCEPT' => 'application/vnd.vendor+json')
+      expect(status).to eq(200)
+    end
+
+    it 'records no media type, even for a content type it declares' do
+      _, _, env = subject.call('HTTP_ACCEPT' => 'application/json')
+      expect(env.keys & [Grape::Env::API_TYPE, Grape::Env::API_SUBTYPE, Grape::Env::API_VENDOR, Grape::Env::API_VERSION, Grape::Env::API_FORMAT]).to be_empty
+    end
+  end
+end

@@ -1,0 +1,446 @@
+# frozen_string_literal: true
+
+describe Grape::DSL::InsideRoute do
+  subject { dummy_class.new }
+
+  let(:dummy_class) do
+    Class.new do
+      include Grape::DSL::InsideRoute
+      include Grape::DSL::Settings
+
+      attr_reader :env, :request
+
+      def initialize
+        @env = {}
+        @header = {}
+      end
+
+      def header(key = nil, val = nil)
+        if key
+          val ? header[key] = val : header.delete(key)
+        else
+          @header ||= Rack::Headers.new
+        end
+      end
+    end
+  end
+
+  describe '#version' do
+    it 'defaults to nil' do
+      expect(subject.version).to be_nil
+    end
+
+    it 'returns env[api.version]' do
+      subject.env[Grape::Env::API_VERSION] = 'dummy'
+      expect(subject.version).to eq 'dummy'
+    end
+  end
+
+  describe '#error!' do
+    it 'raises a Grape::Exceptions::Halt carrying the response' do
+      expect { subject.error! 'Not Found', 404, 'X-Error' => 'detail' }.to raise_error(Grape::Exceptions::Halt) do |halt|
+        expect(halt.response).to have_attributes(status: 404, message: 'Not Found', headers: { 'X-Error' => 'detail' })
+      end
+    end
+
+    # async hands a StandardError raised in a task back to the task waiting on
+    # it, and stops its reactor on any other exception.
+    it 'raises a StandardError' do
+      expect { subject.error! 'Not Found', 404 }.to raise_error(StandardError)
+    end
+
+    it 'sets status' do
+      expect { subject.error! 'Not Found', 404 }.to raise_error(Grape::Exceptions::Halt)
+      expect(subject.status).to eq 404
+    end
+
+    describe 'default_error_status' do
+      before do
+        subject.inheritable_setting.default_error_status = 500
+      end
+
+      it 'sets status to default_error_status' do
+        expect { subject.error! 'Unknown' }.to raise_error(Grape::Exceptions::Halt)
+        expect(subject.status).to eq 500
+      end
+    end
+  end
+
+  describe '#redirect' do
+    describe 'default' do
+      before do
+        subject.redirect '/'
+      end
+
+      it 'sets status to 302' do
+        expect(subject.status).to eq 302
+      end
+
+      it 'sets location header' do
+        expect(subject.header['location']).to eq '/'
+      end
+    end
+
+    describe 'permanent' do
+      before do
+        subject.redirect '/', permanent: true
+      end
+
+      it 'sets status to 301' do
+        expect(subject.status).to eq 301
+      end
+
+      it 'sets location header' do
+        expect(subject.header['location']).to eq '/'
+      end
+    end
+  end
+
+  describe '#status' do
+    %w[GET PUT OPTIONS].each do |method|
+      it "defaults to 200 on #{method}" do
+        subject.env[Rack::REQUEST_METHOD] = method
+        expect(subject.status).to eq 200
+      end
+    end
+
+    it 'defaults to 201 on POST' do
+      subject.env[Rack::REQUEST_METHOD] = Rack::POST
+      expect(subject.status).to eq 201
+    end
+
+    it 'defaults to 204 on DELETE' do
+      subject.env[Rack::REQUEST_METHOD] = Rack::DELETE
+      expect(subject.status).to eq 204
+    end
+
+    it 'defaults to 200 on DELETE with a body present' do
+      subject.env[Rack::REQUEST_METHOD] = Rack::DELETE
+      subject.body 'content here'
+      expect(subject.status).to eq 200
+    end
+
+    it 'defaults to 200 on DELETE with a body holding bytes its encoding does not allow' do
+      subject.env[Rack::REQUEST_METHOD] = Rack::DELETE
+      subject.body "deleted caf\xC3"
+      expect(subject.status).to eq 200
+    end
+
+    it 'returns status set' do
+      subject.status 501
+      expect(subject.status).to eq 501
+    end
+
+    it 'accepts symbol for status' do
+      subject.status :see_other
+      expect(subject.status).to eq 303
+    end
+
+    it 'raises error if unknow symbol is passed' do
+      expect { subject.status :foo_bar }
+        .to raise_error(ArgumentError, 'Unrecognized status code :foo_bar')
+    end
+
+    it 'accepts unknown Integer status codes' do
+      expect { subject.status 210 }.not_to raise_error
+    end
+
+    it 'raises error if status is not a integer or symbol' do
+      expect { subject.status Object.new }
+        .to raise_error(ArgumentError, 'status code must be Integer or Symbol')
+    end
+  end
+
+  describe '#return_no_content' do
+    it 'sets the status code and body' do
+      subject.return_no_content
+      expect(subject.status).to eq 204
+      expect(subject.body).to eq ''
+    end
+  end
+
+  describe '#content_type' do
+    describe 'set' do
+      before do
+        subject.content_type 'text/plain'
+      end
+
+      it 'returns value' do
+        expect(subject.content_type).to eq 'text/plain'
+      end
+    end
+
+    it 'returns default' do
+      expect(subject.content_type).to be_nil
+    end
+  end
+
+  describe '#body' do
+    describe 'set' do
+      before do
+        subject.body 'body'
+      end
+
+      it 'returns value' do
+        expect(subject.body).to eq 'body'
+      end
+    end
+
+    describe 'false' do
+      before do
+        subject.body false
+      end
+
+      it 'sets status to 204' do
+        expect(subject.body).to eq ''
+        expect(subject.status).to eq 204
+      end
+    end
+
+    it 'returns default' do
+      expect(subject.body).to be_nil
+    end
+  end
+
+  describe '#sendfile' do
+    describe 'set' do
+      context 'as file path' do
+        let(:file_path) { '/some/file/path' }
+
+        let(:file_response) do
+          file_body = Grape::ServeStream::FileBody.new(file_path)
+          Grape::ServeStream::StreamResponse.new(file_body)
+        end
+
+        before do
+          subject.header Rack::CACHE_CONTROL, 'cache'
+          subject.header Rack::CONTENT_LENGTH, 123
+          subject.header Rack::TRANSFER_ENCODING, 'base64'
+          subject.sendfile file_path
+        end
+
+        it 'returns value wrapped in StreamResponse' do
+          expect(subject.sendfile).to eq file_response
+        end
+
+        it 'set the correct headers' do
+          expect(subject.header).to match(
+            Rack::CACHE_CONTROL => 'cache',
+            Rack::CONTENT_LENGTH => 123,
+            Rack::TRANSFER_ENCODING => 'base64'
+          )
+        end
+      end
+
+      context 'as object' do
+        let(:file_object) { instance_double(Enumerator, each: nil) }
+
+        it 'raises an error that only a file path is supported' do
+          expect { subject.sendfile file_object }.to raise_error(ArgumentError, /argument must be a file path/)
+        end
+      end
+    end
+
+    it 'returns default' do
+      expect(subject.sendfile).to be_nil
+    end
+  end
+
+  describe '#stream' do
+    describe 'set' do
+      context 'as a file path' do
+        let(:file_path) { '/some/file/path' }
+
+        let(:file_response) do
+          file_body = Grape::ServeStream::FileBody.new(file_path)
+          Grape::ServeStream::StreamResponse.new(file_body)
+        end
+
+        before do
+          subject.header Rack::CACHE_CONTROL, 'cache'
+          subject.header Rack::CONTENT_LENGTH, 123
+          subject.header Rack::TRANSFER_ENCODING, 'base64'
+          subject.stream file_path
+        end
+
+        it 'returns file body wrapped in StreamResponse' do
+          expect(subject.stream).to eq file_response
+        end
+
+        it 'sets only the cache-control header' do
+          expect(subject.header).to match(Rack::CACHE_CONTROL => 'no-cache')
+        end
+      end
+
+      context 'as a stream object' do
+        let(:stream_object) { instance_double(Enumerator, each: nil) }
+
+        let(:stream_response) do
+          Grape::ServeStream::StreamResponse.new(stream_object)
+        end
+
+        before do
+          subject.header Rack::CACHE_CONTROL, 'cache'
+          subject.header Rack::CONTENT_LENGTH, 123
+          subject.header Rack::TRANSFER_ENCODING, 'base64'
+          subject.stream stream_object
+        end
+
+        it 'returns value wrapped in StreamResponse' do
+          expect(subject.stream).to eq stream_response
+        end
+
+        it 'set only the cache-control header' do
+          expect(subject.header).to match(Rack::CACHE_CONTROL => 'no-cache')
+        end
+      end
+
+      context 'as a non-stream object' do
+        let(:non_stream_object) { Object.new }
+
+        it 'raises an error that the object must implement :each' do
+          expect { subject.stream non_stream_object }.to raise_error(ArgumentError, /:each/)
+        end
+      end
+    end
+
+    it 'returns default' do
+      expect(subject.stream).to be_nil
+      expect(subject.header).to be_empty
+    end
+  end
+
+  describe '#route' do
+    before do
+      subject.env[Grape::Env::GRAPE_ROUTING_ARGS] = {}
+      subject.env[Grape::Env::GRAPE_ROUTING_ARGS][:route_info] = 'dummy'
+    end
+
+    it 'returns route_info' do
+      expect(subject.route).to eq 'dummy'
+    end
+  end
+
+  describe '#present' do
+    # see entity_spec.rb for entity representation spec coverage
+
+    describe 'dummy' do
+      before do
+        subject.present 'dummy'
+      end
+
+      it 'presents dummy object' do
+        expect(subject.body).to eq 'dummy'
+      end
+    end
+
+    describe 'with' do
+      describe 'entity' do
+        let(:entity_mock) do
+          entity_mock = Object.new
+          allow(entity_mock).to receive(:represent).and_return('dummy')
+          entity_mock
+        end
+
+        describe 'instance' do
+          before do
+            subject.present 'dummy', with: entity_mock
+          end
+
+          it 'presents dummy object' do
+            expect(subject.body).to eq 'dummy'
+          end
+        end
+
+        # A versioned request hands the entity its version along with env.
+        describe 'on a versioned request' do
+          let(:echoing_entity) do
+            Class.new do
+              def self.represent(object, **options)
+                { object:, version: options[:version], env_given: options.key?(:env) }
+              end
+            end
+          end
+
+          before do
+            subject.env[Grape::Env::API_VERSION] = 'v1'
+            subject.present 'dummy', with: echoing_entity
+          end
+
+          it 'passes the version to the entity' do
+            expect(subject.body).to eq(object: 'dummy', version: 'v1', env_given: true)
+          end
+        end
+      end
+    end
+
+    describe 'multiple entities' do
+      let(:entity_mock_one) do
+        entity_mock_one = Object.new
+        allow(entity_mock_one).to receive(:represent).and_return(dummy1: 'dummy1')
+        entity_mock_one
+      end
+
+      let(:entity_mock_two) do
+        entity_mock_two = Object.new
+        allow(entity_mock_two).to receive(:represent).and_return(dummy2: 'dummy2')
+        entity_mock_two
+      end
+
+      describe 'instance' do
+        before do
+          subject.present 'dummy1', with: entity_mock_one
+          subject.present 'dummy2', with: entity_mock_two
+        end
+
+        it 'presents both dummy objects' do
+          expect(subject.body[:dummy1]).to eq 'dummy1'
+          expect(subject.body[:dummy2]).to eq 'dummy2'
+        end
+      end
+    end
+
+    describe 'non mergeable entity' do
+      let(:entity_mock_one) do
+        entity_mock_one = Object.new
+        allow(entity_mock_one).to receive(:represent).and_return(dummy1: 'dummy1')
+        entity_mock_one
+      end
+
+      let(:entity_mock_two) do
+        entity_mock_two = Object.new
+        allow(entity_mock_two).to receive(:represent).and_return('not a hash')
+        entity_mock_two
+      end
+
+      describe 'instance' do
+        it 'fails' do
+          subject.present 'dummy1', with: entity_mock_one
+          expect do
+            subject.present 'dummy2', with: entity_mock_two
+          end.to raise_error ArgumentError, 'representation of type `String` cannot be merged'
+        end
+      end
+    end
+  end
+
+  describe '#declared' do
+    let(:dummy_class) do
+      Class.new do
+        include Grape::DSL::Declared
+
+        attr_reader :before_filter_passed
+
+        def initialize
+          @before_filter_passed = false
+        end
+      end
+    end
+
+    it 'is not available by default' do
+      expect { subject.declared({}) }.to raise_error(
+        Grape::DSL::InsideRoute::MethodNotYetAvailable
+      )
+    end
+  end
+end

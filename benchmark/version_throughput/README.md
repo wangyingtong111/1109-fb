@@ -1,0 +1,110 @@
+# version_throughput
+
+Cross-version throughput benchmark for Grape. Measures `API.call(env)` requests-per-second for a few tiny JSON APIs that differ only in route shape, against the same `app.rb` definitions exec'd under several Grape releases plus `master`. Used to track regressions and validate refactor wins.
+
+## Files
+
+| File | Role |
+|---|---|
+| `app.rb` | The APIs under test, one per route shape. Kept deliberately small and version-agnostic — only DSL surface stable across Grape 3.x, so the same file can run against `3.0.1 … master` without edits. |
+| `bench.rb` | Single-scenario benchmark. `bench.rb <scenario>` loads `app.rb`, sanity-checks that scenario's response, runs `Benchmark.ips` (2s warmup + 5s measure), prints one `RESULT,<scenario>,<ips>,<μs>,<stddev>,<jit>` line for the orchestrator. The orchestrator discards a line naming a different scenario than the one it asked for, and the trailing field names the JIT that was actually enabled, so it can tell a flag that took effect from one that was silently ignored. |
+| `run.rb` | Orchestrator. For each version it benches: writes a `Gemfile`, runs `bundle install` under `tmp/bench-versions/<version>/`, exec's `bench.rb` once per route shape and available JIT mode — plain, `--yjit`, `--zjit` — parses results, stores them in `tmp/bench-versions/results.json`, then writes `RESULTS.md` from everything stored. |
+| `RESULTS.md` | Generated report — rewritten on every run from the stored results. |
+
+## Route shapes
+
+| Scenario | Request | Routes in the API |
+|---|---|---|
+| `static` | `GET /api/v1/hello` | one literal route |
+| `parameterized` | `GET /api/v1/hello/42` | one `get '/hello/:id'` route |
+| `many_static` | `GET /api/v1/resource199` | 200 literal routes; the request matches the last one |
+| `many_parameterized` | `GET /api/v1/resource199/42` | 200 `get '/resourceN/:id'` routes; the request matches the last one |
+
+Every route is prefixed and path-versioned (`prefix :api`, `version 'v1', using: :path`) and returns `{ hello: 'world' }`.
+
+A single static route used to be the whole benchmark. That shape is the one a router can answer without running a pattern at all — a lookup table keyed by literal path skips the route union entirely — so a change like that moves the `static` number a lot while doing nothing for a route with a parameter in it. Reported alone, it reads as a general throughput win. With a table per shape, `parameterized` shows what an ordinary `/:id` endpoint gets, and the `many_*` pair shows how the route count weighs on a request once its path has to be matched.
+
+## Usage
+
+```sh
+# default: bench master (plus any version with no stored results yet); every route shape
+ruby benchmark/version_throughput/run.rb
+
+# bench exactly these versions again, released ones included
+GRAPE_VERSIONS="3.3.5,master" ruby benchmark/version_throughput/run.rb
+
+# route-shape subset
+GRAPE_SCENARIOS="static,parameterized" ruby benchmark/version_throughput/run.rb
+
+# different Ruby (e.g. one built with YJIT/ZJIT)
+RBENV_VERSION=4.0.7 ruby benchmark/version_throughput/run.rb
+
+# one shape against the working tree, without the orchestrator
+bundle exec ruby benchmark/version_throughput/bench.rb many_parameterized
+```
+
+`master` is benched against the working tree (`gemspec path: <repo root>`), so unstaged changes are picked up. All other versions resolve to released gems on rubygems.org.
+
+A released gem's numbers don't change between runs, so `run.rb` keeps every pass that produced a number in `tmp/bench-versions/results.json`, under the running Ruby's `RUBY_DESCRIPTION`. A run without `GRAPE_VERSIONS` benches `master` and only those versions in `DEFAULT_VERSIONS` that have no stored pass for this Ruby — every version on a first run or a new Ruby, none after that — and carries every other row over. `GRAPE_VERSIONS` benches exactly the versions it names, whether or not they're stored. Either way `RESULTS.md` covers `DEFAULT_VERSIONS` plus any version named in `GRAPE_VERSIONS`, sorted oldest to newest with `master` last, and every route shape with a stored result. A failed pass isn't stored, so the next run benches its version again. Delete `results.json` to start from scratch.
+
+## Output
+
+`RESULTS.md` has one section per route shape. Each section's table has a row per version, listed oldest to newest so it reads as a timeline:
+
+| Version | No JIT (i/s) | μs/req | vs prev | vs 3.0.1 | YJIT (i/s) | μs/req | vs prev | vs 3.0.1 | YJIT speedup | ZJIT (i/s) | μs/req | vs prev | vs 3.0.1 | ZJIT speedup |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| … | … | … | … | … | … | … | … | … | … | … | … | … | … | … |
+
+The two delta columns per pass are the point of the report: `vs prev` is the release-over-release change, `vs <first>` the cumulative change since the oldest version in that table (the header names it — `vs 3.0.1` with the default list). A one-line summary under each table restates first → last for every pass.
+
+A JIT's columns are only emitted if the running Ruby can actually run it: `run.rb` boots `ruby <flag>` and checks `RubyVM::YJIT.enabled?` / `RubyVM::ZJIT.enabled?`, not merely that the constant exists — both are defined on a supporting build whether or not the flag was given. With no JIT available the tables fall back to the compact layout, keeping the `± stddev` column and both deltas.
+
+## Interpreting results
+
+- **Compare a shape across versions, never i/s across shapes.** The tables answer "did this shape get faster", not "which shape is fastest". A change that only speeds up literal paths shows up in `static` and `many_static` and nowhere else — which is the reason the shapes are reported apart.
+- **Noise floor is ~5-8%.** A single 5s window on macOS can easily move a few percent under thermal throttling or background load. Rerun before drawing conclusions on small deltas — a plain run re-benches `master`; name a release in `GRAPE_VERSIONS` to re-bench its row.
+- **Released rows can predate the `master` row.** They're carried over from whichever run stored them, so a change in machine load, OS or power settings since then shows up as a `master` delta. After a change like that, re-bench everything with `GRAPE_VERSIONS` set to the full list.
+- **`master` right after a release benches the same code twice.** When nothing has landed on `master` since the newest benched release, the two rows exercise identical code and their spread is a direct read of the noise floor — not a regression or a win.
+- **Run on a quiet machine.** Close other apps, plug in the laptop, don't touch the keyboard during the run. Every route shape takes ~7s of wall-clock measurement per JIT mode per benched version, plus bundle install on first use; narrow `GRAPE_SCENARIOS` when only one table matters.
+- **`master` vs released gems is not apples-to-apples for code paths that changed.** If a refactor moved code between files, both numbers still measure the same `app.rb` request — that's the point — but interpret deltas as "end-to-end request cost" rather than per-method.
+- **A JIT's speedup is measured against the No JIT pass on the same row.** Every pass shares the same Ruby binary; only the JIT flag differs. Ruby refuses to boot with both `--yjit` and `--zjit`, so each JIT gets its own pass rather than being stacked.
+- **Deltas are computed per pass, on i/s.** A version that failed to bench is skipped as a reference, so `vs prev` always points at the closest version that actually produced a number — an `error:` row never breaks the chain.
+- **Cumulative deltas compound the noise floor.** Read `vs 3.0.1` for the shape of the trend, not as a precise figure.
+
+## Why ZJIT trails YJIT
+
+ZJIT comes out well ahead of the interpreter but well behind YJIT — roughly +20% against +86% on `master`, on the `static` shape. That gap is ZJIT's codegen, not the harness. Measured on Ruby 4.0.7; re-check before assuming it still holds, because the answer is expected to move as ZJIT matures.
+
+What was ruled out:
+
+- **Warmup.** Throughput is flat from a 2s to a 20s warmup in both JITs. Both trigger at 30 calls (`--yjit-call-threshold`, `--zjit-call-threshold`), which a 5s measure passes in the first millisecond.
+- **Compilation.** `compiled_iseq_count: 306` with `failed_iseq_count: 0` — ZJIT compiled the whole request path.
+- **Deoptimisation.** `guard_type_exit_ratio: 0.0%`, `guard_shape_exit_ratio: 2.7%`, ~4 side exits per request.
+- **Grape.** A small non-Grape JSON workload on the same Ruby shows the same ordering, just with narrower margins.
+
+What `--zjit-stats` does show is about 30 uninlined C method calls per request, and the list is the set YJIT emits inline codegen for:
+
+```
+String#include?  Array#any?     Array#to_a   Array#include?
+Regexp#match     Kernel#dup     Hash#fetch   String#to_sym
+```
+
+Only ~36% of sends take an inlined cfunc path, and each uninlined one syncs interpreter state before the call — `vm_write_pc_count` and `vm_write_sp_count` both land near 167 per request. Grape's request path is dispatch-heavy and leans on exactly those core methods, so the gap shows up wider here than on C-bound code.
+
+Reproduce with a fixed call count rather than `Benchmark.ips`, so the counters are per-request:
+
+```sh
+BUNDLE_GEMFILE=tmp/bench-versions/master/Gemfile \
+  bundle exec ruby --zjit --zjit-stats -e '
+    $LOAD_PATH.unshift("benchmark/version_throughput"); require "app"
+    env = Rack::MockRequest.env_for("/api/v1/hello", method: Rack::GET).freeze
+    300_000.times { StaticRouteBenchAPI.call(env.dup) }'
+```
+
+## Adding a version
+
+Add it to `DEFAULT_VERSIONS` in `run.rb`. The next run benches it, since it has no stored results yet, and places it in the report by version number. The orchestrator handles `bundle install` and gemfile generation; nothing else needs to change as long as the new version exposes the DSL `app.rb` uses (`prefix`, `format`, `version 'v1', using: :path`, `get` with a literal or `:param` path).
+
+## Adding a route shape
+
+Define its API in `app.rb`, sticking to DSL every benched version supports. Add its request to `SCENARIOS` in `bench.rb`, keyed by the scenario name, and the same key with a table label and description to `SCENARIO_DEFINITIONS` in `run.rb`, where list order is table order. The request must answer 200 with a body containing `world`, or `bench.rb` aborts before measuring.

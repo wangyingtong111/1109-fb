@@ -1,0 +1,2479 @@
+# frozen_string_literal: true
+
+describe Grape::Validations::ParamsScope do
+  subject do
+    Class.new(Grape::API)
+  end
+
+  def app
+    subject
+  end
+
+  context 'when the options are given as a deprecated positional Hash' do
+    it 'coerces the parameter as if the options had been passed as keyword arguments' do
+      Grape.deprecator.silence do
+        subject.params do
+          requires :id, { type: Integer }
+          optional :page, { type: Integer, default: 1 }
+        end
+      end
+      subject.get('/legacy') { [params[:id].class, params[:page]].join(',') }
+
+      get '/legacy', id: '5'
+      expect(last_response.status).to eq(200)
+      expect(last_response.body).to eq('Integer,1')
+    end
+  end
+
+  context 'when using custom types' do
+    let(:custom_type) do
+      Class.new do
+        attr_reader :value
+
+        def self.parse(value)
+          raise if value == 'invalid'
+
+          new(value)
+        end
+
+        def initialize(value)
+          @value = value
+        end
+      end
+    end
+
+    it 'coerces the parameter via the type\'s parse method' do
+      context = self
+      subject.params do
+        requires :foo, type: context.custom_type
+      end
+      subject.get('/types') { params[:foo].value }
+
+      get '/types', foo: 'valid'
+      expect(last_response.status).to eq(200)
+      expect(last_response.body).to eq('valid')
+
+      get '/types', foo: 'invalid'
+      expect(last_response.status).to eq(400)
+      expect(last_response.body).to include('foo is invalid')
+    end
+  end
+
+  context 'param renaming' do
+    it do
+      subject.params do
+        requires :foo, as: :bar
+        optional :super, as: :hiper
+      end
+      subject.get('/renaming') { "#{declared(params)['bar']}-#{declared(params)['hiper']}" }
+      get '/renaming', foo: 'any', super: 'any2'
+
+      expect(last_response.status).to eq(200)
+      expect(last_response.body).to eq('any-any2')
+    end
+
+    it do
+      subject.params do
+        requires :foo, as: :bar, type: String, coerce_with: lambda(&:strip)
+      end
+      subject.get('/renaming-coerced') { "#{params['bar']}-#{params['foo']}" }
+      get '/renaming-coerced', foo: ' there we go '
+
+      expect(last_response.status).to eq(200)
+      expect(last_response.body).to eq('-there we go')
+    end
+
+    it do
+      subject.params do
+        requires :foo, as: :bar, allow_blank: false
+      end
+      subject.get('/renaming-not-blank') {}
+      get '/renaming-not-blank', foo: ''
+
+      expect(last_response.status).to eq(400)
+      expect(last_response.body).to eq('foo is empty')
+    end
+
+    it do
+      subject.params do
+        requires :foo, as: :bar, allow_blank: false
+      end
+      subject.get('/renaming-not-blank-with-value') {}
+      get '/renaming-not-blank-with-value', foo: 'any'
+
+      expect(last_response.status).to eq(200)
+    end
+
+    it do
+      subject.params do
+        requires :foo, as: :baz, type: Hash do
+          requires :bar, as: :qux
+        end
+      end
+      subject.get('/nested-renaming') { declared(params).to_json }
+      get '/nested-renaming', foo: { bar: 'any' }
+
+      expect(last_response.status).to eq(200)
+      expect(last_response.body).to eq('{"baz":{"qux":"any"}}')
+    end
+
+    it 'renaming can be defined before default' do
+      subject.params do
+        optional :foo, as: :bar, default: 'before'
+      end
+      subject.get('/rename-before-default') { declared(params)[:bar] }
+      get '/rename-before-default'
+
+      expect(last_response.status).to eq(200)
+      expect(last_response.body).to eq('before')
+    end
+
+    it 'renaming can be defined after default' do
+      subject.params do
+        optional :foo, default: 'after', as: :bar
+      end
+      subject.get('/rename-after-default') { declared(params)[:bar] }
+      get '/rename-after-default'
+
+      expect(last_response.status).to eq(200)
+      expect(last_response.body).to eq('after')
+    end
+  end
+
+  context 'array without coerce type explicitly given' do
+    it 'sets the type based on first element' do
+      subject.params do
+        requires :periods, type: Array, values: -> { %w[day month] }
+      end
+      subject.get('/required') { 'required works' }
+
+      get '/required', periods: %w[day month]
+      expect(last_response.status).to eq(200)
+      expect(last_response.body).to eq('required works')
+    end
+
+    it 'fails to call API without Array type' do
+      subject.params do
+        requires :periods, type: Array, values: -> { %w[day month] }
+      end
+      subject.get('/required') { 'required works' }
+
+      get '/required', periods: 'day'
+      expect(last_response.status).to eq(400)
+      expect(last_response.body).to eq('periods is invalid')
+    end
+
+    it 'raises exception when values are of different type' do
+      expect do
+        subject.params { requires :numbers, type: Array, values: [1, 'definitely not a number', 3] }
+      end.to raise_error Grape::Exceptions::IncompatibleOptionValues
+    end
+
+    it 'raises exception when range values have different endpoint types' do
+      expect do
+        subject.params { requires :numbers, type: Array, values: 0.0..10 }
+      end.to raise_error Grape::Exceptions::IncompatibleOptionValues
+    end
+
+    # An empty list says nothing about the member type, so it is taken from
+    # the next one.
+    it 'takes the member type from except_values when values is empty' do
+      expect do
+        subject.params { requires :numbers, type: Array, values: [], except_values: [1, 2] }
+      end.not_to raise_error
+    end
+
+    it 'accepts beginless and endless range values' do
+      expect do
+        subject.params do
+          requires :low, type: Array, values: ..5
+          requires :high, type: Array, values: 1..
+        end
+      end.not_to raise_error
+    end
+
+    it 'still raises for a beginless range whose end is not of the member type' do
+      expect do
+        subject.params { requires :numbers, type: Array, values: ..5, except_values: ['a'] }
+      end.to raise_error Grape::Exceptions::IncompatibleOptionValues
+    end
+
+    it 'accepts an array containing only allowed values, given as a literal array' do
+      subject.params do
+        optional :periods, type: Array, values: %w[day month]
+      end
+      subject.get('/optional') { 'optional works' }
+
+      get '/optional', periods: %w[day month]
+      expect(last_response.status).to eq(200)
+      expect(last_response.body).to eq('optional works')
+    end
+
+    it 'raises a single values error, not a duplicate coercion error, for a disallowed value' do
+      subject.params do
+        optional :periods, type: Array, values: %w[day month]
+      end
+      subject.get('/optional') { 'optional works' }
+
+      get '/optional', periods: ['year']
+      expect(last_response.status).to eq(400)
+      expect(last_response.body).to eq('periods does not have a valid value')
+    end
+
+    it 'still enforces the declared Array type at runtime, given a literal values array' do
+      subject.params do
+        optional :periods, type: Array, values: %w[day month]
+      end
+      subject.get('/optional') { 'optional works' }
+
+      get '/optional', periods: 'day'
+      expect(last_response.status).to eq(400)
+      expect(last_response.body).to eq('periods is invalid')
+    end
+  end
+
+  # An Array group handed something other than an Array fails its own type
+  # check, and its members are not then validated against that value as
+  # though it were one element.
+  context 'array group given a Hash' do
+    it 'reports the group as invalid without validating its members' do
+      subject.params do
+        requires :items, type: Array do
+          requires :id, type: Integer
+        end
+      end
+      subject.post('/items') { 'ok' }
+
+      post '/items', { items: { name: 'x' } }.to_json, 'CONTENT_TYPE' => 'application/json'
+      expect(last_response.status).to eq(400)
+      expect(last_response.body).to eq('items is invalid')
+    end
+  end
+
+  context 'hash group given an Array' do
+    it 'reports the group as invalid without validating the optional array group inside it' do
+      subject.params do
+        requires :meta, type: Hash do
+          optional :items, type: Array do
+            requires :id, type: Integer
+          end
+        end
+      end
+      subject.post('/meta') { 'ok' }
+
+      post '/meta', { meta: [{}] }.to_json, 'CONTENT_TYPE' => 'application/json'
+      expect(last_response.status).to eq(400)
+      expect(last_response.body).to eq('meta is invalid')
+    end
+  end
+
+  context 'coercing values validation with a variant-member-type collection' do
+    it 'accepts values compatible with the declared member types' do
+      expect do
+        subject.params { optional :status, type: [Integer, String], values: [1, 2] }
+      end.not_to raise_error
+    end
+
+    it 'accepts except_values compatible with the declared member types' do
+      expect do
+        subject.params { optional :status, type: [Integer, String], except_values: [3] }
+      end.not_to raise_error
+    end
+
+    it 'accepts a Set container with values compatible with the declared member types' do
+      expect do
+        subject.params { optional :status, type: Set[Integer, String], values: [1, 2] }
+      end.not_to raise_error
+    end
+
+    it 'raises exception when values do not match the first declared member type' do
+      expect do
+        subject.params { optional :status, type: [Integer, String], values: %w[active] }
+      end.to raise_error Grape::Exceptions::IncompatibleOptionValues
+    end
+
+    it 'accepts an array containing only allowed values at request time' do
+      subject.params { optional :status, type: [Integer, String], values: [1, 2] }
+      subject.get('/variant') { 'variant works' }
+
+      get '/variant', status: %w[1 2]
+      expect(last_response.status).to eq(200)
+      expect(last_response.body).to eq('variant works')
+    end
+
+    it 'rejects a disallowed value at request time' do
+      subject.params { optional :status, type: [Integer, String], values: [1, 2] }
+      subject.get('/variant') { 'variant works' }
+
+      get '/variant', status: %w[3]
+      expect(last_response.status).to eq(400)
+      expect(last_response.body).to eq('status does not have a valid value')
+    end
+  end
+
+  context 'coercing values validation with proc' do
+    it 'allows the proc to pass validation without checking' do
+      subject.params { requires :numbers, type: Integer, values: -> { [0, 1, 2] } }
+
+      subject.post('/required') { 'coercion with proc works' }
+      post '/required', numbers: '1'
+      expect(last_response.status).to eq(201)
+      expect(last_response.body).to eq('coercion with proc works')
+    end
+
+    it 'allows the proc to pass validation without checking in value' do
+      subject.params { requires :numbers, type: Integer, values: { value: -> { [0, 1, 2] } } }
+
+      subject.post('/required') { 'coercion with proc works' }
+      post '/required', numbers: '1'
+      expect(last_response.status).to eq(201)
+      expect(last_response.body).to eq('coercion with proc works')
+    end
+
+    it 'allows the proc to pass validation without checking in except' do
+      subject.params { requires :numbers, type: Integer, except_values: -> { [0, 1, 2] } }
+
+      subject.post('/required') { 'coercion with proc works' }
+      post '/required', numbers: '10'
+      expect(last_response.status).to eq(201)
+      expect(last_response.body).to eq('coercion with proc works')
+    end
+  end
+
+  context 'a Set with coerce type explicitly given' do
+    context 'and the values are allowed' do
+      it 'does not raise an exception' do
+        expect do
+          subject.params { optional :numbers, type: Set[Integer], values: 0..2, default: 0..2 }
+        end.not_to raise_error
+      end
+    end
+
+    context 'and the values are not allowed' do
+      it 'raises exception' do
+        expect do
+          subject.params { optional :numbers, type: Set[Integer], values: %w[a b] }
+        end.to raise_error Grape::Exceptions::IncompatibleOptionValues
+      end
+    end
+  end
+
+  context 'with range values' do
+    context "when left range endpoint isn't #kind_of? the type" do
+      it 'raises exception' do
+        expect do
+          subject.params { requires :latitude, type: Integer, values: -90.0..90 }
+        end.to raise_error Grape::Exceptions::IncompatibleOptionValues
+      end
+    end
+
+    context "when right range endpoint isn't #kind_of? the type" do
+      it 'raises exception' do
+        expect do
+          subject.params { requires :latitude, type: Integer, values: -90..90.0 }
+        end.to raise_error Grape::Exceptions::IncompatibleOptionValues
+      end
+    end
+
+    context 'when the default is an array' do
+      context 'and is the entire range of allowed values' do
+        it 'does not raise an exception' do
+          expect do
+            subject.params { optional :numbers, type: Array[Integer], values: 0..2, default: 0..2 }
+          end.not_to raise_error
+        end
+      end
+
+      context 'and is a subset of allowed values' do
+        it 'does not raise an exception' do
+          expect do
+            subject.params { optional :numbers, type: Array[Integer], values: [0, 1, 2], default: [1, 0] }
+          end.not_to raise_error
+        end
+      end
+    end
+
+    context 'when both range endpoints are #kind_of? the type' do
+      it 'accepts values in the range' do
+        subject.params do
+          requires :letter, type: String, values: 'a'..'z'
+        end
+        subject.get('/letter') { params[:letter] }
+
+        get '/letter', letter: 'j'
+        expect(last_response.status).to eq(200)
+        expect(last_response.body).to eq('j')
+      end
+
+      it 'rejects values outside the range' do
+        subject.params do
+          requires :letter, type: String, values: 'a'..'z'
+        end
+        subject.get('/letter') { params[:letter] }
+
+        get '/letter', letter: 'J'
+        expect(last_response.status).to eq(400)
+        expect(last_response.body).to eq('letter does not have a valid value')
+      end
+    end
+  end
+
+  context 'when a parameter is renamed with as' do
+    # `as` is a DSL concern — the rename happens in push_declared_params and
+    # new_scope, both of which take it as a keyword. It reaches them from the
+    # declaration or from an enclosing `with`, the declaration winning.
+    it 'renames a parameter declared with as' do
+      subject.params { requires :a, as: :b, type: String }
+      subject.get('/rename') { declared(params).to_json }
+
+      get '/rename', a: 'x'
+      expect(last_response.status).to eq(200)
+      expect(last_response.body).to eq({ b: 'x' }.to_json)
+    end
+
+    it 'takes the name from an enclosing with block' do
+      subject.params { with(as: :z) { requires :c, type: String } }
+      subject.get('/group_rename') { declared(params).to_json }
+
+      get '/group_rename', c: 'x'
+      expect(last_response.body).to eq({ z: 'x' }.to_json)
+    end
+
+    it 'lets the declaration win over the group' do
+      subject.params { with(as: :z) { requires :c, as: :own, type: String } }
+      subject.get('/both') { declared(params).to_json }
+
+      get '/both', c: 'x'
+      expect(last_response.body).to eq({ own: 'x' }.to_json)
+    end
+  end
+
+  context 'when a presence option is supplied' do
+    # `presence` is how the DSL tells the pipeline a param is required;
+    # `requires` overwrote whatever an API passed, and `optional` honoured it.
+    # Both still resolve exactly as they did, with a warning.
+    it 'is deprecated' do
+      expect do
+        subject.params { requires :a, presence: false }
+      end.to raise_error(ActiveSupport::DeprecationException, /presence/)
+
+      expect do
+        subject.params { optional :a, presence: true }
+      end.to raise_error(ActiveSupport::DeprecationException, /presence/)
+    end
+
+    it 'keeps deciding the outcome the way it always did' do
+      Grape.deprecator.silence do
+        subject.params { optional :a, presence: true }
+      end
+      subject.get('/presence') { 'ok' }
+
+      get '/presence'
+      expect(last_response.status).to eq(400)
+      expect(last_response.body).to eq('a is missing')
+    end
+  end
+
+  context 'parameters in group' do
+    it 'errors when no type is provided' do
+      expect do
+        subject.params do
+          group :a do
+            requires :b
+          end
+        end
+      end.to raise_error Grape::Exceptions::MissingGroupType
+
+      expect do
+        subject.params do
+          optional :a do
+            requires :b
+          end
+        end
+      end.to raise_error Grape::Exceptions::MissingGroupType
+    end
+
+    # `requires` read the group's type through the `with` merge and `optional`
+    # did not, so the same declaration was accepted for one and rejected for
+    # the other.
+    it 'takes the type from an enclosing with block' do
+      expect do
+        subject.params do
+          with(type: Hash) do
+            optional :a do
+              requires :b, type: String
+            end
+          end
+        end
+      end.not_to raise_error
+    end
+
+    # Without a name the block's params landed one level up; with several,
+    # only the first name got them.
+    %w[requires optional].each do |method|
+      it "errors when #{method} is given a block without a name" do
+        expect do
+          subject.params { __send__(method, type: Hash) { requires :b } }
+        end.to raise_error(ArgumentError, 'a params block needs exactly one parameter name, got `0`')
+      end
+
+      it "errors when #{method} is given a block with several names" do
+        expect do
+          subject.params { __send__(method, :a, :c, type: Hash) { requires :b } }
+        end.to raise_error(ArgumentError, 'a params block needs exactly one parameter name, got `2`')
+      end
+    end
+
+    it 'still errors when neither the declaration nor the group provides a type' do
+      expect do
+        subject.params do
+          with(documentation: { in: 'body' }) do
+            optional :a do
+              requires :b, type: String
+            end
+          end
+        end
+      end.to raise_error Grape::Exceptions::MissingGroupType
+    end
+
+    it 'allows Hash as type' do
+      subject.params do
+        group :a, type: Hash do
+          requires :b
+        end
+      end
+      subject.get('/group') { 'group works' }
+      get '/group', a: { b: true }
+      expect(last_response.status).to eq(200)
+      expect(last_response.body).to eq('group works')
+
+      subject.params do
+        optional :a, type: Hash do
+          requires :b
+        end
+      end
+      get '/optional_type_hash'
+    end
+
+    it 'allows Array as type' do
+      subject.params do
+        group :a, type: Array do
+          requires :b
+        end
+      end
+      subject.get('/group') { 'group works' }
+      get '/group', a: [{ b: true }]
+      expect(last_response.status).to eq(200)
+      expect(last_response.body).to eq('group works')
+
+      subject.params do
+        optional :a, type: Array do
+          requires :b
+        end
+      end
+      get '/optional_type_array'
+    end
+
+    it 'handles missing optional Array type' do
+      subject.params do
+        optional :a, type: Array do
+          requires :b
+        end
+      end
+      subject.get('/test') { declared(params).to_json }
+      get '/test'
+      expect(last_response.status).to eq(200)
+      expect(last_response.body).to eq('{"a":[]}')
+    end
+
+    context 'when the value holds an invalid byte sequence' do
+      it 'rejects it where an optional Hash is declared, as any other String' do
+        subject.params do
+          optional :a, type: Hash do
+            optional :b, type: String
+          end
+        end
+        subject.get('/test') { 'ok' }
+
+        get '/test?a=x'
+        expect(last_response.status).to eq(400)
+        expect(last_response.body).to eq('a is invalid')
+
+        get '/test?a=%FF'
+        expect(last_response.status).to eq(400)
+        expect(last_response.body).to eq('a is invalid')
+      end
+
+      it 'rejects it where an optional Hash is declared inside a given, as any other String' do
+        subject.params do
+          optional :x
+          given :x do
+            optional :a, type: Hash do
+              optional :b, type: String
+            end
+          end
+        end
+        subject.get('/test') { 'ok' }
+
+        get '/test?x=1&a=x'
+        expect(last_response.status).to eq(400)
+        expect(last_response.body).to eq('a is invalid')
+
+        get '/test?x=1&a=%FF'
+        expect(last_response.status).to eq(400)
+        expect(last_response.body).to eq('a is invalid')
+      end
+
+      it 'rejects it as an element where an optional Array of Hashes is declared, as any other String' do
+        subject.params do
+          optional :a, type: Array do
+            optional :b, type: String
+          end
+        end
+        subject.get('/test') { 'ok' }
+
+        get '/test?a[]=x'
+        expect(last_response.status).to eq(400)
+        expect(last_response.body).to eq('a[0] is invalid')
+
+        get '/test?a[]=%FF'
+        expect(last_response.status).to eq(400)
+        expect(last_response.body).to eq('a[0] is invalid')
+      end
+    end
+
+    # A scope two levels under one that was not given must not be validated
+    # either: the answer belongs to the whole chain, not to the nearest scope.
+    it 'does not validate a required scope nested in an optional scope that was not given' do
+      subject.params do
+        optional :a, type: Hash do
+          requires :b, type: Hash do
+            requires :c, type: Integer
+          end
+        end
+      end
+      subject.post('/nested_optional') { declared(params).to_json }
+
+      post '/nested_optional', {}.to_json, 'CONTENT_TYPE' => 'application/json'
+      expect(last_response.status).to eq(201)
+
+      post '/nested_optional', { a: { b: {} } }.to_json, 'CONTENT_TYPE' => 'application/json'
+      expect(last_response.status).to eq(400)
+      expect(last_response.body).to eq('a[b][c] is missing')
+    end
+
+    it 'errors with an unsupported type' do
+      expect do
+        subject.params do
+          group :a, type: Set do
+            requires :b
+          end
+        end
+      end.to raise_error Grape::Exceptions::UnsupportedGroupType
+
+      expect do
+        subject.params do
+          optional :a, type: Set do
+            requires :b
+          end
+        end
+      end.to raise_error Grape::Exceptions::UnsupportedGroupType
+    end
+  end
+
+  context 'when validations are dependent on a parameter' do
+    before do
+      subject.params do
+        optional :a
+        given :a do
+          requires :b
+        end
+      end
+      subject.get('/test') { declared(params).to_json }
+    end
+
+    it 'applies the validations only if the parameter is present' do
+      get '/test'
+      expect(last_response.status).to eq(200)
+
+      get '/test', a: true
+      expect(last_response.status).to eq(400)
+      expect(last_response.body).to eq('b is missing')
+
+      get '/test', a: true, b: true
+      expect(last_response.status).to eq(200)
+    end
+
+    # %FF decodes to a String holding a byte UTF-8 does not allow, which
+    # +blank?+ raised on rather than answering.
+    it 'applies the validations if the parameter holds an invalid byte sequence' do
+      get '/test?a=%FF'
+      expect(last_response.status).to eq(400)
+      expect(last_response.body).to eq('b is missing')
+    end
+
+    it 'applies the validations of multiple parameters' do
+      subject.params do
+        optional :a, :b
+        given :a, :b do
+          requires :c
+        end
+      end
+      subject.get('/multiple') { declared(params).to_json }
+
+      get '/multiple'
+      expect(last_response.status).to eq(200)
+
+      get '/multiple', a: true
+      expect(last_response.status).to eq(200)
+
+      get '/multiple', b: true
+      expect(last_response.status).to eq(200)
+
+      get '/multiple', a: true, b: true
+      expect(last_response.status).to eq(400)
+      expect(last_response.body).to eq('c is missing')
+
+      get '/multiple', a: true, b: true, c: true
+      expect(last_response.status).to eq(200)
+    end
+
+    it 'applies only the appropriate validation' do
+      subject.params do
+        optional :a
+        optional :b
+        mutually_exclusive :a, :b
+        given :a do
+          requires :c, type: String
+        end
+        given :b do
+          requires :c, type: Integer
+        end
+      end
+      subject.get('/multiple') { declared(params).to_json }
+
+      get '/multiple'
+      expect(last_response.status).to eq(200)
+
+      get '/multiple', a: true, c: 'test'
+      expect(last_response.status).to eq(200)
+      expect(JSON.parse(last_response.body).symbolize_keys).to eq a: 'true', b: nil, c: 'test'
+
+      get '/multiple', b: true, c: '3'
+      expect(last_response.status).to eq(200)
+      expect(JSON.parse(last_response.body).symbolize_keys).to eq a: nil, b: 'true', c: 3
+
+      get '/multiple', a: true
+      expect(last_response.status).to eq(400)
+      expect(last_response.body).to eq('c is missing')
+
+      get '/multiple', b: true
+      expect(last_response.status).to eq(400)
+      expect(last_response.body).to eq('c is missing')
+
+      get '/multiple', a: true, b: true, c: 'test'
+      expect(last_response.status).to eq(400)
+      expect(last_response.body).to eq('a, b are mutually exclusive, c is invalid')
+    end
+
+    it 'raises an error if the dependent parameter was never specified' do
+      expect do
+        subject.params do
+          given :c do
+          end
+        end
+      end.to raise_error(Grape::Exceptions::UnknownParameter)
+    end
+
+    it 'depends on a parameter named as a String that was declared as a Symbol' do
+      subject.params do
+        optional :a
+        given 'a' do
+          requires :b
+        end
+      end
+      subject.get('/given-string') { 'ok' }
+
+      get '/given-string', a: 'x'
+      expect(last_response.status).to eq(400)
+      expect(last_response.body).to eq('b is missing')
+    end
+
+    it 'knows a parameter declared as a String or a Symbol by either name' do
+      answers = nil
+      subject.params do
+        optional 'a'
+        optional :b
+        answers = [declared_param?(:a), declared_param?('b')]
+      end
+
+      expect(answers).to eq([true, true])
+    end
+
+    it 'does not raise an error if the dependent parameter is a Hash' do
+      expect do
+        subject.params do
+          optional :a, type: Hash do
+            requires :b
+          end
+          given :a do
+            requires :c
+          end
+        end
+      end.not_to raise_error
+    end
+
+    it 'does not raise an error if when using nested given' do
+      expect do
+        subject.params do
+          optional :a, type: Hash do
+            requires :b
+          end
+          given :a do
+            requires :c
+            given :c do
+              requires :d
+            end
+          end
+        end
+      end.not_to raise_error
+    end
+
+    it 'allows nested dependent parameters' do
+      subject.params do
+        optional :a
+        given a: ->(val) { val == 'a' } do
+          optional :b
+          given b: ->(val) { val == 'b' } do
+            optional :c
+            given c: ->(val) { val == 'c' } do
+              requires :d
+            end
+          end
+        end
+      end
+      subject.get('/') { declared(params).to_json }
+
+      get '/'
+      expect(last_response.status).to eq 200
+
+      get '/', a: 'a', b: 'b', c: 'c'
+      expect(last_response.status).to eq 400
+      expect(last_response.body).to eq 'd is missing'
+
+      get '/', a: 'a', b: 'b', c: 'c', d: 'd'
+      expect(last_response.status).to eq 200
+      expect(last_response.body).to eq({ a: 'a', b: 'b', c: 'c', d: 'd' }.to_json)
+    end
+
+    it 'allows renaming of dependent parameters' do
+      subject.params do
+        optional :a
+        given :a do
+          requires :b, as: :c
+        end
+      end
+
+      subject.get('/multiple') { declared(params).to_json }
+
+      get '/multiple', a: 'a', b: 'b'
+
+      body = JSON.parse(last_response.body)
+
+      expect(body.keys).to include('c')
+      expect(body.keys).not_to include('b')
+    end
+
+    it 'allows renaming of dependent on parameter' do
+      subject.params do
+        optional :a, as: :b
+        given a: ->(val) { val == 'x' } do
+          requires :c
+        end
+      end
+      subject.get('/') { declared(params) }
+
+      get '/', a: 'x'
+      expect(last_response.status).to eq 400
+      expect(last_response.body).to eq 'c is missing'
+
+      get '/', a: 'y'
+      expect(last_response.status).to eq 200
+    end
+
+    it 'does not raise if the dependent parameter is not the renamed one' do
+      expect do
+        subject.params do
+          optional :a, as: :b
+          given :a do
+            requires :c
+          end
+        end
+      end.not_to raise_error
+    end
+
+    it 'raises an error if the dependent parameter is the renamed one' do
+      expect do
+        subject.params do
+          optional :a, as: :b
+          given :b do
+            requires :c
+          end
+        end
+      end.to raise_error(Grape::Exceptions::UnknownParameter)
+    end
+
+    it 'does not validate nested requires when given is false' do
+      subject.params do
+        requires :a, type: String, allow_blank: false, values: %w[x y z]
+        given a: ->(val) { val == 'x' } do
+          requires :inner1, type: Hash, allow_blank: false do
+            requires :foo, type: Integer, allow_blank: false
+          end
+        end
+        given a: ->(val) { val == 'y' } do
+          requires :inner2, type: Hash, allow_blank: false do
+            requires :bar, type: Integer, allow_blank: false
+            requires :baz, type: Array, allow_blank: false do
+              requires :baz_category, type: String, allow_blank: false
+            end
+          end
+        end
+        given a: ->(val) { val == 'z' } do
+          requires :inner3, type: Array, allow_blank: false do
+            requires :bar, type: Integer, allow_blank: false
+            requires :baz, type: Array, allow_blank: false do
+              requires :baz_category, type: String, allow_blank: false
+            end
+          end
+        end
+      end
+      subject.get('/varying') { declared(params).to_json }
+
+      get '/varying', a: 'x', inner1: { foo: 1 }
+      expect(last_response.status).to eq(200)
+
+      get '/varying', a: 'y', inner2: { bar: 2, baz: [{ baz_category: 'barstools' }] }
+      expect(last_response.status).to eq(200)
+
+      get '/varying', a: 'y', inner2: { bar: 2, baz: [{ unrelated: 'yep' }] }
+      expect(last_response.status).to eq(400)
+
+      get '/varying', a: 'z', inner3: [{ bar: 3, baz: [{ baz_category: 'barstools' }] }]
+      expect(last_response.status).to eq(200)
+    end
+
+    it 'detect unmet nested dependency' do
+      subject.params do
+        requires :a, type: String, allow_blank: false, values: %w[x y z]
+        given a: ->(val) { val == 'z' } do
+          requires :inner3, type: Array, allow_blank: false do
+            requires :bar, type: String, allow_blank: false
+            given bar: ->(val) { val == 'b' } do
+              requires :baz, type: Array do
+                optional :baz_category, type: String
+              end
+            end
+            given bar: ->(val) { val == 'c' } do
+              requires :baz, type: Array do
+                requires :baz_category, type: String
+              end
+            end
+          end
+        end
+      end
+      subject.get('/nested-dependency') { declared(params).to_json }
+
+      get '/nested-dependency', a: 'z', inner3: [{ bar: 'c', baz: [{ unrelated: 'nope' }] }]
+      expect(last_response.status).to eq(400)
+      expect(last_response.body).to eq 'inner3[0][baz][0][baz_category] is missing'
+    end
+
+    context 'detect when json array' do
+      before do
+        subject.params do
+          requires :array, type: Array do
+            requires :a, type: String
+            given a: ->(val) { val == 'a' } do
+              requires :json, type: Hash do
+                requires :b, type: String
+              end
+            end
+          end
+        end
+
+        subject.post '/nested_array' do
+          'nested array works!'
+        end
+      end
+
+      it 'succeeds' do
+        params = {
+          array: [
+            {
+              a: 'a',
+              json: { b: 'b' }
+            },
+            {
+              a: 'b'
+            }
+          ]
+        }
+        post '/nested_array', params.to_json, 'CONTENT_TYPE' => 'application/json'
+
+        expect(last_response.status).to eq(201)
+      end
+
+      it 'fails' do
+        params = {
+          array: [
+            {
+              a: 'a',
+              json: { b: 'b' }
+            },
+            {
+              a: 'a'
+            }
+          ]
+        }
+        post '/nested_array', params.to_json, 'CONTENT_TYPE' => 'application/json'
+
+        expect(last_response.status).to eq(400)
+        expect(last_response.body).to eq('array[1][json] is missing, array[1][json][b] is missing')
+      end
+    end
+
+    context 'when the request nests its arrays deeper than the declaration' do
+      before do
+        subject.params do
+          requires :lines, type: Array do
+            requires :name, type: String
+          end
+        end
+        subject.post('/lines') { 'ok' }
+      end
+
+      it 'accepts the declared shape' do
+        post '/lines', { lines: [{ name: 'x' }] }.to_json, 'CONTENT_TYPE' => 'application/json'
+
+        expect(last_response.status).to eq(201)
+      end
+
+      # Without this the elements are silently unwrapped, validation passes, and
+      # the endpoint receives an Array where it declared a Hash.
+      it 'rejects elements wrapped in an extra array' do
+        post '/lines', { lines: [[{ name: 'x' }]] }.to_json, 'CONTENT_TYPE' => 'application/json'
+
+        expect(last_response.status).to eq(400)
+        expect(last_response.body).to eq('lines[0] is invalid, lines[0][name] is missing')
+      end
+
+      it 'rejects elements wrapped in several extra arrays' do
+        post '/lines', { lines: [[[{ name: 'x' }]]] }.to_json, 'CONTENT_TYPE' => 'application/json'
+
+        expect(last_response.status).to eq(400)
+      end
+
+      it 'rejects an empty array element' do
+        post '/lines', { lines: [[]] }.to_json, 'CONTENT_TYPE' => 'application/json'
+
+        expect(last_response.status).to eq(400)
+      end
+    end
+
+    context 'when the request nests its arrays deeper than a declaration of optional params' do
+      before do
+        subject.params do
+          requires :orders, type: Array do
+            optional :lines, type: Array do
+              optional :sku, type: String
+            end
+          end
+        end
+        subject.post('/orders') { declared(params) }
+      end
+
+      it 'accepts the declared shape' do
+        post '/orders', { orders: [{ lines: [{ sku: 'a' }] }] }.to_json, 'CONTENT_TYPE' => 'application/json'
+
+        expect(last_response.status).to eq(201)
+      end
+
+      it 'rejects elements wrapped in an extra array' do
+        post '/orders', { orders: [[{ lines: 5 }]] }.to_json, 'CONTENT_TYPE' => 'application/json'
+
+        expect(last_response.status).to eq(400)
+        expect(last_response.body).to eq('orders[0] is invalid')
+      end
+
+      it 'rejects an element of the nested Array that is not a Hash' do
+        post '/orders', { orders: [{ lines: [{ sku: 'a' }, 'b'] }] }.to_json, 'CONTENT_TYPE' => 'application/json'
+
+        expect(last_response.status).to eq(400)
+        expect(last_response.body).to eq('orders[0][lines][1] is invalid')
+      end
+    end
+
+    context 'when an array is declared inside a hash' do
+      before do
+        subject.params do
+          requires :outer, type: Hash do
+            requires :inner, type: Array do
+              requires :leaf, type: String
+            end
+          end
+        end
+        subject.post('/hash_array') { 'ok' }
+      end
+
+      it 'accepts the declared shape' do
+        post '/hash_array', { outer: { inner: [{ leaf: 'x' }] } }.to_json, 'CONTENT_TYPE' => 'application/json'
+
+        expect(last_response.status).to eq(201)
+      end
+
+      it 'rejects elements wrapped in an extra array' do
+        post '/hash_array', { outer: { inner: [[{ leaf: 'x' }]] } }.to_json, 'CONTENT_TYPE' => 'application/json'
+
+        expect(last_response.status).to eq(400)
+      end
+    end
+
+    context 'when arrays are nested in the declaration' do
+      before do
+        subject.params do
+          requires :a, type: Array do
+            requires :b, type: Array do
+              requires :c, type: String
+            end
+          end
+        end
+        subject.post('/nested_arrays') { 'ok' }
+      end
+
+      it 'still descends as deep as the declaration nests' do
+        post '/nested_arrays', { a: [{ b: [{ c: 'x' }] }] }.to_json, 'CONTENT_TYPE' => 'application/json'
+
+        expect(last_response.status).to eq(201)
+      end
+
+      it 'reports errors against the inner elements' do
+        post '/nested_arrays', { a: [{ b: [{}] }] }.to_json, 'CONTENT_TYPE' => 'application/json'
+
+        expect(last_response.status).to eq(400)
+        expect(last_response.body).to eq('a[0][b][0][c] is missing')
+      end
+
+      it 'rejects one level deeper than declared' do
+        post '/nested_arrays', { a: [{ b: [[{ c: 'x' }]] }] }.to_json, 'CONTENT_TYPE' => 'application/json'
+
+        expect(last_response.status).to eq(400)
+      end
+    end
+
+    context 'array without given' do
+      before do
+        subject.params do
+          requires :array, type: Array do
+            requires :a, type: Integer
+            requires :b, type: Integer
+          end
+        end
+
+        subject.post '/array_without_given'
+      end
+
+      it 'fails' do
+        params = {
+          array: [
+            {
+              a: 1,
+              b: 2
+            },
+            {
+              a: 3
+            },
+            {
+              a: 5
+            }
+          ]
+        }
+        post '/array_without_given', params.to_json, 'CONTENT_TYPE' => 'application/json'
+        expect(last_response.body).to eq('array[1][b] is missing, array[2][b] is missing')
+        expect(last_response.status).to eq(400)
+      end
+    end
+
+    context 'array with given' do
+      before do
+        subject.params do
+          requires :array, type: Array do
+            requires :a, type: Integer
+            given a: lambda(&:odd?) do
+              requires :b, type: Integer
+            end
+          end
+        end
+
+        subject.post '/array_with_given'
+      end
+
+      it 'fails' do
+        params = {
+          array: [
+            {
+              a: 1,
+              b: 2
+            },
+            {
+              a: 3
+            },
+            {
+              a: 5
+            }
+          ]
+        }
+        post '/array_with_given', params.to_json, 'CONTENT_TYPE' => 'application/json'
+        expect(last_response.body).to eq('array[1][b] is missing, array[2][b] is missing')
+        expect(last_response.status).to eq(400)
+      end
+    end
+
+    # A scope declared under a given reads only the elements that meet its
+    # dependency. They keep their place among the others, so an error names
+    # the element the request sent.
+    context 'array with a scope declared under given' do
+      it 'names the element of a Hash scope' do
+        subject.params do
+          requires :items, type: Array do
+            optional :kind
+            given kind: ->(val) { val == 'x' } do
+              requires :meta, type: Hash do
+                requires :beer
+              end
+            end
+          end
+        end
+        subject.post('/hash_under_given') { 'ok' }
+
+        params = { items: [{ kind: 'x', meta: {} }, { kind: 'y' }, { kind: 'x', meta: {} }] }
+        post '/hash_under_given', params.to_json, 'CONTENT_TYPE' => 'application/json'
+        expect(last_response.body).to eq('items[0][meta][beer] is missing, items[2][meta][beer] is missing')
+        expect(last_response.status).to eq(400)
+      end
+
+      it 'names the element of an Array scope' do
+        subject.params do
+          requires :items, type: Array do
+            optional :kind
+            given kind: ->(val) { val == 'x' } do
+              requires :subs, type: Array do
+                requires :n
+              end
+            end
+          end
+        end
+        subject.post('/array_under_given') { 'ok' }
+
+        params = { items: [{ kind: 'y' }, { kind: 'x', subs: [{ n: 1 }, {}] }] }
+        post '/array_under_given', params.to_json, 'CONTENT_TYPE' => 'application/json'
+        expect(last_response.body).to eq('items[1][subs][1][n] is missing')
+        expect(last_response.status).to eq(400)
+      end
+
+      it 'names the element of a scope under a given in nested arrays' do
+        subject.params do
+          requires :orders, type: Array do
+            requires :items, type: Array do
+              optional :kind
+              given kind: ->(val) { val == 'x' } do
+                requires :meta, type: Hash do
+                  requires :beer
+                end
+              end
+            end
+          end
+        end
+        subject.post('/nested_under_given') { 'ok' }
+
+        params = { orders: [{ items: [{ kind: 'y' }] }, { items: [{ kind: 'y' }, { kind: 'x', meta: {} }] }] }
+        post '/nested_under_given', params.to_json, 'CONTENT_TYPE' => 'application/json'
+        expect(last_response.body).to eq('orders[1][items][1][meta][beer] is missing')
+        expect(last_response.status).to eq(400)
+      end
+
+      it 'does not validate the given when no element meets its dependency' do
+        subject.params do
+          requires :items, type: Array do
+            optional :kind
+            given kind: ->(val) { val == 'x' } do
+              optional :beer
+              optional :wine
+              exactly_one_of :beer, :wine
+            end
+          end
+        end
+        subject.post('/none_meets_given') { 'ok' }
+
+        post '/none_meets_given', { items: [{ kind: 'y' }, { kind: 'z' }] }.to_json, 'CONTENT_TYPE' => 'application/json'
+        expect(last_response.status).to eq(201)
+      end
+    end
+
+    # An element sent empty meets a dependency its absent key satisfies, so the
+    # given scope validates it, as it does one sent with that key set to null.
+    context 'optional array with given' do
+      before do
+        subject.params do
+          optional :array, type: Array do
+            optional :a
+            given a: ->(val) { val != 'skip' } do
+              requires :b
+            end
+          end
+        end
+
+        subject.post '/optional_array_with_given'
+      end
+
+      it 'validates an element sent empty' do
+        post '/optional_array_with_given', { array: [{ a: 'x', b: 1 }, {}] }.to_json, 'CONTENT_TYPE' => 'application/json'
+        expect(last_response.body).to eq('array[1][b] is missing')
+        expect(last_response.status).to eq(400)
+      end
+
+      it 'passes over an array whose elements are all empty' do
+        post '/optional_array_with_given', { array: [{}] }.to_json, 'CONTENT_TYPE' => 'application/json'
+        expect(last_response.status).to eq(201)
+      end
+    end
+
+    # A given scope reads its array's elements where the array scope does, so
+    # an element wrapped in an extra array is not unwrapped for it either.
+    context 'array with given, nested deeper than the declaration' do
+      before do
+        subject.params do
+          requires :array, type: Array do
+            optional :a
+            given :a do
+              optional :b
+              optional :c
+              mutually_exclusive :b, :c
+            end
+          end
+        end
+
+        subject.post '/array_with_given_nested'
+      end
+
+      it 'does not validate inside the extra array' do
+        post '/array_with_given_nested', { array: [[{ a: 1, b: 1, c: 1 }]] }.to_json, 'CONTENT_TYPE' => 'application/json'
+        expect(last_response.body).to eq('array[0] is invalid')
+        expect(last_response.status).to eq(400)
+      end
+    end
+
+    # A with group inside an array scope is a lateral scope whose params are
+    # the array itself, so each element's index is recorded against the array
+    # scope. Failing a first element as well as the last shows it was: a stale
+    # index names the wrong element.
+    context 'array with a with group' do
+      before do
+        subject.params do
+          requires :array, type: Array do
+            requires :a, type: Integer
+            with(type: Integer) do
+              requires :b
+            end
+          end
+        end
+
+        subject.post '/array_with_group'
+      end
+
+      it 'names the elements that failed' do
+        params = { array: [{ a: 1 }, { a: 3, b: 4 }, { a: 5 }] }
+        post '/array_with_group', params.to_json, 'CONTENT_TYPE' => 'application/json'
+        expect(last_response.body).to eq('array[0][b] is missing, array[2][b] is missing')
+        expect(last_response.status).to eq(400)
+      end
+    end
+
+    context 'nested json array with given' do
+      before do
+        subject.params do
+          requires :workflow_nodes, type: Array do
+            requires :steps, type: Array do
+              requires :id, type: String
+              optional :type, type: String, values: %w[send_messsge assign_user assign_team tag_conversation snooze close add_commit]
+              given type: ->(val) { val == 'send_messsge' } do
+                requires :message, type: Hash do
+                  requires :content, type: String
+                end
+              end
+            end
+          end
+        end
+
+        subject.post '/nested_json_array_with_given'
+      end
+
+      it 'passes' do
+        params = {
+          workflow_nodes: [
+            {
+              id: 'eqibmvEzPo8hQOSt',
+              title: 'Node 1',
+              is_start: true,
+              steps: [
+                {
+                  id: 'DvdSZaIm1hEd5XO5',
+                  type: 'send_messsge',
+                  message: {
+                    content: '打击好',
+                    menus: []
+                  }
+                },
+                {
+                  id: 'VY6MIwycBw0b51Ib',
+                  type: 'add_commit',
+                  comment_content: '初来乍到'
+                }
+              ]
+            }
+          ]
+        }
+        post '/nested_json_array_with_given', params.to_json, 'CONTENT_TYPE' => 'application/json'
+        expect(last_response.status).to eq(201)
+      end
+    end
+
+    it 'includes the parameter within #declared(params)' do
+      get '/test', a: true, b: true
+
+      expect(JSON.parse(last_response.body)).to eq('a' => 'true', 'b' => 'true')
+    end
+
+    it 'returns a sensible error message within a nested context' do
+      subject.params do
+        requires :bar, type: Hash do
+          optional :a
+          given :a do
+            requires :b
+          end
+        end
+      end
+      subject.get('/nested') { 'worked' }
+
+      get '/nested', bar: { a: true }
+      expect(last_response.status).to eq(400)
+      expect(last_response.body).to eq('bar[b] is missing')
+    end
+
+    it 'includes the nested parameter within #declared(params)' do
+      subject.params do
+        requires :bar, type: Hash do
+          optional :a
+          given :a do
+            requires :b
+          end
+        end
+      end
+      subject.get('/nested') { declared(params).to_json }
+
+      get '/nested', bar: { a: true, b: 'yes' }
+      expect(JSON.parse(last_response.body)).to eq('bar' => { 'a' => 'true', 'b' => 'yes' })
+    end
+
+    it 'includes level 2 nested parameters outside the given within #declared(params)' do
+      subject.params do
+        requires :bar, type: Hash do
+          optional :a
+          given :a do
+            requires :c, type: Hash do
+              requires :b
+            end
+          end
+        end
+      end
+      subject.get('/nested') { declared(params).to_json }
+
+      get '/nested', bar: { a: true, c: { b: 'yes' } }
+      expect(JSON.parse(last_response.body)).to eq('bar' => { 'a' => 'true', 'c' => { 'b' => 'yes' } })
+    end
+
+    context 'when the dependent parameter is not present #declared(params)' do
+      context 'lateral parameter' do
+        before do
+          [true, false].each do |evaluate_given|
+            subject.params do
+              optional :a
+              given :a do
+                optional :b
+              end
+            end
+            subject.get("/evaluate_given_#{evaluate_given}") { declared(params, evaluate_given:).to_json }
+          end
+        end
+
+        it 'evaluate_given_false' do
+          get '/evaluate_given_false', b: 'b'
+          expect(JSON.parse(last_response.body)).to eq('a' => nil, 'b' => 'b')
+        end
+
+        it 'evaluate_given_true' do
+          get '/evaluate_given_true', b: 'b'
+          expect(JSON.parse(last_response.body)).to eq('a' => nil)
+        end
+      end
+
+      context 'lateral hash parameter' do
+        before do
+          [true, false].each do |evaluate_given|
+            subject.params do
+              optional :a, values: %w[x y]
+              given a: ->(a) { a == 'x' } do
+                optional :b, type: Hash do
+                  optional :c
+                end
+                optional :e
+              end
+              given a: ->(a) { a == 'y' } do
+                optional :b, type: Hash do
+                  optional :d
+                end
+                optional :f
+              end
+            end
+            subject.get("/evaluate_given_#{evaluate_given}") { declared(params, evaluate_given:).to_json }
+          end
+        end
+
+        it 'evaluate_given_false' do
+          get '/evaluate_given_false', a: 'x'
+          expect(JSON.parse(last_response.body)).to eq('a' => 'x', 'b' => { 'd' => nil }, 'e' => nil, 'f' => nil)
+
+          get '/evaluate_given_false', a: 'y'
+          expect(JSON.parse(last_response.body)).to eq('a' => 'y', 'b' => { 'd' => nil }, 'e' => nil, 'f' => nil)
+        end
+
+        it 'evaluate_given_true' do
+          get '/evaluate_given_true', a: 'x'
+          expect(JSON.parse(last_response.body)).to eq('a' => 'x', 'b' => { 'c' => nil }, 'e' => nil)
+
+          get '/evaluate_given_true', a: 'y'
+          expect(JSON.parse(last_response.body)).to eq('a' => 'y', 'b' => { 'd' => nil }, 'f' => nil)
+        end
+      end
+
+      context 'lateral parameter within lateral hash parameter' do
+        before do
+          [true, false].each do |evaluate_given|
+            subject.params do
+              optional :a, values: %w[x y]
+              given a: ->(a) { a == 'x' } do
+                optional :b, type: Hash do
+                  optional :c
+                  given :c do
+                    optional :g
+                    optional :e, type: Hash do
+                      optional :h
+                    end
+                  end
+                end
+              end
+              given a: ->(a) { a == 'y' } do
+                optional :b, type: Hash do
+                  optional :d
+                  given :d do
+                    optional :f
+                    optional :e, type: Hash do
+                      optional :i
+                    end
+                  end
+                end
+              end
+            end
+            subject.get("/evaluate_given_#{evaluate_given}") { declared(params, evaluate_given:).to_json }
+          end
+        end
+
+        it 'evaluate_given_false' do
+          get '/evaluate_given_false', a: 'x'
+          expect(JSON.parse(last_response.body)).to eq('a' => 'x', 'b' => { 'd' => nil, 'f' => nil, 'e' => { 'i' => nil } })
+
+          get '/evaluate_given_false', a: 'x', b: { c: 'c' }
+          expect(JSON.parse(last_response.body)).to eq('a' => 'x', 'b' => { 'd' => nil, 'f' => nil, 'e' => { 'i' => nil } })
+
+          get '/evaluate_given_false', a: 'y'
+          expect(JSON.parse(last_response.body)).to eq('a' => 'y', 'b' => { 'd' => nil, 'f' => nil, 'e' => { 'i' => nil } })
+
+          get '/evaluate_given_false', a: 'y', b: { d: 'd' }
+          expect(JSON.parse(last_response.body)).to eq('a' => 'y', 'b' => { 'd' => 'd', 'f' => nil, 'e' => { 'i' => nil } })
+        end
+
+        it 'evaluate_given_true' do
+          get '/evaluate_given_true', a: 'x'
+          expect(JSON.parse(last_response.body)).to eq('a' => 'x', 'b' => { 'c' => nil })
+
+          get '/evaluate_given_true', a: 'x', b: { c: 'c' }
+          expect(JSON.parse(last_response.body)).to eq('a' => 'x', 'b' => { 'c' => 'c', 'g' => nil, 'e' => { 'h' => nil } })
+
+          get '/evaluate_given_true', a: 'y'
+          expect(JSON.parse(last_response.body)).to eq('a' => 'y', 'b' => { 'd' => nil })
+
+          get '/evaluate_given_true', a: 'y', b: { d: 'd' }
+          expect(JSON.parse(last_response.body)).to eq('a' => 'y', 'b' => { 'd' => 'd', 'f' => nil, 'e' => { 'i' => nil } })
+        end
+      end
+
+      context 'lateral parameter within an array param' do
+        before do
+          [true, false].each do |evaluate_given|
+            subject.params do
+              optional :array, type: Array do
+                optional :a
+                given :a do
+                  optional :b
+                end
+              end
+            end
+            subject.post("/evaluate_given_#{evaluate_given}") do
+              declared(params, evaluate_given:).to_json
+            end
+          end
+        end
+
+        it 'evaluate_given_false' do
+          post '/evaluate_given_false', { array: [{ b: 'b' }, { a: 'a', b: 'b' }] }.to_json, 'CONTENT_TYPE' => 'application/json'
+          expect(JSON.parse(last_response.body)).to eq('array' => [{ 'a' => nil, 'b' => 'b' }, { 'a' => 'a', 'b' => 'b' }])
+        end
+
+        it 'evaluate_given_true' do
+          post '/evaluate_given_true', { array: [{ b: 'b' }, { a: 'a', b: 'b' }] }.to_json, 'CONTENT_TYPE' => 'application/json'
+          expect(JSON.parse(last_response.body)).to eq('array' => [{ 'a' => nil }, { 'a' => 'a', 'b' => 'b' }])
+        end
+      end
+
+      context 'nested given parameter' do
+        before do
+          [true, false].each do |evaluate_given|
+            subject.params do
+              optional :a
+              optional :c
+              given :a do
+                given :c do
+                  optional :b
+                end
+              end
+            end
+            subject.post("/evaluate_given_#{evaluate_given}") do
+              declared(params, evaluate_given:).to_json
+            end
+          end
+        end
+
+        it 'evaluate_given_false' do
+          post '/evaluate_given_false', { a: 'a', b: 'b' }.to_json, 'CONTENT_TYPE' => 'application/json'
+          expect(JSON.parse(last_response.body)).to eq('a' => 'a', 'b' => 'b', 'c' => nil)
+
+          post '/evaluate_given_false', { c: 'c', b: 'b' }.to_json, 'CONTENT_TYPE' => 'application/json'
+          expect(JSON.parse(last_response.body)).to eq('a' => nil, 'b' => 'b', 'c' => 'c')
+
+          post '/evaluate_given_false', { a: 'a', c: 'c', b: 'b' }.to_json, 'CONTENT_TYPE' => 'application/json'
+          expect(JSON.parse(last_response.body)).to eq('a' => 'a', 'b' => 'b', 'c' => 'c')
+        end
+
+        it 'evaluate_given_true' do
+          post '/evaluate_given_true', { a: 'a', b: 'b' }.to_json, 'CONTENT_TYPE' => 'application/json'
+          expect(JSON.parse(last_response.body)).to eq('a' => 'a', 'c' => nil)
+
+          post '/evaluate_given_true', { c: 'c', b: 'b' }.to_json, 'CONTENT_TYPE' => 'application/json'
+          expect(JSON.parse(last_response.body)).to eq('a' => nil, 'c' => 'c')
+
+          post '/evaluate_given_true', { a: 'a', c: 'c', b: 'b' }.to_json, 'CONTENT_TYPE' => 'application/json'
+          expect(JSON.parse(last_response.body)).to eq('a' => 'a', 'b' => 'b', 'c' => 'c')
+        end
+      end
+
+      context 'nested given parameter within an array param' do
+        before do
+          [true, false].each do |evaluate_given|
+            subject.params do
+              optional :array, type: Array do
+                optional :a
+                optional :c
+                given :a do
+                  given :c do
+                    optional :b
+                  end
+                end
+              end
+            end
+            subject.post("/evaluate_given_#{evaluate_given}") do
+              declared(params, evaluate_given:).to_json
+            end
+          end
+        end
+
+        let :evaluate_given_params do
+          {
+            array: [
+              { a: 'a', b: 'b' },
+              { c: 'c', b: 'b' },
+              { a: 'a', c: 'c', b: 'b' }
+            ]
+          }
+        end
+
+        it 'evaluate_given_false' do
+          post '/evaluate_given_false', evaluate_given_params.to_json, 'CONTENT_TYPE' => 'application/json'
+          expect(JSON.parse(last_response.body)).to eq('array' => [{ 'a' => 'a', 'b' => 'b', 'c' => nil }, { 'a' => nil, 'b' => 'b', 'c' => 'c' }, { 'a' => 'a', 'b' => 'b', 'c' => 'c' }])
+        end
+
+        it 'evaluate_given_true' do
+          post '/evaluate_given_true', evaluate_given_params.to_json, 'CONTENT_TYPE' => 'application/json'
+          expect(JSON.parse(last_response.body)).to eq('array' => [{ 'a' => 'a', 'c' => nil }, { 'a' => nil, 'c' => 'c' }, { 'a' => 'a', 'b' => 'b', 'c' => 'c' }])
+        end
+      end
+
+      context 'nested given parameter within a nested given parameter within an array param' do
+        before do
+          [true, false].each do |evaluate_given|
+            subject.params do
+              optional :array, type: Array do
+                optional :a
+                optional :c
+                given :a do
+                  given :c do
+                    optional :array, type: Array do
+                      optional :a
+                      optional :c
+                      given :a do
+                        given :c do
+                          optional :b
+                        end
+                      end
+                    end
+                  end
+                end
+              end
+            end
+            subject.post("/evaluate_given_#{evaluate_given}") do
+              declared(params, evaluate_given:).to_json
+            end
+          end
+        end
+
+        let :evaluate_given_params do
+          {
+            array: [{
+              a: 'a',
+              c: 'c',
+              array: [
+                { a: 'a', b: 'b' },
+                { c: 'c', b: 'b' },
+                { a: 'a', c: 'c', b: 'b' }
+              ]
+            }]
+          }
+        end
+
+        it 'evaluate_given_false' do
+          expected_response_hash = {
+            'array' => [{
+              'a' => 'a',
+              'c' => 'c',
+              'array' => [
+                { 'a' => 'a', 'b' => 'b', 'c' => nil },
+                { 'a' => nil, 'c' => 'c', 'b' => 'b' },
+                { 'a' => 'a', 'c' => 'c', 'b' => 'b' }
+              ]
+            }]
+          }
+          post '/evaluate_given_false', evaluate_given_params.to_json, 'CONTENT_TYPE' => 'application/json'
+          expect(JSON.parse(last_response.body)).to eq(expected_response_hash)
+        end
+
+        it 'evaluate_given_true' do
+          expected_response_hash = {
+            'array' => [{
+              'a' => 'a',
+              'c' => 'c',
+              'array' => [
+                { 'a' => 'a', 'c' => nil },
+                { 'a' => nil, 'c' => 'c' },
+                { 'a' => 'a', 'b' => 'b', 'c' => 'c' }
+              ]
+            }]
+          }
+          post '/evaluate_given_true', evaluate_given_params.to_json, 'CONTENT_TYPE' => 'application/json'
+          expect(JSON.parse(last_response.body)).to eq(expected_response_hash)
+        end
+      end
+    end
+  end
+
+  context 'default value in given block' do
+    before do
+      subject.params do
+        optional :a, values: %w[a b]
+        given a: ->(val) { val == 'a' } do
+          optional :b, default: 'default'
+        end
+      end
+      subject.get('/') { params.to_json }
+    end
+
+    context 'when dependency meets' do
+      it 'sets default value for dependent parameter' do
+        get '/', a: 'a'
+        expect(last_response.body).to eq({ a: 'a', b: 'default' }.to_json)
+      end
+    end
+
+    context 'when dependency does not meet' do
+      it 'does not set default value for dependent parameter' do
+        get '/', a: 'b'
+        expect(last_response.body).to eq({ a: 'b' }.to_json)
+      end
+    end
+  end
+
+  context 'when validations are dependent on a parameter within an array param' do
+    before do
+      subject.params do
+        requires :foos, type: Array do
+          optional :foo
+          given :foo do
+            requires :bar
+          end
+        end
+      end
+      subject.get('/test') { 'ok' }
+    end
+
+    it 'passes none Hash params' do
+      get '/test', foos: ['']
+      expect(last_response.status).to eq(200)
+      expect(last_response.body).to eq('ok')
+    end
+  end
+
+  # A validator run on its own -- as a custom validator's unit test does --
+  # runs outside the request's ParamScopeTracker. Nothing is tracked then: the
+  # elements a +given+ scope narrowed its array down to, and the element
+  # indices, which is why the names below carry none.
+  context 'when a given scope within an array param is validated outside a request' do
+    before do
+      subject.params do
+        requires :items, type: Array do
+          optional :a
+          given :a do
+            requires :b
+            optional :c, type: Hash do
+              requires :d
+            end
+          end
+        end
+      end
+    end
+
+    it 'still reports what is missing' do
+      env = Rack::MockRequest.env_for('/', params: { items: [{ a: 1, c: { e: 1 } }, { a: 1, b: 2, c: { d: 3 } }] })
+      request = Grape::Request.new(env)
+      errors = subject.inheritable_setting.validations.flat_map do |validator|
+        validator.validate(request)
+        []
+      rescue Grape::Exceptions::ValidationArrayErrors => e
+        e.errors.map { |error| "#{error.params.join(', ')} #{error.message}" }
+      end
+
+      expect(errors).to eq(['items[b] is missing', 'items[c][d] is missing'])
+    end
+  end
+
+  # The same, for an array scope at the root, which its validators check
+  # element by element without the iterator.
+  context 'when an array param is validated outside a request' do
+    before do
+      subject.params do
+        requires :items, type: Array do
+          requires :b
+        end
+      end
+    end
+
+    it 'still reports what is missing' do
+      request = Grape::Request.new(Rack::MockRequest.env_for('/', params: { items: [{ a: 1 }, { a: 2, b: 3 }] }))
+      errors = subject.inheritable_setting.validations.flat_map do |validator|
+        validator.validate(request)
+        []
+      rescue Grape::Exceptions::ValidationArrayErrors => e
+        e.errors.map { |error| "#{error.params.join(', ')} #{error.message}" }
+      end
+
+      expect(errors).to eq(['items[b] is missing'])
+    end
+  end
+
+  context 'when validations are dependent on a parameter within an array param within #declared(params).to_json' do
+    before do
+      subject.params do
+        requires :foos, type: Array do
+          optional :foo_type, :baz_type
+          given :foo_type do
+            requires :bar
+          end
+        end
+      end
+      subject.post('/test') { declared(params).to_json }
+    end
+
+    it 'applies the constraint within each value' do
+      post '/test',
+           { foos: [{ foo_type: 'a' }, { baz_type: 'c' }] }.to_json,
+           'CONTENT_TYPE' => 'application/json'
+
+      expect(last_response.status).to eq(400)
+      expect(last_response.body).to eq('foos[0][bar] is missing')
+    end
+  end
+
+  context 'when validations are dependent on a parameter with specific value' do
+    # build test cases from all combinations of declarations and options
+    a_decls = %i[optional requires]
+    a_options = [{}, { values: %w[x y z] }]
+    b_options = [{}, { type: String }, { allow_blank: false }, { type: String, allow_blank: false }]
+    combinations = a_decls.product(a_options, b_options)
+    combinations.each_with_index do |(a_decl, a_opts, b_opts), i|
+      context "(case #{i})" do
+        before do
+          # puts "a_decl: #{a_decl}, a_opts: #{a_opts}, b_opts: #{b_opts}"
+          subject.params do
+            __send__ a_decl, :a, **a_opts
+            given(a: ->(val) { val == 'x' }) { requires :b, **b_opts }
+            given(a: ->(val) { val == 'y' }) { requires :c, **b_opts }
+          end
+          subject.get('/test') { declared(params).to_json }
+        end
+
+        if a_decl == :optional
+          it 'skips validation when base param is missing' do
+            get '/test'
+            expect(last_response.status).to eq(200)
+          end
+        end
+
+        it 'skips validation when base param does not have a specified value' do
+          get '/test', a: 'z'
+          expect(last_response.status).to eq(200)
+
+          get '/test', a: 'z', b: ''
+          expect(last_response.status).to eq(200)
+        end
+
+        it 'applies the validation when base param has the specific value' do
+          get '/test', a: 'x'
+          expect(last_response.status).to eq(400)
+          expect(last_response.body).to include('b is missing')
+
+          get '/test', a: 'x', b: true
+          expect(last_response.status).to eq(200)
+
+          get '/test', a: 'x', b: true, c: ''
+          expect(last_response.status).to eq(200)
+        end
+
+        it 'includes the parameter within #declared(params)' do
+          get '/test', a: 'x', b: true
+          expect(JSON.parse(last_response.body)).to eq('a' => 'x', 'b' => 'true', 'c' => nil)
+        end
+      end
+    end
+  end
+
+  it 'raises an error if the dependent parameter was never specified' do
+    expect do
+      subject.params do
+        given :c do
+        end
+      end
+    end.to raise_error(Grape::Exceptions::UnknownParameter)
+  end
+
+  it 'returns a sensible error message within a nested context' do
+    subject.params do
+      requires :bar, type: Hash do
+        optional :a
+        given a: ->(val) { val == 'x' } do
+          requires :b
+        end
+      end
+    end
+    subject.get('/nested') { 'worked' }
+
+    get '/nested', bar: { a: 'x' }
+    expect(last_response.status).to eq(400)
+    expect(last_response.body).to eq('bar[b] is missing')
+  end
+
+  it 'includes the nested parameter within #declared(params)' do
+    subject.params do
+      requires :bar, type: Hash do
+        optional :a
+        given a: ->(val) { val == 'x' } do
+          requires :b
+        end
+      end
+    end
+    subject.get('/nested') { declared(params).to_json }
+
+    get '/nested', bar: { a: 'x', b: 'yes' }
+    expect(JSON.parse(last_response.body)).to eq('bar' => { 'a' => 'x', 'b' => 'yes' })
+  end
+
+  it 'includes level 2 nested parameters outside the given within #declared(params)' do
+    subject.params do
+      requires :bar, type: Hash do
+        optional :a
+        given a: ->(val) { val == 'x' } do
+          requires :c, type: Hash do
+            requires :b
+          end
+        end
+      end
+    end
+    subject.get('/nested') { declared(params).to_json }
+
+    get '/nested', bar: { a: 'x', c: { b: 'yes' } }
+    expect(JSON.parse(last_response.body)).to eq('bar' => { 'a' => 'x', 'c' => { 'b' => 'yes' } })
+  end
+
+  it 'includes deeply nested parameters within #declared(params)' do
+    subject.params do
+      requires :arr1, type: Array do
+        requires :hash1, type: Hash do
+          requires :arr2, type: Array do
+            requires :hash2, type: Hash do
+              requires :something, type: String
+            end
+          end
+        end
+      end
+    end
+    subject.get('/nested_deep') { declared(params).to_json }
+
+    get '/nested_deep', arr1: [{ hash1: { arr2: [{ hash2: { something: 'value' } }] } }]
+    expect(last_response.status).to eq(200)
+    expect(JSON.parse(last_response.body)).to eq('arr1' => [{ 'hash1' => { 'arr2' => [{ 'hash2' => { 'something' => 'value' } }] } }])
+  end
+
+  context 'failing fast' do
+    context 'when fail_fast is not defined' do
+      it 'does not stop validation' do
+        subject.params do
+          requires :one
+          requires :two
+          requires :three
+        end
+        subject.get('/fail-fast') { declared(params).to_json }
+
+        get '/fail-fast'
+        expect(last_response.status).to eq(400)
+        expect(last_response.body).to eq('one is missing, two is missing, three is missing')
+      end
+    end
+
+    context 'when fail_fast is defined it stops the validation' do
+      it 'of other params' do
+        subject.params do
+          requires :one, fail_fast: true
+          requires :two
+        end
+        subject.get('/fail-fast') { declared(params).to_json }
+
+        get '/fail-fast'
+        expect(last_response.status).to eq(400)
+        expect(last_response.body).to eq('one is missing')
+      end
+
+      it 'for a single param' do
+        subject.params do
+          requires :one, allow_blank: false, regexp: /[0-9]+/, fail_fast: true
+        end
+        subject.get('/fail-fast') { declared(params).to_json }
+
+        get '/fail-fast', one: ''
+        expect(last_response.status).to eq(400)
+        expect(last_response.body).to eq('one is empty')
+      end
+    end
+  end
+
+  context 'when params have group attributes' do
+    context 'with validations' do
+      before do
+        subject.params do
+          with(allow_blank: false) do
+            requires :id
+            optional :name
+            optional :address, allow_blank: true
+          end
+        end
+        subject.get('test')
+      end
+
+      context 'when data is invalid' do
+        before do
+          get 'test', id: '', name: ''
+        end
+
+        it 'returns a validation error' do
+          expect(last_response.status).to eq(400)
+        end
+
+        it 'applies group validations for every parameter' do
+          expect(last_response.body).to eq('id is empty, name is empty')
+        end
+      end
+
+      context 'when parameter has the same validator as a group' do
+        before do
+          get 'test', id: 'id', address: ''
+        end
+
+        it 'returns a successful response' do
+          expect(last_response.status).to eq(200)
+        end
+
+        it 'prioritizes parameter validation over group validation' do
+          expect(last_response.body).not_to include('address is empty')
+        end
+      end
+    end
+
+    context 'with types' do
+      before do
+        subject.params do
+          with(type: Date) do
+            requires :created_at
+          end
+        end
+        subject.get('test') { params[:created_at] }
+      end
+
+      context 'when invalid date provided' do
+        before do
+          get 'test', created_at: 'not_a_date'
+        end
+
+        it 'responds with HTTP error' do
+          expect(last_response.status).to eq(400)
+        end
+
+        it 'returns a validation error' do
+          expect(last_response.body).to eq('created_at is invalid')
+        end
+      end
+
+      context 'when created_at receives a valid date' do
+        before do
+          get 'test', created_at: '2016-01-01'
+        end
+
+        it 'returns a successful response' do
+          expect(last_response.status).to eq(200)
+        end
+
+        it 'returns a date' do
+          expect(last_response.body).to eq('2016-01-01')
+        end
+      end
+    end
+
+    context 'with several group attributes' do
+      before do
+        subject.params do
+          with(values: [1]) do
+            requires :id, type: Integer
+          end
+
+          with(allow_blank: false) do
+            optional :address, type: String
+          end
+
+          requires :name
+        end
+        subject.get('test')
+      end
+
+      context 'when data is invalid' do
+        before do
+          get 'test', id: 2, address: ''
+        end
+
+        it 'responds with HTTP error' do
+          expect(last_response.status).to eq(400)
+        end
+
+        it 'returns a validation error' do
+          expect(last_response.body).to eq('id does not have a valid value, address is empty, name is missing')
+        end
+      end
+
+      context 'when correct data is provided' do
+        before do
+          get 'test', id: 1, address: 'Some street', name: 'John'
+        end
+
+        it 'returns a successful response' do
+          expect(last_response.status).to eq(200)
+        end
+      end
+    end
+
+    context 'with nested groups' do
+      before do
+        subject.params do
+          with(type: Integer) do
+            requires :id
+
+            with(type: Date) do
+              requires :created_at
+              optional :updated_at
+            end
+          end
+        end
+        subject.get('test')
+      end
+
+      context 'when data is invalid' do
+        before do
+          get 'test', id: 'wrong', created_at: 'not_a_date', updated_at: '2016-01-01'
+        end
+
+        it 'responds with HTTP error' do
+          expect(last_response.status).to eq(400)
+        end
+
+        it 'returns a validation error' do
+          expect(last_response.body).to eq('id is invalid, created_at is invalid')
+        end
+      end
+
+      context 'when correct data is provided' do
+        before do
+          get 'test', id: 1, created_at: '2016-01-01'
+        end
+
+        it 'returns a successful response' do
+          expect(last_response.status).to eq(200)
+        end
+      end
+    end
+
+    context 'with many levels of nested groups' do
+      before do
+        subject.params do
+          requires :first_level, type: Hash do
+            with(type: Integer) do
+              requires :value
+              with(type: String) do
+                optional :second_level, type: Array do
+                  optional :name, type: String
+                  with(type: Integer) do
+                    optional :third_level, type: Array do
+                      requires :value, type: Integer
+                      optional :position
+                    end
+                  end
+                end
+              end
+              requires :id
+            end
+          end
+        end
+        subject.put('/nested') { declared(params).to_json }
+      end
+
+      context 'when data is valid' do
+        let(:request_params) do
+          {
+            first_level: {
+              value: '10',
+              second_level: [
+                {
+                  name: '13',
+                  third_level: [
+                    {
+                      value: '2',
+                      position: '1'
+                    }
+                  ]
+                }
+              ],
+              id: '20'
+            }
+          }
+        end
+
+        it 'validates and coerces correctly' do
+          put '/nested', request_params.to_json, 'CONTENT_TYPE' => 'application/json'
+
+          expect(last_response.status).to eq(200)
+          expect(JSON.parse(last_response.body, symbolize_names: true)).to eq(
+            first_level: {
+              value: 10,
+              second_level: [
+                { name: '13', third_level: [{ value: 2, position: 1 }] }
+              ],
+              id: 20
+            }
+          )
+        end
+      end
+
+      context 'when data is invalid' do
+        let(:request_params) do
+          {
+            first_level: {
+              value: 'wrong',
+              second_level: [
+                { name: 'name', third_level: [{ position: 'wrong' }] }
+              ]
+            }
+          }
+        end
+
+        it 'responds with HTTP error' do
+          put '/nested', request_params.to_json, 'CONTENT_TYPE' => 'application/json'
+          expect(last_response.status).to eq(400)
+        end
+
+        it 'responds with a validation error' do
+          put '/nested', request_params.to_json, 'CONTENT_TYPE' => 'application/json'
+
+          expect(last_response.body)
+            .to include('first_level[value] is invalid')
+            .and include('first_level[id] is missing')
+            .and include('first_level[second_level][0][third_level][0][value] is missing')
+            .and include('first_level[second_level][0][third_level][0][position] is invalid')
+        end
+      end
+    end
+  end
+
+  context 'with exactly_one_of validation for optional parameters within an Hash param' do
+    before do
+      subject.params do
+        optional :memo, type: Hash do
+          optional :text, type: String
+          optional :custom_body, type: Hash, coerce_with: JSON
+          exactly_one_of :text, :custom_body
+        end
+      end
+      subject.get('test')
+    end
+
+    context 'when correct data is provided' do
+      it 'returns a successful response' do
+        get 'test', memo: {}
+        expect(last_response.status).to eq(200)
+
+        get 'test', memo: { text: 'HOGEHOGE' }
+        expect(last_response.status).to eq(200)
+
+        get 'test', memo: { custom_body: '{ "xxx": "yyy" }' }
+        expect(last_response.status).to eq(200)
+      end
+    end
+
+    context 'when invalid data is provided' do
+      it 'returns a failure response' do
+        get 'test', memo: { text: 'HOGEHOGE', custom_body: '{ "xxx": "yyy" }' }
+        expect(last_response.status).to eq(400)
+
+        get 'test', memo: '{ "custom_body": "HOGE" }'
+        expect(last_response.status).to eq(400)
+      end
+    end
+  end
+
+  # A nested scope's block runs with that scope as self, which is how these
+  # examples get hold of one.
+  describe '#params' do
+    let(:api) { Class.new(Grape::API) }
+
+    it 'answers the params it is given at the root' do
+      params = { foo: 'bar' }
+      expect(described_class.new(api:).params(params)).to be(params)
+    end
+
+    it 'answers the value under its element' do
+      foo = nil
+      described_class.new(api:) do
+        requires :foo, type: Hash do
+          foo = self
+          requires :bar
+        end
+      end
+      expect(foo.params({ foo: { bar: 1 } })).to eq({ bar: 1 })
+    end
+
+    it 'answers the value under its element in each element of an Array further up' do
+      sub = nil
+      described_class.new(api:) do
+        requires :items, type: Array do
+          requires :sub, type: Hash do
+            sub = self
+            requires :a
+          end
+        end
+      end
+      expect(sub.params({ items: [{ sub: { a: 1 } }, { sub: { a: 2 } }] })).to eq([{ a: 1 }, { a: 2 }])
+    end
+
+    it 'answers an empty Hash when the scope above resolved to neither a Hash nor an Array' do
+      bar = nil
+      described_class.new(api:) do
+        requires :foo, type: Hash do
+          requires :bar, type: Hash do
+            bar = self
+            requires :baz
+          end
+        end
+      end
+      expect(bar.params({ foo: 'not a hash' })).to eq({})
+    end
+  end
+
+  describe Grape::Validations::ParamsScope::Attr do
+    let(:scope) { instance_double(Grape::Validations::ParamsScope) }
+
+    describe '.attr_key' do
+      it 'returns a plain value unchanged' do
+        expect(described_class.attr_key(:id)).to eq(:id)
+      end
+
+      it 'recurses into the #key of a nested Attr' do
+        inner = described_class.new(:id, scope)
+        outer = described_class.new(inner, scope)
+        expect(described_class.attr_key(outer)).to eq(:id)
+      end
+
+      it 'transforms the values of a Hash of nested declared params' do
+        inner = described_class.new(:id, scope)
+        result = described_class.attr_key(nested: [inner])
+        expect(result).to eq(nested: [:id])
+      end
+    end
+
+    describe '.attrs_keys' do
+      it 'maps declared params to their keys' do
+        declared_params = [described_class.new(:id, scope), described_class.new(:name, scope)]
+        expect(described_class.attrs_keys(declared_params)).to eq(%i[id name])
+      end
+    end
+  end
+end

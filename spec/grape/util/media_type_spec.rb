@@ -1,0 +1,167 @@
+# frozen_string_literal: true
+
+RSpec.describe Grape::Util::MediaType do
+  shared_examples 'MediaType' do
+    it { is_expected.to eq(described_class.new(type:, subtype:)) }
+  end
+
+  describe '.parse' do
+    subject(:media_type) { described_class.parse(header) }
+
+    context 'when header blank?' do
+      let(:header) { nil }
+
+      it { is_expected.to be_nil }
+    end
+
+    context 'when header is not a mime type' do
+      let(:header) { 'abc' }
+
+      it { is_expected.to be_nil }
+    end
+
+    context 'when header is a valid mime type' do
+      let(:header) { [type, subtype].join('/') }
+      let(:type) { 'text' }
+      let(:subtype) { 'html' }
+
+      it_behaves_like 'MediaType'
+
+      context 'when header is a vendor mime type' do
+        let(:type) { 'application' }
+        let(:subtype) { 'vnd.test-v1+json' }
+
+        it_behaves_like 'MediaType'
+      end
+
+      context 'when header is a vendor mime type without version' do
+        let(:type) { 'application' }
+        let(:subtype) { 'vnd.ms-word' }
+
+        it_behaves_like 'MediaType'
+      end
+    end
+
+    # Media types are case-insensitive (RFC 9110 §8.3.1); the vendor pattern is
+    # written in lower case, so anything else used to parse as no vendor at all.
+    context 'when the header is not in lower case' do
+      subject(:media_type) { described_class.parse(header) }
+
+      let(:header) { 'APPLICATION/VND.TEST-V1+JSON' }
+
+      it 'parses the vendor, version and format' do
+        expect(media_type.vendor).to eq('test')
+        expect(media_type.version).to eq('v1')
+        expect(media_type.format).to eq('json')
+      end
+
+      it 'down-cases the type and subtype' do
+        expect(media_type.type).to eq('application')
+        expect(media_type.subtype).to eq('vnd.test-v1+json')
+      end
+    end
+
+    context 'when a hyphen could end the vendor or the version' do
+      let(:header) { 'application/vnd.acme-2024-06-20+json' }
+
+      it 'keeps the hyphens in the vendor without one to parse for' do
+        media_type = described_class.parse(header)
+        expect([media_type.vendor, media_type.version]).to eq(%w[acme-2024-06 20])
+      end
+
+      it 'keeps them in the version when parsed for the vendor' do
+        media_type = described_class.parse(header, vendor_pattern: described_class.vendor_pattern('acme'))
+        expect([media_type.vendor, media_type.version, media_type.format]).to eq(%w[acme 2024-06-20 json])
+      end
+
+      it 'parses a hyphenated vendor' do
+        media_type = described_class.parse('application/vnd.my-vendor-v1+json', vendor_pattern: described_class.vendor_pattern('my-vendor'))
+        expect([media_type.vendor, media_type.version]).to eq(%w[my-vendor v1])
+      end
+
+      it 'parses another vendor as it would without one' do
+        expect(described_class.parse('application/vnd.other-2024-06-20+json', vendor_pattern: described_class.vendor_pattern('acme')))
+          .to eq(described_class.parse('application/vnd.other-2024-06-20+json'))
+      end
+    end
+  end
+
+  describe '.match?' do
+    subject { described_class.match?(media_type) }
+
+    context 'when media_type is blank?' do
+      let(:media_type) { nil }
+
+      it { is_expected.to be_falsey }
+    end
+
+    context 'when header is not a mime type' do
+      let(:media_type) { 'abc' }
+
+      it { is_expected.to be_falsey }
+    end
+
+    context 'when header has an empty subtype' do
+      let(:media_type) { 'application/' }
+
+      it { is_expected.to be_falsey }
+    end
+
+    context 'when header is a valid mime type but not vendor' do
+      let(:media_type) { 'text/html' }
+
+      it { is_expected.to be_falsey }
+    end
+
+    context 'when header is a vendor mime type' do
+      let(:media_type) { 'application/vnd.test-v1+json' }
+
+      it { is_expected.to be_truthy }
+    end
+  end
+
+  describe '.best_quality' do
+    subject(:media_type) { described_class.best_quality(header, available_media_types) }
+
+    let(:available_media_types) { %w[application/json text/html] }
+
+    context 'when header is blank?' do
+      let(:header) { nil }
+      let(:type) { 'application' }
+      let(:subtype) { 'json' }
+
+      it_behaves_like 'MediaType'
+    end
+
+    context 'when header is not blank' do
+      let(:header) { [type, subtype].join('/') }
+      let(:type) { 'text' }
+      let(:subtype) { 'html' }
+
+      it 'calls Rack::Utils.best_q_match' do
+        allow(Rack::Utils).to receive(:best_q_match).and_call_original
+        expect(media_type).to eq(described_class.new(type:, subtype:))
+      end
+    end
+  end
+
+  describe '.==' do
+    subject { described_class.new(type:, subtype:) }
+
+    let(:type) { 'application' }
+    let(:subtype) { 'vnd.test-v1+json' }
+    let(:other_media_type_class) { Class.new(Struct.new(:type, :subtype, :vendor, :version, :format)) }
+    let(:other_media_type_instance) { other_media_type_class.new(type, subtype, 'test', 'v1', 'json') }
+
+    it { is_expected.not_to eq(other_media_type_class.new(type, subtype, 'test', 'v1', 'json')) }
+  end
+
+  describe '.hash' do
+    subject { Set.new([described_class.new(type:, subtype:)]) }
+
+    let(:type) { 'text' }
+    let(:subtype) { 'html' }
+
+    it { is_expected.to include(described_class.new(type:, subtype:)) }
+  end
+end

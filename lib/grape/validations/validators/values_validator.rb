@@ -1,0 +1,60 @@
+# frozen_string_literal: true
+
+module Grape
+  module Validations
+    module Validators
+      class ValuesValidator < Base
+        default_message_key :values
+
+        def initialize(attrs, options, required, scope, opts)
+          super
+          values = option_value
+
+          # Zero-arity procs return a collection per-request (e.g. DB-backed lists).
+          # Non-zero-arity procs are per-element predicates, called directly at validation time.
+          # Anything else is the collection itself, held as it came rather than
+          # behind a lambda that would only hand it back.
+          if values.is_a?(Proc)
+            @values_call = values
+            @values_is_predicate = !values.arity.zero?
+          else
+            @values = values
+            @values_is_predicate = false
+          end
+        end
+
+        def validate_param!(attr_name, params)
+          val = scrub(params[attr_name])
+
+          return if val.nil? && !required?
+          return if blank_and_allowed?(val)
+          return if check_values?(val, attr_name)
+
+          validation_error!(attr_name)
+        end
+
+        private
+
+        # +false+ is a value: AS's +blank?+ says otherwise.
+        def blank_and_allowed?(val)
+          val != false && val.blank? && allow_blank?
+        end
+
+        def check_values?(val, attr_name)
+          param_array = val.nil? ? [nil] : Array.wrap(val)
+          return predicate_holds?(param_array, attr_name) if @values_is_predicate
+
+          values = @values_call ? @values_call.call : @values
+          values.nil? || param_array.all? { |param| values.include?(param) }
+        end
+
+        def predicate_holds?(param_array, attr_name)
+          param_array.all? { |param| @values_call.call(param) }
+        rescue StandardError => e
+          warn "Error '#{e}' raised while validating attribute '#{attr_name}'"
+          false
+        end
+      end
+    end
+  end
+end

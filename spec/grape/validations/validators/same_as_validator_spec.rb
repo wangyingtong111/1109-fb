@@ -1,0 +1,118 @@
+# frozen_string_literal: true
+
+describe Grape::Validations::Validators::SameAsValidator do
+  describe '/' do
+    let(:app) do
+      Class.new(Grape::API) do
+        params do
+          requires :password
+          requires :password_confirmation, same_as: :password
+        end
+        post do
+        end
+      end
+    end
+
+    context 'is the same' do
+      it do
+        post '/', password: '987654', password_confirmation: '987654'
+        expect(last_response.status).to eq(201)
+        expect(last_response.body).to eq('')
+      end
+    end
+
+    context 'is not the same' do
+      it do
+        post '/', password: '123456', password_confirmation: 'whatever'
+        expect(last_response.status).to eq(400)
+        expect(last_response.body).to eq('password_confirmation is not the same as password')
+      end
+    end
+
+    context 'is left out' do
+      it 'reports it missing only' do
+        post '/', password: '987654'
+        expect(last_response.status).to eq(400)
+        expect(last_response.body).to eq('password_confirmation is missing')
+      end
+    end
+  end
+
+  describe '/value-hash' do
+    let(:app) do
+      Class.new(Grape::API) do
+        params do
+          requires :password
+          requires :password_confirmation, same_as: { value: :password }
+        end
+        post '/value-hash' do
+        end
+      end
+    end
+
+    context 'is the same' do
+      it do
+        post '/value-hash', password: '987654', password_confirmation: '987654'
+        expect(last_response.status).to eq(201)
+        expect(last_response.body).to eq('')
+      end
+    end
+
+    context 'is not the same' do
+      it do
+        post '/value-hash', password: '123456', password_confirmation: 'whatever'
+        expect(last_response.status).to eq(400)
+        expect(last_response.body).to eq('password_confirmation is not the same as password')
+      end
+    end
+  end
+
+  describe '/custom-message' do
+    let(:app) do
+      Class.new(Grape::API) do
+        params do
+          requires :password
+          requires :password_confirmation, same_as: { value: :password, message: 'not match' }
+        end
+        post '/custom-message' do
+        end
+      end
+    end
+
+    context 'is the same' do
+      it do
+        post '/custom-message', password: '987654', password_confirmation: '987654'
+        expect(last_response.status).to eq(201)
+        expect(last_response.body).to eq('')
+      end
+    end
+
+    context 'is not the same' do
+      it do
+        post '/custom-message', password: '123456', password_confirmation: 'whatever'
+        expect(last_response.status).to eq(400)
+        expect(last_response.body).to eq('password_confirmation not match')
+      end
+    end
+  end
+
+  describe 'a non-hash element inside an Array scope' do
+    let(:app) do
+      Class.new(Grape::API) do
+        params do
+          requires :pair, type: Array do
+            requires :a, same_as: :b
+          end
+        end
+        post 'nested' do
+        end
+      end
+    end
+
+    it 'responds with a validation error instead of raising a TypeError' do
+      post '/nested', pair: ['str']
+      expect(last_response.status).to eq(400)
+      expect(last_response.body).to eq('pair[0] is invalid, pair[0][a] is missing')
+    end
+  end
+end

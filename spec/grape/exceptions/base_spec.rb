@@ -1,0 +1,188 @@
+# frozen_string_literal: true
+
+describe Grape::Exceptions::Base do
+  describe '#to_s' do
+    subject { described_class.new(message:).to_s }
+
+    let(:message) { 'a_message' }
+
+    it { is_expected.to eq(message) }
+  end
+
+  describe '#message' do
+    subject { described_class.new(message:).message }
+
+    let(:message) { 'a_message' }
+
+    it { is_expected.to eq(message) }
+  end
+
+  describe '#[]' do
+    subject(:exception) { described_class.new(status: 418, message: 'a_message', headers: { 'X-Foo' => 'bar' }) }
+
+    it 'reads status via symbol index' do
+      expect(exception[:status]).to eq(418)
+    end
+
+    it 'reads message via symbol index' do
+      expect(exception[:message]).to eq('a_message')
+    end
+
+    it 'reads headers via symbol index' do
+      expect(exception[:headers]).to eq('X-Foo' => 'bar')
+    end
+
+    it 'raises NoMethodError for an unknown index' do
+      expect { exception[:unknown] }.to raise_error(NoMethodError)
+    end
+  end
+
+  describe '#compose_message' do
+    subject { described_class.new.__send__(:compose_message, key, **attributes) }
+
+    let(:key) { :invalid_formatter }
+    let(:attributes) { { klass: String, to_format: 'xml' } }
+
+    after { I18n.reload! }
+
+    context 'when I18n enforces available locales' do
+      context 'when the fallback locale is available' do
+        around do |example|
+          I18n.available_locales = %i[de en]
+          I18n.with_locale(:de) { example.run }
+        ensure
+          I18n.available_locales = %i[en]
+        end
+
+        it 'returns the translated message' do
+          expect(subject).to eq('cannot convert String to xml')
+        end
+      end
+
+      context 'when the fallback locale is not available' do
+        around do |example|
+          I18n.available_locales = %i[de jp]
+          I18n.with_locale(:de) do
+            example.run
+          ensure
+            I18n.available_locales = %i[en]
+          end
+        end
+
+        it 'returns the scoped translation key as a string' do
+          expect(subject).to eq("grape.errors.messages.#{key}")
+        end
+      end
+    end
+
+    context 'when I18n does not enforce available locales' do
+      around do |example|
+        I18n.enforce_available_locales = false
+        example.run
+      ensure
+        I18n.enforce_available_locales = true
+      end
+
+      context 'when the fallback locale is available' do
+        around do |example|
+          I18n.available_locales = %i[de en]
+          I18n.with_locale(:de) { example.run }
+        ensure
+          I18n.available_locales = %i[en]
+        end
+
+        it 'returns the translated message' do
+          expect(subject).to eq('cannot convert String to xml')
+        end
+      end
+
+      context 'when the fallback locale is not available' do
+        around do |example|
+          I18n.available_locales = %i[de jp]
+          I18n.with_locale(:de) { example.run }
+        ensure
+          I18n.available_locales = %i[en]
+        end
+
+        it 'returns the translated message' do
+          expect(subject).to eq('cannot convert String to xml')
+        end
+      end
+    end
+
+    context 'when the message defines an optional step' do
+      let(:key) { :missing_vendor_option }
+      let(:attributes) { {} }
+
+      it 'renders every step, including the optional summary' do
+        expect(subject).to include('Problem:', 'Summary:', 'Resolution:')
+      end
+    end
+
+    context 'when the message omits an optional step' do
+      let(:key) { :invalid_message_body }
+      let(:attributes) { { body_format: 'application/json' } }
+
+      it 'does not leak the missing step i18n key into the message' do
+        expect(subject).not_to include('grape.errors.messages')
+      end
+
+      it 'omits the missing step label' do
+        expect(subject).not_to include('Summary:')
+      end
+
+      it 'still renders the steps that are present' do
+        expect(subject).to include('Problem:', 'Resolution:')
+      end
+    end
+
+    context 'when the message defines a step with a blank translation' do
+      let(:key) { :blank_step_message }
+      let(:attributes) { {} }
+
+      before do
+        I18n.backend.store_translations(:en, grape: { errors: { messages: { key => { problem: 'the problem', summary: '', resolution: 'the resolution' } } } })
+      end
+
+      it 'omits the blank step' do
+        expect(subject).to eq("\nProblem:\n  the problem\nResolution:\n  the resolution")
+      end
+    end
+  end
+
+  describe '#translate_message (private)' do
+    subject(:translate_message) { described_class.new.__send__(:translate_message, translation_key) }
+
+    context 'when given a Proc' do
+      let(:translation_key) { -> { 'from a proc' } }
+
+      it 'calls the Proc' do
+        expect(translate_message).to eq('from a proc')
+      end
+    end
+
+    context 'when given a Hash matching {key:, **opts}' do
+      let(:translation_key) { { key: :invalid_formatter, klass: String, to_format: 'xml' } }
+
+      it 'translates using the key and forwards the remaining pairs as opts' do
+        expect(translate_message).to eq('cannot convert String to xml')
+      end
+    end
+
+    context 'when given a Hash that does not have a :key entry' do
+      let(:translation_key) { { klass: String, to_format: 'xml' } }
+
+      it 'raises NoMatchingPatternKeyError' do
+        expect { translate_message }.to raise_error(NoMatchingPatternKeyError)
+      end
+    end
+
+    context 'when given anything else (e.g. a plain String)' do
+      let(:translation_key) { 'a literal message' }
+
+      it 'returns it unchanged' do
+        expect(translate_message).to eq('a literal message')
+      end
+    end
+  end
+end

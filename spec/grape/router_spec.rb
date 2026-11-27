@@ -1,0 +1,659 @@
+# frozen_string_literal: true
+
+describe Grape::Router do
+  # Regression: the maps used to be auto-vivifying hashes, so a request whose
+  # HTTP method had no routes inserted a key at request time — a data race
+  # under concurrency and unbounded growth from arbitrary methods. A compiled
+  # router freezes its maps, and Grape::API::Instance freezes the router
+  # itself, so a write like that raises rather than passing silently: routing
+  # such a request without error is what shows none happens.
+  describe 'routing a method that has no routes' do
+    subject(:router) { described_class.new }
+
+    let(:endpoint) { instance_double(Grape::Endpoint) }
+    let(:pattern) do
+      Grape::Router::Pattern.new(origin: '/hello', suffix: '', anchor: true, params: {}, version: nil, requirements: {})
+    end
+    let(:route) { Grape::Router::Route.new(endpoint, :get, pattern, {}, forward_match: false) }
+
+    before do
+      router.append(route)
+      router.compile!
+      router.freeze
+    end
+
+    %w[POST PUT PROPFIND CUSTOM].each do |http_method|
+      it "answers #{http_method} with the default 404" do
+        status, = router.call(Rack::MockRequest.env_for('/hello', method: http_method))
+
+        expect(status).to eq(404)
+      end
+    end
+  end
+
+  # Regression: the optimized map was compiled from Grape::HTTP_SUPPORTED_METHODS,
+  # so a route registered for any other verb stayed in @map and out of the map
+  # #match? reads. It was advertised in the resource's Allow header and then
+  # 405'd on every request.
+  describe 'routes registered with a non-standard HTTP method' do
+    subject(:router) { described_class.new }
+
+    let(:endpoint) { ->(_env) { [200, {}, ['purged']] } }
+    let(:pattern) do
+      Grape::Router::Pattern.new(origin: '/cache', suffix: '', anchor: true, params: {}, version: nil, requirements: {})
+    end
+
+    before do
+      router.append(Grape::Router::Route.new(endpoint, :purge, pattern, {}, forward_match: false))
+      router.compile!
+    end
+
+    it 'matches a request using that method' do
+      status, _, body = router.call(Rack::MockRequest.env_for('/cache', method: 'PURGE'))
+
+      expect(status).to eq(200)
+      expect(body.to_a).to eq(['purged'])
+    end
+
+    it 'still 404s a method that has no routes' do
+      status, = router.call(Rack::MockRequest.env_for('/cache', method: 'PROPFIND'))
+
+      expect(status).to eq(404)
+    end
+  end
+
+  describe 'routing static paths' do
+    subject(:router) { described_class.new }
+
+    def append_route(endpoint, origin:, version: nil)
+      pattern = Grape::Router::Pattern.new(origin:, suffix: '', anchor: true, params: {}, version:, requirements: {})
+      router.append(Grape::Router::Route.new(endpoint, :get, pattern, {}, forward_match: false))
+    end
+
+    it 'preserves an earlier parameterized route and fresh captured values' do
+      captured_ids = []
+      dynamic_endpoint = lambda do |env|
+        id = env.fetch(Grape::Env::GRAPE_ROUTING_ARGS).fetch(:id)
+        captured_ids << id.dup
+        id << '!'
+        [200, {}, [id]]
+      end
+      append_route(dynamic_endpoint, origin: '/:id')
+      append_route(->(_env) { raise 'the parameterized route should match first' }, origin: '/status')
+      router.compile!
+
+      bodies = Array.new(2) do
+        status, _, body = router.call(Rack::MockRequest.env_for('/status'))
+        expect(status).to eq(200)
+
+        body.to_a.join
+      end
+
+      expect(bodies).to eq(%w[status! status!])
+      expect(captured_ids).to eq(%w[status status])
+    end
+
+    it 'routes every declared path version' do
+      versions = []
+      endpoint = lambda do |env|
+        versions << env.fetch(Grape::Env::GRAPE_ROUTING_ARGS).fetch(:version)
+        [200, {}, ['ok']]
+      end
+      append_route(endpoint, origin: '/:version/status', version: %w[v1 v2])
+      router.compile!
+
+      %w[v1 v2].each do |version|
+        status, = router.call(Rack::MockRequest.env_for("/#{version}/status"))
+        expect(status).to eq(200)
+      end
+
+      expect(versions).to eq(%w[v1 v2])
+    end
+  end
+
+  # Regression: a cascading route used to hand straight over to the
+  # allowed-methods route — the *last* route registered for the path — so any
+  # route between the first match and that last one was unreachable.
+  describe 'cascading routes' do
+    subject(:router) { described_class.new }
+
+    let(:pattern) do
+      Grape::Router::Pattern.new(origin: '/hello', suffix: '', anchor: true, params: {}, version: nil, requirements: {})
+    end
+    let(:cascading) { ->(_env) { [404, { 'x-cascade' => 'pass' }, []] } }
+    let(:serving) { ->(_env) { [200, {}, ['served']] } }
+    let(:any_handler) { ->(_env) { [200, {}, ['any']] } }
+
+    def append_route(endpoint, method = :get)
+      router.append(Grape::Router::Route.new(endpoint, method, pattern, {}, forward_match: false))
+    end
+
+    def response_body
+      _, _, body = router.call(Rack::MockRequest.env_for('/hello'))
+      body.each_with_object(+'') { |chunk, buffer| buffer << chunk }
+    end
+
+    it 'hands over to a sibling route registered after the cascading one' do
+      append_route(cascading)
+      append_route(cascading)
+      append_route(serving)
+      router.compile!
+
+      expect(response_body).to eq('served')
+    end
+
+    it 'prefers a sibling of the same method over an ANY route' do
+      append_route(cascading)
+      append_route(serving)
+      append_route(any_handler, '*')
+      router.compile!
+
+      expect(response_body).to eq('served')
+    end
+
+    it 'falls through to an ANY route once every sibling has cascaded' do
+      append_route(cascading)
+      append_route(cascading)
+      append_route(any_handler, '*')
+      router.compile!
+
+      expect(response_body).to eq('any')
+    end
+
+    # Rack requires every body it hands out to be closed.
+    it 'closes the body of a response it cascades past' do
+      closed = []
+      body = ['declined']
+      body.define_singleton_method(:close) { closed << true }
+      append_route(->(_env) { [404, { 'x-cascade' => 'pass' }, body] })
+      append_route(serving)
+      router.compile!
+
+      expect(response_body).to eq('served')
+      expect(closed).to eq([true])
+    end
+
+    it 'closes the body of a cascading sibling an ANY route answers in place of' do
+      closed = []
+      body = ['declined']
+      body.define_singleton_method(:close) { closed << true }
+      append_route(cascading)
+      append_route(->(_env) { [404, { 'x-cascade' => 'pass' }, body] })
+      append_route(any_handler, '*')
+      router.compile!
+
+      expect(response_body).to eq('any')
+      expect(closed).to eq([true])
+    end
+
+    it 'answers its own 404 when every sibling has cascaded, whatever they answered' do
+      append_route(->(_env) { [406, { 'x-cascade' => 'pass' }, ['declined']] })
+      append_route(->(_env) { [406, { 'x-cascade' => 'pass' }, ['declined too']] })
+      router.compile!
+
+      status, headers, body = router.call(Rack::MockRequest.env_for('/hello'))
+      expect(status).to eq(404)
+      expect(headers['x-cascade']).to eq('pass')
+      expect(body).to eq(['404 Not Found'])
+    end
+
+    it 'answers its own 404 when the only route has cascaded, whatever it answered' do
+      append_route(->(_env) { [406, { 'x-cascade' => 'pass' }, ['declined']] })
+      router.compile!
+
+      status, headers, body = router.call(Rack::MockRequest.env_for('/hello'))
+      expect(status).to eq(404)
+      expect(headers['x-cascade']).to eq('pass')
+      expect(body).to eq(['404 Not Found'])
+    end
+
+    it 'answers its own 404 when only an ANY route has cascaded, whatever it answered' do
+      append_route(->(_env) { [406, { 'x-cascade' => 'pass' }, ['declined']] }, '*')
+      router.compile!
+
+      status, headers, body = router.call(Rack::MockRequest.env_for('/hello'))
+      expect(status).to eq(404)
+      expect(headers['x-cascade']).to eq('pass')
+      expect(body).to eq(['404 Not Found'])
+    end
+
+    it 'closes the body of every response it answers in place of' do
+      closed = []
+      closing_body = lambda do
+        ['declined'].tap { |body| body.define_singleton_method(:close) { closed << true } }
+      end
+      append_route(->(_env) { [404, { 'x-cascade' => 'pass' }, closing_body.call] })
+      append_route(->(_env) { [404, { 'x-cascade' => 'pass' }, closing_body.call] })
+      append_route(->(_env) { [404, { 'x-cascade' => 'pass' }, closing_body.call] }, '*')
+      router.compile!
+
+      router.call(Rack::MockRequest.env_for('/hello'))
+      expect(closed).to eq([true, true, true])
+    end
+  end
+
+  # The README: an invalid version is a 406 with `cascade: false`, otherwise a
+  # 404 if no other route matches. How many routes declined must not change that.
+  describe 'a version no route answers' do
+    let(:unknown_version) { { 'HTTP_ACCEPT' => 'application/vnd.acme-v9+txt' } }
+
+    def versioned_api(versions, cascade: true)
+      Class.new(Grape::API) do
+        format :txt
+        versions.each do |name|
+          version(name, using: :header, vendor: 'acme', cascade:)
+          get('/things') { name }
+        end
+      end
+    end
+
+    shared_examples 'a declined request' do
+      it 'answers 404 and lets an upstream app keep looking' do
+        get '/things', {}, unknown_version
+
+        expect(last_response.status).to eq(404)
+        expect(last_response.headers['X-Cascade']).to eq('pass')
+        expect(last_response.body).to eq('404 Not Found')
+      end
+    end
+
+    context 'with one version' do
+      let(:app) { versioned_api(%w[v1]) }
+
+      it_behaves_like 'a declined request'
+    end
+
+    context 'with several versions' do
+      let(:app) { versioned_api(%w[v1 v2 v3]) }
+
+      it_behaves_like 'a declined request'
+
+      it 'still routes a version one of them declares' do
+        get '/things', {}, 'HTTP_ACCEPT' => 'application/vnd.acme-v3+txt'
+
+        expect(last_response.status).to eq(200)
+        expect(last_response.body).to eq('v3')
+      end
+    end
+
+    context 'with an ANY route' do
+      let(:app) do
+        Class.new(Grape::API) do
+          format :txt
+          version 'v1', using: :header, vendor: 'acme', cascade: true
+          route(:any, '/things') { 'any' }
+        end
+      end
+
+      it_behaves_like 'a declined request'
+    end
+
+    context 'with an ANY route overlapping a path another method has a route on' do
+      let(:app) do
+        Class.new(Grape::API) do
+          format :txt
+          version 'v1', using: :header, vendor: 'acme', cascade: true
+          get('/things') { 'things' }
+          route(:any, '*path') { 'any' }
+        end
+      end
+
+      it 'answers 404 rather than 405, as a route matched and declined' do
+        put '/things', {}, unknown_version
+
+        expect(last_response.status).to eq(404)
+        expect(last_response.headers['X-Cascade']).to eq('pass')
+      end
+    end
+
+    context 'when the last version does not cascade' do
+      let(:app) do
+        Class.new(Grape::API) do
+          format :txt
+          version 'v1', using: :header, vendor: 'acme', cascade: true
+          get('/things') { 'v1' }
+          version 'v2', using: :header, vendor: 'acme', cascade: false
+          get('/things') { 'v2' }
+        end
+      end
+
+      it 'answers its 406' do
+        get '/things', {}, unknown_version
+
+        expect(last_response.status).to eq(406)
+        expect(last_response.headers['X-Cascade']).to be_nil
+      end
+    end
+
+    # Rack::Cascade goes by the status alone, so a 406 stopped it short of the
+    # next app, X-Cascade or not.
+    context 'when behind a Rack::Cascade' do
+      let(:app) do
+        Rack::Cascade.new([versioned_api(%w[v1 v2]), ->(_env) { [200, { 'content-type' => 'text/plain' }, ['next app']] }])
+      end
+
+      it 'reaches the next app' do
+        get '/things', {}, unknown_version
+
+        expect(last_response.status).to eq(200)
+        expect(last_response.body).to eq('next app')
+      end
+    end
+  end
+
+  # Regression: routing args were seeded once (`||=`) and merged in place, so
+  # when a route cascaded (X-Cascade pass) the next candidate still saw the
+  # previous attempt's :route_info and path captures.
+  describe 'routing args across cascading routes' do
+    let(:app) do
+      v2 = Class.new(Grape::API) do
+        version 'v2', using: :header, vendor: 'grape', cascade: true
+        get ':id' do
+          { from: 'v2' }
+        end
+      end
+      v1 = Class.new(Grape::API) do
+        format :json
+        version 'v1', using: :header, vendor: 'grape'
+        get ':name' do
+          { origin: route.origin, params: params.to_h }
+        end
+      end
+      Class.new(Grape::API) do
+        format :json
+        mount v2
+        mount v1
+      end
+    end
+
+    it 'does not leak route_info or path captures from a cascaded attempt' do
+      get '/123', {}, 'HTTP_ACCEPT' => 'application/vnd.grape-v1+json'
+
+      expect(last_response.status).to eq(200)
+      body = JSON.parse(last_response.body)
+      expect(body['origin']).to eq('/:name')
+      expect(body['params']).to eq('name' => '123')
+    end
+  end
+
+  # An earlier route that names a param twice answers a path another route
+  # spells out in full, with an Array capture. That path is left to the union
+  # each time rather than kept for every request to share: only a String is
+  # frozen whole in the table.
+  describe 'routing a static path an earlier route answers with an Array capture' do
+    let(:app) do
+      Class.new(Grape::API) do
+        format :json
+        get('/:a/x/:a') do
+          first = params[:a].first
+          seen = first.dup
+          first << '!' unless first.frozen?
+          { seen: }
+        end
+        get('/one/x/two') { { route: 'literal' } }
+      end
+    end
+
+    it 'hands each request its own capture' do
+      bodies = Array.new(2) { Rack::MockRequest.new(app).get('/one/x/two').body }
+
+      expect(bodies).to eq([{ seen: 'one' }.to_json] * 2)
+    end
+  end
+
+  # Regression: Rack hands PATH_INFO over binary, and a binary string holding
+  # non-ASCII bytes raises when matched against a UTF-8 regexp. A route whose
+  # path holds a non-ASCII literal compiles to one, so on such an API every
+  # path carrying raw non-ASCII bytes raised instead of routing.
+  describe 'routing a binary path holding non-ASCII bytes' do
+    let(:app) do
+      Class.new(Grape::API) do
+        get('/café') { 'static non-ascii literal' }
+        get('/café/:id') { "non-ascii literal #{params[:id]}" }
+        get('/plain/:id') { "plain #{params[:id] == 'é'}" }
+      end
+    end
+
+    def request_path(path)
+      env = Rack::MockRequest.env_for('/')
+      env[Rack::PATH_INFO] = path.b
+      status, _, body = app.call(env)
+      buffer = +''
+      body.each { |chunk| buffer << chunk }
+      body.close if body.respond_to?(:close)
+      [status, buffer]
+    end
+
+    it 'routes a UTF-8 path to the route with a non-ASCII literal' do
+      expect(request_path('/café/42')).to eq([200, 'non-ascii literal 42'])
+    end
+
+    it 'routes a UTF-8 path to a route spelling out a non-ASCII literal in full' do
+      expect(request_path('/café')).to eq([200, 'static non-ascii literal'])
+    end
+
+    it 'routes a UTF-8 path to an ASCII route of the same API' do
+      expect(request_path('/plain/é')).to eq([200, 'plain true'])
+    end
+
+    it 'answers a path whose bytes are not UTF-8 as one no route matched' do
+      expect(request_path("/plain/\xFF").first).to eq(404)
+    end
+
+    it 'does not recognize a path whose bytes are not UTF-8' do
+      expect(app.recognize_path("/plain/\xFF".b)).to be_nil
+    end
+
+    it 'recognizes a UTF-8 path' do
+      expect(app.recognize_path('/café/42'.b)).to be_a(Grape::Endpoint)
+    end
+
+    context 'when no route holds a non-ASCII literal' do
+      let(:app) do
+        Class.new(Grape::API) do
+          get('/plain/:id') { "plain #{params[:id].valid_encoding?}" }
+        end
+      end
+
+      it 'still routes a path whose bytes are not UTF-8' do
+        expect(request_path("/plain/\xFF")).to eq([200, 'plain false'])
+      end
+    end
+  end
+
+  # When no route for the request's method matches its path, the router answers
+  # 405 if a route for another method does, and 404 otherwise. It only tries the
+  # paths the method has no route on, since the others share a pattern with a
+  # route that has just missed -- so these cover a path with no route for the
+  # method, a covered path whose pattern overlaps an uncovered one, and methods
+  # with no routes at all, for which every path is still a candidate.
+  describe 'answering a path no route for the method matches' do
+    let(:app) do
+      Class.new(Grape::API) do
+        format :json
+        get('/items') { 'index' }
+        post('/items') { 'create' }
+        get('/items/:id') { 'show' }
+        put('/items/:id') { 'update' }
+        delete('/items/:id') { 'destroy' }
+        # Digits only, so /users/me misses it and reaches the POST-only path.
+        get('/users/:id', requirements: { id: /\d+/ }) { 'user' }
+        post('/users/me') { 'me' }
+      end
+    end
+
+    it 'answers 405 from a path the method has no route on' do
+      post '/items/1'
+
+      expect(last_response.status).to eq(405)
+      expect(last_response.headers['Allow']).to eq('OPTIONS, GET, PUT, DELETE, HEAD')
+    end
+
+    it 'answers 405 from an uncovered path when a covered one overlaps it' do
+      get '/users/me'
+
+      expect(last_response.status).to eq(405)
+      expect(last_response.headers['Allow']).to eq('OPTIONS, POST')
+    end
+
+    it 'answers 405 to a method that has no routes at all' do
+      patch '/items/1'
+
+      expect(last_response.status).to eq(405)
+      expect(last_response.headers['Allow']).to eq('OPTIONS, GET, PUT, DELETE, HEAD')
+    end
+
+    it 'answers OPTIONS for a path' do
+      options '/items/1'
+
+      expect(last_response.status).to eq(204)
+      expect(last_response.headers['Allow']).to eq('OPTIONS, GET, PUT, DELETE, HEAD')
+    end
+
+    it 'answers 404 to a path no route matches' do
+      get '/nothing/here'
+      expect(last_response.status).to eq(404)
+
+      post '/nothing/here'
+      expect(last_response.status).to eq(404)
+    end
+
+    it 'answers HEAD to a path no route matches without a body' do
+      head '/nothing/here'
+      expect(last_response.status).to eq(404)
+      expect(last_response.body).to be_empty
+
+      get '/nothing/here'
+      expect(last_response.body).to eq('404 Not Found')
+    end
+
+    context 'when every path has a route for the method' do
+      let(:app) do
+        Class.new(Grape::API) do
+          get('/items') { 'index' }
+          get('/items/:id') { 'show' }
+          delete('/items/:id') { 'destroy' }
+        end
+      end
+
+      it 'answers 404 to a path no route matches' do
+        get '/nothing/here'
+
+        expect(last_response.status).to eq(404)
+      end
+    end
+
+    # Rack::Cascade moves on from a 405 with the env the first app answered it
+    # on, so the next app must not find that answer's Allow methods in it.
+    context 'when behind a Rack::Cascade' do
+      let(:app) do
+        Rack::Cascade.new([Class.new(Grape::API) { get('/items') { 'index' } }, super()])
+      end
+
+      it 'lets the next app answer the method the first one does not allow' do
+        post '/items'
+
+        expect(last_response.status).to eq(201)
+        expect(last_response.body).to eq('"create"')
+      end
+    end
+  end
+
+  # The allowed-methods routes are narrowed like a method's own: a table of
+  # the paths they spell out in full, then buckets by a literal segment. This
+  # API has enough paths for both, and each answer is the one walking every
+  # allowed-methods route in registration order gives.
+  describe 'answering a method a path has no route for on an API with many paths' do
+    let(:app) do
+      Class.new(Grape::API) do
+        format :json
+        %w[alpha beta gamma delta epsilon eta].each do |name|
+          get("/#{name}") { name }
+          post("/#{name}") { name }
+          get("/#{name}/:id") { name }
+          put("/#{name}/:id") { name }
+        end
+        get('/zeta/:id', requirements: { id: /\d+/ }) { 'zeta' }
+        delete('/zeta/special') { 'special' }
+        get('/theta/:id') { 'theta' }
+        post('/theta/new') { 'new' }
+        get('/café/:id') { 'café' }
+        get('/:slug') { 'slug' }
+      end
+    end
+
+    def allow_for(http_method, path)
+      public_send(http_method, path)
+      [last_response.status, last_response.headers['Allow']]
+    end
+
+    it 'answers OPTIONS for a path spelled out in full' do
+      expect(allow_for(:options, '/gamma')).to eq([204, 'OPTIONS, GET, POST, HEAD'])
+    end
+
+    it 'answers OPTIONS for a path with a param' do
+      expect(allow_for(:options, '/gamma/7')).to eq([204, 'OPTIONS, GET, PUT, HEAD'])
+    end
+
+    it 'answers OPTIONS for a path with a format extension' do
+      expect(allow_for(:options, '/gamma.json')).to eq([204, 'OPTIONS, GET, POST, HEAD'])
+      expect(allow_for(:options, '/gamma/7.json')).to eq([204, 'OPTIONS, GET, PUT, HEAD'])
+    end
+
+    it 'answers OPTIONS for a path spelled with a percent-encoding' do
+      expect(allow_for(:options, '/g%61mma/7')).to eq([204, 'OPTIONS, GET, PUT, HEAD'])
+    end
+
+    it 'answers OPTIONS for a path only the route with no literal segment matches' do
+      expect(allow_for(:options, '/other')).to eq([204, 'OPTIONS, GET, HEAD'])
+    end
+
+    it 'answers OPTIONS from the earlier of two routes matching a path spelled out in full' do
+      expect(allow_for(:options, '/theta/new')).to eq([204, 'OPTIONS, GET, HEAD'])
+    end
+
+    it 'answers OPTIONS from the later route when the earlier one misses the path' do
+      expect(allow_for(:options, '/zeta/special')).to eq([204, 'OPTIONS, DELETE'])
+      expect(allow_for(:options, '/zeta/7')).to eq([204, 'OPTIONS, GET, HEAD'])
+    end
+
+    it 'answers 404 to OPTIONS for a path no route matches' do
+      expect(allow_for(:options, '/nothing/here/at/all')).to eq([404, nil])
+      expect(allow_for(:options, '/gamma/7/more')).to eq([404, nil])
+    end
+
+    it 'answers 405 from a path spelled out in full' do
+      expect(allow_for(:put, '/gamma')).to eq([405, 'OPTIONS, GET, POST, HEAD'])
+      expect(allow_for(:get, '/zeta/special')).to eq([405, 'OPTIONS, DELETE'])
+    end
+
+    it 'answers 405 from a path with a param' do
+      expect(allow_for(:post, '/gamma/7')).to eq([405, 'OPTIONS, GET, PUT, HEAD'])
+      expect(allow_for(:delete, '/gamma/7.json')).to eq([405, 'OPTIONS, GET, PUT, HEAD'])
+      expect(allow_for(:delete, '/g%61mma/7')).to eq([405, 'OPTIONS, GET, PUT, HEAD'])
+    end
+
+    it 'answers 405 from a path only the route with no literal segment matches' do
+      expect(allow_for(:post, '/other')).to eq([405, 'OPTIONS, GET, HEAD'])
+    end
+
+    it 'answers 405 to a method that has no routes at all' do
+      expect(allow_for(:patch, '/gamma')).to eq([405, 'OPTIONS, GET, POST, HEAD'])
+      expect(allow_for(:patch, '/gamma/7')).to eq([405, 'OPTIONS, GET, PUT, HEAD'])
+    end
+
+    it 'answers 404 to a path no route matches' do
+      expect(allow_for(:put, '/nothing/here/at/all')).to eq([404, nil])
+      expect(allow_for(:delete, '/gamma/7/more')).to eq([404, nil])
+      expect(allow_for(:patch, '/nothing/here/at/all')).to eq([404, nil])
+    end
+
+    it 'does not recognize a path whose bytes are not UTF-8' do
+      expect(app.recognize_path("/gamma/\xFF".b)).to be_nil
+    end
+
+    it 'recognizes a path with a param' do
+      expect(app.recognize_path('/gamma/7')).to be_a(Grape::Endpoint)
+    end
+  end
+end

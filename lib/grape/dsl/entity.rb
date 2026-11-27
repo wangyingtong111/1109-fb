@@ -1,0 +1,122 @@
+# frozen_string_literal: true
+
+module Grape
+  module DSL
+    module Entity
+      # Allows you to make use of Grape Entities by setting
+      # the response body to the serializable hash of the
+      # entity provided in the `:with` option. This has the
+      # added benefit of automatically passing along environment
+      # and version information to the serialization, making it
+      # very easy to do conditional exposures. See Entity docs
+      # for more info.
+      #
+      # @param args [Array] either `(object)` or `(key, object)` where key is a Symbol
+      #   used to nest the representation under that key in the response body.
+      # @param root [Symbol, String, nil] wraps the representation under this root key.
+      # @param with [Class, nil] the entity class to use for representation.
+      #   If omitted, the entity class is inferred from the object via {#entity_class_for_obj}.
+      # @param options [Hash] additional options forwarded to the entity's `represent` call.
+      #
+      # @example
+      #
+      #   get '/users/:id' do
+      #     present User.find(params[:id]),
+      #       with: API::Entities::User,
+      #       admin: current_user.admin?
+      #   end
+      def present(*args, root: nil, with: nil, **options)
+        # No [nil, object] Array to destructure for the one-argument form.
+        object = args.first
+        key, object = args if args.count == 2 && object.is_a?(Symbol)
+        entity_class = with || entity_class_for_obj(object)
+        representation = entity_class ? entity_representation_for(entity_class, object, options) : object
+        representation = { root => representation } if root
+
+        body merged_with_body(representation, key, entity_class)
+      end
+
+      # Attempt to locate the Entity class for a given object, if not given
+      # explicitly: a +represent+ registration or Klass::Entity for the object's
+      # class or an ancestor, then the same for its element class. Object is
+      # excluded: a global ::Entity class is not a representer.
+      # @param object [Object] the object to locate the Entity class for
+      # @return [Class] the located Entity class, or nil if none is found
+      def entity_class_for_obj(object)
+        # Read once for both lookups: it walks every scope up to the API's root,
+        # and any object that answers #first (a Hash among them) needs both.
+        representations = inheritable_setting.representations
+        entity_for_class(object.class, representations) || entity_for_class(element_class(object), representations)
+      end
+
+      private
+
+      # +representation+ merged into the body an earlier +present+ set: under
+      # +key+ when there is one, and whole when it came from an entity.
+      def merged_with_body(representation, key, entity_class)
+        return body&.merge(key => representation) || { key => representation } if key
+        return representation unless entity_class && body
+        raise ArgumentError, "representation of type `#{representation.class}` cannot be merged" unless representation.respond_to?(:merge)
+
+        body.merge(representation)
+      end
+
+      # The class standing in for a collection or wrapper: ActiveRecord::Relation
+      # and the like expose #klass, anything else falls back to the class of its
+      # first element.
+      #
+      # Consulted only once the object's own class has come up empty, because
+      # both tests are duck-typed and plenty of single objects answer them —
+      # a Struct is Enumerable, so it responds to #first, and so does any model
+      # that includes Enumerable. Asking this first meant `represent Model,
+      # with: Entity` was silently ignored for those, the entity for the
+      # *element* type being looked up instead. Deferring it also keeps #first
+      # from being called at all when the object resolves on its own class.
+      #
+      # @param object [Object] the object to represent.
+      # @return [Class, nil]
+      def element_class(object)
+        return object.klass if object.respond_to?(:klass)
+
+        object.first.class if object.respond_to?(:first)
+      end
+
+      # @param klass [Class, nil] the class to look an entity up for.
+      # @param representations [Hash, nil] the +represent+ registrations in scope.
+      # @return [Class, nil] the registered or conventionally named entity.
+      def entity_for_class(klass, representations)
+        return if klass.nil?
+
+        if representations
+          potential = klass.ancestors.detect { |ancestor| representations.key?(ancestor) }
+          return representations[potential] if potential && representations[potential]
+        end
+
+        conventional_entity_for(klass) if klass.const_defined?(:Entity)
+      end
+
+      # The +Entity+ constant of the nearest of +klass+'s ancestors defining
+      # one, when it can represent.
+      def conventional_entity_for(klass)
+        owner = klass.ancestors.detect { |ancestor| ancestor != Object && ancestor.const_defined?(:Entity, false) }
+        return unless owner
+
+        entity = owner.const_get(:Entity, false)
+        entity if entity.respond_to?(:represent)
+      end
+
+      # The embeds go straight into the call: collected into a Hash of their
+      # own and splatted, they cost every +present+ a second Hash.
+      #
+      # @param entity_class [Class] the entity class to use for representation.
+      # @param object [Object] the object to represent.
+      # @param options [Hash] additional options forwarded to the entity's `represent` call.
+      # @return the representation of the given object as done through the given entity_class.
+      def entity_representation_for(entity_class, object, options)
+        return entity_class.represent(object, env:, **options) unless env.key?(Grape::Env::API_VERSION)
+
+        entity_class.represent(object, env:, version: env[Grape::Env::API_VERSION], **options)
+      end
+    end
+  end
+end

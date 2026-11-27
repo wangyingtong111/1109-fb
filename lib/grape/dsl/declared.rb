@@ -1,0 +1,32 @@
+# frozen_string_literal: true
+
+module Grape
+  module DSL
+    module Declared
+      # Denotes a situation where a DSL method has been invoked in a
+      # filter which it should not yet be available in
+      class MethodNotYetAvailable < StandardError
+        def initialize(msg = '#declared is not available prior to parameter validation')
+          super
+        end
+      end
+
+      # A filtering method that will return a hash
+      # consisting only of keys that have been declared by a
+      # `params` statement against the current/target endpoint or parent
+      # namespaces.
+      # @param passed_params [Hash] The initial hash to filter. Usually this will just be `params`
+      # @param include_parent_namespaces [Boolean] false to only return params declared against the current/target endpoint
+      # @param include_missing [Boolean] include declared params that were not passed
+      # @param evaluate_given [Boolean] drop params whose +given+ condition is not met
+      # @param stringify [Boolean] return String keys
+      def declared(passed_params, include_parent_namespaces: true, include_missing: true, evaluate_given: false, stringify: false)
+        raise MethodNotYetAvailable unless before_filter_passed
+
+        declared_params = compiled_declared_params
+        handler = DeclaredParamsHandler.new(include_missing:, evaluate_given:, stringify:, contract_key_map: declared_params.contract_key_maps)
+        handler.call(passed_params, include_parent_namespaces ? declared_params.all : declared_params.own)
+      end
+    end
+  end
+end

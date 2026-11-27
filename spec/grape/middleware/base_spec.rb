@@ -1,0 +1,363 @@
+# frozen_string_literal: true
+
+describe Grape::Middleware::Base do
+  subject { described_class.new(blank_app) }
+
+  let(:blank_app) { ->(_) { [200, {}, 'Hi there.'] } }
+
+  it 'has the app as an accessor' do
+    expect(subject.app).to eq(blank_app)
+  end
+
+  it 'calls through to the app' do
+    expect(subject.call({})).to eq([200, {}, 'Hi there.'])
+  end
+
+  context 'callbacks' do
+    subject do
+      recorded = calls
+      Class.new(described_class) do
+        define_method(:before) { recorded << :before }
+        define_method(:after) do
+          recorded << :after
+          nil
+        end
+      end.new(blank_app)
+    end
+
+    let(:calls) { [] }
+
+    it 'calls #before and #after' do
+      subject.call({})
+      expect(calls).to eq(%i[before after])
+    end
+
+    context 'when the app raises' do
+      let(:blank_app) { ->(_) { raise StandardError } }
+
+      it 'still calls #after' do
+        expect { subject.call({}) }.to raise_error(StandardError)
+        expect(calls).to eq(%i[before after])
+      end
+    end
+  end
+
+  context 'after callback' do
+    subject do
+      Class.new(described_class) do
+        def after
+          [200, {}, 'Hello from after callback']
+        end
+      end.new(blank_app)
+    end
+
+    it 'overwrites application response' do
+      expect(subject.call({}).last).to eq('Hello from after callback')
+    end
+  end
+
+  context 'after callback with errors' do
+    subject do
+      Class.new(described_class) do
+        def after
+          raise StandardError, 'boom'
+        end
+      end.new(blank_app)
+    end
+
+    it 'reraises the error after showing a warning' do
+      expect { subject.call({}) }
+        .to raise_error(StandardError, 'boom')
+        .and output(/caught error of type StandardError in after callback/).to_stderr
+    end
+  end
+
+  it 'is able to access the response' do
+    subject.call!({})
+    expect(subject.response).to be_a(Rack::Response)
+  end
+
+  describe '#response' do
+    subject do
+      described_class.new(response)
+    end
+
+    before { subject.call!({}) }
+
+    context 'when Array' do
+      let(:rack_response) { Rack::Response.new('test', 204, abc: 1) }
+      let(:response) { ->(_) { [204, { abc: 1 }, 'test'] } }
+
+      it 'status' do
+        expect(subject.response.status).to eq(204)
+      end
+
+      it 'body' do
+        expect(subject.response.body).to eq(['test'])
+      end
+
+      it 'header' do
+        expect(subject.response.headers).to have_key(:abc)
+      end
+
+      it 'returns the memoized Rack::Response instance' do
+        allow(Rack::Response).to receive(:new).and_return(rack_response)
+        expect(subject.response).to eq(rack_response)
+      end
+    end
+
+    context 'when Rack::Response' do
+      let(:rack_response) { Rack::Response.new('test', 204, abc: 1) }
+      let(:response) { ->(_) { rack_response } }
+
+      it 'status' do
+        expect(subject.response.status).to eq(204)
+      end
+
+      it 'body' do
+        expect(subject.response.body).to eq(['test'])
+      end
+
+      it 'header' do
+        expect(subject.response.headers).to have_key(:abc)
+      end
+
+      it 'returns the memoized Rack::Response instance' do
+        expect(subject.response).to eq(rack_response)
+      end
+    end
+  end
+
+  describe '#context' do
+    subject { described_class.new(blank_app) }
+
+    it 'allows access to response context' do
+      subject.call!(Grape::Env::API_ENDPOINT => { header: 'some header' })
+      expect(subject.context).to eq(header: 'some header')
+    end
+  end
+
+  context 'options' do
+    it 'persists options passed at initialization' do
+      expect(described_class.new(blank_app, abc: true).options[:abc]).to be true
+    end
+
+    context 'defaults' do
+      let(:example_ware) do
+        Class.new(Grape::Middleware::Base) do
+          const_set(:DEFAULT_OPTIONS, { monkey: true }.freeze)
+        end
+      end
+
+      it 'persists the default options' do
+        expect(example_ware.new(blank_app).options[:monkey]).to be true
+      end
+
+      it 'overrides default options when provided' do
+        expect(example_ware.new(blank_app, monkey: false).options[:monkey]).to be false
+      end
+    end
+
+    context 'when an unrelated top-level ::Options constant is in scope' do
+      # The `options` gem (a transitive dep of e.g. progress_bar) defines a
+      # global ::Options. const_defined?(:Options) reaches it through Object,
+      # but `self.class::Options` does not, so the naive guard raised NameError.
+      before { stub_const('Options', Module.new) }
+
+      let(:example_ware) do
+        Class.new(Grape::Middleware::Base) do
+          const_set(:DEFAULT_OPTIONS, { monkey: true }.freeze)
+        end
+      end
+
+      it 'builds without resolving the global ::Options' do
+        expect { example_ware.new(blank_app) }.not_to raise_error
+      end
+
+      it 'falls back to the legacy DEFAULT_OPTIONS path' do
+        expect(example_ware.new(blank_app).options[:monkey]).to be true
+      end
+
+      it 'does not expose a config object' do
+        expect(example_ware.new(blank_app).config).to be_nil
+      end
+    end
+
+    context 'when an unrelated top-level ::DEFAULT_OPTIONS constant is in scope' do
+      before { stub_const('DEFAULT_OPTIONS', { monkey: true }.freeze) }
+
+      let(:example_ware) { Class.new(described_class) }
+
+      it 'ignores the global ::DEFAULT_OPTIONS' do
+        expect(example_ware.new(blank_app).options).not_to have_key(:monkey)
+      end
+    end
+
+    context 'when a middleware defines an instance-level #default_options' do
+      let(:example_ware) do
+        Class.new(Grape::Middleware::Base) do
+          def default_options
+            { monkey: true }
+          end
+        end
+      end
+
+      it 'merges options through the instance method instead of a constant' do
+        expect(example_ware.new(blank_app).options[:monkey]).to be true
+      end
+
+      it 'overrides default options when provided' do
+        expect(example_ware.new(blank_app, monkey: false).options[:monkey]).to be false
+      end
+    end
+
+    context 'when a middleware declares its own Options Data class' do
+      let(:example_ware) do
+        Class.new(Grape::Middleware::Base) do
+          self::Options = Data.define(:monkey)
+        end
+      end
+
+      it 'routes options through the Options value object' do
+        instance = example_ware.new(blank_app, monkey: true)
+        expect(instance.config.monkey).to be true
+        expect(instance.options[:monkey]).to be true
+      end
+
+      it 'still resolves its own Options when a global ::Options is in scope' do
+        stub_const('Options', Module.new)
+        expect(example_ware.new(blank_app, monkey: true).config.monkey).to be true
+      end
+    end
+
+    context 'when a middleware inherits its parent Options Data class' do
+      let(:parent_ware) do
+        Class.new(Grape::Middleware::Base) do
+          self::Options = Data.define(:monkey)
+        end
+      end
+
+      let(:child_ware) { Class.new(parent_ware) }
+
+      it 'inherits the ancestor Options without redeclaring it' do
+        expect(child_ware.new(blank_app, monkey: true).config.monkey).to be true
+      end
+    end
+  end
+
+  context 'header' do
+    let(:example_ware) do
+      Class.new(Grape::Middleware::Base) do
+        def before
+          header 'X-Test-Before', 'Hi'
+        end
+
+        def after
+          header 'X-Test-After', 'Bye'
+          nil
+        end
+      end
+    end
+
+    let(:app) do
+      context = self
+
+      Rack::Builder.app do
+        use context.example_ware
+        run ->(_) { [200, {}, ['Yeah']] }
+      end
+    end
+
+    it 'is able to set a header' do
+      get '/'
+      expect(last_response.headers['X-Test-Before']).to eq('Hi')
+      expect(last_response.headers['X-Test-After']).to eq('Bye')
+    end
+
+    context 'when the downstream app returns a Rack::Response' do
+      let(:app) do
+        context = self
+
+        Rack::Builder.app do
+          use context.example_ware
+          run ->(_) { Rack::Response.new('Yeah', 200, {}) }
+        end
+      end
+
+      it 'merges the header onto the Rack::Response' do
+        get '/'
+        expect(last_response.headers['X-Test-Before']).to eq('Hi')
+        expect(last_response.headers['X-Test-After']).to eq('Bye')
+      end
+    end
+  end
+
+  context 'header overwrite' do
+    let(:example_ware) do
+      Class.new(Grape::Middleware::Base) do
+        def before
+          header 'X-Test-Overwriting', 'Hi'
+        end
+
+        def after
+          header 'X-Test-Overwriting', 'Bye'
+          nil
+        end
+      end
+    end
+    let(:api) do
+      Class.new(Grape::API) do
+        get('/') do
+          header 'X-Test-Overwriting', 'Yeah'
+          'Hello'
+        end
+      end
+    end
+
+    let(:app) do
+      context = self
+
+      Rack::Builder.app do
+        use context.example_ware
+        run context.api.new
+      end
+    end
+
+    it 'overwrites header by after headers' do
+      get '/'
+      expect(last_response.headers['X-Test-Overwriting']).to eq('Bye')
+    end
+  end
+
+  describe 'query_params' do
+    let(:dummy_middleware) do
+      Class.new(Grape::Middleware::Base) do
+        def before
+          query_params
+        end
+      end
+    end
+
+    let(:app) do
+      context = self
+      Rack::Builder.app do
+        use context.dummy_middleware
+        run ->(_) { [200, {}, ['Yeah']] }
+      end
+    end
+
+    context 'when query params are conflicting' do
+      it 'raises an ConflictingTypes error' do
+        expect { get '/?x[y]=1&x[y]z=2' }.to raise_error(Grape::Exceptions::RequestError)
+      end
+    end
+
+    context 'when query params is over the specified limit' do
+      let(:query_params) { "foo#{'[a]' * Rack::Utils.param_depth_limit}=bar" }
+
+      it 'raises an ConflictingTypes error' do
+        expect { get "/?foo#{'[a]' * Rack::Utils.param_depth_limit}=bar" }.to raise_error(Grape::Exceptions::RequestError)
+      end
+    end
+  end
+end

@@ -1,0 +1,265 @@
+# frozen_string_literal: true
+
+describe Grape::DSL::Routing do
+  subject { dummy_class }
+
+  let(:dummy_class) do
+    Class.new do
+      extend Grape::DSL::Routing
+      extend Grape::DSL::Mounting
+      extend Grape::DSL::Settings
+      extend Grape::DSL::Validations
+
+      class << self
+        attr_reader :instance, :base
+        attr_accessor :configuration
+      end
+
+      @endpoints = []
+    end
+  end
+
+  let(:proc) { -> {} }
+  let(:options) { { a: :b } }
+  let(:path) { '/dummy' }
+
+  describe '.prefix' do
+    it 'sets a prefix for route' do
+      prefix = '/api'
+      subject.prefix prefix
+      expect(subject.inheritable_setting.root_prefix).to eq(prefix)
+    end
+  end
+
+  describe '.scope' do
+    let(:root_app) do
+      Class.new(Grape::API) do
+        scope :my_scope do
+          get :my_endpoint do
+            return_no_content
+          end
+        end
+      end
+    end
+
+    it 'create a scope without affecting the URL' do
+      env = Rack::MockRequest.env_for('/my_endpoint', method: Rack::GET)
+      response = Rack::MockResponse[*root_app.call(env)]
+      expect(response).to be_no_content
+    end
+  end
+
+  describe '.do_not_route_head!' do
+    it 'sets do not route head option' do
+      subject.do_not_route_head!
+      expect(subject.inheritable_setting.do_not_route_head?).to be(true)
+    end
+  end
+
+  describe '.do_not_route_options!' do
+    it 'sets do not route options option' do
+      subject.do_not_route_options!
+      expect(subject.inheritable_setting.do_not_route_options?).to be(true)
+    end
+  end
+
+  describe '.route' do
+    it 'marks end of the route' do
+      expect(subject.inheritable_setting).to receive(:route_end)
+      subject.route(:any)
+    end
+
+    it 'resets validations' do
+      expect(subject.inheritable_setting).to receive(:reset_validations!)
+      subject.route(:any)
+    end
+
+    it 'defines a new endpoint' do
+      expect { subject.route(:any) }
+        .to change { subject.endpoints.count }.from(0).to(1)
+    end
+
+    # Requirements are merged by param name when routes are built, so a lone
+    # constraint has nothing to attach to and used to raise a TypeError there,
+    # on the first request rather than here.
+    it 'rejects requirements that are not a Hash' do
+      expect { subject.route(:any, '/', requirements: Integer) }
+        .to raise_error(ArgumentError, 'requirements must be a Hash of param name => constraint, got `Class`')
+    end
+
+    it 'does not duplicate identical endpoints' do
+      subject.route(:any)
+      expect { subject.route(:any) }
+        .not_to change(subject.endpoints, :count)
+    end
+
+    it 'generates correct endpoint options' do
+      subject.inheritable_setting.route[:description] = { fiz: 'baz' }
+      subject.inheritable_setting.add_params_documentation({ nuz: 'naz' })
+
+      expect(Grape::Endpoint).to receive(:new) do |_inheritable_setting, endpoint_options|
+        expect(endpoint_options[:http_methods]).to eq :get
+        expect(endpoint_options[:path]).to eq '/foo'
+        expect(endpoint_options[:api]).to eq subject
+        expect(endpoint_options[:params]).to eq(nuz: 'naz')
+        expect(endpoint_options[:requirements]).to eq(id: /\d/)
+        expect(endpoint_options[:anchor]).to be(false)
+        expect(endpoint_options[:route_options]).to eq(foo: 'bar', fiz: 'baz')
+      end.and_yield
+
+      subject.route(:get, '/foo', requirements: { id: /\d/ }, anchor: false, foo: 'bar', &proc {})
+    end
+  end
+
+  describe '.get' do
+    it 'delegates to .route' do
+      subject.get path, **options, &proc
+      expect(subject.routes.last).to have_attributes(request_method: Rack::GET, origin: path, options:)
+    end
+  end
+
+  describe '.post' do
+    it 'delegates to .route' do
+      subject.post path, **options, &proc
+      expect(subject.routes.last).to have_attributes(request_method: Rack::POST, origin: path, options:)
+    end
+  end
+
+  describe '.put' do
+    it 'delegates to .route' do
+      subject.put path, **options, &proc
+      expect(subject.routes.last).to have_attributes(request_method: Rack::PUT, origin: path, options:)
+    end
+  end
+
+  describe '.head' do
+    it 'delegates to .route' do
+      subject.head path, **options, &proc
+      expect(subject.routes.last).to have_attributes(request_method: Rack::HEAD, origin: path, options:)
+    end
+  end
+
+  describe '.delete' do
+    it 'delegates to .route' do
+      subject.delete path, **options, &proc
+      expect(subject.routes.last).to have_attributes(request_method: Rack::DELETE, origin: path, options:)
+    end
+  end
+
+  describe '.options' do
+    it 'delegates to .route' do
+      subject.options path, **options, &proc
+      expect(subject.routes.last).to have_attributes(request_method: Rack::OPTIONS, origin: path, options:)
+    end
+  end
+
+  describe '.patch' do
+    it 'delegates to .route' do
+      subject.patch path, **options, &proc
+      expect(subject.routes.last).to have_attributes(request_method: Rack::PATCH, origin: path, options:)
+    end
+  end
+
+  describe '.namespace' do
+    it 'creates a new namespace with given name and options' do
+      subject.namespace(:foo, foo: 'bar') {}
+      expect(subject.namespace(:foo, foo: 'bar')).to eq(Grape::Namespace.new(:foo, foo: 'bar'))
+    end
+
+    it 'rejects requirements that are not a Hash' do
+      expect { subject.namespace(:foo, requirements: Integer) {} }
+        .to raise_error(ArgumentError, 'requirements must be a Hash of param name => constraint, got `Class`')
+    end
+
+    it 'calls #joined_space_path on Namespace' do
+      inside_namespace = nil
+      subject.namespace(:foo, foo: 'bar') do
+        inside_namespace = namespace
+      end
+      expect(inside_namespace).to eq('/foo')
+    end
+  end
+
+  describe '.group' do
+    it 'is alias to #namespace' do
+      expect(subject.method(:group)).to eq subject.method(:namespace)
+    end
+  end
+
+  describe '.resource' do
+    it 'is alias to #namespace' do
+      expect(subject.method(:resource)).to eq subject.method(:namespace)
+    end
+  end
+
+  describe '.resources' do
+    it 'is alias to #namespace' do
+      expect(subject.method(:resources)).to eq subject.method(:namespace)
+    end
+  end
+
+  describe '.segment' do
+    it 'is alias to #namespace' do
+      expect(subject.method(:segment)).to eq subject.method(:namespace)
+    end
+  end
+
+  describe '.routes' do
+    let(:main_app) { Class.new(Grape::API) }
+    let(:first_app) { Class.new(Grape::API) }
+    let(:second_app) { Class.new(Grape::API) }
+
+    before do
+      main_app.mount(first_app => '/first_app', second_app => '/second_app')
+    end
+
+    it 'returns flatten endpoints routes' do
+      expect(main_app.endpoints).not_to be_empty
+      expect(main_app.routes).to eq(main_app.endpoints.map(&:routes).flatten)
+    end
+
+    context 'when #routes was already called once' do
+      it 'memoizes' do
+        object_id = main_app.routes.object_id
+        expect(main_app.routes.object_id).to eq(object_id)
+      end
+    end
+  end
+
+  describe '.route_param' do
+    let!(:options) { { requirements: regex } }
+    let(:regex) { /(.*)/ }
+
+    it 'opens a namespace named after the param' do
+      inside_namespace = nil
+      subject.route_param('foo') { inside_namespace = namespace }
+      expect(inside_namespace).to eq('/:foo')
+    end
+
+    it 'nests requirements option under param name' do
+      requirements = nil
+      subject.route_param('foo', **options) { requirements = inheritable_setting.namespaces.last.requirements }
+      expect(requirements).to eq(foo: regex)
+    end
+
+    it 'does not modify options parameter' do
+      expect { subject.route_param('foo', **options) {} }
+        .not_to(change { options })
+    end
+
+    # The param is named here, so any lone constraint belongs to it — not just
+    # a Regexp, which was the only one nested before.
+    it 'nests a lone capture type under param name' do
+      requirements = nil
+      subject.route_param('foo', requirements: Integer) { requirements = inheritable_setting.namespaces.last.requirements }
+      expect(requirements).to eq(foo: Integer)
+    end
+
+    # A Hash would name the param twice, or constrain a capture this namespace
+    # does not introduce — Mustermann resolves that to no constraint at all.
+    it 'rejects a Hash of requirements' do
+      expect { subject.route_param('foo', requirements: { foo: Integer }, &proc {}) }
+        .to raise_error(ArgumentError, 'route_param :`foo` constrains :`foo`; pass the constraint itself, or a Hash of requirements to the enclosing namespace')
+    end
+  end
+end

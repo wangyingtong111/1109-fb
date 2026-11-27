@@ -1,0 +1,46 @@
+# frozen_string_literal: true
+
+module Grape
+  class Cookies
+    extend Forwardable
+
+    DELETED_COOKIES_ATTRS = {
+      max_age: '0',
+      value: '',
+      expires: Time.at(0).freeze
+    }.freeze
+
+    def_delegators :cookies, :[], :each
+
+    def initialize(rack_cookies)
+      @cookies = ActiveSupport::HashWithIndifferentAccess.new(rack_cookies)
+      @send_cookies = nil
+    end
+
+    def response_cookies
+      return unless @send_cookies
+
+      send_cookies.each do |name|
+        yield name, cookies[name]
+      end
+    end
+
+    def []=(name, value)
+      cookies[name] = value
+      send_cookies << name
+    end
+
+    # Same attributes Rack::Utils uses to delete a cookie
+    def delete(name, **opts)
+      self.[]=(name, opts.merge(DELETED_COOKIES_ATTRS))
+    end
+
+    private
+
+    attr_reader :cookies
+
+    def send_cookies
+      @send_cookies ||= Set.new
+    end
+  end
+end

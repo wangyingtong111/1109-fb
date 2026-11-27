@@ -1,0 +1,460 @@
+# frozen_string_literal: true
+
+module Grape
+  module Middleware
+    class Error < Base
+      include PrecomputedContentTypes
+
+      Options = Data.define(
+        :all_rescue_handler, :base_only_rescue_handlers, :content_types,
+        :default_error_formatter, :default_message, :default_status,
+        :error_formatters, :format,
+        :grape_exceptions_rescue_handler, :internal_grape_exceptions_rescue_handler,
+        :rescue_all, :rescue_grape_exceptions, :rescue_handlers, :rescue_options
+      ) do
+        def initialize(
+          all_rescue_handler: nil, base_only_rescue_handlers: nil, content_types: nil,
+          default_error_formatter: nil, default_message: '', default_status: nil,
+          error_formatters: nil, format: :txt,
+          grape_exceptions_rescue_handler: nil, internal_grape_exceptions_rescue_handler: nil,
+          rescue_all: false, rescue_grape_exceptions: false, rescue_handlers: nil,
+          rescue_options: nil
+        )
+          # `rescue_options:`, `default_error_formatter:` and `default_status:`
+          # arrive nil from `Endpoint#error_middleware_options` when the API
+          # called no `rescue_from`, no `format` and no `default_error_status` —
+          # and an explicit nil bypasses a keyword default, so restore them here
+          # rather than letting nil reach `rescue_options.backtrace` in
+          # `#initialize`, the formatter lookup in `#format_message` or an error
+          # response's status. A bare `super` hands the parameters over as they
+          # stand, these three included.
+          rescue_options ||= Grape::DSL::RescueOptions.new
+          default_error_formatter ||= Grape::ErrorFormatter::Txt
+          default_status ||= 500
+          super
+        end
+      end
+
+      # Read off ivars rather than delegated into +config+: rendering an error
+      # asks for most of them, and each delegator cost a Forwardable frame plus
+      # a Data reader for a value that was fixed when the middleware was built.
+      attr_reader :all_rescue_handler, :base_only_rescue_handlers, :default_error_formatter,
+                  :default_message, :default_status, :error_formatters, :format,
+                  :grape_exceptions_rescue_handler, :internal_grape_exceptions_rescue_handler,
+                  :rescue_all, :rescue_grape_exceptions, :rescue_handlers, :rescue_options
+
+      # +:backtrace+ / +:original_exception+ on the rescue options become
+      # +#include_backtrace+ / +#include_original_exception+ on the middleware,
+      # which is what the formatter call site reads.
+      attr_reader :include_backtrace, :include_original_exception
+
+      # Emitted by {#render_failsafe_response} once even the framework's own message
+      # could not be rendered. Deliberately built without a formatter, an i18n
+      # lookup or anything else that could be the thing that is broken.
+      FAILSAFE_STATUS = 500
+      FAILSAFE_MESSAGE = '500 Internal Server Error'
+      FAILSAFE_CONTENT_TYPE = 'text/plain'
+
+      def initialize(app, **options)
+        super
+        read_rescue_config(config)
+        read_rendering_config(config)
+      end
+
+      # Base#call copies the middleware for every request so that #call! can
+      # keep the env in an ivar, but only rendering an error reads it there. A
+      # request that goes through without one is answered by the one instance
+      # the stack built, and a copy is taken once there is an error to render.
+      def call(env)
+        respond(env).to_a
+      end
+
+      def call!(env)
+        @env = env
+        respond(env)
+      end
+
+      protected
+
+      # What #respond hands a thrown error or a raised exception to: a copy of
+      # the middleware, holding the request's env for the rendering below.
+      def render_thrown(env, error)
+        @env = env
+        error_response(error)
+      end
+
+      def render_raised(env, exception)
+        @env = env
+        run_rescue_handler(find_handler(exception.class), exception, env[Grape::Env::API_ENDPOINT])
+      end
+
+      private
+
+      # What #find_handler looks a rescue handler up in.
+      def read_rescue_config(config)
+        @all_rescue_handler = config.all_rescue_handler
+        @base_only_rescue_handlers = config.base_only_rescue_handlers
+        @grape_exceptions_rescue_handler = config.grape_exceptions_rescue_handler
+        @internal_grape_exceptions_rescue_handler = config.internal_grape_exceptions_rescue_handler
+        @rescue_all = config.rescue_all
+        @rescue_grape_exceptions = config.rescue_grape_exceptions
+        @rescue_handlers = config.rescue_handlers
+      end
+
+      # What an error response is rendered with.
+      def read_rendering_config(config)
+        @default_error_formatter = config.default_error_formatter
+        @default_message = config.default_message
+        @default_status = config.default_status
+        @error_formatters = config.error_formatters
+        @format = config.format
+        @rescue_options = config.rescue_options
+        @include_backtrace = @rescue_options.backtrace
+        @include_original_exception = @rescue_options.original_exception
+      end
+
+      # Whether the app answered is recorded rather than returned from inside
+      # the +catch+ block: a +return+ there leaves the method through Kernel#catch,
+      # which unwinds like a throw and allocates for it, on every request that
+      # did not fail.
+      #
+      # +error!+ raises a Halt carrying what a +throw :error+ carries. It is
+      # taken inside the +catch+, so it is rendered where a thrown error is and
+      # never reaches a +rescue_from+ handler, the +:all+ one included.
+      def respond(env)
+        answered = false
+        response = catch(:error) do
+          app_response = @app.call(env)
+          answered = true
+          app_response
+        rescue Grape::Exceptions::Halt => e
+          e.response
+        end
+        answered ? response : dup.render_thrown(env, response)
+      rescue Exception => e # rubocop:disable Lint/RescueException
+        dup.render_raised(env, e)
+      end
+
+      # +headers+ is handed over as it is: Rack::Response copies it into a
+      # Headers of its own, and every caller builds it fresh for this response.
+      def rack_response(status, headers, message)
+        body = html_content_type?(headers[Rack::CONTENT_TYPE]) ? Rack::Utils.escape_html(message) : message
+        Rack::Response.new(Array.wrap(body), Rack::Utils.status_code(status), headers)
+      end
+
+      # Escaping must key off the media type only, case-insensitively. Comparing
+      # the raw header against 'text/html' would let a parameterized value such
+      # as 'text/html; charset=utf-8' (or a differently-cased 'Text/HTML', which
+      # browsers still treat as HTML) skip escaping and reflect an unescaped
+      # message into an HTML response. Such a header can be set from several
+      # places (a registered content type, or a custom Content-Type passed to
+      # error!/rescue_from), but they all render here.
+      def html_content_type?(content_type)
+        Grape::ContentTypes.media_type(content_type).to_s.casecmp?('text/html')
+      end
+
+      def format_message(error)
+        error_formatter.call(error:, env:, include_backtrace:, include_original_exception:)
+      end
+
+      # The registry answers nil for a format nothing is registered for, and
+      # the API's +default_error_formatter+ — +ErrorFormatter::Txt+ unless the
+      # API set another — takes it from there, so this always has something
+      # callable. The +throw :error, 406+ that used to stand in for a missing
+      # formatter could not work anyway: nothing catches +:error+ around this
+      # call (+#respond+ has left its +catch+ by the time +error_response+ runs),
+      # so it raised +UncaughtThrowError+ and the request answered with the
+      # failsafe 500 rather than the 406 it named.
+      def error_formatter
+        Grape::ErrorFormatter.formatter_for(env[Grape::Env::API_FORMAT] || format, error_formatters) || default_error_formatter
+      end
+
+      # The media type an error is labelled with: the one its formatter names,
+      # such as RFC 9457's +application/problem+json+, else the request
+      # format's. A Proc formatter names none.
+      def error_content_type
+        formatter = error_formatter
+        return content_type unless formatter.respond_to?(:content_type)
+
+        formatter.content_type || content_type
+      end
+
+      def find_handler(klass)
+        registered_entry = registered_rescue_handler_entry(klass)
+
+        grape_exceptions_precedence_handler(klass, registered_entry) ||
+          registered_entry&.last ||
+          rescue_handler_for_grape_exception(klass) ||
+          rescue_handler_for_any_class(klass) ||
+          raise
+      end
+
+      def error_response(error = nil)
+        raw = Grape::Exceptions::ErrorResponse.coerce(error)
+        payload = Grape::Exceptions::ErrorResponse.new(
+          status: raw.status || default_status,
+          message: raw.message || default_message,
+          headers: error_response_headers(raw.headers),
+          backtrace: resolved_backtrace(raw),
+          original_exception: raw.original_exception
+        )
+        env[Grape::Env::API_ENDPOINT].status(payload.status) # error! may not have been called
+        render_response(payload)
+      end
+
+      # The content type the error renders as, under any +headers+ it carries.
+      def error_response_headers(headers)
+        content_type_header = { Rack::CONTENT_TYPE => error_content_type }
+        return content_type_header unless headers.is_a?(Hash)
+
+        content_type_header.merge!(headers)
+      end
+
+      # The backtrace an error formatter is handed. Assembled only when the API
+      # asked for one with `rescue_from ..., backtrace: true`: reading it off
+      # the exception is not free — +Exception#backtrace+ builds the whole Array
+      # of location strings — and every built-in formatter drops it otherwise.
+      # A formatter that wants one regardless still has +original_exception+.
+      def resolved_backtrace(raw)
+        return [] unless include_backtrace
+
+        raw.backtrace || raw.original_exception&.backtrace || []
+      end
+
+      # An error formatter that raises on its payload would take the exception
+      # out through every middleware above Grape: rendering from a rescue
+      # handler runs in #respond's rescue clause, which nothing covers. Grape has
+      # committed to an error by now, so it answers with one that does not
+      # depend on the payload.
+      #
+      # +Grape.config.raise_rendering_errors+ opts back out, for an application
+      # that would rather have the exception propagate as it did before.
+      def render_response(payload)
+        rack_response(payload.status, payload.headers, format_message(payload))
+      rescue StandardError => e
+        raise if Grape.config.raise_rendering_errors
+
+        record_rendering_failure(e)
+        render_failsafe_response
+      end
+
+      # The exception is published on the rack env (see {#expose_exception}) and
+      # written to +rack.errors+ so it reaches the log with no tracker installed.
+      # Rails writes to $stderr from its failsafe branch for the same reason:
+      # deferring the logging to the application is not an option when the
+      # application's own error rendering is what broke.
+      def record_rendering_failure(error)
+        expose_exception(error)
+        env[Rack::RACK_ERRORS]&.write("Grape could not render the error response: #{error.class}: #{error.message}\n")
+      end
+
+      # First retry the API's own format with the framework's InternalServerError,
+      # whose message is a static string and so cannot be what defeated the first
+      # attempt. Should even that fail — a wholesale broken formatter, rather than
+      # one payload it choked on — drop the formatter entirely. Both attempts call
+      # {#format_message} directly rather than re-entering {#error_response}, so
+      # this path cannot recurse.
+      def render_failsafe_response
+        headers = { Rack::CONTENT_TYPE => error_content_type }
+        rack_response(FAILSAFE_STATUS, headers, format_message(failsafe_payload(headers)))
+      rescue StandardError
+        rack_response(FAILSAFE_STATUS, { Rack::CONTENT_TYPE => FAILSAFE_CONTENT_TYPE }, FAILSAFE_MESSAGE)
+      end
+
+      # Publish an exception Grape swallowed, on both keys. +grape.exception+ is
+      # Grape's own and has been set on these paths all along; +rack.exception+ is
+      # what the ecosystem actually reads to find an exception that never
+      # propagated — sentry-ruby collects +env['rack.exception'] ||
+      # env['sinatra.error']+ — so a tracker mounted above Grape keeps reporting
+      # these with no application change.
+      def expose_exception(error)
+        env[Grape::Env::GRAPE_EXCEPTION] = error
+        env[Grape::Env::RACK_EXCEPTION] = error
+      end
+
+      def failsafe_payload(headers)
+        Grape::Exceptions::ErrorResponse.new(
+          status: FAILSAFE_STATUS,
+          message: Grape::Exceptions::InternalServerError.new.message,
+          headers:,
+          backtrace: [],
+          original_exception: nil
+        )
+      end
+
+      # No +backtrace:+: #resolved_backtrace reads it off +original_exception+
+      # when the API asked for one, and only then, since building it is the
+      # dearest part of rendering the error.
+      def default_rescue_handler(exception)
+        error_response(
+          Grape::Exceptions::ErrorResponse.new(
+            message: exception.message,
+            original_exception: exception
+          )
+        )
+      end
+
+      # An exception raised in a +rescue_from+ block is never handed to a
+      # catch-all, so the +:all+ entry does not end the scan: an enclosing
+      # scope's handler still takes it.
+      def registered_rescue_handler(klass)
+        registered_rescue_handler_entry(klass, catch_all: false)&.last
+      end
+
+      # The matched entry rather than just its handler, so callers can tell
+      # *which* class matched — see {#grape_exceptions_precedence_handler}.
+      #
+      # Nil once the scan reaches the +:all+ entry of the nearest scope that
+      # declared +rescue_from :all+ (see InheritableSetting#rescue_handlers):
+      # what it catches goes to the catch-all, after #find_handler's Grape
+      # exception checks, rather than to an enclosing scope's handler.
+      # @return [Array(Class, #call), nil]
+      def registered_rescue_handler_entry(klass, catch_all: true)
+        rescue_handler_entry_from(base_only_rescue_handlers) { |err| klass == err } ||
+          rescue_handler_entry_from(rescue_handlers) do |err|
+            next klass <= err unless err == :all
+
+            catch_all && klass <= StandardError
+          end
+      end
+
+      def rescue_handler_entry_from(handlers)
+        error, handler = handlers&.find { |err, _handler| yield(err) }
+
+        return if error.nil? || error == :all
+
+        [error, handler || method(:default_rescue_handler)]
+      end
+
+      # +rescue_from :grape_exceptions+ is an opt-in to keep Grape's own errors
+      # rendering with their own status — a validation failure stays a 400
+      # instead of becoming whatever the app's catch-all returns.
+      #
+      # It only ever worked against +rescue_from :all+, which lives in
+      # +all_rescue_handler+ and is consulted last. Spelled as a class instead,
+      # +rescue_from StandardError+ is a *registered* handler, matched first,
+      # and Grape's exceptions are StandardErrors — so the opt-in silently did
+      # nothing and validation errors came back as 500s either way.
+      #
+      # Let it win over a handler that only matched through a non-Grape
+      # ancestor. One registered for a Grape exception class is more specific
+      # than the opt-in and still wins, so an explicit
+      # +rescue_from Grape::Exceptions::ValidationErrors+ keeps its handler.
+      #
+      # InvalidVersionHeader is left alone: it must keep reaching Rack so the
+      # next versioned route is tried.
+      def grape_exceptions_precedence_handler(klass, registered_entry)
+        return unless rescue_grape_exceptions
+        return unless klass <= Grape::Exceptions::Base
+        return if klass == Grape::Exceptions::InvalidVersionHeader
+
+        matched, = registered_entry
+        return if matched.nil? || matched <= Grape::Exceptions::Base
+
+        grape_exceptions_rescue_handler || method(:error_response)
+      end
+
+      def rescue_handler_for_grape_exception(klass)
+        return unless klass <= Grape::Exceptions::Base
+        return method(:error_response) if klass == Grape::Exceptions::InvalidVersionHeader
+        return unless rescue_grape_exceptions || !rescue_all
+
+        grape_exceptions_rescue_handler || method(:error_response)
+      end
+
+      def rescue_handler_for_any_class(klass)
+        return unless klass <= StandardError
+        return unless rescue_all || rescue_grape_exceptions
+
+        all_rescue_handler || method(:default_rescue_handler)
+      end
+
+      def run_rescue_handler(handler, error, endpoint, redispatched: false)
+        callable = handler.is_a?(Symbol) ? endpoint.public_method(handler) : handler
+        response = catch(:error) do
+          call_rescue_handler(callable, error, endpoint)
+        rescue Grape::Exceptions::Halt => e
+          e.response
+        rescue StandardError => e
+          raise if Grape.config.raise_rescue_handler_errors
+
+          return redispatch(e, endpoint, redispatched)
+        end
+
+        return error_response(response) if error?(response)
+        return response if response.is_a?(Rack::Response)
+
+        run_rescue_handler(method(:default_rescue_handler), Grape::Exceptions::InvalidResponse.new, endpoint)
+      end
+
+      # A +rescue_from+ block runs as the endpoint. A Method (the middleware's
+      # own handlers, or the endpoint's for a +with:+ Symbol) is already bound
+      # to a receiver that instance_exec cannot change, so it is called as it
+      # is rather than turned into a Proc first.
+      def call_rescue_handler(callable, error, endpoint)
+        if callable.is_a?(Method)
+          callable.arity.zero? ? callable.call : callable.call(error)
+        elsif callable.arity.zero?
+          endpoint.instance_exec(&callable)
+        else
+          endpoint.instance_exec(error, &callable)
+        end
+      end
+
+      # Route an exception raised inside a +rescue_from+ block.
+      #
+      # * If we have already redispatched once (the redispatched handler
+      #   itself raised), go straight to {#framework_default} — bounds the
+      #   chain at one redispatch.
+      # * Else if the exception has a registered +rescue_from+ handler,
+      #   run it.
+      # * Else if it's a +Grape::Exceptions::Base+ subclass, render it
+      #   through +error_response+ with its own +status+ and +message+.
+      # * Else fall through to {#safe_default}, which lets the user opt
+      #   in via +rescue_from :internal_grape_exceptions+ or, failing
+      #   that, applies the framework default.
+      def redispatch(error, endpoint, already_redispatched)
+        return framework_default(endpoint) if already_redispatched
+
+        registered = registered_rescue_handler(error.class)
+
+        return run_rescue_handler(registered, error, endpoint, redispatched: true) if registered
+        return run_rescue_handler(method(:error_response), error, endpoint, redispatched: true) if error.is_a?(Grape::Exceptions::Base)
+
+        safe_default(error, endpoint)
+      end
+
+      # The unrecognised-error path. Exposes the original exception on
+      # the rack env so upstream Rack middleware (loggers, error
+      # trackers) can observe it. If the user registered a
+      # +rescue_from :internal_grape_exceptions+ handler, that handler
+      # runs and owns the response. Otherwise the framework renders the
+      # generic +InternalServerError+ — never the original exception's
+      # message. The framework deliberately does no logging of its own
+      # here; that's the application's call.
+      def safe_default(error, endpoint)
+        expose_exception(error)
+        return run_rescue_handler(internal_grape_exceptions_rescue_handler, error, endpoint, redispatched: true) if internal_grape_exceptions_rescue_handler
+
+        framework_default(endpoint)
+      end
+
+      def framework_default(endpoint)
+        run_rescue_handler(method(:default_rescue_handler), Grape::Exceptions::InternalServerError.new, endpoint)
+      end
+
+      def error!(message, status = default_status, headers = {}, backtrace = [], original_exception = nil)
+        env[Grape::Env::API_ENDPOINT].status(status) # not error! inside route
+        merged_headers = { Rack::CONTENT_TYPE => error_content_type }.merge!(headers)
+        error = Grape::Exceptions::ErrorResponse.new(
+          status:, message:, headers: merged_headers, backtrace:, original_exception:
+        )
+        rack_response(status, merged_headers, format_message(error))
+      end
+
+      def error?(response)
+        response.is_a?(Grape::Exceptions::ErrorResponse)
+      end
+    end
+  end
+end

@@ -1,0 +1,3475 @@
+Upgrading Grape
+===============
+
+### Upgrading to >= 4.2.0
+
+#### Upload tempfiles are deleted once the response is closed
+
+Grape now closes and deletes the tempfiles of a multipart upload once the response is closed, or once an exception escapes the API ([#3086](https://github.com/ruby-grape/grape/pull/3086)). It used to leave them until garbage collection or the process exited, unless the API ran inside an application that already did this, such as Rails with its `Rack::TempfileReaper`.
+
+Code that keeps an uploaded tempfile after the response, for instance by handing its path to a background job, has to copy or move the file first:
+
+```ruby
+post 'avatar' do
+  path = Rails.root.join('tmp', 'uploads', SecureRandom.uuid)
+  FileUtils.cp(params[:avatar][:tempfile].path, path)
+  ProcessAvatarJob.perform_later(path.to_s)
+end
+```
+
+#### A required param the request left out is only reported missing
+
+A `requires` param the request left out now answers `is missing` and nothing else ([#3100](https://github.com/ruby-grape/grape/pull/3100)). Its other validators, custom ones included, are only called for a param the request sent, as they already were for an `optional` one. A custom validator that read the value used to be handed `nil` for it and raise, so the request answered `500` instead of `400`. The README's own `AlphaNumeric` example did that.
+
+The built-in validators that added a second error for a missing param no longer do:
+
+```ruby
+params do
+  requires :n, type: Integer, values: [1, 2]
+  requires :email, type: String, allow_blank: false
+end
+```
+
+```
+# Before
+n is missing, n does not have a valid value, email is missing, email is empty
+# After
+n is missing, email is missing
+```
+
+This also drops the `does not have a valid value` that [#3010](https://github.com/ruby-grape/grape/pull/3010) added after `is missing` for a nested param with `values` (see [A required param with `values` rejects `nil` in a nested scope](#a-required-param-with-values-rejects-nil-in-a-nested-scope)). A param sent as `null` is still validated, and `values` still rejects it. A custom validator that has to see a missing param, to report it in its own words for instance, can override `validate(request)`, which is called whether the param was sent or not.
+
+#### `Grape::Util::MediaType` parses for a vendor's pattern
+
+`Grape::Util::MediaType.parse`, `.best_quality` and `.new` take `vendor_pattern:`, the pattern `Grape::Util::MediaType.vendor_pattern(vendor)` answers, in place of `vendor:` ([#3098](https://github.com/ruby-grape/grape/pull/3098)). The header versioner looks its vendor's pattern up as it is built, so a request no longer reads a cache. Only code calling these internals is affected: pass `vendor_pattern: Grape::Util::MediaType.vendor_pattern(vendor)`.
+
+#### A `use` of unknown params raises when the API compiles
+
+A mounted API can now `use` the reusable `params` of the scope it is mounted in ([#3087](https://github.com/ruby-grape/grape/pull/3087)). An API's `params` blocks run before it is mounted, so a name `use` cannot find no longer raises `Params :name not found!` as the API class is defined. It raises when the API compiles, either on its first request or at `compile!`. A Rails application that eager loads compiles the APIs mounted in its routes at boot, so a misspelled name still fails the boot there. Elsewhere, call `compile!` on your API at boot, or in a spec, to catch one before a request does.
+
+#### Minimum required ActiveSupport is now 8.0
+
+Grape no longer supports Rails 7.2, which reached end of life on 2026-08-09. ActiveSupport 8.0 is now the minimum (`add_dependency 'activesupport', '>= 8.0'`) ([#3056](https://github.com/ruby-grape/grape/pull/3056)). Upgrade to Rails 8.0 or newer before bumping Grape, or to ActiveSupport 8.0 or newer if you run Grape without Rails.
+
+#### Minimum required Rack is now 3.1
+
+Grape no longer supports Rack 2.2 or 3.0. Rack 3.1 is now the minimum (`add_dependency 'rack', '>= 3.1'`) ([#3063](https://github.com/ruby-grape/grape/pull/3063)). Rack's [security policy](https://github.com/rack/rack/security/policy) covers its current release series and the one before it, now 3.2 and 3.1. Rack 3.0 has had no release since 3.0.18, so it is still affected by [GHSA-2j8w-xcrc-x985](https://github.com/rack/rack/security/advisories/GHSA-2j8w-xcrc-x985), which was fixed only in 3.1.23 and 3.2.8. Upgrade to Rack 3.1 or newer before bumping Grape. Coming from Rack 2.2, the header names Grape sets are lower case (see [Headers](#headers)), and Rack's [upgrade guide](https://github.com/rack/rack/blob/main/UPGRADE-GUIDE.md) covers the rest.
+
+`Grape::Util::Header`, which stood for `Rack::Headers` on Rack 3 and `Rack::Utils::HeaderHash` on Rack 2, is removed. Use `Rack::Headers`.
+
+A mounted Rack app declines a request with `x-cascade: pass`, the lowercase name the Rack 3 SPEC requires. Grape no longer reads `X-Cascade`, the Rack 2 spelling, from the plain Hash such an app answers with ([#3064](https://github.com/ruby-grape/grape/pull/3064) read both).
+
+#### APIs mounted in a Rails application's routes are compiled at boot
+
+When `config.eager_load` is on, as it is in production, Grape's Railtie now compiles the APIs mounted in the application's routes, and in the routes of the engines it mounts, as soon as the routes are loaded, rather than leaving it to the first request each process answers ([#3022](https://github.com/ruby-grape/grape/pull/3022)). A `compile!` call the application already makes can stay: an API is compiled once.
+
+Compiling builds each endpoint's middleware stack, so a middleware's `initialize` now runs at boot, and before the workers fork under a server that preloads the application, such as Puma with `preload_app!`. A middleware that opens a connection or starts a thread in `initialize` should do it on its first request instead. An API that fails to compile now fails the boot rather than its first request.
+
+#### Undeclared params can be rejected, and will be by default from Grape 5.0
+
+Set to `false`, `Grape.config.allow_undeclared_params` answers `400` to a request carrying a param its endpoint did not declare ([#3054](https://github.com/ruby-grape/grape/pull/3054)). It defaults to `true`, so nothing changes in 4.2.0, but Grape 5.0 makes `false` the default.
+
+To find out ahead of 5.0 what it would reject, set it to `false` in your test suite and declare what your endpoints read without declaring, such as an access token read by a `before` filter:
+
+```ruby
+Grape.config.allow_undeclared_params = false
+```
+
+To keep accepting undeclared params from 5.0, set it to `true`. See [Rejecting Undeclared Parameters](README.md#rejecting-undeclared-parameters).
+
+#### A helper reaches every route of its scope, wherever it is declared
+
+A `helpers` block or module used to reach only the routes declared below it in the same scope. A route declared above it raised `NameError` when it called the helper ([#34](https://github.com/ruby-grape/grape/issues/34)). Since [#3061](https://github.com/ruby-grape/grape/pull/3061) it reaches every route of its scope, as it already did from an enclosing scope and through `mount`.
+
+So a helper method defined twice in one scope now answers with its last definition in every route of that scope, including the routes declared between the two definitions:
+
+```ruby
+helpers { def greeting = 'first' }
+get('/before') { greeting } # was 'first', now 'second'
+helpers { def greeting = 'second' }
+get('/after') { greeting }  # 'second'
+```
+
+Until 5.0, Grape warns about each such route when the API compiles:
+
+```
+Grape: helper `greeting` is defined again below GET /before in the same scope, so since 4.2.0 that route answers with the later definition (see UPGRADING.md). Rename one of them, or declare the route in its own namespace.
+```
+
+To keep a different method per route, give the methods different names, or declare the routes in separate namespaces, each with its own `helpers`. `use`, `rescue_from` and the `before`/`after` callbacks still apply only to the routes declared below them.
+
+#### A path opening with an optional segment answers without it under a namespace
+
+A route path opening with an optional segment, such as `get '(:type)'` inside `namespace :root`, now also answers `/root` ([#3065](https://github.com/ruby-grape/grape/pull/3065)). Before, the slash Grape put between the namespace and the path was required, and a request path is never matched with a trailing slash, so `/root` answered `404`. The same goes for a mount path, a prefix, a path version, and a slash written in front of the segment, as in `get 'users/(:id)'`.
+
+* The route's `path` and `origin` move the slash into the segment: `/root(/:type)` instead of `/root/(:type)`. Anything reading them, such as API documentation, sees the new spelling.
+* A route declared after it for the path itself, such as `get` in the same namespace, no longer answers that path, as the earlier route now matches it first. Declare that route first, or drop it.
+
+#### `version` raises `ArgumentError` on a positional options Hash, or any version that is not a String, Symbol or Integer
+
+Since 3.0.0 ([#2618](https://github.com/ruby-grape/grape/pull/2618)), Ruby turns a trailing Hash into keyword arguments only when it is written without braces. A braced options Hash given to `version` landed among the version names instead. The API got a version named after the Hash and stayed on the default `:path` strategy, with no warning. `version` now raises `ArgumentError` when it boots instead ([#3060](https://github.com/ruby-grape/grape/pull/3060)), as `auth`, `http_basic` and `desc` have since 4.0.0:
+
+```ruby
+# Before: path versioning, with `/v1/...` routes
+version 'v1', { using: :header, vendor: 'acme' }
+
+# After
+version 'v1', using: :header, vendor: 'acme'
+```
+
+Writing the options as keywords also applies them. If clients reached such an API through `/v1/...`, they have been using path versioning. To keep it, drop the options (`version 'v1'`), or pass `using: :path`.
+
+Every version given to `version`, inside an Array too, must now be a non-empty String, Symbol or Integer. Anything else used to be turned into a String: `nil` and an empty name into a version no request could reach, a Float such as `1.10` into `"1.1"`, `true` into `"true"`. Write such a version as a String (`version '1.10'`). An empty Array of versions raises as well.
+
+#### A request every route declines answers 404, however many routes declined
+
+A route declines a request by answering with `X-Cascade: pass`, as a version declared with `cascade: true` does for a version it does not serve. As the [README](README.md#header) documents, the router then answers its own `404` if no other route takes the request. It only did so when one route had declined: with two or more routes on the path, the last one's response came back instead, and so did that of an ANY route (since 4.0.0). So a request for an unknown version answered `404` from an API with one version and `406` from an API with several.
+
+Every such request now answers the router's `404`, with `X-Cascade: pass` still set ([#3043](https://github.com/ruby-grape/grape/pull/3043)).
+
+* A client or spec expecting `406` for an unknown version from an API with several versions now gets `404`. To keep the `406`, declare `cascade: false` on the last version only: a version that does not cascade answers every request it does not serve, so the versions after it are never reached.
+* The status, headers and body of a declined response are dropped, so a response you want a client to see must not set `X-Cascade: pass`. The same goes for a Rack app mounted on a path other routes share.
+* Behind `Rack::Cascade`, which looks only at the status, such a request now reaches the next app instead of stopping at the `406`.
+
+#### A parameter name written as a String is kept as a Symbol
+
+`requires`, `optional`, `given`, the group rules such as `mutually_exclusive`, and `same_as:` now keep a parameter name written as a String as a Symbol ([#3069](https://github.com/ruby-grape/grape/pull/3069)). Under `build_with :hash`, whose params have Symbol keys, a String name found nothing: `requires 'name'` answered `name is missing` to a request that sent it, and an optional one was not validated and came back from `declared` as `nil`. Every params builder answers a Symbol, so such names now work as Symbol names do.
+
+* A custom validator receives such a name as a Symbol in `validate_param!(attr_name, params)`. Compare `attr_name.to_s` if it checked the name against a String. Error messages and `declared(params)` name it as before.
+* `given 'name'` finds a parameter declared as `:name`, and `given :name` one declared as `'name'`, where both raised `Grape::Exceptions::UnknownParameter`.
+
+#### A `rescue_from :all` in a namespace or mounted API outranks the enclosing scope's handlers
+
+A `rescue_from :all` declared in a namespace or a mounted API now takes precedence over the handlers of the scopes around it, as a nested class handler already did ([#3073](https://github.com/ruby-grape/grape/pull/3073)). An enclosing scope's handler used to win whenever its class matched, so with the API below a `ZeroDivisionError` raised under `/alpacas` was answered by the root's handler, not the namespace's catch-all:
+
+```ruby
+rescue_from ZeroDivisionError do
+  error!('root', 500)
+end
+
+namespace :alpacas do
+  rescue_from :all do
+    error!('alpacas', 503) # now answers the ZeroDivisionError
+  end
+  get { 1 / 0 }
+end
+```
+
+To keep the enclosing handler for such an exception, register its class in the nested scope as well: a scope's class handlers still rank ahead of its own `rescue_from :all`. An exception `rescue_from :all` does not catch, one that is not a `StandardError`, still reaches the enclosing scope's handlers, and so does one raised inside the catch-all's block.
+
+#### A mounting API's `default_error_status` reaches the routes its mounted APIs defined first
+
+An API's `default_error_status` now applies to every route of the APIs it mounts, whichever was defined first ([#3083](https://github.com/ruby-grape/grape/pull/3083)). A route used to keep 500 when nothing above it had set `default_error_status` by the time it was defined. So in the usual layout below, where the mounted API is defined before the API that mounts it, `error!` and the exceptions `rescue_from` answers without a status of their own gave 500:
+
+```ruby
+class Status < Grape::API
+  get :status do
+    error!('unavailable') # now 400, was 500
+  end
+end
+
+class Base < Grape::API
+  default_error_status 400
+  mount Status
+end
+```
+
+A route defined after the mount already answered 400. A `default_error_status` the mounting API sets after `mount` now applies too, as its `format` and `rescue_from` already did. A mounted API's own `default_error_status` still wins, so to keep 500 in a mounted API, declare `default_error_status 500` in it.
+
+### Upgrading to >= 4.1.0
+
+#### `Rack::Head` wraps the router instead of each endpoint's stack
+
+`Rack::Head` used to be the first middleware in each endpoint's stack. That missed a Rack app mounted with `mount`, which the router calls directly, and a middleware inserted ahead of it with `insert 0`: a `HEAD` request to either got the full body back. A single `Rack::Head` around the router now strips the body of every `HEAD` response the API gives ([#3042](https://github.com/ruby-grape/grape/pull/3042)).
+
+An endpoint's stack now starts with `Grape::Middleware::Error`, and three things follow from that:
+
+* `insert_before Rack::Head` and `insert_after Rack::Head` raise `No such middleware to insert before: Rack::Head` (or `after`) when the API compiles. Use `insert 0` to put a middleware first.
+* A middleware inserted by index lands one place further in. `insert 1` used to put it between `Rack::Head` and `Grape::Middleware::Error`; it now puts it inside `Grape::Middleware::Error`, so `rescue_from` handles what it raises. Use `insert 0` to keep it outside.
+* A middleware inserted with `insert 0` now sees the full body of a `HEAD` response, as one added with `use` always has.
+
+#### A `:jsonl` format you declared now gets Grape's JSON Lines formatter, parser and error formatter
+
+Grape now renders, parses and reports errors in JSON Lines under `:jsonl` ([#3029](https://github.com/ruby-grape/grape/pull/3029)). An API that declared `content_type :jsonl, ...` itself, with nothing of its own registered for it, gets Grape's:
+
+* A response body that is not a String renders as JSON Lines. A String is still served as it is.
+* A request body is parsed into an Array in `env['api.request.body']`, where it used to be the raw String. Keep the String with `parser :jsonl, nil`.
+* An error renders as a JSON line instead of through `default_error_formatter`.
+
+A formatter, parser or error formatter you register for `:jsonl` with `formatter`, `parser` or `error_formatter` still takes precedence.
+
+#### Formats named `:md` and `:markdown` have a built-in formatter
+
+`Grape::Formatter::Md` renders the `:md` format and `Grape::Formatter::Markdown` the `:markdown` one ([#3025](https://github.com/ruby-grape/grape/pull/3025)). Neither is a default content type, so only an API that declares one is affected. See [Serving Markdown](README.md#serving-markdown).
+
+* An API that declared `content_type :md` (or `:markdown`) without a matching `formatter` used to send its bodies unchanged. A String still is. An object answering `to_markdown` is now rendered with it, and any other object raises `Grape::Exceptions::InvalidFormatter`: it answers in the default format when the client negotiated Markdown, and `500` otherwise.
+* `:md` and `:markdown` now name the same format. An API that declared one of them used to answer the other extension (and `?format=`) in its default format, or `406`; it now answers it in Markdown, under the name it declared.
+* A `formatter :md` or `formatter :markdown` of your own still takes precedence.
+* A formatter class of your own named `Md` or `Markdown` that inherits `Grape::Formatter::Base` now replaces Grape's globally, with a warning that `md` or `markdown` is already registered. Rename it, and declare it with `formatter :md, YourFormatter` (or `:markdown`) in the APIs that use it.
+
+#### `logger` applies to the API it is set on
+
+`logger` kept the logger in settings shared by the whole process, so setting it on one API replaced it on every other: two APIs that each set a logger both logged to whichever was set last.
+
+A logger now belongs to the API it is set on, and to the APIs mounted under it that set none of their own ([#3024](https://github.com/ruby-grape/grape/pull/3024)). An API that sets none, and is mounted under none that does, still logs to a default shared by every such API, so a level set on that default reaches all of them as before.
+
+```ruby
+class Users < Grape::API
+  logger Logger.new('users.log')
+end
+
+class Orders < Grape::API
+  logger Logger.new('orders.log')
+end
+
+# Users.logger  Before: the orders.log logger  After: the users.log logger
+```
+
+If an API logged to a logger set on another API that does not mount it, set the logger on that API as well, or on an API that mounts both. Setting one on `Grape::API::Instance` no longer reaches the APIs you define.
+
+#### `error!` raises `Grape::Exceptions::Halt` instead of throwing `:error`
+
+`error!` used to `throw :error`, and a throw is not an exception. Active Record commits a transaction that a throw leaves, so `error!` inside `transaction` saved what the block had written while the client was told the request failed ([#2197](https://github.com/ruby-grape/grape/issues/2197)). A throw cannot leave the fiber or thread it was thrown in either, so `error!` inside an `Async` task answered 500 instead of its status.
+
+`error!` now raises `Grape::Exceptions::Halt` ([#3023](https://github.com/ruby-grape/grape/pull/3023)), a `StandardError` carrying the same response (`#response`, also `#status` and `#headers`). Grape renders it as it rendered the thrown error, without handing it to a `rescue_from` handler, `rescue_from :all` included.
+
+* A `rescue => e` or `rescue StandardError` around `error!` now catches it, whether in a route, a helper, a filter or a middleware added with `use`. Narrow the rescue, or let `Halt` through:
+
+  ```ruby
+  rescue Grape::Exceptions::Halt
+    raise
+  rescue StandardError => e
+    # ...
+  ```
+
+* Code that wraps `error!` in `catch(:error)`, a spec for instance, now gets the exception. Rescue `Grape::Exceptions::Halt` and read `#response`, the `Grape::Exceptions::ErrorResponse` that used to be thrown.
+* An `ActiveSupport::Notifications` subscriber to `endpoint_run.grape`, `endpoint_render.grape` or `endpoint_run_filters.grape` now finds `:exception` and `:exception_object` in the payload when `error!` ends the request, as it does for any exception.
+
+`throw :error` from your own middleware or `rescue_from` handlers still works.
+
+#### `Grape::Exceptions::ErrorResponse` is no longer a `Data`
+
+Every error response builds at least two `ErrorResponse`s, and building a `Data` costs several times what building a plain object does. It is now a plain frozen class ([#3023](https://github.com/ruby-grape/grape/pull/3023)). It is still built with keywords, each optional, and still answers its readers.
+
+It no longer copies itself with `#with`, compares by value (`==`, `eql?`, `hash`), converts with `#to_h`, lists `members`, takes positional arguments or takes part in pattern matching. Build a new one with `ErrorResponse.new` instead of calling `#with`. To check a payload, read its fields, for instance with `have_attributes(status: 404, message: 'Not Found')` in a spec.
+
+#### `Grape::Middleware::Versioner::Header` answers a common Accept header without `#before`
+
+`Middleware::Base#call` copied the header versioner for every request so that `#before` could keep the env and the Accept header it scrubs in instance variables. When the API is not strict and the Accept header is one the versioner worked out when it was built (a media type it declares, `*/*` or none), it now records the media type and calls the app from the one instance the stack built ([#3017](https://github.com/ruby-grape/grape/pull/3017)). Any other request still goes through `#before`.
+
+A subclass that overrides `#before` is therefore not called for those requests. Override `#call` instead, and keep what a request needs in locals or in the env rather than in instance variables: the instance is shared by every request.
+
+#### `Grape::Middleware::Auth::Base#call` no longer goes through `#call!`
+
+`Middleware::Base#call` copied the auth middleware for every request so that `#call!` could keep the env in an instance variable, which only the strategy's block read, to find the endpoint that checks the credentials. The block now takes the endpoint from the request's env, and `#call` answers from the one instance the stack built ([#3018](https://github.com/ruby-grape/grape/pull/3018)). `#call!` still answers a request when called directly.
+
+A subclass that overrides `#call!` is therefore no longer called for a request. Override `#call` instead, and keep what a request needs in locals or in the env rather than in instance variables: the instance is shared by every request. A strategy registered with `Grape::Middleware::Auth::Strategies.add` is a middleware of its own and is not affected.
+
+#### `Grape::Middleware::Error#call` no longer goes through `#call!`
+
+`Grape::Middleware::Error` is in every endpoint's stack, and `Middleware::Base#call` copied it for every request so that `#call!` could keep the env in an ivar, which only rendering an error reads. It now answers from the one instance the stack built, and copies itself only once there is an error to render ([#3016](https://github.com/ruby-grape/grape/pull/3016)). `#call!` still answers a request when called directly.
+
+A subclass that overrides `#call!` to wrap every request is therefore no longer called for one. Override `#call` instead, and keep what a request needs in locals or in the env rather than in instance variables: the instance is shared by every request.
+
+#### A blank element of an optional Array block is validated when others are not blank
+
+An optional Array param given a block used to pass over every empty element, even one sent with others ([#3014](https://github.com/ruby-grape/grape/pull/3014)). So `[{"sku":"A"}, {}]` passed `requires :sku` inside the block, and `[{"sku":"A"}, null]` or `[{"sku":"A"}, ""]` reached the endpoint, where `params[:variants].map { |variant| variant[:sku] }` raised. Such an element is now validated like any other:
+
+```ruby
+params do
+  optional :variants, type: Array do
+    requires :sku
+  end
+end
+
+# {"variants": [{"sku": "A"}, {}]}
+# Before: 201, the second variant has no sku
+# After:  400, variants[1][sku] is missing
+
+# {"variants": [{"sku": "A"}, null]}
+# Before: 201, the endpoint gets nil
+# After:  400, variants[1] is invalid, variants[1][sku] is missing
+```
+
+A blank element that is not a Hash is also rejected in a required Array param whose block declares only optional params: `{"tags": [" ", {"label": "y"}]}` against `requires :tags, type: Array do optional :label end` now answers `tags[0] is invalid`.
+
+An Array whose elements are all blank is still passed over, as the whole param is when it is left out, and so is an optional Array scope left out of an element of an Array further up. To keep accepting placeholder elements, leave them out on the client, or declare the param without a block (`optional :variants, type: Array`) and check its elements in the endpoint.
+
+#### A header version holding a hyphen is read whole
+
+With `version ..., using: :header`, a version holding a hyphen, such as a date (`2024-06-20`) or `2.0-beta`, is now read whole ([#3013](https://github.com/ruby-grape/grape/pull/3013)). The Accept header was split at the version's last hyphen, so the request was routed to the right version but reported the wrong one:
+
+```
+# version '2024-06-20', using: :header, vendor: 'acme'
+# Accept: application/vnd.acme-2024-06-20+json
+# Before
+version            # => "20"
+env['api.vendor']  # => "acme-2024-06"
+# After
+version            # => "2024-06-20"
+env['api.vendor']  # => "acme"
+```
+
+An undeclared version of that shape now fails with `Grape::Exceptions::InvalidVersionHeader` (`API version not found.`), where it failed with `Grape::Exceptions::InvalidAcceptHeader` (`API vendor not found.`).
+
+#### An `Integer` param rejects a number with a fractional part
+
+A param of `type: Integer` now rejects a number with a fractional part instead of truncating it ([#3011](https://github.com/ruby-grape/grape/pull/3011)). A JSON body's `2.99` became `2` and `-0.5` became `0`, while the same value sent as a string, `"2.99"` in a query, was already rejected. The same applies to `Array[Integer]` and `Set[Integer]` elements. A whole number such as `1.0` still becomes `1`.
+
+```
+# {"quantity": 2.99} against `requires :quantity, type: Integer`
+# Before
+201, params[:quantity] == 2
+# After
+400, quantity is invalid
+```
+
+`types: [Integer, Float]` now answers `2.99` for that body, as it already did for the query string, where it used to answer `2`. To keep accepting and truncating fractional numbers, declare the param `type: Float` and call `to_i` on it, or pass `coerce_with: ->(value) { Integer(value.to_f) }`.
+
+#### A required param with `values` rejects `nil` in a nested scope
+
+A `requires` param with `values:` now rejects `nil` in a Hash scope, an Array scope or a `given` block, not only at the root ([#3010](https://github.com/ruby-grape/grape/pull/3010)). So does a value that coerces to `nil`, such as `""` for `type: Integer`. Before, only the root scope rejected it, so `{"lines":[{"qty":null}]}` passed the declaration below and reached the endpoint with `qty` set to `nil`:
+
+```ruby
+params do
+  requires :lines, type: Array do
+    requires :qty, type: Integer, values: 1..99
+  end
+end
+```
+
+That request now answers `400` with `lines[0][qty] does not have a valid value`. A nested param that is missing now reports that message after `is missing`, as a root param already did:
+
+```
+# Before
+address[country] is missing
+# After
+address[country] is missing, address[country] does not have a valid value
+```
+
+A child scope whose optional parent is absent is still not validated. To keep accepting `nil`, declare the param with `optional` instead.
+
+#### A mounted Rack app is an ANY route
+
+A Rack app mounted with `mount` (a lambda, Sinatra, Rails engine, anything that is not a Grape API) is now routed as an ANY route, like `route :any`, and keeps the place it was mounted in ([#3012](https://github.com/ruby-grape/grape/pull/3012)). Before, its route carried the method `ANY`, which the router has no routes for. The app was reached only as the fallback that answers `405` and auto `OPTIONS`, and that had these effects:
+
+* A `route :any, '*path'` catch-all took every request meant for the app, even one declared after the `mount`.
+* The app's env carried `grape.allowed_methods` (`["OPTIONS", "ANY"]`).
+* A method the app should have answered got `405` when a Grape route used the same path for another method.
+
+```ruby
+mount RackApp => '/rack'
+route(:any, '*path') { error!('not found', 404) }
+
+# GET /rack/x  Before: 404 from the catch-all  After: RackApp
+```
+
+```ruby
+mount RackApp => '/rack'
+get('rack/status') { 'ok' }
+
+# POST /rack/status  Before: 405 (Allow: OPTIONS, GET, HEAD)  After: RackApp
+```
+
+The mount's route reports `request_method` as `'*'` instead of `'ANY'`. Code that picks mounted apps out of `API.routes` by that value should compare with `'*'`.
+
+#### A validation error without a message says the param is invalid
+
+A `Grape::Exceptions::Validation` created without a `message:` now carries the `:invalid` message key and the message `is invalid` ([#2993](https://github.com/ruby-grape/grape/pull/2993)). Before, its `message_key` was `nil`, and its message was the exception's class name, which went into the response. A custom validator with no `default_message_key` that calls `validation_error!(attr_name)` answered:
+
+```
+# Before
+number Grape::Exceptions::Validation
+# After
+number is invalid
+```
+
+Code that checked `message_key` for `nil` to find such errors should check for `:invalid` instead. The message can be translated or overridden under `grape.errors.messages.invalid`.
+
+#### A `requires` or `optional` block needs exactly one name
+
+A `requires` or `optional` given a block now raises `ArgumentError` unless it names exactly one parameter ([#2991](https://github.com/ruby-grape/grape/pull/2991)). Both forms were accepted before, and both declared something other than what they read:
+
+```ruby
+# No name: the block's params were declared one level up, and under
+# `optional` they were still required.
+optional type: Hash do
+  requires :x
+end
+
+# Several names: `b` was required, but only `a` got the block's params,
+# and `b` was left out of `declared`.
+requires :a, :b, type: Hash do
+  requires :x
+end
+```
+
+Name the one parameter the block describes, and repeat the block for each parameter that shares its shape:
+
+```ruby
+requires :a, type: Hash do
+  requires :x
+end
+requires :b, type: Hash do
+  requires :x
+end
+```
+#### A query string Grape does not parse no longer decides the response
+
+Grape parsed the query string of every request that had one, only to look for a `?format=` override ([#2972](https://github.com/ruby-grape/grape/pull/2972)). It now parses it only when the string could name that param, and leaves it to whoever reads the params otherwise.
+
+A query string Rack refuses to parse -- nested past `Rack::Utils.param_depth_limit`, naming one key as both a value and a hash, or carrying more pairs than the parser accepts -- therefore no longer answers `400` on an endpoint that reads no params. Such a request is answered the way any other request for that route is:
+
+```ruby
+get('/ping') { 'pong' }
+
+# Before
+GET /ping?a[a][a]...=1 # => 400
+# After
+GET /ping?a[a][a]...=1 # => 200
+```
+
+An endpoint that reads the params -- one with a `params` block, or whose code asks for `params` -- still answers `400`, from the parse it asked for.
+
+#### A `redirect` body you pass carries the API's content type
+
+A body given to `redirect` with `body:` is rendered by the API's formatter, and the response now carries that format's content type instead of `text/plain` ([#2968](https://github.com/ruby-grape/grape/pull/2968)). On a JSON API, `redirect '/there', body: { message: 'moved' }` sent `{"message":"moved"}` labelled `text/plain`; it is now labelled `application/json`. The message Grape generates when no body is given is still plain text under `text/plain`.
+
+A client that picked the redirect body's parser by its `Content-Type` now gets the format the body is in; one that relied on `text/plain` for every redirect sees the API's own content type on those that pass a body.
+
+#### Every `middleware` entry ends in its block
+
+Each entry `API.middleware` returns now ends in the block its `use`, `insert`, `insert_before` or `insert_after` was given, `nil` when there was none ([#2967](https://github.com/ruby-grape/grape/pull/2967)). A Proc passed as the last argument used to be taken for the block, so `use SomeMiddleware, ->(env) { ... }` built the middleware without its callable and raised `ArgumentError`.
+
+```ruby
+use SomeMiddleware, 'abc'
+
+# Before
+API.middleware # => [[:use, SomeMiddleware, 'abc']]
+# After
+API.middleware # => [[:use, SomeMiddleware, 'abc', nil]]
+```
+
+Code that reads these entries should take the last element as the block.
+
+#### Minimum required Ruby is now 3.3.1
+
+Grape no longer supports Ruby 3.3.0; 3.3.1 is now the minimum (`required_ruby_version = '>= 3.3.1'`) ([#2966](https://github.com/ruby-grape/grape/pull/2966)). Ruby 3.3.0 rejects forwarding an anonymous parameter (`*`, `**`, `&`) from inside a block, which Grape does, so Grape could not be loaded on it; 3.3.1 fixed that. Upgrade your runtime to Ruby 3.3.1 or newer before bumping Grape.
+
+#### An Array param given a block rejects elements that are not a Hash
+
+The block of `requires :items, type: Array do ... end` declares the keys of each element, and an element that is not a Hash now answers `400` with `items[1] is invalid` ([#2957](https://github.com/ruby-grape/grape/pull/2957)). It used to fail only where the block required a key of it, so a block whose params are all optional let a String, a number or a nested Array through to the endpoint, and an Array nested one level too deep in a nested Array scope passed validation and then made `declared` raise. An Array whose elements are all blank — `nil`, `''`, `false`, `[]`, `{}` — is still passed over; a blank element sent with others is not (see above).
+
+Where a block does require a key, the element's own error now comes first:
+
+```
+# Before
+items[0][key] is missing
+# After
+items[0] is invalid, items[0][key] is missing
+```
+
+An API that accepts elements of other shapes in the same list should declare the param without a block (`type: Array`) and check the elements itself.
+
+#### A collection with multiple member types rejects what it cannot coerce
+
+A param declared as a collection whose members may be of several types — `type: Array[Integer, String]`, or such a collection listed in `types:` — is now validated the way a collection of one type is ([#2955](https://github.com/ruby-grape/grape/pull/2955)). A value that is not an Array, and an Array holding a member none of the types accepts, answer `400` with `is invalid`. The first used to reach the endpoint as `nil`, even under `requires`, and the second with an internal `Grape::Validations::Types::InvalidValue` object where the member was. A `nil` value or an empty String is still `nil`.
+
+A `coerce_with` method given to such a param is now handed every value, as it is for `types:`, instead of only an Array. A method that splits a String into the collection works now; one that only ever expected an Array may raise on a String, which answers `400`.
+#### A route's failure entity no longer presents a String error message
+
+An entity named for a status in a route's `failure` (or `http_codes`) is now applied to a structured `error!` message only — a Hash or an object — and a String message renders as it does without one ([#2953](https://github.com/ruby-grape/grape/pull/2953)). An entity exposing attributes cannot read any off a String, so `error!('Unauthorized', 401)` under `desc failure: [[401, 'Unauthorized', API::Error]]` raised while rendering and was answered with a `500`; it now answers `401` with the message. An entity written to take the String itself is no longer handed one; give it a Hash to expose from instead:
+
+```ruby
+# Before
+class API::Error < Grape::Entity
+  expose(:message) { |message, _options| message }
+end
+error!('Unauthorized', 401)
+
+# After
+class API::Error < Grape::Entity
+  expose :message
+end
+error!({ message: 'Unauthorized' }, 401)
+```
+#### `lint!` checks every response once, from the API that is served
+
+`lint!` and `Grape.config.lint` used to put `Rack::Lint` in each endpoint's stack, which missed two kinds of response: the 404 the router answers for a path nothing matches, and those of a Rack app mounted with `mount`, which the router calls directly. A single `Rack::Lint` around the router now checks every response the API gives ([#2960](https://github.com/ruby-grape/grape/pull/2960)). Two things follow from that.
+
+`lint!` counts only at the top level of the API that is served. Declared inside a namespace, or in an API mounted into another one, it no longer does anything: declare it on the API you serve, or set `Grape.config.lint`.
+
+A test suite that lints its API may start raising `Rack::Lint::LintError` where a mounted Rack app breaks the Rack SPEC — returning a frozen headers Hash, for instance — or where a spec calls the API with an incomplete env:
+
+```ruby
+# Before: passed under Grape.config.lint
+MyAPI.call({})
+
+# After
+MyAPI.call(Rack::MockRequest.env_for('/'))
+```
+#### The header versioner's `api.*` env values are frozen
+
+`version ..., using: :header` now answers the Accept headers most requests send from a table built once, so every request sending the same header is handed the same parsed media type ([#2936](https://github.com/ruby-grape/grape/pull/2936)). The strings it writes into the env — `api.type`, `api.subtype`, `api.vendor`, `api.version` and `api.format` — are therefore frozen, as is `Grape::Util::MediaType` itself. Code that altered one of them in place now raises `FrozenError`; build a new String instead:
+
+```ruby
+# Before
+env['api.version'] << '-beta'
+
+# After
+env['api.version'] = "#{env['api.version']}-beta"
+```
+
+#### `Grape::Util::Lazy` no longer builds a tree of value wrappers
+
+A configuration read is now a single `Grape::Util::Lazy::Value` holding the configuration it was read from and the path of keys walked into it, rather than a node in a tree mirroring the whole `with:` Hash ([#2950](https://github.com/ruby-grape/grape/pull/2950)). `Grape::Util::Lazy::ValueHash`, `Grape::Util::Lazy::ValueArray` and `Grape::Util::Lazy::ValueEnumerable` are gone, as are `Value#reached_by` and `Value#fetch`; `Value#access_keys` is now `Value#path`. The `configuration` DSL is unchanged — only code reaching into these internals is affected.
+
+`Grape::Util::EndpointConfiguration#evaluate` also answers the configuration Hash itself now, instead of rebuilding a copy on each call. Mutating what `configuration` returns inside an endpoint therefore persists for later requests, where it used to be discarded:
+
+```ruby
+# Before: mutated a throwaway copy
+# After: mutates the configuration every later request reads
+get '/x' do
+  configuration[:list] << 'item'
+end
+
+# Treat it as read-only, or copy it first
+get '/x' do
+  list = configuration[:list].dup
+  list << 'item'
+end
+```
+
+### Upgrading to >= 4.0.0
+
+#### A positional options Hash is no longer accepted by `auth`, `http_basic` or `desc`
+
+Deprecated in 3.3 ([#2723](https://github.com/ruby-grape/grape/pull/2723), [#2728](https://github.com/ruby-grape/grape/pull/2728)). These take keyword arguments:
+
+```ruby
+# Before
+auth :custom, { realm: 'r', opaque: 'o' }
+http_basic({ realm: 'API' })
+desc 'Get users', { detail: 'Returns every user' }
+
+# After
+auth :custom, realm: 'r', opaque: 'o'
+http_basic realm: 'API'
+desc 'Get users', detail: 'Returns every user'
+```
+
+A leftover positional Hash now raises `ArgumentError` rather than warning. A call that already used bare keyword syntax, or a block, is unaffected.
+
+#### `http_digest` is removed
+
+`Grape::Middleware::Auth::DSL#http_digest` is gone. Calling it now raises `NoMethodError` while the API class is being defined.
+
+Nothing it could reach has existed since **2.0.0**, which removed `Rack::Auth::Digest` along with Grape's `:http_digest` strategy ([#2361](https://github.com/ruby-grape/grape/pull/2361)) after Rack 3 dropped digest authentication. The method survived that removal and kept recording its settings happily, so an API declaring `http_digest` still booted — and then raised `Grape::Exceptions::UnknownAuthStrategy` on the *first request*, from inside the middleware build, as an uncaught exception rather than a response. Failing while the class is defined is the point of removing it.
+
+**If you registered your own `:http_digest` strategy**, it still works; call `auth` directly:
+
+```ruby
+Grape::Middleware::Auth::Strategies.add(:http_digest, MyDigestStrategy, ->(settings) { [settings[:realm]] })
+
+class API < Grape::API
+  auth :http_digest, realm: 'API Authorization', opaque: 'secret' do |username|
+    # ...
+  end
+end
+```
+
+The removed method supplied two defaults that `auth` does not, so pass them explicitly if you were relying on them: `realm` defaulted to `'API Authorization'`, and `opaque` to `'secret'` (nested inside `realm` when `realm` was itself a Hash).
+
+#### A `rescue_from` handler can no longer return or throw a Hash
+
+Deprecated in 3.3. A handler that returned `{ message:, status:, headers: }` was read as an error response. Say what you mean instead:
+
+```ruby
+# Before
+rescue_from :all do |e|
+  { message: e.message, status: 500, headers: {} }
+end
+
+# After
+rescue_from :all do |e|
+  error!(e.message, 500)
+end
+```
+
+A handler that still returns such a Hash no longer has it interpreted: the response is an invalid one, which Grape answers with its framework default rather than with the status the Hash carried.
+
+#### Middleware `Options` no longer answer `[]`, and the `DEFAULT_OPTIONS` constants are gone
+
+Deprecated in 3.3, when middleware options moved to per-class `Options` `Data` value objects. `Grape::Middleware::Error::DEFAULT_OPTIONS`, `Grape::Middleware::Formatter::DEFAULT_OPTIONS` and `Grape::Middleware::Versioner::Base::DEFAULT_OPTIONS` are removed, as is Hash-style access on the `Options` objects themselves:
+
+```ruby
+# Before
+middleware.config[:default_format]
+Grape::Middleware::Formatter::DEFAULT_OPTIONS[:default_format]
+
+# After
+middleware.config.default_format
+Grape::Middleware::Formatter::Options.new.default_format
+```
+
+`Grape::Middleware::Base` still supports a plain `DEFAULT_OPTIONS` Hash on middleware that declares no `Options` class, so third-party middleware written against that path is unaffected.
+
+#### `Grape::Router.normalize_path` is removed
+
+Deprecated in 3.3. Use `Grape::Util::PathNormalizer.call`, which is where the implementation has lived since.
+
+#### Custom validators read `@options`, not `@option`
+
+`Grape::Validations::Validators::Base` kept `@option` as an alias of `@options` from 3.2 with a note to drop it at the next major. A custom validator reading `@option` now sees `nil`:
+
+```ruby
+# Before
+def validate_param!(attr_name, params)
+  return if params[attr_name].length <= @option
+  # ...
+end
+
+# After
+def validate_param!(attr_name, params)
+  return if params[attr_name].length <= @options
+  # ...
+end
+```
+
+`@options`, `option_value` and the rest of the documented custom-validator surface are unchanged.
+#### `Grape::ErrorFormatter.formatter_for` answers `nil` for an unregistered format
+
+It used to take the API's `default_error_formatter` as a third argument and end in `default_error_formatter || Grape::ErrorFormatter::Txt` — a global registry implementing the caller's fallback policy. It is now a lookup, the same shape as `Grape::Parser.parser_for`:
+
+```ruby
+Grape::ErrorFormatter.formatter_for(:json)     # => Grape::ErrorFormatter::Json
+Grape::ErrorFormatter.formatter_for(:unknown)  # => nil, was Grape::ErrorFormatter::Txt
+```
+
+Passing a third argument now raises `ArgumentError`. The fallback moved to `Grape::Middleware::Error`, which applies the API's `default_error_formatter` and resolves that to `Grape::ErrorFormatter::Txt` when the API set none.
+
+Error responses are unchanged, including the precedence: a formatter registered for the requested format still wins over the API's `default_error_formatter`, which applies to formats that have none of their own.
+
+Two things follow at definition time, where the lookup's fallback used to hide them.
+
+`default_error_formatter` names an error formatter, so a name nothing is registered under is now an error rather than a silent `Txt`:
+
+```ruby
+default_error_formatter :jsonn
+# => Grape::Exceptions::UnknownErrorFormatter: unknown error formatter: jsonn
+```
+
+`format` names a *format*, and a format with no error formatter of its own is ordinary, so it still succeeds — but the stored setting is now `nil` rather than `Grape::ErrorFormatter::Txt`:
+
+```ruby
+content_type :xls, 'application/vnd.ms-excel'
+format :xls
+MyAPI.default_error_formatter # => nil, was Grape::ErrorFormatter::Txt
+```
+
+The middleware supplies `Txt` at render time, so error responses are unchanged; the setting is only visible if you read it back.
+
+#### `error_formatter` now requires a formatter
+
+`error_formatter` takes the formatter positionally or as `with:`. Called with neither, it used to register `nil` for that format:
+
+```ruby
+error_formatter :json # no formatter given
+```
+
+`Grape::ErrorFormatter.formatter_for` hands a registered value back as-is, so the format resolved to no formatter at all — and every error response in that format then failed to render and came back as the failsafe `500 Internal Server Error` in `text/plain`, whatever status and message the API had asked for.
+
+That call now raises `ArgumentError` when the API is defined, rather than on the first error the API tries to render. Pass the formatter:
+
+```ruby
+error_formatter :json, with: MyErrorFormatter
+```
+
+An API that already passes one is unaffected, and a format with no `error_formatter` of its own keeps falling back to `default_error_formatter` and then to `Grape::ErrorFormatter::Txt`.
+
+#### `grape/testing` is no longer loaded unless you require it
+
+`Grape::Testing` has been documented as opt-in since 3.3 — "intended for test environments only and is not loaded by default" — but it was never excluded from Grape's eager load, so `require 'grape'` installed it anyway. It extends `Grape::Endpoint` with `before_each` / `reset_before_each` and prepends a wrapper around `Grape::Endpoint#run` that every request goes through.
+
+It is now excluded, so the documented behaviour is the actual one. If your suite calls `Grape::Endpoint.before_each` without requiring the module first, it will now raise `NoMethodError`. Add the require the 3.3 note already asked for to your test helper:
+
+```ruby
+require 'grape/testing'
+```
+
+Nothing else changes: the module's API is the same, and referencing the `Grape::Testing` constant still autoloads it.
+
+#### The versioner's `pattern` option has been removed
+
+`Grape::Middleware::Versioner::Base` accepted a `pattern` option, which `Versioner::Path` matched the candidate version segment against before recording it. It dates from the original versioner (2010), where it was the only way to decide whether the first path segment was a version — there was no declared version list yet.
+
+`versions:` took that job over: a segment is checked against the versions the API declared, and an unrecognized one answers 404. `pattern` was never connected to the `version` DSL that arrived later — `DSL::Routing#version` does not accept a `pattern:` keyword and `Endpoint#build_stack` never passed one — so it could only be reached by inserting the middleware yourself:
+
+```ruby
+use Grape::Middleware::Versioner::Path, versions: %w[v1], pattern: /v.+/
+```
+
+which also meant forgoing what `version` does for routing. That now raises `ArgumentError: unknown keyword: :pattern`, at the point the middleware is built rather than on a request.
+
+`Grape::Middleware::Versioner::Base::DEFAULT_OPTIONS` no longer carries a `:pattern` key, and `Versioner::Base#pattern` is gone. An API that declares its version through `version 'v1', using: :path` is unaffected — it never had a pattern.
+
+The one behaviour that disappears with it: a hand-wired versioner could use `pattern` to say "this segment is not a version at all", leaving `api.version` unset and letting the request through, as distinct from "unknown version", which answers 404. Nothing in the `version` DSL exposed that distinction, and `versions:` cannot express it. If you relied on it, match the segment yourself in a small middleware ahead of the versioner rather than through this option.
+
+#### An error response carries a backtrace only when one was asked for
+
+Every error response used to materialize the raised exception's backtrace, even though the built-in error formatters render it only under `rescue_from ..., backtrace: true`. It is now assembled only when that option is set, since `Exception#backtrace` builds an Array of location Strings on every call and a Grape error is raised deep inside the request stack.
+
+`Grape::Exceptions::ErrorResponse#backtrace` is therefore an empty Array on the payload handed to an error formatter unless the API asked for backtraces. The built-in formatters are unaffected — they already guarded on the `include_backtrace:` argument they are passed.
+
+A custom error formatter that reads `error.backtrace` while ignoring that argument will now see an empty Array. Read it from the exception instead, which still travels on the payload:
+
+```ruby
+# before
+error.backtrace
+
+# after — equivalent regardless of the rescue options
+error.original_exception&.backtrace || []
+```
+
+`Grape::Exceptions::ErrorResponse.from_exception` no longer stores a backtrace either, for the same reason; `original_exception` is set, so nothing is lost.
+
+#### An endpoint that declares helpers is served from a subclass of `Grape::Endpoint`
+
+Helpers were included into the singleton class of the per-request copy of an endpoint, which meant every request built a fresh singleton class and re-ran `Module#include`. They are now included once, when the API is compiled, into a subclass owned by that endpoint, and each request copies an instance of it.
+
+The endpoint exposed as `env['api.endpoint']` (and handed to `before`/`after` filters, `rescue_from` blocks and middleware) is therefore an instance of that subclass rather than of `Grape::Endpoint` itself, for any endpoint whose scope declares `helpers`. Endpoints with no helpers are unaffected.
+
+Inheritance-based checks are unchanged:
+
+```ruby
+endpoint.is_a?(Grape::Endpoint)      # => true, as before
+endpoint.kind_of?(Grape::Endpoint)   # => true, as before
+Grape::Endpoint === endpoint         # => true, as before
+```
+
+Exact-class checks are not, and have no equivalent — use `is_a?`:
+
+```ruby
+# before => true, now => false
+endpoint.instance_of?(Grape::Endpoint)
+endpoint.class == Grape::Endpoint
+
+# before => "Grape::Endpoint", now => "Grape::Endpoint(helpers)"
+endpoint.class.name
+endpoint.class.to_s
+```
+
+The subclass carries a temporary name (`Module#set_temporary_name`), so it never answers `nil` to `#name` or renders as a bare `#<Class:0x...>` address. Code that logs or groups by `endpoint.class.name` — an error tracker keying on it, say — will see `Grape::Endpoint(helpers)` for these endpoints, and should match on `is_a?` if it needs to treat both kinds alike.
+#### The `desc` `default` key is renamed to `default_response`
+
+grape-swagger reads a route's default response as `route.default_response`, a name Grape never defined — the `desc` DSL wrote the key as `default`, and the reader for it resolved to `Hash#default` on the route's options bag, so it answered `nil` for every route. A default response declared the way the README documented it therefore never reached the generated OpenAPI document.
+
+The key, the `desc` block method and the route reader are all named `default_response` now. `default` still works everywhere it did, and warns:
+
+```ruby
+# deprecated
+desc 'Delete a widget' do
+  default code: 'default', message: 'unexpected error'
+end
+desc 'Delete a widget', default: { code: 'default' }
+route.default
+
+# preferred
+desc 'Delete a widget' do
+  default_response code: 'default', message: 'unexpected error'
+end
+desc 'Delete a widget', default_response: { code: 'default' }
+route.default_response
+```
+
+A `desc 'x', default: ...` keyword is stored under `:default_response`, so a route carries one key under one name. Code reading `route.options[:default]` directly — rather than through the reader — has to read `route.options[:default_response]` instead.
+#### A group's type check is now the same for `requires` and `optional`
+
+The rule that a group declaration needs a type (`Array`, `Hash`, `JSON` or `Array[JSON]`) was implemented twice — once in `ParamsScope#new_scope` for `requires`, once inline in `optional` — and the two copies had drifted. `optional` read the type before merging in the attributes of an enclosing `with`, so a group type supplied by `with` was invisible to it:
+
+```ruby
+params do
+  with(type: Hash) do
+    requires(:a) { requires :b, type: String }   # accepted
+    optional(:a) { optional :b, type: String }   # raised MissingGroupType
+  end
+end
+```
+
+Both are accepted now. A group with no type from either the declaration or an enclosing `with` still raises `Grape::Exceptions::MissingGroupType`, and an unsupported type still raises `Grape::Exceptions::UnsupportedGroupType`.
+
+One case stops raising. `optional :a, using: SomeEntity do ... end` — a block *and* `using:` — raised `MissingGroupType` before; it now ignores the block and documents the entity's params, which is what `requires` has always done with that combination. If you have such a declaration, the block was never going to be applied; delete it or drop `using:`.
+#### The `presence` option of `requires` and `optional` is deprecated
+
+`presence` is how the params DSL tells the validation pipeline that a parameter is required. It travelled as a key written into the same options Hash that carries an API's own options, so an API could set it — and got opposite results depending on which method it was passed to, because `requires` overwrote it while nothing overwrote it for `optional`:
+
+```ruby
+requires :a, presence: false   # ignored: :a is still required
+optional :a, presence: true    # honoured: :a is actually required
+```
+
+Both still resolve exactly as they did, and now emit a deprecation warning. Declare the parameter with `requires` to make it required and `optional` to make it optional; the option will be ignored outright in a future release.
+
+#### A `with` block's `message` now reaches the presence validator
+
+The presence entry for a `requires` was built before the attributes of an enclosing `with` were merged in, so a group-level `message:` never reached it. It does now:
+
+```ruby
+params do
+  with(message: 'custom missing') do
+    requires :a
+  end
+end
+
+# before: "a is missing"
+# now:    "a custom missing"
+```
+
+An API that sets `message:` on a `with` block and relies on the generic wording for missing parameters will see its own message instead.
+
+#### `refresh_already_mounted` is no longer a `mount` option
+
+`mount` accepted an undocumented `refresh_already_mounted` option that replaced any endpoint already mounted for the same base API instead of adding a second one. It exists for Grape's own re-mounting machinery: when a class-level method runs after a `mount`, `Grape::API.refresh_mount_step` replays that mount, and replaying it naively would duplicate the endpoint.
+
+That decision belongs to the replay, not to the call, so the endpoint replacement moved into the private `refresh_mounted_api` which is the only caller that ever wanted it. Nothing changes for the re-mounting itself.
+
+Passing the option to `mount` still works and now warns; it will be ignored in a future release. There is no replacement, because an API has no reason to ask for it — mounting the same app twice on purpose is still two endpoints.
+
+#### A `mount` target is recognised as a mapping only when it is a `Hash`
+
+`mount` decided between "a Hash of app => path" and "a bare app mounted at /" with `mounts.respond_to?(:each_pair)`. A `Struct` and an `OpenStruct` answer that too, and neither can express an app => path mapping — their keys are member names — so a Rack app that happened to be one was read as a mapping and silently mounted its own field value as a path:
+
+```ruby
+RackStruct = Struct.new(:name) do
+  def call(env) = [200, {}, ['ok']]
+end
+
+mount RackStruct.new('x')
+
+# before: mounted at "/x", because :name => 'x' was read as app => path
+# now:    mounted at "/", as the Rack app it is
+```
+
+The test is now `mounts.is_a?(Hash)`. Every Hash-like people pass — `HashWithIndifferentAccess`, `Hashie::Mash`, `ActiveSupport::OrderedOptions` — subclasses `Hash` and is unaffected.
+
+#### `use`, `helpers`, `rescue_from` and other registrations no longer reach routes defined above them
+
+A route captures the middleware, helpers, callbacks and rescue handlers registered above it. That was already true most of the time, but not always: `Grape::Util::InheritableSetting#point_in_time_copy` copied a scope's stackable store and its rescue-handler maps shallowly, so the nested Arrays and Hashes stayed shared with the scope. A registration added *after* an endpoint was defined therefore still reached that endpoint — but only when the key already held at least one registration when the endpoint was defined, since otherwise the scope allocated a fresh store only for itself.
+
+The outcome depended on something the API never expressed:
+
+```ruby
+class A < Grape::API
+  use Middleware1
+  get('/x') { }      # endpoint defined here
+  use Middleware2    # applied to GET /x
+end
+
+class B < Grape::API
+  get('/x') { }      # endpoint defined here
+  use Middleware2    # NOT applied to GET /x
+end
+```
+
+`A` and `B` state the same thing and behaved differently. Both now behave like `B`. The same held for `rescue_from` declared below a route.
+
+**What can break.** An API that declares `use` (or `helpers`, a filter such as `before`, or `rescue_from`) below its routes and relies on it applying to them. That arrangement only ever worked when an earlier registration for the same key happened to seed the stack, so it was never dependable, but code written against it will now see the middleware or helper silently not run.
+
+**The fix is to move the registration above the routes it should cover**, which is where Grape's documentation has always placed it:
+
+```ruby
+class A < Grape::API
+  use Middleware1
+  use Middleware2
+  get('/x') { }
+end
+```
+
+Nothing changes for the ordinary arrangement — registrations declared before a route, or inherited from an enclosing namespace or a mounting API, still apply exactly as before, including values an enclosing scope gains after the nested scope was created.
+#### `rescue_from :grape_exceptions` now outranks a catch-all class handler
+
+`rescue_from :grape_exceptions` is an opt-in to keep Grape's own errors rendering with their own status — a validation failure answers `400` rather than whatever the application's catch-all returns.
+
+It only ever worked against `rescue_from :all`. Written as a class instead, a catch-all is a *registered* handler, which `Grape::Middleware::Error` consults first, and Grape's exceptions are `StandardError`s — so the opt-in was silently inert:
+
+```ruby
+rescue_from StandardError do
+  error!('server error', 500)
+end
+rescue_from :grape_exceptions
+```
+
+| request | before | 4.0 |
+| --- | --- | --- |
+| fails parameter validation | **500** `server error` | `400` |
+| raises an application error | `500` `server error` | unchanged |
+
+**What can break.** An API that registers a catch-all as a class *and* opts into `:grape_exceptions` will now answer Grape's own status for Grape's own errors, where it previously answered the catch-all's. That is what the opt-in asks for, so the change makes the two spellings agree — but a client or test asserting the catch-all's status for a validation failure will see the new one.
+
+Precedence is unchanged in every other case. A handler registered for a specific Grape exception class is more precise than the opt-in and still wins:
+
+```ruby
+rescue_from Grape::Exceptions::ValidationErrors do
+  error!('unprocessable', 422)   # still runs
+end
+rescue_from StandardError { ... }
+rescue_from :grape_exceptions
+```
+
+Application errors still reach the catch-all, `rescue_from :all` behaves as before, and `Grape::Exceptions::InvalidVersionHeader` is still never rescued, so version cascading keeps working. An API that does not use `rescue_from :grape_exceptions` is unaffected.
+
+#### `redirect` renders its default message as plain text
+
+The `redirect` API set the content type to `text/plain`, but delegated body rendering to the formatter. With an API defaulting to JSON, a `redirect` would render the body as JSON with a `text/plain` content-type header.
+
+```ruby
+class API < Grape::API
+  format :json
+  get('/r') { redirect '/there' }
+end
+```
+
+```
+Content-Type: text/plain
+
+"This resource has been moved temporarily to /there."
+```
+
+Grape now renders the message it generates with the txt formatter, so the body is the plain sentence the content type claims:
+
+```
+Content-Type: text/plain
+
+This resource has been moved temporarily to /there.
+```
+
+**What can break.** Code that parses a redirect body — `JSON.parse(response.body)` on a redirect succeeded before and now raises — or a test asserting on the encoded form. On a JSON API the `Location` header, the status and the `Content-Type` are unchanged, so a client that follows the redirect is unaffected.
+
+On an API whose formatter cannot serialize a String, such as `format :xml`, `redirect` did not work at all: the formatter raised, and the response was a `500` carrying an error document and no `Location` header. Those APIs now get the `302` and the `Location` they always should have.
+
+This applies only to the message Grape generates. A body you pass yourself is still rendered by the API's formatter, unchanged:
+
+```ruby
+redirect '/there', body: { message: 'moved' }   # still {"message":"moved"} on a JSON API
+```
+
+#### Path params are tagged UTF-8 instead of ASCII-8BIT
+
+Params captured from the request path — `route_param`, `:id`-style segments, splats — now come back tagged `UTF-8`. They used to carry the `ASCII-8BIT` encoding of Rack's `PATH_INFO`, because Mustermann decodes the path against that raw string and nothing re-tagged the result. Query and body params were already `UTF-8`, since Rack tags those itself.
+
+**Why UTF-8.** Nothing obliges a client to send it — HTTP treats the request target as octets, and Rack's SPEC has CGI keys carry non-ASCII as `ASCII-8BIT`. UTF-8 is a convention rather than a guarantee. But it is the convention Rack itself already applies to everything *except* the path: `Rack::QueryParser#unescape` decodes the query string and form bodies with `URI.decode_www_form_component(string, Encoding::UTF_8)`, which tags the result without validating it.
+
+One request carrying the same invalid octets in three places, before this change:
+
+| source | encoding | `valid_encoding?` |
+| --- | --- | --- |
+| query — `?q=%C3%28` | `UTF-8` | `false` |
+| form body — `form=%C3%28` | `UTF-8` | `false` |
+| path — `/%C3%28` | **`ASCII-8BIT`** | `true` |
+
+The bytes are equally malformed in all three; only the label differed. The path reads `true` merely because `ASCII-8BIT` considers every byte sequence valid. So this change is not Grape adopting an outside convention — it is Grape agreeing with the library handing it the request. The path param was the odd one out only because Mustermann decodes against `PATH_INFO` directly and never had Rack's `unescape` applied to it.
+
+Grape does exactly what Rack does: re-tag, do not validate. The bytes are untouched, so octets that are *not* UTF-8 stay detectably invalid rather than being scrubbed into something the client never sent. (Rails takes the same approach for path captures — `ActionDispatch::Journey::Router` force-encodes each one to UTF-8 after unescaping.)
+
+**What this fixes.** An API's own declarations used to disagree with themselves depending on where a value arrived from — a binary string never equals the UTF-8 literal it was written as:
+
+```ruby
+params { requires :id, type: String, values: ['café'] }
+```
+
+| request | before | 4.0 |
+| --- | --- | --- |
+| `GET /?id=café` (query) | `200` | unchanged |
+| `GET /café` (path) | `400 "id does not have a valid value"` | `200` |
+
+The same held for `same_as`, `except_values`, and any comparison an endpoint made against a non-ASCII literal. Serialization was affected too: a non-ASCII path param rendered into a JSON response emitted an encoding warning from the `json` gem, and is slated to raise there in json 3.0.
+
+**What can break.** Only the encoding tag changes; the bytes are untouched, and an invalid byte sequence stays invalid rather than being scrubbed. Comparisons against pure-ASCII strings are unaffected. Code that relied on a path param being binary — concatenating one with genuinely binary data, for instance — can now raise `Encoding::CompatibilityError`, and should call `.b` on the param to opt back into binary:
+
+```ruby
+params[:id].b + binary_blob
+```
+
+An application that worked around the old behavior with its own `force_encoding(Encoding::UTF_8)` needs no change; that call is now a no-op.
+
+**Restoring the old behavior wholesale.** If enough code depends on binary path params that patching each site is impractical, a `before` filter at the top of your root API re-tags them all back. `env['grape.routing_args']` holds exactly the params that came from the path, so query and body params are left alone, and `before` runs ahead of validation, so declarations see the binary strings too:
+
+```ruby
+class API < Grape::API
+  before do
+    env['grape.routing_args']&.each_key do |key|
+      next if key == :route_info
+
+      value = params[key]
+      params[key] = value.b if value.is_a?(String)
+      params[key] = value.map(&:b) if value.is_a?(Array)
+    end
+  end
+
+  # ... mounts and routes
+end
+```
+
+Declared in the root API, this covers mounted APIs too. Treat it as a migration aid rather than a permanent setting: it restores the inconsistency this change fixes, so `values: ['café']` will keep rejecting `GET /café` while accepting `?id=café`.
+#### A failed error rendering answers 500 instead of escaping the middleware stack
+
+When Grape could not render an error response — an error formatter handed a payload it cannot serialize, most often — the exception escaped every middleware above Grape and reached the application server. Rendering runs inside `Grape::Middleware::Error#call!`'s own `rescue` clause, so that clause did not cover it.
+
+Grape now answers `500` instead: first retrying the API's format with the framework's own `Internal Server Error` message, then falling back to a bare `text/plain` body if even that cannot be rendered.
+
+This mirrors what `ActionDispatch::ShowExceptions#render_exception` does in Rails: try the application's own error rendering, and fall back to a bare `500 Internal Server Error` in `text/plain` when that rendering is itself broken.
+
+**What can break.** Code that observed these exceptions by letting them propagate — a test asserting `expect { get '/' }.to raise_error`, most directly — no longer sees them raised. The exception is published on the rack env instead, under both Grape's own key and the conventional one that error trackers read:
+
+```ruby
+env[Grape::Env::RACK_EXCEPTION]  # 'rack.exception' — what trackers collect
+env[Grape::Env::GRAPE_EXCEPTION] # 'grape.exception' — same object, Grape's key
+```
+
+An error tracker mounted as Rack middleware above Grape therefore keeps reporting these with no change on your side: sentry-ruby, for one, collects `env['rack.exception'] || env['sinatra.error']` for exactly this case — an exception that was handled rather than raised. The failure is also written to `rack.errors`, so it lands in the server log even with no tracker installed.
+
+**Opting out.** To keep the pre-4.0 behaviour and have the exception propagate out of the middleware stack:
+
+```ruby
+Grape.configure do |config|
+  config.raise_rendering_errors = true
+end
+```
+
+With this on, the failsafe never runs: the exception is re-raised untouched, so neither env key is set and nothing is written to `rack.errors` — whatever caught it before catches it again.
+
+Exceptions that no `rescue_from` matches still propagate exactly as before; only rendering failures changed.
+
+#### `Array`/`Set` of an unsupported type is rejected when the API is defined
+
+Declaring a collection whose element type Grape cannot coerce — `type: Array[Foo]` or `type: Set[Foo]` where `Foo` is neither a primitive, a structure, nor a valid custom type — now raises as soon as the `params` block is evaluated, i.e. while the API class is being loaded:
+
+```
+ArgumentError: type Foo should support coercion via `[]`
+```
+
+This is a **load-time** failure. An application that boots today can fail to boot on 4.0 without any request being made.
+
+A valid custom type is one that implements a class-level `parse` taking exactly one argument (`Grape::Validations::Types.custom?`). A class that implements neither that nor `[]` was never coercible, so such a declaration was always a misconfiguration — but it used to surface much later, and much less clearly.
+
+**What changed.** Nothing about which types are supported; only *when* the element coercer is built. [#2817](https://github.com/ruby-grape/grape/pull/2817) made `ArrayCoercer` build it eagerly in the constructor rather than memoizing it on first use, because coercers are shared across requests and must not create state at request time. Building it eagerly means the unsupported element type is discovered while the route is being defined.
+
+Previously the coercer was built on the first request that actually supplied the parameter. An API that declared the parameter but was never sent one — a documentation-only declaration, for instance — never built it and never raised. When a request did supply it, the same `ArgumentError` was raised inside the coercer and swallowed by the coercion validator into a generic `400`:
+
+```json
+{ "error": "foo is invalid" }
+```
+
+so the misconfiguration presented as a puzzling per-request validation failure rather than as a broken declaration.
+
+Note that the non-collection form has always raised at definition time:
+
+| declaration | before | 4.0 |
+| --- | --- | --- |
+| `type: Foo` | `ArgumentError` when defined | unchanged |
+| `type: Array[Foo]` | accepted; `400 "is invalid"` per request | `ArgumentError` when defined |
+
+The collection form's leniency was an accident of the lazy build, not a supported behavior. The two are now consistent.
+
+**Fixing a declaration that now raises.** Give the type a one-argument `parse`, which is what makes it a custom type:
+
+```ruby
+class Foo
+  def self.parse(value)
+    new(value)
+  end
+end
+
+params { requires :foos, type: Array[Foo] }
+```
+
+Or coerce the collection yourself, in which case Grape does not build an element coercer at all:
+
+```ruby
+params { requires :foos, type: Array[Foo], coerce_with: ->(value) { Array(value).map { |v| Foo.new(v) } } }
+```
+
+Or, if the class is only there to describe the parameter and never to coerce it — the common case behind this break — drop `type:` and document it instead:
+
+```ruby
+params { requires :foos, documentation: { type: Foo } }
+```
+
+Defining `self.[]` on the class silences the load-time error, because that is the escape hatch for `dry-types` objects, but it does **not** make the type coercible: such a parameter still fails with `400 "is invalid"` on every request. Prefer `parse` or `coerce_with`.
+
+#### The `cascade` getter returns the configured value
+
+Calling `cascade` with no argument used to report whether cascading had been *configured at all* (`cascade false` still read back as `true`, contradicting the actual runtime behavior, which was correctly disabled). It now returns the configured value itself — `true`/`false` as set, or `true` when never set. Code that used the getter to detect "was `cascade` called" rather than "does this API cascade" must track that separately.
+#### A cascading route hands over to every remaining route
+
+A route that answers with `X-Cascade: pass` — what a version mismatch does by default — now hands the request to every remaining matching route, in registration order, before the router gives up. Previously it handed over to the *last* route registered for the path and stopped there, so with three or more routes sharing a path (typically three mounted API versions) every route in between was unreachable.
+
+Two consequences:
+
+* **A middle version is now served.** `mount v1; mount v2; mount v3` alongside a catch-all `route :any, '*path'` answered `406 API version not found` for v2, while v1 and v3 worked; v2 is now served.
+* **An unmatched version reaches a catch-all.** When a catch-all ANY route is present, a request whose version matches nothing now falls through to it instead of surfacing the versioner's `406`, which is what `cascade: true` (the default) asks for. Declare `version ..., cascade: false` to keep the hard 406 — that path is unchanged and never consults the catch-all.
+#### `Grape::Util::InheritableValues` has been removed
+
+Inheritable settings no longer layer a scope's values over a store handed down from the enclosing scope. Each `Grape::Util::InheritableSetting` now keeps only what its own scope assigned, and resolves a lookup by walking `#parent` — the same move `Grape::Util::StackableValues` got in [#2823](https://github.com/ruby-grape/grape/pull/2823), and the reason `Grape::Util::InheritableValues` no longer has anything to do.
+
+Resolution is unchanged in every observable way: the nearest scope wins, a scope may override an inherited value with an explicit `nil`, and a value an enclosing scope gains later is still visible through scopes already nested inside it. Only the class is gone. Nothing in Grape referenced it outside `InheritableSetting`; code that constructed one directly should keep a plain Hash per scope and resolve against the parent chain.
+
+#### `forward_match` is no longer exposed on routes
+
+`forward_match` is an internal, construction-time detail that decides how a route matches incoming paths (a prefix match for mounted Rack apps, the compiled pattern otherwise). It is now passed to `Grape::Router::Route` as a keyword argument and derived from the mounted app instead of being carried in the route's options.
+
+As a result it is no longer readable through `route.options[:forward_match]` or the `route.forward_match` reader — both previously returned the flag. Nothing in Grape consumed either, so this only affects code that introspected routes directly; there is no replacement, as the value is now purely internal.
+
+#### `Grape::Endpoint.new` takes `http_methods:` instead of `method:`
+
+`Grape::Endpoint.new` now receives the HTTP verb(s) under the `http_methods:` keyword instead of `method:`, matching the name used everywhere else. If you build endpoints directly (uncommon — this is an internal API normally driven by the routing DSL), rename the keyword:
+
+```ruby
+# before
+Grape::Endpoint.new(settings, method: :get, path: '/foo', for: self)
+
+# after
+Grape::Endpoint.new(settings, http_methods: :get, path: '/foo', for: self)
+```
+
+Relatedly, an endpoint's public `options` Hash no longer carries `:method` or `:path`. Nothing in Grape read `:method`, and the only reader of `:path` was an internal test; both values are available from the route instead — `route.request_method` for the verb and `route.path` for the (compiled) path, which is what grape-swagger and other introspection already use. The raw definition-time path array is no longer exposed on the endpoint.
+
+#### `Grape::Endpoint.new` takes `api:` instead of `for:`
+
+The keyword identifying the API an endpoint belongs to has been renamed from `for:` — a reserved word whose value can't be referenced as a local — to `api:`:
+
+```ruby
+# before
+Grape::Endpoint.new(settings, http_methods: :get, path: '/foo', for: my_api)
+
+# after
+Grape::Endpoint.new(settings, http_methods: :get, path: '/foo', api: my_api)
+```
+
+The owning API is no longer carried on the endpoint's public `options` Hash — `endpoint.options[:for]` is gone. Use the new `endpoint.api` reader instead.
+
+#### Route metadata is exposed through readers, not the `options` Hash
+
+A route's computed metadata — `version`, `namespace`, `prefix`, `requirements`, `anchor` and `settings` — is now exposed through plain readers instead of being merged into the route's `options` Hash. `namespace`, `prefix` and `settings` are passed to `Grape::Router::Route` as explicit keyword arguments; `version`, `anchor` and `requirements` are read from the route's pattern (they shape how it matches).
+
+The readers are unchanged — keep using them:
+
+```ruby
+route.version       # => 'v1'
+route.namespace     # => '/things'
+route.prefix        # => 'api'
+route.requirements  # => {}
+route.anchor        # => true
+route.settings      # => { ... }
+```
+
+What changed is the raw bag. `route.options` now holds only what was declared for the route, so it no longer carries the *computed* values for these keys — `route.options[:version]`, `[:namespace]`, `[:prefix]` and `[:settings]` return `nil`. Nothing in Grape or grape-swagger read them that way (grape-swagger uses the `route.prefix` and `route.settings` readers). `requirements` and `anchor` — which can be supplied as route options (e.g. a mount's `anchor: false`) — are covered separately below: they too are now first-class endpoint inputs and likewise no longer appear in `route.options`. The effective value always comes from the reader.
+
+#### `Grape::Endpoint` no longer accepts a `format:` keyword
+
+The `:format` member was removed from the endpoint's internal `Options`. Nothing ever passed `format:` to `Grape::Endpoint.new` — `config.format` was always `nil` — so this has no runtime effect (the `(.:format)`/`(.json)` route suffix comes from `Grape::Path`, not from this value). But `Grape::Endpoint.new(..., format: …)` now raises `unknown keyword: :format` instead of silently ignoring it.
+
+`Grape::Router::Pattern#initialize` no longer accepts `format:` either. It was never given a non-`nil` value — a route's `:format` capture comes from the path suffix built by `Grape::Path`, not from the pattern — so the keyword was dead. `Grape::Router::Pattern.new(..., format: …)` now raises `unknown keyword: :format`.
+
+#### `desc` no longer populates `namespace_setting(:description)`
+
+`desc` used to store its settings under both the route scope (`route_setting(:description)`) and the namespace scope (`namespace_setting(:description)`). The namespace copy was write-only — the namespace scope isn't wired for inheritance and nothing in Grape or grape-swagger ever read it — so `desc` now writes only the route scope. `namespace_setting(:description)` returns `nil`; read a route's description through `route_setting(:description)` or the `route.description` reader.
+#### `Grape::Router::Route#params` no longer takes an argument
+
+`Route#params` used to do two jobs depending on its argument: `route.params(input)` extracted param values from a matched request path, while `route.params` (no argument) returned the route's declared param definitions. These are now separate methods:
+
+```ruby
+route.params            # declared param definitions, keyed by name (unchanged)
+route.params_for(input) # values extracted from a matched path (was route.params(input))
+```
+
+The no-argument form is unchanged — grape-swagger and other documentation consumers keep using `route.params`. Only the value-extraction form moved, and it is internal to the router; if you called `route.params(input)` directly, switch to `route.params_for(input)`.
+
+#### `params` is a first-class endpoint input, no longer in `route.options`
+
+A route's declared params were previously carried inside the `route_options` bag and reachable as `route.options[:params]`. They are now composed into their own endpoint input (`Grape::Endpoint::Options` gains a `:params` member and `Grape::Endpoint.new` a `params:` keyword) and exposed only through `route.params`. `route.options[:params]` now returns `nil`. Nothing in Grape or grape-swagger read it that way — grape-swagger uses the `route.params` method — so this only affects code that reached into the options Hash for params directly.
+
+#### `requirements` and `anchor` are first-class endpoint inputs, no longer in `route.options`
+
+Like `params` above, a route's `requirements` and `anchor` were previously carried inside the `route_options` bag. They are now composed into their own endpoint inputs (`Grape::Endpoint::Options` gains `:requirements` and `:anchor` members, and `Grape::Endpoint.new` gains `requirements:` and `anchor:` keywords) and exposed only through the `route.requirements` and `route.anchor` readers. `route.options[:requirements]` and `route.options[:anchor]` now return `nil` — including for a mount's `anchor: false`. Nothing in Grape or grape-swagger read them that way, so this only affects code that reached into the options Hash for these keys directly.
+
+#### Params state is recorded through `InheritableSetting` accessors
+
+The state accumulated by `params` / `contract` blocks — validator instances, declared params, param documentation and reusable named params — is now recorded and read through dedicated accessors on `Grape::Util::InheritableSetting` (`validations` / `add_validation`, `declared_params` / `add_declared_params`, `params_documentation` / `add_params_documentation`, `named_params` / `add_named_params`, `reset_validations!`) instead of raw `namespace_stackable` keys, following the same move made for rescue handlers. The keys' storage is unchanged for now, so `namespace_stackable[:validations]` and friends still return the same values, but they should be considered internal.
+
+Related contract changes, none with known external consumers:
+
+* `Grape::Endpoint#inherit_settings` now takes the parent `Grape::Util::InheritableSetting` instead of that setting's raw `namespace_stackable` store.
+* The endpoint's request-time validator snapshot moved from `route_setting(:saved_validations)` to `route_setting(:validations)`, symmetric with `route_setting(:declared_params)`. The vestigial `saved_` prefix dated back to the 2014 settings refactor. Neither key appears in `route.settings`, as before.
+* `Grape::Util::InheritableSetting#api_class` (a Hash nothing in Grape ever wrote to) and `#point_in_time_copies` (only ever used internally) are removed.
+#### Callback filters are recorded through `InheritableSetting` accessors
+
+The filter blocks registered by `before`, `before_validation`, `after_validation`, `after` and `finally` are now recorded and read through dedicated accessors on `Grape::Util::InheritableSetting` — `add_callback(name, block)` to record, and `callbacks` returning a Hash keyed by the DSL method names (`callbacks[:before]`, `callbacks[:finally]`, …) — instead of raw `namespace_stackable` keys, following the same move made for rescue handlers. The keys' storage is unchanged for now, so `namespace_stackable[:befores]` and friends still return the same values, but the pluralized keys should be considered internal.
+#### Rescue configuration is recorded through `InheritableSetting` accessors
+
+The remaining rescue state written by `rescue_from` is now recorded and read through dedicated accessors on `Grape::Util::InheritableSetting`, completing the encapsulation started with `rescue_handlers` / `add_rescue_handlers`:
+
+* `rescue_options` / `add_rescue_options(options)` replace `namespace_stackable[:rescue_options]`. The reader absorbs the nearest-scope-wins convention (previously the `&.last` at the read site) and returns a single `Grape::DSL::RescueOptions` or `nil`, not the raw stack.
+* `add_all_rescue_handler(handler)`, `add_grape_exceptions_rescue_handler(handler)` and `add_internal_grape_exceptions_rescue_handler(handler)` replace the direct `namespace_inheritable` writes for the `rescue_from :all` / `:grape_exceptions` / `:internal_grape_exceptions` meta selectors; each records its handler and flips the associated flags.
+* `rescue_all?`, `rescue_grape_exceptions?`, `all_rescue_handler`, `grape_exceptions_rescue_handler` and `internal_grape_exceptions_rescue_handler` replace the corresponding `namespace_inheritable` reads. The two `?` readers return `false` (rather than `nil`) when never set; `Grape::Middleware::Error` only ever used them in boolean context, so behavior is unchanged.
+
+The keys' storage is unchanged for now, so `namespace_stackable[:rescue_options]` and the `namespace_inheritable` keys still return the same values, but they should be considered internal.
+#### Content negotiation state is recorded through `InheritableSetting` accessors
+
+The state written by the `content_type`, `format`, `formatter`, `parser` and `error_formatter` DSL methods is now recorded and read through dedicated accessors on `Grape::Util::InheritableSetting` (`content_types` / `add_content_type`, `formatters` / `add_formatter`, `parsers` / `add_parser`, `error_formatters` / `add_error_formatter`) instead of raw `namespace_stackable` keys, following the same move made for rescue handlers. Each writer records one single-entry Hash per registration and each reader absorbs the `namespace_stackable_with_hash` deep-merge convention, returning the merged name => value Hash (nearest scope wins) or `nil` when nothing is registered. The keys' storage is unchanged for now, so `namespace_stackable[:content_types]` and friends still return the same values, but they should be considered internal.
+#### `represent` registrations are recorded through `InheritableSetting` accessors
+
+The model-class => entity-class registrations written by `represent` are now recorded and read through dedicated accessors on `Grape::Util::InheritableSetting` (`representations` / `add_representation(model_class, entity_class)`) instead of raw `namespace_stackable` keys, following the same move made for rescue handlers. The reader absorbs the `namespace_stackable_with_hash` deep-merge convention, returning the merged Hash (nearest scope wins) or `nil` when nothing is registered. The key's storage is unchanged for now, so `namespace_stackable[:representations]` still returns the same values, but it should be considered internal.
+
+Also removed: the `namespace_stackable[:representations] ||= []` line in `Grape::Endpoint#initialize`. It was provably inert — `Grape::Util::StackableValues#[]` always returns an array (a frozen empty one for never-written keys), which is truthy, so the `||=` assignment could never execute. No settings state changes as a result.
+#### Middleware and helper registrations are recorded through `InheritableSetting` accessors
+
+The state written by the middleware DSL (`use`, `insert`, `insert_before`, `insert_after`) and by `helpers` is now recorded and read through dedicated accessors on `Grape::Util::InheritableSetting` (`middleware` / `add_middleware`, `helpers` / `add_helper`) instead of raw `namespace_stackable` keys, following the same move made for rescue handlers. The keys' storage is unchanged for now, so `namespace_stackable[:middleware]` and `namespace_stackable[:helpers]` still return the same values, but they should be considered internal.
+
+One micro-change: the `middleware` DSL reader dropped its `|| []` fallback — `Grape::Util::StackableValues#[]` never returns `nil`, so the fallback was dead code. When no middleware is registered the reader now returns the shared frozen empty array instead of a fresh mutable one; no caller in Grape or grape-swagger mutates the returned array.
+#### Namespace and mount-path registrations are recorded through `InheritableSetting` accessors
+
+The `Grape::Namespace` objects registered by the `namespace` DSL (and its `group` / `resource` / `resources` / `segment` aliases) and the mount path recorded by `mount` are now written and read through dedicated accessors on `Grape::Util::InheritableSetting` instead of raw `namespace_stackable` keys, following the same move made for rescue handlers:
+
+* `namespaces` / `add_namespace(namespace)` replace `namespace_stackable[:namespace]` (not to be confused with the pre-existing `namespace` reader, which returns the namespace-settings store).
+* `namespace_path` returns the normalized joined path prefix, absorbing the `Grape::Namespace.joined_space_path(...)` call previously spelled out at the read sites, and `namespace_requirements` returns the requirements declared by registered namespaces, absorbing the `filter_map(&:requirements)`.
+* `mount_path` / `add_mount_path(path)` replace `namespace_stackable[:mount_path]`; the reader absorbs the outermost-wins convention (previously the `.first` at the read site in `Endpoint#build_stack`).
+
+The keys' storage is unchanged for now, so `namespace_stackable[:namespace]` and `namespace_stackable[:mount_path]` still return the same values, but they should be considered internal.
+#### Contract key maps are recorded through `InheritableSetting` accessors
+
+The Dry::Schema key maps registered by `contract` blocks are now recorded and read through dedicated accessors on `Grape::Util::InheritableSetting` (`contract_key_maps` / `add_contract_key_map(key_map)`) instead of the raw `namespace_stackable[:contract_key_map]` key, following the same move made for rescue handlers. The key's storage is unchanged for now, so `namespace_stackable[:contract_key_map]` still returns the same values, but it should be considered internal.
+#### Format and error-response defaults are recorded through `InheritableSetting` accessors
+
+The nearest-wins scalars written by the `format`, `default_format`, `default_error_formatter` and `default_error_status` DSL methods are now recorded and read through dedicated accessors on `Grape::Util::InheritableSetting` (`format` / `format=`, `default_format` / `default_format=`, `default_error_formatter` / `default_error_formatter=`, `default_error_status` / `default_error_status=`) instead of raw `namespace_inheritable` keys — the first batch of the `namespace_inheritable` cleanup, following the pattern used for `namespace_stackable`. Since these are overriding assignments rather than stacking registrations, the writers use plain `=` instead of the `add_*` naming. The keys' storage is unchanged for now, so `namespace_inheritable[:format]` and friends still return the same values, but they should be considered internal.
+#### Versioning state is recorded through `InheritableSetting` accessors
+
+The nearest-wins scalars written by the `version`, `prefix` and `cascade` DSL methods are now recorded and read through dedicated accessors on `Grape::Util::InheritableSetting` (`version` / `version=`, `version_options` / `version_options=`, `root_prefix` / `root_prefix=`, `cascade` / `cascade=`) instead of raw `namespace_inheritable` keys. `cascade` is presence-sensitive — an explicit `nil` is distinct from never-set — so the accessor family includes `cascade_defined?`, absorbing the `namespace_inheritable.key?(:cascade)` checks previously spelled out in `DSL::Routing#cascade` and `Grape::API::Instance#cascade?`. The keys' storage is unchanged for now, so `namespace_inheritable[:version]` and friends still return the same values, but they should be considered internal.
+#### Routing scope flags are recorded through `InheritableSetting` accessors
+
+The flags flipped by `do_not_route_head!`, `do_not_route_options!`, `do_not_document!` and `lint!` are now recorded and read through dedicated accessors on `Grape::Util::InheritableSetting` (`!` writers, `?` readers) instead of raw `namespace_inheritable` keys. The `?` readers return `false` (rather than `nil`) when never set; every consumer only used them in boolean context, so behavior is unchanged. The keys' storage is unchanged for now, so `namespace_inheritable[:do_not_route_head]` and friends still return the same values, but they should be considered internal.
+#### `build_params_with` and `auth` are recorded through `InheritableSetting` accessors
+
+The params-builder strategy written by `build_with` (both the API-level and the params-block DSL) and the authentication configuration written by the `auth` DSL are now recorded and read through dedicated accessors on `Grape::Util::InheritableSetting` (`build_params_with` / `build_params_with=`, `auth` / `auth=`) instead of raw `namespace_inheritable` keys, completing the per-key `namespace_inheritable` cleanup. The keys' storage is unchanged for now, so `namespace_inheritable[:build_params_with]` and `namespace_inheritable[:auth]` still return the same values, but they should be considered internal.
+
+#### `InheritableSetting`'s raw stores are internal, except `namespace_stackable`
+
+The per-key encapsulation documented in the sections above is now enforced where the ecosystem allows: `Grape::Util::InheritableSetting#namespace_inheritable` is protected and `#namespace_stackable_with_hash` is private — every `namespace_inheritable` key is reachable only through its dedicated accessor.
+
+`#namespace_stackable` deliberately **remains public**: grape-swagger reads it directly (`swagger_documentation_adder.rb` reads `[:namespace]` and `[:mount_path]`, `token_owner_resolver.rb` reads `[:helpers]`, and `request_param_parsers/route.rb` walks the `StackableValues#inherited_values` chain to collect per-scope params). Treat it as read-only from outside Grape and prefer the dedicated accessors (`namespaces`, `mount_paths`, `helpers`, …) for everything they cover; the reader may be narrowed in a future major once grape-swagger has migrated. The `route`, `namespace` and `global` scratch stores (backing `route_setting` / `namespace_setting` / `global_setting`) also remain public and unchanged.
+
+Two supporting changes:
+
+* `Router::Pattern::Path` no longer receives a merged dump of both stores; `Endpoint#to_routes` passes the new `InheritableSetting#path_settings` snapshot — a `Grape::Util::InheritableSetting::PathSettings` value object (`Data`) — which carries exactly the six values `Path` reads (full mount-path stack, root prefix, format, raw content-types stack, version, version options) with always-present keys. `Path`'s `key?`-presence guards became nil-tolerant truthiness checks — equivalent under the snapshot. `Endpoint#prepare_default_path_settings` is removed.
+* `InheritableSetting#mount_paths` is added, exposing the full mount-path stack (one entry per mount level, outermost first), complementing `#mount_path`, which returns only the outermost entry.
+
+#### `Grape::Util::StackableValues` is a read-only view, not a store
+
+Stackable registrations now live on `Grape::Util::InheritableSetting` itself, as one plain Hash of `key => Array` per scope, and inheritance is resolved by walking `#parent` — the same recursion `#rescue_handlers` already used. Previously the registrations lived in a `StackableValues` instance which maintained its own parallel chain through `#inherited_values`, so every scope carried two links to its parent.
+
+`InheritableSetting#namespace_stackable` still returns a `Grape::Util::StackableValues`, still resolves reads across the chain, and still exposes `#new_values` / `#inherited_values` / `#keys` / `#to_hash`, so the grape-swagger call sites listed above keep working unchanged. What changed:
+
+* It is now a **view built on demand**, not the backing store. Each call returns a new instance, so the object is no longer identity-stable across calls, and writing to it registers nothing.
+* `StackableValues#[]=` and `#delete` are removed — the class is read-only. Registration happens through the semantic `add_*` accessors on `InheritableSetting`.
+* `StackableValues.new` now takes `(new_values, inherited_values)` instead of `(inherited_values = nil)`.
+* `Grape::Util::BaseInheritable` is removed. It existed only to share plumbing between `StackableValues` and `InheritableValues`; with the former no longer a store, its contents moved into `Grape::Util::InheritableValues`, whose public behavior is unchanged (its now-unused `#keys` is dropped).
+
+Settings semantics are otherwise deliberately identical, including two pre-existing quirks worth knowing about, since neither is fixed here:
+
+* A stack reader returns the backing Array itself when only the current scope registered anything (a frozen empty Array when nothing is registered anywhere), so callers must treat the result as read-only.
+* `#point_in_time_copy` copies the per-scope Hash shallowly, so the per-key Arrays stay shared with the source. A registration made on a scope *after* an endpoint was defined in it is therefore still visible to that endpoint — but only when the same key already had a registration when the endpoint was defined. This is why `use SomeMiddleware` written below a route can still apply to it.
+
+### Upgrading to >= 3.3
+
+#### Minimum required Ruby is now 3.3
+
+Grape no longer supports Ruby 3.2; 3.3 is now the minimum (`required_ruby_version = '>= 3.3'`). Upgrade your runtime to Ruby 3.3 or newer before bumping Grape.
+
+#### `mustermann-grape` is no longer a dependency
+
+Grape's path-pattern grammar (previously the `mustermann-grape` gem) now lives in Grape itself as `Grape::Router::MustermannPattern`, and Grape depends on `mustermann` directly. This is transparent for normal Grape usage.
+
+The inlined class is no longer registered as a Mustermann type, so if your app called `Mustermann.new(pattern, type: :grape)` and relied on Grape loading `mustermann-grape` for you, add it to your Gemfile explicitly:
+
+```ruby
+gem 'mustermann-grape'
+```
+
+#### `Grape::Exceptions::ValidationErrors.new` keyword renamed `errors:` → `exceptions:`
+
+`Grape::Exceptions::ValidationErrors#initialize` now takes its input array under the `exceptions:` keyword instead of `errors:`. The kwarg accepts a mix of `Grape::Exceptions::Validation` and `Grape::Exceptions::ValidationArrayErrors` instances; `ValidationArrayErrors` wrappers are flattened internally via `flat_map(&:errors)`. The `errors` reader on the constructed instance (the grouped `{params => [Validation, ...]}` Hash) is unchanged.
+
+```ruby
+# before
+Grape::Exceptions::ValidationErrors.new(errors: [validation, validation_array_errors], headers:)
+
+# after
+Grape::Exceptions::ValidationErrors.new(exceptions: [validation, validation_array_errors], headers:)
+```
+
+#### `Grape::Exceptions::ValidationErrors` no longer mixes in `Enumerable`
+
+`Grape::Exceptions::ValidationErrors` no longer includes `Enumerable` and no longer defines a public `#each`. The Enumerable surface (`#each`, `#map`, `#select`, `#to_a`, etc.) was undocumented and untested; the documented accessors — `#errors`, `#full_messages`, `#message`, `#as_json` — are unchanged.
+
+If a `rescue_from` block iterated over the exception instance, switch to `#errors`:
+
+```ruby
+# before
+rescue_from Grape::Exceptions::ValidationErrors do |e|
+  e.each { |attribute, error| ... }
+end
+
+# after
+rescue_from Grape::Exceptions::ValidationErrors do |e|
+  e.errors.each do |attributes, errs|
+    errs.each { |error| ... }
+  end
+end
+```
+
+#### `rescue_from` rejects meta selectors mixed with exception classes
+
+`rescue_from` used to silently drop additional exception classes when its first argument was a meta selector (`:all`, `:grape_exceptions`, `:internal_grape_exceptions`). It now raises `ArgumentError` so the misuse is caught at definition time:
+
+```ruby
+# previously: MyError was silently dropped — only :all took effect
+rescue_from :all, MyError, with: :handler
+
+# now: ArgumentError ("rescue_from :all does not accept additional arguments")
+# split into two declarations instead:
+rescue_from :all, with: :handler
+rescue_from MyError, with: :other_handler
+```
+
+Calls that only use one meta selector or only use exception classes (the documented forms) are unaffected.
+
+#### `auth` and `http_basic` now take keyword arguments
+
+`Grape::Middleware::Auth::DSL#auth` and `#http_basic` now accept their options as keyword arguments instead of a positional `Hash`. Calls using bare keyword syntax or a block are unaffected:
+
+```ruby
+http_basic realm: 'API' do |u, p|
+  # ...
+end
+
+auth :my_strategy, realm: 'API', &proc
+```
+
+Passing a positional options `Hash` still works but is deprecated and will be removed in a future release:
+
+```ruby
+# deprecated
+http_basic({ realm: 'API' })
+auth :my_strategy, { realm: 'API' }
+
+# preferred
+http_basic(realm: 'API')
+auth :my_strategy, realm: 'API'
+```
+
+#### Middleware options now route through per-class `Options` `Data` value objects
+
+`Grape::Middleware::Error`, `Grape::Middleware::Formatter`, and `Grape::Middleware::Versioner::Base` each declare an `Options` `Data.define` and route their `**options` kwargs through it on `initialize`. This means **unknown kwargs now raise `ArgumentError`** instead of being silently swallowed:
+
+```ruby
+# previously: silently swallowed (Formatter doesn't actually read :rescue_options)
+Grape::Middleware::Formatter.new(app, rescue_options: { backtrace: true })
+
+# now: ArgumentError (unknown keyword: :rescue_options)
+```
+
+Each `Options` class accepts exactly the kwargs the middleware actually reads. The supported sets:
+
+- `Middleware::Error::Options`: `all_rescue_handler`, `base_only_rescue_handlers`, `content_types`, `default_error_formatter`, `default_message`, `default_status`, `error_formatters`, `format`, `grape_exceptions_rescue_handler`, `internal_grape_exceptions_rescue_handler`, `rescue_all`, `rescue_grape_exceptions`, `rescue_handlers`, `rescue_options`.
+- `Middleware::Formatter::Options`: `content_types`, `default_format`, `format`, `formatters`, `parsers`.
+- `Middleware::Versioner::Base::Options`: `content_types`, `format`, `mount_path`, `pattern`, `prefix`, `version_options`, `versions`.
+
+The `Hash`-based `options` reader on `Grape::Middleware::Base` continues to return a frozen Hash representation of the Data (`config.to_h.freeze`) for back-compat with subclasses that read `options[:key]`. A new `config` reader exposes the typed Data instance — prefer the named accessors going forward:
+
+```ruby
+# back-compat (still works)
+options[:format]
+
+# preferred
+config.format
+# or, on converted middlewares, just `format` (provided via def_delegators)
+```
+
+`Options#[]` is defined as a Hash-style shim with a deprecation warning so legacy `data[:key]` callers get a migration nudge:
+
+```ruby
+# emits Grape.deprecator warning
+Grape::Middleware::Error::Options.new[:format]
+```
+
+#### `DEFAULT_OPTIONS` constants on converted middlewares are deprecated
+
+`Grape::Middleware::Error::DEFAULT_OPTIONS`, `Grape::Middleware::Formatter::DEFAULT_OPTIONS`, and `Grape::Middleware::Versioner::Base::DEFAULT_OPTIONS` still exist as a frozen `Hash` representation of the `Options` defaults (`Options.new.to_h.freeze`), for back-compat with any code that referenced these constants directly. They will be removed in a future release; introspect the `Options` `Data` class itself instead.
+
+#### `Grape::Middleware::Globals` removed
+
+`Grape::Middleware::Globals` and the three env constants it set (`Grape::Env::GRAPE_REQUEST`, `Grape::Env::GRAPE_REQUEST_HEADERS`, `Grape::Env::GRAPE_REQUEST_PARAMS`) have been deleted. The middleware was introduced in 2013 (commit `9987090b`) but never mounted by Grape's own stack — the `Grape::Request` it built is now constructed directly inside `Grape::Endpoint`. Nothing in `lib/` read those env keys.
+
+If you mounted `Grape::Middleware::Globals` in your own Rack stack to populate `env['grape.request']` for downstream middleware, replicate it locally:
+
+```ruby
+class MyGlobals
+  def initialize(app); @app = app; end
+
+  def call(env)
+    request = Grape::Request.new(env)
+    env['grape.request'] = request
+    env['grape.request.headers'] = request.headers
+    env['grape.request.params'] = request.params if env['rack.input']
+    @app.call(env)
+  end
+end
+```
+
+The original implementation is preserved in git history at [`6b4111b3:lib/grape/middleware/globals.rb`](https://github.com/ruby-grape/grape/blob/6b4111b3/lib/grape/middleware/globals.rb).
+
+#### `error_formatter` now receives a `Grape::Exceptions::ErrorResponse` value object
+
+Custom error formatters now receive a frozen `Grape::Exceptions::ErrorResponse` as the `error:` keyword argument, alongside three request-time context kwargs. The new signature:
+
+```ruby
+def call(error:, env: nil, include_backtrace: false, include_original_exception: false)
+```
+
+`error` is the same value object the middleware uses internally, with `status` / `message` / `headers` / `backtrace` / `original_exception` accessors. The two `include_*` booleans are forwarded from the matching `rescue_from` options (previously buried inside `options[:rescue_options]`).
+
+Existing positional formatters break and need to be updated:
+
+```ruby
+# Before
+error_formatter :txt, ->(message, backtrace, options, env, original_exception) { ... }
+
+module CustomFormatter
+  def self.call(message, backtrace, options, env, original_exception)
+    ...
+  end
+end
+
+# After — pick fields off `error`
+error_formatter :txt, ->(error:, **) { "[#{error.status}] #{error.message}" }
+
+module CustomFormatter
+  def self.call(error:, **)
+    { status: error.status, message: error.message, backtrace: error.backtrace }
+  end
+end
+```
+
+Migration:
+
+| Old positional arg | New |
+| --- | --- |
+| `message` | `error.message` |
+| `backtrace` | `error.backtrace` |
+| `original_exception` | `error.original_exception` |
+| `options[:rescue_options][:backtrace]` | `include_backtrace` (kwarg) |
+| `options[:rescue_options][:original_exception]` | `include_original_exception` (kwarg) |
+| `env` | `env` (kwarg, still passed) |
+| HTTP status | `error.status` (newly exposed) |
+| Response headers | `error.headers` (newly exposed) |
+
+The remaining middleware-options keys (`default_status`, `format`, `rescue_handlers`, …) were framework-internal and have never been part of the documented contract.
+
+The change resolves [#2527](https://github.com/ruby-grape/grape/issues/2527): the HTTP `status` and the response `headers` are now part of the formatter contract, so JSON:API–style error bodies (which embed the status code) and header-aware formatters can be written without reaching into `env[Grape::Env::API_ENDPOINT]`.
+
+#### `version` now takes explicit keyword arguments
+
+`version` previously accepted `**options` and silently ignored any keys it didn't use. It now declares its options explicitly:
+
+```ruby
+def version(*args, using: :path, cascade: true, parameter: 'apiver', strict: false, vendor: nil, &block)
+```
+
+Passing an unrecognised keyword now raises `ArgumentError` instead of being swallowed. The most common offender is `format:` — it was never a `version` option (response format is set with `format`/`default_format`, and header-versioned requests carry the format in their `Accept` header), but the old splat let `version 'v1', using: :header, vendor: 'x', format: :json` through as a no-op.
+
+```ruby
+# Before — `format:` silently ignored
+version 'v1', using: :header, vendor: 'x', format: :json
+
+# After
+version 'v1', using: :header, vendor: 'x'   # set responses with `format :json` / `default_format :json`
+```
+
+Recognized keys are `using:`, `cascade:`, `parameter:`, `strict:`, `vendor:`. Calls using only those are unaffected.
+
+#### `Grape::Middleware::Base#options` is now frozen
+
+`@options` is frozen at the end of `Grape::Middleware::Base#initialize` (after `merge_default_options`). The hash is initialized once and treated as immutable for the lifetime of the middleware. Custom middleware that mutates `options[...]` at runtime will now raise `FrozenError`.
+
+If your custom middleware was patching its own options on the fly:
+
+```ruby
+# Before
+class MyMiddleware < Grape::Middleware::Base
+  def before
+    options[:flag] = compute_flag
+    # ...
+  end
+end
+
+# After — store mutable runtime state on a dedicated ivar
+class MyMiddleware < Grape::Middleware::Base
+  def before
+    @flag = compute_flag
+    # ...
+  end
+end
+```
+
+Reading `options[...]` is unchanged.
+
+#### Throw `:error` payloads are now `Grape::Exceptions::ErrorResponse`
+
+The payload thrown via `throw :error, ...` is now a `Grape::Exceptions::ErrorResponse` value object instead of a `Hash`. If you `catch(:error)` and inspect the payload, switch from `payload[:status]` to `payload.status` (or `payload[:message]` to `payload.message`, etc.). User-defined `throw :error, hash` calls continue to work — `Middleware::Error#error_response` coerces Hashes, exceptions, and `ErrorResponse` instances at the boundary.
+
+Returning or throwing a `Hash` with `:message`, `:status`, and `:headers` from a `rescue_from` handler is now deprecated and will be removed in a future release. Use `error!(...)` or return/throw a `Grape::Exceptions::ErrorResponse` instead.
+
+#### `Grape::Request#grape_routing_args` has been removed
+
+`grape_routing_args` was previously public to support third-party `params_builder` extensions, which have since been removed. With no remaining callers, the method has been removed. If you were calling it externally, read `env[Grape::Env::GRAPE_ROUTING_ARGS]` directly.
+
+#### `endpoint_run_filters.grape` notification no longer fired for empty filter lists
+
+`ActiveSupport::Notifications` subscribers listening to `endpoint_run_filters.grape` will no longer receive an event when the filter list for a given phase (`:before`, `:before_validation`, `:after_validation`, `:after`, `:finally`) is empty. Previously every phase emitted an event on every request regardless of whether any filters were registered. If you relied on these events to infer per-phase timing, subscribe to `endpoint_run.grape` (which always fires once per request) or register a no-op filter to keep the phase instrumented.
+
+#### `Grape::Endpoint.before_each` moved to `Grape::Testing`
+
+`Grape::Endpoint.before_each` and `Grape::Endpoint.reset_before_each` are now only available after requiring `grape/testing`. This module is intended for test environments only and is not loaded by default.
+
+Add the following to your test helper:
+
+```ruby
+require 'grape/testing'
+```
+
+The `before_each` method now always requires a block — calling it without one raises `ArgumentError`. To clear registered hooks, use the new dedicated `reset_before_each` method:
+
+```ruby
+# Before
+after { Grape::Endpoint.before_each nil }
+
+# After
+after { Grape::Endpoint.reset_before_each }
+```
+
+#### `Grape::Endpoint#logger` now returns the API's configured logger
+
+Calling `logger` inside a route handler, filter (`before` / `before_validation` / `after_validation` / `after` / `finally`), or `rescue_from` block previously raised `NoMethodError` unless the application defined a helper:
+
+```ruby
+class MyAPI < Grape::API
+  logger Logger.new($stdout)
+
+  helpers do
+    def logger
+      MyAPI.logger
+    end
+  end
+end
+```
+
+`Grape::Endpoint` now exposes `#logger` directly, so the helper is no longer necessary:
+
+```ruby
+class MyAPI < Grape::API
+  logger Logger.new($stdout)
+  # logger is now reachable inside route handlers, filters, and rescue_from blocks
+end
+```
+
+**Helper override still wins.** Helpers are mixed into the endpoint's singleton class via `singleton_class.include(@helpers)`, and singleton-class methods take precedence over instance methods on `Grape::Endpoint`. If your application already defines `logger` in a `helpers` block (or a module included via `helpers`), that definition continues to override `Endpoint#logger`. You can safely keep the helper or remove it — both paths produce the same result for the canonical `MyAPI.logger` case above.
+
+**Behaviour change for code that didn't define a helper.** If your code references `logger` inside an endpoint context *without* a corresponding `helpers` definition, that call previously raised `NoMethodError` and now returns the API's configured logger. This is almost always the intended behaviour, but if you were relying on the `NoMethodError` (for instance to short-circuit logging in test environments via `rescue NoMethodError`), update your code to check `respond_to?(:logger)` or to gate logging on a feature flag.
+
+#### Exceptions raised inside `rescue_from` blocks are now caught
+
+Previously, an exception raised inside a `rescue_from` block was uncaught and bubbled up to Rack, producing the Rack default 500 page. The framework now catches and routes it:
+
+1. If the re-raised exception's class has a registered `rescue_from` handler, that handler runs (one redispatch only — a second raise stops the chain).
+2. If the re-raised exception is a `Grape::Exceptions::Base` subclass, it is rendered via the default Grape error path with its own `status` and `message`.
+3. Otherwise, the original exception is exposed on `env['grape.exception']` for upstream Rack middleware to observe, and the response is a generic `Grape::Exceptions::InternalServerError` (`500 Internal Server Error`) — the original exception's message is **not** rendered to the API consumer.
+
+This means deliberate re-raises in a `rescue_from` block (e.g. translating one exception class into another) now compose with the rest of your `rescue_from` configuration, and accidental crashes (typos, `NoMethodError`, …) no longer leak internal detail to API consumers.
+
+The framework deliberately does **not** log unhandled internal exceptions itself — formatting and destination are application concerns. To log, forward to an error tracker, or customize the response shape for these errors, register a `rescue_from :internal_grape_exceptions` handler:
+
+```ruby
+rescue_from :internal_grape_exceptions do |e|
+  Sentry.capture_exception(e)
+  error!({ message: 'Something went wrong' }, 500)
+end
+```
+
+When this handler is registered, the framework hands the original exception to you and you own the response shape entirely.
+
+If you relied on the old behaviour and want raw exception messages exposed in development, register a catch-all handler:
+
+```ruby
+rescue_from StandardError do |e|
+  error!({ message: e.message, class: e.class.name }, 500)
+end
+```
+
+
+### Upgrading to >= 3.2
+
+#### Rack parameter parsing errors now raise `Grape::Exceptions::RequestError`
+
+Rack errors raised during parameter parsing (malformed multipart, parameter type conflicts, encoding issues, etc.) are now wrapped in `Grape::Exceptions::RequestError` instead of their previous specific exception classes (`Grape::Exceptions::EmptyMessageBody`, `Grape::Exceptions::TooManyMultipartFiles`, `Grape::Exceptions::TooDeepParameters`, `Grape::Exceptions::ConflictingTypes`, `Grape::Exceptions::InvalidParameters`). Those classes have been removed.
+
+If you rescue any of these specific exceptions, update your rescue clauses to use `Grape::Exceptions::RequestError`:
+
+```ruby
+# Before
+rescue Grape::Exceptions::ConflictingTypes, Grape::Exceptions::TooDeepParameters => e
+  # ...
+
+# After
+rescue Grape::Exceptions::RequestError => e
+  # ...
+```
+
+The error message is now forwarded directly from Rack rather than translated through Grape's locale system. On Rack 3, all Rack bad-request errors share the `Rack::BadRequest` marker module and are covered by a single rescue.
+
+#### `endpoint_run_validators.grape` notification no longer fired when there are no validators
+
+`ActiveSupport::Notifications` subscribers listening to `endpoint_run_validators.grape` will no longer receive an event for endpoints that have no validators. If you rely on this notification to measure every request, subscribe to `endpoint_run.grape` instead, which always fires.
+
+#### Custom validators: use `default_message_key` and `validation_error!`
+
+Validators are now instantiated once at definition time and frozen. Any setup should happen in `initialize`, not in `validate_param!`.
+
+If your custom validator did work in `validate_param!` that only depends on the validator's options (not the param value), move it to `initialize`. A common case is compiling a value derived from options — for example, building a `Regexp`. Previously this may have been cached back into `@options`, which now raises `FrozenError` since `@options` and its nested values are deep-frozen by the base class:
+
+**Before:**
+```ruby
+class MyValidator < Grape::Validations::Validators::Base
+  def validate_param!(attr_name, params)
+    # raises FrozenError: @options is frozen, cannot store compiled pattern back into it
+    @options[:compiled] ||= Regexp.new(@options[:pattern])
+    validation_error!(attr_name) unless params[attr_name].match?(@options[:compiled])
+  end
+end
+```
+
+**After:**
+```ruby
+class MyValidator < Grape::Validations::Validators::Base
+  def initialize(attrs, options, required, scope, opts)
+    super
+    @pattern = Regexp.new(@options[:pattern]).freeze
+  end
+
+  def validate_param!(attr_name, params)
+    validation_error!(attr_name) unless params[attr_name].match?(@pattern)
+  end
+end
+```
+
+Any Array or Hash derived from options and stored in an ivar should be frozen, since the validator instance is shared across requests. `@options` itself (and any nested Hash/Array/String values within it) is deep-frozen by the base class, so mutations like `@options[:values] << 'extra'` will also raise a `FrozenError`.
+
+#### Custom validators: rename `@option` to `@options`
+
+The instance variable holding the validator's option value has been renamed from `@option` to `@options`. `@option` remains as an alias for backwards compatibility but will be removed in the next major release. Update any custom validators to use `@options` instead.
+
+Several new helpers are available — see [Available helpers](README.md#available-helpers) in the README for full documentation and examples.
+
+#### `with` now uses keyword arguments
+
+The `with` DSL method now uses `**opts` instead of a positional hash. Calls using bare keyword syntax are unaffected:
+
+```ruby
+# still works
+with(type: String, documentation: { in: 'body' }) { ... }
+```
+
+However, passing an explicit hash literal will now raise an `ArgumentError`:
+
+```ruby
+# raises ArgumentError
+with({ type: String }) { ... }
+```
+
+See [#2663](https://github.com/ruby-grape/grape/pull/2663) for more information.
+
+#### Custom validators: use `translate` instead of `I18n` directly
+
+`Grape::Util::Translation` is now included in `Grape::Validations::Validators::Base`. Custom validators that previously called `I18n.t` or `I18n.translate` directly should switch to the `translate`, which provides the same `:en` fallback logic used by all built-in validators.
+
+Key points:
+- `scope` defaults to `'grape.errors.messages'` — no need to specify it for standard error message keys.
+- Interpolation variables are passed directly to I18n.
+- `format` is no longer needed — `translate` returns the fully interpolated string.
+
+```ruby
+# Before
+raise Grape::Exceptions::Validation.new(
+  params: [@scope.full_name(attr_name)],
+  message: format(I18n.t(:my_key, scope: 'grape.errors.messages'), min: 2, max: 10)
+)
+
+# After
+raise Grape::Exceptions::Validation.new(
+  params: [@scope.full_name(attr_name)],
+  message: translate(:my_key, min: 2, max: 10)
+)
+```
+
+See [#2662](https://github.com/ruby-grape/grape/pull/2662) for more information.
+
+### Upgrading to >= 3.1
+
+#### Explicit kwargs for `namespace` and `route_param`
+
+The `API#namespace` and `route_param` methods are now defined with `**options` instead of `options = {}`. In addtion, `requirements` in explicitly defined so it's not in `options` anymore. You can still call `requirements` like before but `options[:requirements]` will be empty. For `route_param`, `type` is also an explicit parameter so it's not in `options` anymore. See [#2647](https://github.com/ruby-grape/grape/pull/2647) for more information.
+
+#### ParamsBuilder Grape::Extensions
+
+Deprecated [ParamsBuilder's extensions](https://github.com/ruby-grape/grape/blob/master/UPGRADING.md#params-builder) have been removed.
+
+#### Enhanced API compile!
+
+Endpoints are now "compiled" instead of lazy loaded. Historically, when calling `YourAPI.compile!` in `config.ru` (or just receiving the first API call), only routing was compiled see [Grape::Router#compile!](https://github.com/ruby-grape/grape/blob/bf90e95c3b17c415c944363b1c07eb9727089ee7/lib/grape/router.rb#L41-L54) and endpoints were lazy loaded. Now, it's part of the API compilation. See [#2645](https://github.com/ruby-grape/grape/pull/2645) for more information.
+
+### Upgrading to >= 3.0.0
+
+#### Ruby 3+ Argument Delegation Modernization
+
+Grape has been modernized to use Ruby 3+'s preferred argument delegation patterns. This change replaces `args.extract_options!` with explicit `**kwargs` parameters throughout the codebase.
+
+- All DSL methods now use explicit keyword arguments (`**kwargs`) instead of extracting options from mixed argument lists
+- Method signatures are now more explicit and follow Ruby 3+ best practices
+- The `active_support/core_ext/array/extract_options` dependency has been removed
+
+Passing the options of `requires`, `optional` and `use` as a trailing positional Hash still works, but is deprecated:
+
+```ruby
+params do
+  requires :id, { type: Integer } # deprecated
+  requires :id, type: Integer     # do this instead
+end
+```
+
+Under `extract_options!` the braces made no difference. They do now: Ruby only turns a trailing Hash into keyword arguments when it is written without braces, so a braced Hash lands in the splat and would otherwise be taken for a parameter name.
+
+See [#2618](https://github.com/ruby-grape/grape/pull/2618) for more information.
+
+#### Configuration API Migration from ActiveSupport::Configurable to Dry::Configurable
+
+Grape has migrated from `ActiveSupport::Configurable` to `Dry::Configurable` for its configuration system since its [deprecated](https://github.com/rails/rails/blob/1cdd190a25e483b65f1f25bbd0f13a25d696b461/activesupport/lib/active_support/configurable.rb#L3-L7).
+
+See [#2617](https://github.com/ruby-grape/grape/pull/2617) for more information.
+
+#### Endpoint execution simplified and `return` deprecated
+
+Executing a endpoint's block has been simplified and calling `return` in it has been deprecated. Use `next` instead.
+
+See [#2577](https://github.com/ruby-grape/grape/pull/2577) for more information.
+
+#### Old Deprecations Clean Up
+
+- `rack_response` has been removed in favor of using `error!`.
+- `Grape::Exceptions::MissingGroupType` and `Grape::Exceptions::UnsupportedGroupType` aliases `MissingGroupTypeError and `UnsupportedGroupType` have been removed.
+- `Grape::Validations::Base` has been removed in favor of `Grape::Validations::Validators::Base`.
+
+See [2573](https://github.com/ruby-grape/grape/pull/2573) for more information.
+
+### Upgrading to >= 2.4.0
+
+#### Grape::Middleware::Auth::Base
+`type` is now validated at compile time and will raise a `Grape::Exceptions::UnknownAuthStrategy` if unknown.
+
+#### Grape::Middleware::Base
+
+- Second argument `options` is now a double splat (**) instead of single splat (*). If you're redefining `initialize` in your middleware and/or calling `super` in it, you might have to adapt the signature and the `super` call. Also, you might have to remove `{}` if you're pass `options` as a literal `Hash` or add `**` if you're using a variable.
+- `Grape::Middleware::Helpers` has been removed. The equivalent method `context` is now part of `Grape::Middleware::Base`.
+
+#### Grape::Http::Headers, Grape::Util::Lazy::Object
+
+Both have been removed. See [2554](https://github.com/ruby-grape/grape/pull/2554).
+Here are the notable changes:
+
+- Constants like `HTTP_ACCEPT` have been replaced by their literal value.
+- `SUPPORTED_METHODS` has been moved to `Grape` module.
+- `HTTP_HEADERS` has been moved to `Grape::Request` and renamed `KNOWN_HEADERS`. The last has been refreshed with new headers, and it's not lazy anymore.
+- `SUPPORTED_METHODS_WITHOUT_OPTIONS` and `find_supported_method` have been removed.
+
+#### Grape::Middleware::Base
+
+- Constant `TEXT_HTML` has been removed in favor of using literal string 'text/html'.
+- `rack_request` and `query_params` have been added. Feel free to call these in your middlewares.
+
+#### Params Builder
+
+- Passing a class to `build_with` or `Grape.config.param_builder` has been deprecated in favor of a symbolized short_name. See `SHORTNAME_LOOKUP` in [params_builder](lib/grape/params_builder.rb).
+- Including Grape's extensions like `Grape::Extensions::Hashie::Mash::ParamBuilder` has been deprecated in favor of using `build_with` at the route level.
+
+#### Accept Header Negotiation Harmonized
+
+[Accept](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Accept) header is now fully interpreted through `Rack::Utils.best_q_match` which is following [RFC2616 14.1](https://datatracker.ietf.org/doc/html/rfc2616#section-14.1). Since [Grape 2.1.0](https://github.com/ruby-grape/grape/blob/master/CHANGELOG.md#210-20240615), the [header versioning strategy](https://github.com/ruby-grape/grape?tab=readme-ov-file#header) was adhering to it, but `Grape::Middleware::Formatter` never did.
+
+Your API might act differently since it will strictly follow the [RFC2616 14.1](https://datatracker.ietf.org/doc/html/rfc2616#section-14.1) when interpreting the `Accept` header. Here are the differences:
+
+##### Invalid or missing quality ranking
+The following used to yield `application/xml` and now will yield `application/json` as the preferred media type:
+- `application/json;q=invalid,application/xml;q=0.5`
+- `application/json,application/xml;q=1.0`
+
+For the invalid case, the value `invalid` was automatically `to_f` and `invalid.to_f` equals `0.0`. Now, since it doesn't match [Rack's regex](https://github.com/rack/rack/blob/3-1-stable/lib/rack/utils.rb#L138), its interpreted as non provided and its quality ranking equals 1.0.
+
+For the non provided case, 1.0 was automatically assigned and in a case of multiple best matches, the first was returned based on Ruby's sort_by `quality`. Now, 1.0 is still assigned and the last is returned in case of multiple best matches. See [Rack's implementation](https://github.com/rack/rack/blob/e8f47608668d507e0f231a932fa37c9ca551c0a5/lib/rack/utils.rb#L167) of the RFC.
+
+##### Considering the closest generic when vendor tree
+Excluding the [header versioning strategy](https://github.com/ruby-grape/grape?tab=readme-ov-file#header), whenever a media type with the [vendor tree](https://datatracker.ietf.org/doc/html/rfc6838#section-3.2) leading facet `vnd.` like `application/vnd.api+json` was provided, Grape would also consider its closest generic when negotiating. In that case, `application/json` was added to the negotiation. Now, it will just consider the provided media types without considering any closest generics, and you'll need to [register](https://github.com/ruby-grape/grape?tab=readme-ov-file#api-formats) it.
+You can find the official vendor tree registrations on [IANA](https://www.iana.org/assignments/media-types/media-types.xhtml)
+
+#### Custom Validators
+
+If you now receive an error of `'Grape::Validations.require_validator': unknown validator: your_custom_validation (Grape::Exceptions::UnknownValidator)` after upgrading to 2.4.0 then you will need to ensure that you require the `your_custom_validation` file before your Grape API code is loaded.
+
+See [2533](https://github.com/ruby-grape/grape/issues/2533) for more information.
+
+### Upgrading to >= 2.3.0
+
+### `content_type` vs `api.format` inside API
+
+Before 2.3.0, `content_type` had priority over `env['api.format']` when set in an API, which was incorrect. The priority has been flipped and `env['api.format']` will be checked first.
+In addition, the function `api_format` has been added. Instead of setting `env['api.format']` directly, you can call `api_format`.
+See [#2506](https://github.com/ruby-grape/grape/pull/2506) for more information.
+
+#### Remove Deprecated Methods and Options
+
+- Deprecated `file` method has been removed. Use `send_file` or `stream`.
+See [#2500](https://github.com/ruby-grape/grape/pull/2500) for more information.
+
+- The `except` and `proc` options have been removed from the `values` validator. Use `except_values` validator or assign `proc` directly to `values`.
+See [#2501](https://github.com/ruby-grape/grape/pull/2501) for more information.
+
+- `Passing an options hash and a block to 'desc'` deprecation has been removed. Move all hash options to block instead.
+See [#2502](https://github.com/ruby-grape/grape/pull/2502) for more information.
+
+### Upgrading to >= 2.2.0
+
+### `Length` validator
+
+After Grape 2.2.0, `length` validator will only take effect for parameters with types that support `#length` method, will not throw `ArgumentError` exception.
+
+See [#2464](https://github.com/ruby-grape/grape/pull/2464) for more information.
+
+### Upgrading to >= 2.1.0
+
+#### Optional Builder
+
+The `builder` gem dependency has been made optional as it's only used when generating XML. If your code does, add `builder` to your `Gemfile`.
+
+See [#2445](https://github.com/ruby-grape/grape/pull/2445) for more information.
+
+#### Deep Merging of Parameter Attributes
+
+Grape now uses `deep_merge` to combine parameter attributes within the `with` method. Previously, attributes defined at the parameter level would override those defined at the group level.
+With deep merge, attributes are now combined, allowing for more detailed and nuanced API specifications.
+
+For example:
+
+```ruby
+with(documentation: { in: 'body' }) do
+  optional :vault, documentation: { default: 33 }
+end
+```
+
+Before it was equivalent to:
+
+```ruby
+optional :vault, documentation: { default: 33 }
+```
+
+After it is an equivalent of:
+
+```ruby
+optional :vault, documentation: { in: 'body', default: 33 }
+```
+
+See [#2432](https://github.com/ruby-grape/grape/pull/2432) for more information.
+
+#### Zeitwerk
+
+Grape's autoloader has been updated and it's now based on [Zeitwerk](https://github.com/fxn/zeitwerk).
+If you MP (Monkey Patch) some files and you're not following the [file structure](https://github.com/fxn/zeitwerk?tab=readme-ov-file#file-structure), you might end up with a Zeitwerk error.
+
+See [#2363](https://github.com/ruby-grape/grape/pull/2363) for more information.
+
+#### Changes in rescue_from
+
+The `rack_response` method has been deprecated and the `error_response` method has been removed. Use `error!` instead.
+
+See [#2414](https://github.com/ruby-grape/grape/pull/2414) for more information.
+
+#### Change in parameters precedence
+
+When using together with `Grape::Extensions::Hash::ParamBuilder`, `route_param` takes higher precedence over a regular parameter defined with same name, which now matches the default param builder behavior.
+
+This was a regression introduced by [#2326](https://github.com/ruby-grape/grape/pull/2326) in Grape v1.8.0.
+
+```ruby
+Grape.configure do |config|
+  config.param_builder = Grape::Extensions::Hash::ParamBuilder
+end
+
+params do
+  requires :foo, type: String
+end
+route_param :foo do
+  get do
+    { value: params[:foo] }
+  end
+end
+```
+
+Request:
+
+```bash
+curl -X POST -H "Content-Type: application/json" localhost:9292/bar -d '{"foo": "baz"}'
+```
+
+Response prior to v1.8.0:
+
+```json
+{
+  "value": "bar"
+}
+```
+
+v1.8.0..v2.0.0:
+
+```json
+{
+  "value": "baz"
+}
+```
+
+v2.1.0+:
+
+```json
+{
+  "value": "bar"
+}
+```
+
+See [#2378](https://github.com/ruby-grape/grape/pull/2378) for details.
+
+#### Grape::Router::Route.route_xxx methods have been removed
+
+- `route_method` is accessible through `request_method`
+- `route_path` is accessible through `path`
+- Any other `route_xyz` are accessible through `options[xyz]`
+
+#### Instance variables scope
+
+Due to the changes done in [#2377](https://github.com/ruby-grape/grape/pull/2377), the instance variables defined inside each of the endpoints (or inside a `before` validator) are now accessible inside the `rescue_from`. The behavior of the instance variables was undefined until `2.1.0`.
+
+If you were using the same variable name defined inside an endpoint or `before` validator inside a `rescue_from` handler, you need to take in mind that you can start getting different values or you can be overriding values.
+
+Before:
+```ruby
+class TwitterAPI < Grape::API
+  before do
+    @var = 1
+  end
+
+  get '/' do
+    puts @var # => 1
+    raise
+  end
+
+  rescue_from :all do
+    puts @var # => nil
+  end
+end
+```
+
+After:
+```ruby
+class TwitterAPI < Grape::API
+  before do
+    @var = 1
+  end
+
+  get '/' do
+    puts @var # => 1
+    raise
+  end
+
+  rescue_from :all do
+    puts @var # => 1
+  end
+end
+```
+
+#### Recognizing Path
+
+Grape now considers the types of the configured `route_params` in order to determine the endpoint that matches with the performed request.
+
+So taking into account this `Grape::API` class
+
+```ruby
+class Books < Grape::API
+  resource :books do
+    route_param :id, type: Integer do
+      # GET /books/:id
+      get do
+        #...
+      end
+    end
+
+    resource :share do
+      # POST /books/share
+      post do
+      # ....
+      end
+    end
+  end
+end
+```
+
+Before:
+```ruby
+API.recognize_path '/books/1' # => /books/:id
+API.recognize_path '/books/share' # => /books/:id
+API.recognize_path '/books/other' # => /books/:id
+```
+
+After:
+```ruby
+API.recognize_path '/books/1' # => /books/:id
+API.recognize_path '/books/share' # => /books/share
+API.recognize_path '/books/other' # => nil
+```
+
+This implies that before this changes, when you performed `/books/other` and it matched with the `/books/:id` endpoint, you get a `400 Bad Request` response because the type of the provided `:id` param was not an `Integer`. However, after upgrading to version `2.1.0` you will get a `404 Not Found` response, because there is not a defined endpoint that matches with `/books/other`.
+
+See [#2379](https://github.com/ruby-grape/grape/pull/2379) for more information.
+
+### Upgrading to >= 2.0.0
+
+#### Headers
+
+As per [rack/rack#1592](https://github.com/rack/rack/issues/1592) Rack 3 is following the HTTP/2+ semantics which require header names to be lower case. To avoid compatibility issues, starting with Grape 1.9.0, headers will be cased based on what version of Rack you are using.
+
+Given this request:
+
+```shell
+curl -H "Content-Type: application/json" -H "Secret-Password: foo" ...
+```
+
+If you are using Rack 3 in your application then the headers will be set to:
+
+```ruby
+{ "content-type" => "application/json", "secret-password" => "foo"}
+```
+
+This means if you are checking for header values in your application, you would need to change your code to use downcased keys.
+
+```ruby
+get do
+  # This would use headers['Secret-Password'] in Rack < 3
+  error!('Unauthorized', 401) unless headers['secret-password'] == 'swordfish'
+end
+```
+
+See [#2355](https://github.com/ruby-grape/grape/pull/2355) for more information.
+
+#### Digest auth deprecation
+
+Digest auth has been removed along with the deprecation of `Rack::Auth::Digest` in Rack 3.
+
+See [#2294](https://github.com/ruby-grape/grape/issues/2294) for more information.
+
+### Upgrading to >= 1.7.0
+
+#### Exceptions renaming
+
+The following exceptions has been renamed for consistency through exceptions naming :
+
+* `MissingGroupTypeError` => `MissingGroupType`
+* `UnsupportedGroupTypeError` => `UnsupportedGroupType`
+
+See [#2227](https://github.com/ruby-grape/grape/pull/2227) for more information.
+
+#### Handling Multipart Limit Errors
+
+Rack supports a configurable limit on the number of files created from multipart parameters (`Rack::Utils.multipart_part_limit`) and raises an error if params are received that create too many files.  If you were handling the Rack error directly, Grape now wraps that error in `Grape::Execeptions::TooManyMultipartFiles`.  Additionally, Grape will return a 413 status code if the exception goes unhandled.
+
+### Upgrading to >= 1.6.0
+
+#### Parameter renaming with :as
+
+Prior to 1.6.0 the [parameter renaming](https://github.com/ruby-grape/grape#renaming) with `:as` was directly touching the request payload ([`#params`](https://github.com/ruby-grape/grape#parameters)) while duplicating the old and the new key to be both available in the hash. This allowed clients to bypass any validation in case they knew the internal name of the parameter.  Unfortunately, in combination with [grape-swagger](https://github.com/ruby-grape/grape-swagger) the internal name (name set with `:as`) of the parameters were documented.
+
+This behavior was fixed. Parameter renaming is now done when using the [`#declared(params)`](https://github.com/ruby-grape/grape#declared) parameters helper. This stops confusing validation/coercion behavior.
+
+Here comes an illustration of the old and new behaviour as code:
+
+```ruby
+# (1) Rename a to b, while client sends +a+
+optional :a, type: Integer, as: :b
+params = { a: 1 }
+declared(params, include_missing: false)
+# expected => { b: 1 }
+# actual   => { b: 1 }
+
+# (2) Rename a to b, while client sends +b+
+optional :a, type: Integer, as: :b, values: [1, 2, 3]
+params = { b: '5' }
+declared(params, include_missing: false)
+# expected => { }        (>= 1.6.0)
+# actual   => { b: '5' } (uncasted, unvalidated, <= 1.5.3)
+```
+
+Another implication of this change is the dependent parameter resolution. Prior to 1.6.0 the following code produced a `Grape::Exceptions::UnknownParameter` because `:a` was replaced by `:b`:
+
+```ruby
+params do
+  optional :a, as: :b
+  given :a do # (<= 1.5.3 you had to reference +:b+ here to make it work)
+    requires :c
+  end
+end
+```
+
+This code now works without any errors, as the renaming is just an internal behaviour of the `#declared(params)` parameter helper.
+
+See [#2189](https://github.com/ruby-grape/grape/pull/2189) for more information.
+
+### Upgrading to >= 1.5.3
+
+#### Nil value and coercion
+
+Prior to 1.2.5 version passing a `nil` value for a parameter with a custom coercer would invoke the coercer, and not passing a parameter would not invoke it.
+This behavior was not tested or documented. Version 1.3.0 quietly changed this behavior, in that `nil` values skipped the coercion. Version 1.5.3 fixes and documents this as follows:
+
+```ruby
+class Api < Grape::API
+  params do
+    optional :value, type: Integer, coerce_with: ->(val) { val || 0 }
+  end
+
+  get 'example' do
+     params[:my_param]
+  end
+  get '/example', params: { value: nil }
+  # 1.5.2 = nil
+  # 1.5.3 = 0
+  get '/example', params: {}
+  # 1.5.2 = nil
+  # 1.5.3 = nil
+end
+```
+See [#2164](https://github.com/ruby-grape/grape/pull/2164) for more information.
+
+### Upgrading to >= 1.5.1
+
+#### Dependent params
+
+If you use [dependent params](https://github.com/ruby-grape/grape#dependent-parameters) with
+`Grape::Extensions::Hash::ParamBuilder`, make sure a parameter to be dependent on is set as a Symbol.
+If a String is given, a parameter that other parameters depend on won't be found even if it is present.
+
+_Correct_:
+```ruby
+given :matrix do
+  # dependent params
+end
+```
+
+_Wrong_:
+```ruby
+given 'matrix' do
+  # dependent params
+end
+```
+
+### Upgrading to >= 1.5.0
+
+Prior to 1.3.3, the `declared` helper would always return the complete params structure if `include_missing=true` was set. In 1.3.3 a regression was introduced such that a missing Hash with or without nested parameters would always resolve to `{}`.
+
+In 1.5.0 this behavior is reverted, so the whole params structure will always be available via `declared`, regardless of whether any params are passed.
+
+The following rules now apply to the `declared` helper when params are missing and `include_missing=true`:
+
+* Hash params with children will resolve to a Hash with keys for each declared child.
+* Hash params with no children will resolve to `{}`.
+* Set params will resolve to `Set.new`.
+* Array params will resolve to `[]`.
+* All other params will resolve to `nil`.
+
+#### Example
+
+```ruby
+class Api < Grape::API
+  params do
+    optional :outer, type: Hash do
+      optional :inner, type: Hash do
+        optional :value, type: String
+      end
+    end
+  end
+  get 'example' do
+    declared(params, include_missing: true)
+  end
+end
+```
+
+```
+get '/example'
+# 1.3.3 = {}
+# 1.5.0 = {outer: {inner: {value:null}}}
+```
+
+For more information see [#2103](https://github.com/ruby-grape/grape/pull/2103).
+
+### Upgrading to >= 1.4.0
+
+#### Reworking stream and file and un-deprecating stream like-objects
+
+Previously in 0.16 stream-like objects were deprecated. This release restores their functionality for use-cases other than file streaming.
+
+This release deprecated `file` in favor of `sendfile` to better document its purpose.
+
+To deliver a file via the Sendfile support in your web server and have the Rack::Sendfile middleware enabled. See [`Rack::Sendfile`](https://www.rubydoc.info/gems/rack/Rack/Sendfile).
+```ruby
+class API < Grape::API
+  get '/' do
+    sendfile '/path/to/file'
+  end
+end
+```
+
+Use `stream` to stream file content in chunks.
+
+```ruby
+class API < Grape::API
+  get '/' do
+    stream '/path/to/file'
+  end
+end
+```
+
+Or use `stream` to stream other kinds of content. In the following example a streamer class
+streams paginated data from a database.
+
+```ruby
+class MyObject
+  attr_accessor :result
+
+  def initialize(query)
+    @result = query
+  end
+
+  def each
+    yield '['
+    # Do paginated DB fetches and return each page formatted
+    first = false
+    result.find_in_batches do |records|
+      yield process_records(records, first)
+      first = false
+    end
+    yield ']'
+  end
+
+  def process_records(records, first)
+    buffer = +''
+    buffer << ',' unless first
+    buffer << records.map(&:to_json).join(',')
+    buffer
+  end
+end
+
+class API < Grape::API
+  get '/' do
+    stream MyObject.new(Sprocket.all)
+  end
+end
+```
+
+### Upgrading to >= 1.3.3
+
+#### Nil values for structures
+
+Nil values have always been a special case when dealing with types, especially with the following structures:
+
+- Array
+- Hash
+- Set
+
+The behavior for these structures has changed throughout the latest releases. For example:
+
+```ruby
+class Api < Grape::API
+  params do
+    require :my_param, type: Array[Integer]
+  end
+
+  get 'example' do
+     params[:my_param]
+  end
+  get '/example', params: { my_param: nil }
+  # 1.3.3 = []
+  # 1.3.2 = nil
+end
+```
+
+For now on, `nil` values stay `nil` values for all types, including arrays, sets and hashes.
+
+If you want to have the same behavior as 1.3.1, apply a `default` validator:
+
+```ruby
+class Api < Grape::API
+  params do
+    require :my_param, type: Array[Integer], default: []
+  end
+
+  get 'example' do
+     params[:my_param]
+  end
+  get '/example', params: { my_param: nil } # => []
+end
+```
+
+#### Default validator
+
+Default validator is now applied for `nil` values.
+
+```ruby
+class Api < Grape::API
+  params do
+    requires :my_param, type: Integer, default: 0
+  end
+
+  get 'example' do
+     params[:my_param]
+  end
+  get '/example', params: { my_param: nil } #=> before: nil, after: 0
+end
+```
+
+### Upgrading to >= 1.3.0
+
+You will need to upgrade to this version if you depend on `rack >= 2.1.0`.
+
+#### Ruby
+
+After adding dry-types, Ruby 2.4 or newer is required.
+
+#### Coercion
+
+[Virtus](https://github.com/solnic/virtus) has been replaced by [dry-types](https://dry-rb.org/gems/dry-types/1.2/) for parameter coercion. If your project depends on Virtus outside of Grape, explicitly add it to your `Gemfile`.
+
+Here's an example of how to migrate a custom type from Virtus to dry-types:
+
+```ruby
+# Legacy Grape parser
+class SecureUriType < Virtus::Attribute
+  def coerce(input)
+    URI.parse value
+  end
+
+  def value_coerced?(input)
+    value.is_a? String
+  end
+end
+
+params do
+  requires :secure_uri, type: SecureUri
+end
+```
+
+To use dry-types, we need to:
+
+1. Remove the inheritance of `Virtus::Attribute`
+1. Rename `coerce` to `self.parse`
+1. Rename `value_coerced?` to `self.parsed?`
+
+The custom type must have a class-level `parse` method to the model. A class-level `parsed?` is needed if the parsed type differs from the defined type. In the example below, since `SecureUri` is not the same as `URI::HTTPS`, `self.parsed?` is needed:
+
+```ruby
+# New dry-types parser
+class SecureUri
+  def self.parse(value)
+    URI.parse value
+  end
+
+  def self.parsed?(value)
+    value.is_a? URI::HTTPS
+  end
+end
+
+params do
+  requires :secure_uri, type: SecureUri
+end
+```
+
+#### Coercing to `FalseClass` or `TrueClass` no longer works
+
+Previous Grape versions allowed this, though it wasn't documented:
+
+```ruby
+requires :true_value, type: TrueClass
+requires :bool_value, types: [FalseClass, TrueClass]
+```
+
+This is no longer supported, if you do this, your values will never be valid. Instead you should do this:
+
+```ruby
+requires :true_value, type: Boolean # in your endpoint you should validate if this is actually `true`
+requires :bool_value, type: Boolean
+```
+
+#### Ensure that Array types have explicit coercions
+
+Unlike Virtus, dry-types does not perform any implict coercions. If you have any uses of `Array[String]`, `Array[Integer]`, etc. be sure they use a `coerce_with` block. For example:
+
+```ruby
+requires :values, type: Array[String]
+```
+
+It's quite common to pass a comma-separated list, such as `tag1,tag2` as `values`. Previously Virtus would implicitly coerce this to `Array(values)` so that `["tag1,tag2"]` would pass the type checks, but with `dry-types` the values are no longer coerced for you. To fix this, you might do:
+
+```ruby
+requires :values, type: Array[String], coerce_with: ->(val) { val.split(',').map(&:strip) }
+```
+
+Likewise, for `Array[Integer]`, you might do:
+
+```ruby
+requires :values, type: Array[Integer], coerce_with: ->(val) { val.split(',').map(&:strip).map(&:to_i) }
+```
+
+For more information see [#1920](https://github.com/ruby-grape/grape/pull/1920).
+
+### Upgrading to >= 1.2.4
+
+#### Headers in `error!` call
+
+Headers in `error!` will be merged with `headers` hash. If any header need to be cleared on `error!` call, make sure to move it to the `after` block.
+
+```ruby
+class SampleApi < Grape::API
+  before do
+    header 'X-Before-Header', 'before_call'
+  end
+
+  get 'ping' do
+    header 'X-App-Header', 'on_call'
+    error! :pong, 400, 'X-Error-Details' => 'Invalid token'
+  end
+end
+```
+**Former behaviour**
+```ruby
+  response.headers['X-Before-Header'] # => nil
+  response.headers['X-App-Header'] # => nil
+  response.headers['X-Error-Details'] # => Invalid token
+```
+
+**Current behaviour**
+```ruby
+  response.headers['X-Before-Header'] # => 'before_call'
+  response.headers['X-App-Header'] # => 'on_call'
+  response.headers['X-Error-Details'] # => Invalid token
+```
+
+### Upgrading to >= 1.2.1
+
+#### Obtaining the name of a mounted class
+
+In order to make obtaining the name of a mounted class simpler, we've delegated `.to_s` to `base.name`
+
+**Deprecated in 1.2.0**
+```ruby
+  payload[:endpoint].options[:for].name
+```
+**New**
+```ruby
+  payload[:endpoint].options[:for].to_s
+```
+
+### Upgrading to >= 1.2.0
+
+#### Changes in the Grape::API class
+
+##### Patching the class
+
+In an effort to make APIs re-mountable, The class `Grape::API` no longer refers to an API instance, rather, what used to be `Grape::API` is now `Grape::API::Instance` and `Grape::API` was replaced with a class that can contain several instances of `Grape::API`.
+
+This changes were done in such a way that no code-changes should be required. However, if experiencing problems, or relying on private methods and internal behaviour too deeply, it is possible to restore the prior behaviour by replacing the references from `Grape::API` to `Grape::API::Instance`.
+
+Note, this is particularly relevant if you are opening the class `Grape::API` for modification.
+
+**Deprecated**
+```ruby
+class Grape::API
+  # your patched logic
+  ...
+end
+```
+**New**
+```ruby
+class Grape::API::Instance
+  # your patched logic
+  ...
+end
+```
+
+##### `name` (and other caveats) of the mounted API
+
+After the patch, the mounted API is no longer a Named class inheriting from `Grape::API`, it is an anonymous class which inherit from `Grape::API::Instance`.
+
+What this means in practice, is:
+
+- Generally: you can access the named class from the instance calling the getter `base`.
+- In particular: If you need the `name`, you can use `base`.`name`.
+
+**Deprecated**
+
+```ruby
+  payload[:endpoint].options[:for].name
+```
+
+**New**
+
+```ruby
+  payload[:endpoint].options[:for].base.name
+```
+
+#### Changes in rescue_from returned object
+
+Grape will now check the object returned from `rescue_from` and ensure that it is a `Rack::Response`. That makes sure response is valid and avoids exposing service information. Change any code that invoked `Rack::Response.new(...).finish` in a custom `rescue_from` block to `Rack::Response.new(...)` to comply with the validation.
+
+```ruby
+class Twitter::API < Grape::API
+  rescue_from :all do |e|
+    # version prior to 1.2.0
+    Rack::Response.new([ e.message ], 500, { 'Content-type' => 'text/error' }).finish
+    # 1.2.0  version
+    Rack::Response.new([ e.message ], 500, { 'Content-type' => 'text/error' })
+  end
+end
+```
+
+See [#1757](https://github.com/ruby-grape/grape/pull/1757) and [#1776](https://github.com/ruby-grape/grape/pull/1776) for more information.
+
+### Upgrading to >= 1.1.0
+
+#### Changes in HTTP Response Code for Unsupported Content Type
+
+For PUT, POST, PATCH, and DELETE requests where a non-empty body and a "Content-Type" header is supplied that is not supported by the Grape API, Grape will no longer return a 406 "Not Acceptable" HTTP status code and will instead return a 415 "Unsupported Media Type" so that the usage of HTTP status code falls more in line with the specification of [RFC 2616](https://www.ietf.org/rfc/rfc2616.txt).
+
+### Upgrading to >= 1.0.0
+
+#### Changes in XML and JSON Parsers
+
+Grape no longer uses `multi_json` or `multi_xml` by default and uses `JSON` and `ActiveSupport::XmlMini` instead. This has no visible impact on JSON processing, but the default behavior of the XML parser has changed. For example, an XML POST containing `<user>Bobby T.</user>` was parsed as `Bobby T.` with `multi_xml`, and as now parsed as `{"__content__"=>"Bobby T."}` with `XmlMini`.
+
+If you were using `MultiJson.load`, `MultiJson.dump` or `MultiXml.parse`, you can substitute those with `Grape::Json.load`, `Grape::Json.dump`, `::Grape::Xml.parse`, or directly with `JSON.load`, `JSON.dump`, `XmlMini.parse`, etc.
+
+To restore previous behavior, add `multi_json` or `multi_xml` to your `Gemfile` and `require` it.
+
+See [#1623](https://github.com/ruby-grape/grape/pull/1623) for more information.
+
+#### Changes in Parameter Class
+
+The default class for `params` has changed from `Hashie::Mash` to `ActiveSupport::HashWithIndifferentAccess` and the `hashie` dependency has been removed. This means that by default you can no longer access parameters by method name.
+
+```ruby
+class API < Grape::API
+  params do
+    optional :color, type: String
+  end
+  get do
+    params[:color] # use params[:color] instead of params.color
+  end
+end
+```
+
+To restore the behavior of prior versions, add `hashie` to your `Gemfile` and `include Grape::Extensions::Hashie::Mash::ParamBuilder` in your API.
+
+```ruby
+class API < Grape::API
+  include Grape::Extensions::Hashie::Mash::ParamBuilder
+
+  params do
+    optional :color, type: String
+  end
+  get do
+    # params.color works
+  end
+end
+```
+
+This behavior can also be overridden on individual parameter blocks using `build_with`.
+
+```ruby
+params do
+  build_with Grape::Extensions::Hash::ParamBuilder
+  optional :color, type: String
+end
+```
+
+If you're constructing your own `Grape::Request` in a middleware, you can pass different parameter handlers to create the desired `params` class with `build_params_with`.
+
+```ruby
+def request
+  Grape::Request.new(env, build_params_with: Grape::Extensions::Hashie::Mash::ParamBuilder)
+end
+```
+
+See [#1610](https://github.com/ruby-grape/grape/pull/1610) for more information.
+
+#### The `except`, `except_message`, and `proc` options of the `values` validator are deprecated.
+
+The new `except_values` validator should be used in place of the `except` and `except_message` options of the `values` validator.
+
+Arity one Procs may now be used directly as the `values` option to explicitly test param values.
+
+**Deprecated**
+```ruby
+params do
+  requires :a, values: { value: 0..99, except: [3] }
+  requires :b, values: { value: 0..99, except: [3], except_message: 'not allowed' }
+  requires :c, values: { except: ['admin'] }
+  requires :d, values: { proc: -> (v) { v.even? } }
+end
+```
+**New**
+```ruby
+params do
+  requires :a, values: 0..99, except_values: [3]
+  requires :b, values: 0..99, except_values: { value: [3], message: 'not allowed' }
+  requires :c, except_values: ['admin']
+  requires :d, values: -> (v) { v.even? }
+end
+```
+
+See [#1616](https://github.com/ruby-grape/grape/pull/1616) for more information.
+
+### Upgrading to >= 0.19.1
+
+#### DELETE now defaults to status code 200 for responses with a body, or 204 otherwise
+
+Prior to this version, DELETE requests defaulted to a status code of 204 No Content, even when the response included content. This behavior confused some clients and prevented the formatter middleware from running properly. As of this version, DELETE requests will only default to a 204 No Content status code if no response body is provided, and will default to 200 OK otherwise.
+
+Specifically, DELETE behaviour has changed as follows:
+
+- In versions < 0.19.0, all DELETE requests defaulted to a 200 OK status code.
+- In version 0.19.0, all DELETE requests defaulted to a 204 No Content status code, even when content was included in the response.
+- As of version 0.19.1, DELETE requests default to a 204 No Content status code, unless content is supplied, in which case they default to a 200 OK status code.
+
+To achieve the old behavior, one can specify the status code explicitly:
+
+```ruby
+delete :id do
+  status 204 # or 200, for < 0.19.0 behavior
+  'foo successfully deleted'
+end
+```
+
+One can also use the new `return_no_content` helper to explicitly return a 204 status code and an empty body for any request type:
+
+```ruby
+delete :id do
+  return_no_content
+  'this will not be returned'
+end
+```
+
+See [#1550](https://github.com/ruby-grape/grape/pull/1550) for more information.
+
+### Upgrading to >= 0.18.1
+
+#### Changes in priority of :any routes
+
+Prior to this version, `:any` routes were searched after matching first route and 405 routes. This behavior has changed and `:any` routes are now searched before 405 processing. In the following example the `:any` route will match first when making a request with an unsupported verb.
+
+```ruby
+post :example do
+  'example'
+end
+route :any, '*path' do
+  error! :not_found, 404
+end
+
+get '/example' #=> before: 405, after: 404
+```
+
+#### Removed param processing from built-in OPTIONS handler
+
+When a request is made to the built-in `OPTIONS` handler, only the `before` and `after` callbacks associated with the resource will be run.  The `before_validation` and `after_validation` callbacks and parameter validations will be skipped.
+
+See [#1505](https://github.com/ruby-grape/grape/pull/1505) for more information.
+
+#### Changed endpoint params validation
+
+Grape now correctly returns validation errors for all params when multiple params are passed to a requires.
+The following code will return `one is missing, two is missing` when calling the endpoint without parameters.
+
+```ruby
+params do
+  requires :one, :two
+end
+```
+
+Prior to this version the response would be `one is missing`.
+
+See [#1510](https://github.com/ruby-grape/grape/pull/1510) for more information.
+
+#### The default status code for DELETE is now 204 instead of 200.
+
+Breaking change: Sets the default response status code for a delete request to 204. A status of 204 makes the response more distinguishable and therefore easier to handle on the client side, particularly because a DELETE request typically returns an empty body as the resource was deleted or voided.
+
+To achieve the old behavior, one has to set it explicitly:
+```ruby
+delete :id do
+  status 200
+  'foo successfully deleted'
+end
+```
+
+For more information see: [#1532](https://github.com/ruby-grape/grape/pull/1532).
+
+### Upgrading to >= 0.17.0
+
+#### Removed official support for Ruby < 2.2.2
+
+Grape is no longer automatically tested against versions of Ruby prior to 2.2.2. This is because of its dependency on activesupport which, with version 5.0.0, now requires at least Ruby 2.2.2.
+
+See [#1441](https://github.com/ruby-grape/grape/pull/1441) for nmore information.
+
+#### Changed priority of `rescue_from` clauses applying
+
+The `rescue_from` clauses declared inside a namespace would take a priority over ones declared in the root scope.
+This could possibly affect those users who use different `rescue_from` clauses in root scope and in namespaces.
+
+See [#1405](https://github.com/ruby-grape/grape/pull/1405) for more information.
+
+#### Helper methods injected inside `rescue_from` in middleware
+
+Helper methods are injected inside `rescue_from` may cause undesirable effects. For example, definining a helper method called `error!` will take precendence over the built-in `error!` method and should be renamed.
+
+See [#1451](https://github.com/ruby-grape/grape/issues/1451) for an example.
+
+### Upgrading to >= 0.16.0
+
+#### Replace rack-mount with new router
+
+The `Route#route_xyz` methods have been deprecated since 0.15.1.
+
+Please use `Route#xyz` instead.
+
+Note that the `Route#route_method` was replaced by `Route#request_method`.
+
+The following code would work correctly.
+
+```ruby
+TwitterAPI::versions # yields [ 'v1', 'v2' ]
+TwitterAPI::routes # yields an array of Grape::Route objects
+TwitterAPI::routes[0].version # => 'v1'
+TwitterAPI::routes[0].description # => 'Includes custom settings.'
+TwitterAPI::routes[0].settings[:custom] # => { key: 'value' }
+
+TwitterAPI::routes[0].request_method # => 'GET'
+```
+
+#### `file` method accepts path to file
+
+Now to serve files via Grape just pass the path to the file. Functionality with FileStreamer-like objects is deprecated.
+
+Please, replace your FileStreamer-like objects with paths of served files.
+
+Old style:
+
+```ruby
+class FileStreamer
+  def initialize(file_path)
+    @file_path = file_path
+  end
+
+  def each(&blk)
+    File.open(@file_path, 'rb') do |file|
+      file.each(10, &blk)
+    end
+  end
+end
+
+# ...
+
+class API < Grape::API
+  get '/' do
+    file FileStreamer.new('/path/to/file')
+  end
+end
+```
+
+New style:
+
+```ruby
+class API < Grape::API
+  get '/' do
+    file '/path/to/file'
+  end
+end
+```
+
+### Upgrading to >= 0.15.0
+
+#### Changes to availability of `:with` option of `rescue_from` method
+
+The `:with` option of `rescue_from` does not accept value except Proc, String or Symbol now.
+
+If you have been depending the old behavior, you should use lambda block instead.
+
+```ruby
+class API < Grape::API
+  rescue_from :all, with: -> { Rack::Response.new('rescued with a method', 400) }
+end
+```
+
+#### Changes to behavior of `after` method of middleware on error
+
+The `after` method of the middleware is now also called on error. The following code would work correctly.
+
+```ruby
+class ErrorMiddleware < Grape::Middleware::Base
+  def after
+    return unless @app_response && @app_response[0] == 500
+    env['rack.logger'].debug("Raised error on #{env['PATH_INFO']}")
+  end
+end
+```
+
+See [#1147](https://github.com/ruby-grape/grape/issues/1147) and [#1240](https://github.com/ruby-grape/grape/issues/1240) for discussion of the issues.
+
+A warning will be logged if an exception is raised in an `after` callback, which points you to middleware that was not called in the previous version and is called now.
+
+```
+caught error of type NoMethodError in after callback inside Api::Middleware::SomeMiddleware : undefined method `headers' for nil:NilClass
+```
+
+See [#1285](https://github.com/ruby-grape/grape/pull/1285) for more information.
+
+#### Changes to Method Not Allowed routes
+
+A `405 Method Not Allowed` error now causes `Grape::Exceptions::MethodNotAllowed` to be raised, which will be rescued via `rescue_from :all`. Restore old behavior with the following error handler.
+
+```ruby
+rescue_from Grape::Exceptions::MethodNotAllowed do |e|
+  error! e.message, e.status, e.headers
+end
+```
+
+See [#1283](https://github.com/ruby-grape/grape/pull/1283) for more information.
+
+#### Changes to Grape::Exceptions::Validation parameters
+
+When raising `Grape::Exceptions::Validation` explicitly, replace `message_key` with `message`.
+
+For example,
+
+```ruby
+fail Grape::Exceptions::Validation, params: [:oauth_token_secret], message_key: :presence
+```
+
+becomes
+
+```ruby
+fail Grape::Exceptions::Validation, params: [:oauth_token_secret], message: :presence
+```
+
+See [#1295](https://github.com/ruby-grape/grape/pull/1295) for more information.
+
+### Upgrading to >= 0.14.0
+
+#### Changes to availability of DSL methods in filters
+
+The `#declared` method of the route DSL is no longer available in the `before` filter.  Using `declared` in a `before` filter will now raise `Grape::DSL::InsideRoute::MethodNotYetAvailable`.
+
+See [#1074](https://github.com/ruby-grape/grape/issues/1074) for discussion of the issue.
+
+#### Changes to header versioning and invalid header version handling
+
+Identical endpoints with different versions now work correctly. A regression introduced in Grape 0.11.0 caused all but the first-mounted version for such an endpoint to wrongly throw an `InvalidAcceptHeader`. As a side effect, requests with a correct vendor but invalid version can no longer be rescued from a `rescue_from` block.
+
+See [#1114](https://github.com/ruby-grape/grape/pull/1114) for more information.
+
+#### Bypasses formatters when status code indicates no content
+
+To be consistent with rack and it's handling of standard responses associated with no content, both default and custom formatters will now be bypassed when processing responses for status codes defined [by rack](https://github.com/rack/rack/blob/master/lib/rack/utils.rb#L567)
+
+See [#1190](https://github.com/ruby-grape/grape/pull/1190) for more information.
+
+#### Redirects respond as plain text with message
+
+`#redirect` now uses `text/plain` regardless of whether that format has been enabled. This prevents formatters from attempting to serialize the message body and allows for a descriptive message body to be provided - and optionally overridden - that better fulfills the theme of the HTTP spec.
+
+See [#1194](https://github.com/ruby-grape/grape/pull/1194) for more information.
+
+### Upgrading to >= 0.12.0
+
+#### Changes in middleware
+
+The Rack response object is no longer converted to an array by the formatter, enabling streaming. If your custom middleware is accessing `@app_response`, update it to expect a `Rack::Response` instance instead of an array.
+
+For example,
+
+```ruby
+class CacheBusterMiddleware < Grape::Middleware::Base
+  def after
+    @app_response[1]['Expires'] = Time.at(0).utc.to_s
+    @app_response
+  end
+end
+```
+
+becomes
+
+```ruby
+class CacheBusterMiddleware < Grape::Middleware::Base
+  def after
+    @app_response.headers['Expires'] = Time.at(0).utc.to_s
+    @app_response
+  end
+end
+```
+
+See [#1029](https://github.com/ruby-grape/grape/pull/1029) for more information.
+
+There is a known issue because of this change. When Grape is used with an older than 1.2.4 version of [warden](https://github.com/hassox/warden) there may be raised the following exception having the [rack-mount](https://github.com/jm/rack-mount) gem's lines as last ones in the backtrace:
+
+```
+NoMethodError: undefined method `[]' for nil:NilClass
+```
+
+The issue can be solved by upgrading warden to 1.2.4 version.
+
+See [#1151](https://github.com/ruby-grape/grape/issues/1151) for more information.
+
+#### Changes in present
+
+Using `present` with objects that responded to `merge` would cause early evaluation of the represented object, with unexpected side-effects, such as missing parameters or environment within rendering code. Grape now only merges represented objects with a previously rendered body, usually when multiple `present` calls are made in the same route.
+
+See [grape-with-roar#5](https://github.com/dblock/grape-with-roar/issues/5) and [#1023](https://github.com/ruby-grape/grape/issues/1023).
+
+#### Changes to regexp validator
+
+Parameters with `nil` value will now pass `regexp` validation. To disallow `nil` value for an endpoint, add `allow_blank: false`.
+
+```ruby
+params do
+  requires :email, allow_blank: false, regexp: /.+@.+/
+end
+```
+
+See [#957](https://github.com/ruby-grape/grape/pull/957) for more information.
+
+#### Replace error_response with error! in rescue_from blocks
+
+Note: `error_response` is being deprecated, not removed.
+
+```ruby
+def error!(message, status = options[:default_status], headers = {}, backtrace = [])
+  headers = { 'Content-Type' => content_type }.merge(headers)
+  rack_response(format_message(message, backtrace), status, headers)
+end
+```
+
+For example,
+
+```
+error_response({ message: { message: 'No such page.', id: 'missing_page' }, status: 404, headers: { 'Content-Type' => 'api/error' })
+```
+
+becomes
+
+```
+error!({ message: 'No such page.', id: 'missing_page' }, 404, { 'Content-Type' => 'api/error' })
+```
+
+`error!` also supports just passing a message. `error!('Server error.')` and `format: :json` returns the following JSON response
+
+```
+{ 'error': 'Server error.' }
+```
+
+with a status code of 500 and a Content Type of text/error.
+
+Optionally, also replace `Rack::Response.new` with `error!.`
+The following are equivalent:
+
+```
+Rack::Response.new([ e.message ], 500, { "Content-type" => "text/error" }).finish
+error!(e)
+```
+
+See [#889](https://github.com/ruby-grape/grape/issues/889) for more information.
+
+#### Changes to routes when using `format`
+
+Version 0.10.0 has introduced a change via [#809](https://github.com/ruby-grape/grape/pull/809) whereas routes no longer got file-type suffixes added if you declared a single API `format`. This has been reverted, it's now again possible to call API with proper suffix when single `format` is defined:
+
+```ruby
+class API < Grape::API
+  format :json
+
+  get :hello do
+    { hello: 'world' }
+  end
+end
+```
+
+Will respond with JSON to `/hello` **and** `/hello.json`.
+
+Will respond with 404 to `/hello.xml`, `/hello.txt` etc.
+
+See the [#1001](https://github.com/ruby-grape/grape/pull/1001) and [#914](https://github.com/ruby-grape/grape/issues/914) for more info.
+
+### Upgrading to >= 0.11.0
+
+#### Added Rack 1.6.0 support
+
+Grape now supports, but doesn't require Rack 1.6.0. If you encounter an issue with parsing requests larger than 128KB, explictly require Rack 1.6.0 in your Gemfile.
+
+```ruby
+gem 'rack', '~> 1.6.0'
+```
+
+See [#559](https://github.com/ruby-grape/grape/issues/559) for more information.
+
+#### Removed route_info
+
+Key route_info is excluded from params.
+
+See [#879](https://github.com/ruby-grape/grape/pull/879) for more information.
+
+
+#### Fix callbacks within a version block
+
+Callbacks defined in a version block are only called for the routes defined in that block. This was a regression introduced in Grape 0.10.0, and is fixed in this version.
+
+See [#901](https://github.com/ruby-grape/grape/pull/901) for more information.
+
+
+#### Make type of group of parameters required
+
+Groups of parameters now require their type to be set explicitly as Array or Hash.
+Not setting the type now results in MissingGroupTypeError, unsupported type will raise UnsupportedTypeError.
+
+See [#886](https://github.com/ruby-grape/grape/pull/886) for more information.
+
+### Upgrading to >= 0.10.1
+
+#### Changes to `declared(params, include_missing: false)`
+
+Attributes with `nil` values or with values that evaluate to `false` are no longer considered *missing* and will be returned when `include_missing` is set to `false`.
+
+See [#864](https://github.com/ruby-grape/grape/pull/864) for more information.
+
+### Upgrading to >= 0.10.0
+
+#### Changes to content-types
+
+The following content-types have been removed:
+
+* atom (application/atom+xml)
+* rss (application/rss+xml)
+* jsonapi (application/jsonapi)
+
+This is because they have never been properly supported.
+
+#### Changes to desc
+
+New block syntax:
+
+Former:
+
+```ruby
+  desc "some descs",
+    detail: 'more details',
+    entity: API::Entities::Entity,
+    params: API::Entities::Status.documentation,
+    named: 'a name',
+    headers: [XAuthToken: {
+      description: 'Valdates your identity',
+      required: true
+    }
+  get nil, http_codes: [
+    [401, 'Unauthorized', API::Entities::BaseError],
+    [404, 'not found', API::Entities::Error]
+  ] do
+```
+
+Now:
+
+```ruby
+desc "some descs" do
+  detail 'more details'
+  params API::Entities::Status.documentation
+  success API::Entities::Entity
+  failure [
+    [401, 'Unauthorized', API::Entities::BaseError],
+    [404, 'not found', API::Entities::Error]
+  ]
+  named 'a name'
+  headers [
+    XAuthToken: {
+      description: 'Valdates your identity',
+      required: true
+    },
+    XOptionalHeader: {
+      description: 'Not really needed',
+      required: false
+    }
+  ]
+end
+```
+
+#### Changes to Route Options and Descriptions
+
+A common hack to extend Grape with custom DSL methods was manipulating `@last_description`.
+
+``` ruby
+module Grape
+  module Extensions
+    module SortExtension
+      def sort(value)
+        @last_description ||= {}
+        @last_description[:sort] ||= {}
+        @last_description[:sort].merge! value
+        value
+      end
+    end
+
+    Grape::API.extend self
+  end
+end
+```
+
+You could access this value from within the API with `route.route_sort` or, more generally, via `env['api.endpoint'].options[:route_options][:sort]`.
+
+This will no longer work, use the documented and supported `route_setting`.
+
+``` ruby
+module Grape
+  module Extensions
+    module SortExtension
+      def sort(value)
+        route_setting :sort, sort: value
+        value
+      end
+    end
+
+    Grape::API.extend self
+  end
+end
+```
+
+To retrieve this value at runtime from within an API, use `env['api.endpoint'].route_setting(:sort)` and when introspecting a mounted API, use `route.route_settings[:sort]`.
+
+#### Accessing Class Variables from Helpers
+
+It used to be possible to fetch an API class variable from a helper function. For example:
+
+```ruby
+@@static_variable = 42
+
+helpers do
+  def get_static_variable
+    @@static_variable
+  end
+end
+
+get do
+  get_static_variable
+end
+```
+
+This will no longer work. Use a class method instead of a helper.
+
+```ruby
+@@static_variable = 42
+
+def self.get_static_variable
+  @@static_variable
+end
+
+get do
+  get_static_variable
+end
+```
+
+For more information see [#836](https://github.com/ruby-grape/grape/issues/836).
+
+#### Changes to Custom Validators
+
+To implement a custom validator, you need to inherit from `Grape::Validations::Base` instead of `Grape::Validations::Validator`.
+
+For more information see [Custom Validators](https://github.com/ruby-grape/grape#custom-validators) in the documentation.
+
+#### Changes to Raising Grape::Exceptions::Validation
+
+In previous versions raising `Grape::Exceptions::Validation` required a single `param`.
+
+```ruby
+raise Grape::Exceptions::Validation, param: :id, message_key: :presence
+```
+
+The `param` argument has been deprecated and is now an array of `params`, accepting multiple values.
+
+```ruby
+raise Grape::Exceptions::Validation, params: [:id], message_key: :presence
+```
+
+#### Changes to routes when using `format`
+
+Routes will no longer get file-type suffixes added if you declare a single API `format`. For example,
+
+```ruby
+class API < Grape::API
+  format :json
+
+  get :hello do
+    { hello: 'world' }
+  end
+end
+```
+
+Pre-0.10.0, this would respond with JSON to `/hello`, `/hello.json`, `/hello.xml`, `/hello.txt`, etc.
+
+Now, this will only respond with JSON to `/hello`, but will be a 404 when trying to access `/hello.json`, `/hello.xml`, `/hello.txt`, etc.
+
+If you declare further `content_type`s, this behavior will be circumvented. For example, the following API will respond with JSON to `/hello`, `/hello.json`, `/hello.xml`, `/hello.txt`, etc.
+
+```ruby
+class API < Grape::API
+  format :json
+  content_type :json, 'application/json'
+
+  get :hello do
+    { hello: 'world' }
+  end
+end
+```
+
+See the [the updated API Formats documentation](https://github.com/ruby-grape/grape#api-formats) and [#809](https://github.com/ruby-grape/grape/pull/809) for more info.
+
+#### Changes to Evaluation of Permitted Parameter Values
+
+Permitted and default parameter values are now only evaluated lazily for each request when declared as a proc. The following code would raise an error at startup time.
+
+```ruby
+params do
+  optional :v, values: -> { [:x, :y] }, default: -> { :z }
+end
+```
+
+Remove the proc to get the previous behavior.
+
+```ruby
+params do
+  optional :v, values: [:x, :y], default: :z
+end
+```
+
+See [#801](https://github.com/ruby-grape/grape/issues/801) for more information.
+
+#### Changes to version
+
+If version is used with a block, the callbacks defined within that version block are not scoped to that individual block. In other words, the callback would be inherited by all versions blocks that follow the first one e.g
+
+```ruby
+class API < Grape::API
+  resource :foo do
+    version 'v1', :using => :path do
+      before do
+        @output ||= 'hello1'
+      end
+      get '/' do
+        @output += '-v1'
+      end
+    end
+
+    version 'v2', :using => :path do
+      before do
+        @output ||= 'hello2'
+      end
+      get '/:id' do
+        @output += '-v2'
+      end
+    end
+  end
+end
+```
+
+when making a API call `GET /foo/v2/1`, the API would set instance variable `@output` to `hello1-v2`
+
+See [#898](https://github.com/ruby-grape/grape/issues/898) for more information.
+
+
+### Upgrading to >= 0.9.0
+
+#### Changes in Authentication
+
+The following middleware classes have been removed:
+
+* `Grape::Middleware::Auth::Basic`
+* `Grape::Middleware::Auth::Digest`
+* `Grape::Middleware::Auth::OAuth2`
+
+When you use theses classes directly like:
+
+```ruby
+ module API
+   class Root < Grape::API
+     class Protected < Grape::API
+       use Grape::Middleware::Auth::OAuth2,
+           token_class: 'AccessToken',
+           parameter: %w(access_token api_key)
+
+```
+
+you have to replace these classes.
+
+As replacement can be used
+
+* `Grape::Middleware::Auth::Basic`  => [`Rack::Auth::Basic`](https://github.com/rack/rack/blob/master/lib/rack/auth/basic.rb)
+* `Grape::Middleware::Auth::Digest` => [`Rack::Auth::Digest::MD5`](https://github.com/rack/rack/blob/master/lib/rack/auth/digest/md5.rb)
+* `Grape::Middleware::Auth::OAuth2` => [warden-oauth2](https://github.com/opperator/warden-oauth2) or [rack-oauth2](https://github.com/nov/rack-oauth2)
+
+If this is not possible you can extract the middleware files from [grape v0.7.0](https://github.com/ruby-grape/grape/tree/v0.7.0/lib/grape/middleware/auth) and host these files within your application
+
+See [#703](https://github.com/ruby-grape/Grape/pull/703) for more information.
+
+### Upgrading to >= 0.7.0
+
+#### Changes in Exception Handling
+
+Assume you have the following exception classes defined.
+
+```ruby
+class ParentError < StandardError; end
+class ChildError < ParentError; end
+```
+
+In Grape <= 0.6.1, the `rescue_from` keyword only handled the exact exception being raised. The following code would rescue `ParentError`, but not `ChildError`.
+
+```ruby
+rescue_from ParentError do |e|
+  # only rescue ParentError
+end
+```
+
+This made it impossible to rescue an exception hieararchy, which is a more sensible default. In Grape 0.7.0 or newer, both `ParentError` and `ChildError` are rescued.
+
+```ruby
+rescue_from ParentError do |e|
+  # rescue both ParentError and ChildError
+end
+```
+
+To only rescue the base exception class, set `rescue_subclasses: false`.
+
+```ruby
+rescue_from ParentError, rescue_subclasses: false do |e|
+  # only rescue ParentError
+end
+```
+
+See [#544](https://github.com/ruby-grape/grape/pull/544) for more information.
+
+
+#### Changes in the Default HTTP Status Code
+
+In Grape <= 0.6.1, the default status code returned from `error!` was 403.
+
+```ruby
+error! "You may not reticulate this spline!" # yields HTTP error 403
+```
+
+This was a bad default value, since 403 means "Forbidden". Change any call to `error!` that does not specify a status code to specify one. The new default value is a more sensible default of 500, which is "Internal Server Error".
+
+```ruby
+error! "You may not reticulate this spline!", 403 # yields HTTP error 403
+```
+
+You may also use `default_error_status` to change the global default.
+
+```ruby
+default_error_status 400
+```
+
+See [#525](https://github.com/ruby-grape/Grape/pull/525) for more information.
+
+
+#### Changes in Parameter Declaration and Validation
+
+In Grape <= 0.6.1, `group`, `optional` and `requires` keywords with a block accepted either an `Array` or a `Hash`.
+
+```ruby
+params do
+  requires :id, type: Integer
+  group :name do
+    requires :first_name
+    requires :last_name
+  end
+end
+```
+
+This caused the ambiguity and unexpected errors described in [#543](https://github.com/ruby-grape/Grape/issues/543).
+
+In Grape 0.7.0, the `group`, `optional` and `requires` keywords take an additional `type` attribute which defaults to `Array`. This means that without a `type` attribute, these nested parameters will no longer accept a single hash, only an array (of hashes).
+
+Whereas in 0.6.1 the API above accepted the following json, it no longer does in 0.7.0.
+
+```json
+{
+  "id": 1,
+  "name": {
+    "first_name": "John",
+    "last_name" : "Doe"
+  }
+}
+```
+
+The `params` block should now read as follows.
+
+```ruby
+params do
+  requires :id, type: Integer
+  requires :name, type: Hash do
+    requires :first_name
+    requires :last_name
+  end
+end
+```
+
+See [#545](https://github.com/ruby-grape/Grape/pull/545) for more information.
+
+
+### Upgrading to 0.6.0
+
+In Grape <= 0.5.0, only the first validation error was raised and processing aborted. Validation errors are now collected and a single `Grape::Exceptions::ValidationErrors` exception is raised. You can access the collection of validation errors as `.errors`.
+
+```ruby
+rescue_from Grape::Exceptions::Validations do |e|
+  Rack::Response.new({
+    status: 422,
+    message: e.message,
+    errors: e.errors
+  }.to_json, 422)
+end
+```
+
+For more information see [#462](https://github.com/ruby-grape/grape/issues/462).

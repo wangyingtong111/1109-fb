@@ -1,0 +1,16 @@
+name: Danger
+
+on:
+  pull_request:
+    types: [opened, reopened, edited, synchronize]
+
+jobs:
+  danger:
+    uses: danger/danger-pr-comment/.github/workflows/danger-run.yml@645e89bcc7be89ee7e8362166110b05cbced8e59 # v0.3.0
+    # What the called workflow asks for. It needs no secret but the token.
+    permissions:
+      contents: read
+    with:
+      ruby-version: '3.4'
+      gemfile: gemfiles/danger.gemfile
+      bundler-cache: true

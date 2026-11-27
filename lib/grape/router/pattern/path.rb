@@ -1,0 +1,89 @@
+# frozen_string_literal: true
+
+module Grape
+  class Router
+    class Pattern
+      # Assembles the path template a {Pattern} compiles into a matcher. It turns
+      # a raw path plus the path-settings snapshot taken by
+      # {Grape::Util::InheritableSetting#path_settings} (mount paths, root
+      # prefix, path-versioning and format) into an +origin+ (the route prefix)
+      # and a +suffix+ (the format segment). {Pattern.build} is the entry point
+      # that wires this into pattern construction.
+      class Path
+        DEFAULT_FORMAT_SEGMENT = '(/.:format)'
+        NO_VERSIONING_WITH_VALID_PATH_FORMAT_SEGMENT = '(.:format)'
+        VERSION_SEGMENT = ':version'
+
+        attr_reader :origin, :suffix
+
+        def initialize(raw_path, raw_namespace, settings)
+          @origin = PartsCache[build_parts(raw_path, raw_namespace, settings)]
+          @suffix = build_suffix(raw_path, raw_namespace, settings)
+        end
+
+        def to_s
+          "#{origin}#{suffix}"
+        end
+
+        private
+
+        def build_suffix(raw_path, raw_namespace, settings)
+          return "(.#{settings.format})" if uses_specific_format?(settings)
+          return NO_VERSIONING_WITH_VALID_PATH_FORMAT_SEGMENT if !uses_path_versioning?(settings) || valid_part?(raw_namespace) || valid_part?(raw_path)
+
+          DEFAULT_FORMAT_SEGMENT
+        end
+
+        def build_parts(raw_path, raw_namespace, settings)
+          parts = []
+          add_part(parts, settings.mount_path)
+          add_part(parts, settings.root_prefix)
+          parts << VERSION_SEGMENT if uses_path_versioning?(settings)
+          add_part(parts, raw_namespace)
+          add_part(parts, raw_path)
+          parts
+        end
+
+        def add_part(parts, value)
+          parts << value if value && not_slash?(value)
+        end
+
+        def not_slash?(value)
+          value != '/'
+        end
+
+        def uses_specific_format?(settings)
+          settings.format && Array(settings.content_types).size == 1
+        end
+
+        def uses_path_versioning?(settings)
+          settings.version && settings.version_options.using == :path
+        end
+
+        def valid_part?(part)
+          part&.match?(/\A\S/) && not_slash?(part)
+        end
+
+        # The parts are joined by slashes, so a path opening with an optional
+        # group under a namespace, mount path, prefix or version --
+        # +get '(:type)'+ in +namespace :root+ -- compiled to +/root/(:type)+.
+        # The slash outside the group is required, and a request path never
+        # ends in one, as it is normalized the way this one is: +/root+ matched
+        # nothing. Inside the group, the slash goes with the segment it
+        # separates, and +/root(/:type)+ answers +/root+ and +/root/x+ alike.
+        # A slash opening the path stays where it is, for +/+ to match
+        # +/(:type)+.
+        class PartsCache < Grape::Util::Cache
+          SLASH_BEFORE_OPTIONAL_GROUP = %r{(?<=.)/\(/?}
+
+          def initialize
+            super
+            @cache = Hash.new do |h, parts|
+              h[parts] = Grape::Util::PathNormalizer.call(parts.join('/')).gsub(SLASH_BEFORE_OPTIONAL_GROUP, '(/')
+            end
+          end
+        end
+      end
+    end
+  end
+end

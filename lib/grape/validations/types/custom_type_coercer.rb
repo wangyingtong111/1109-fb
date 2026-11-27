@@ -1,0 +1,131 @@
+# frozen_string_literal: true
+
+module Grape
+  module Validations
+    module Types
+      # This class will detect type classes that implement
+      # a class-level +parse+ method. The method should accept one
+      # +String+ argument and should return the value coerced to
+      # the appropriate type. The method may raise an exception if
+      # there are any problems parsing the string.
+      #
+      # Alternately an optional +method+ may be supplied (see the
+      # +coerce_with+ option of {Grape::DSL::Parameters#requires}).
+      # This may be any class or object implementing +parse+ or +call+,
+      # with the same contract as described above.
+      #
+      # Type Checking
+      # -------------
+      #
+      # Calls to +coerced?+ will consult this class to check
+      # that the coerced value produced above is in fact of the
+      # expected type. By default this class performs a basic check
+      # against the type supplied, but this behaviour will be
+      # overridden if the class implements a class-level
+      # +coerced?+ or +parsed?+ method. This method
+      # will receive a single parameter that is the coerced value
+      # and should return +true+ if the value meets type expectations.
+      # Arbitrary assertions may be made here but the grape validation
+      # system should be preferred.
+      #
+      # Alternately a proc or other object responding to +call+ may be
+      # supplied in place of a type. This should implement the same
+      # contract as +coerced?+, and must be supplied with a coercion
+      # +method+.
+      class CustomTypeCoercer
+        extend Grape::Util::FreezeOnNew
+
+        TYPE_CHECK_METHODS = %i[coerced? parsed?].freeze
+        COLLECTION_TYPES = [Array, Set].freeze
+
+        # What a coercer calls to coerce and to check. Frozen objects rather
+        # than lambdas: a lambda carries the coercer as its self and the values
+        # it closes over as they are, so a compiled API holding one could not
+        # be frozen all the way down.
+        HashSymbolizer = Data.define(:coercion) do
+          def call(val) = coercion.call(val).deep_symbolize_keys
+        end
+
+        # +dup+ before +map!+: the collection is whatever the user's coercion
+        # method returned — possibly frozen, possibly the input itself — so we
+        # must not mutate it in place. +dup+ also preserves the class, keeping a
+        # +Set+ a +Set+ (unlike +map+, which would return an +Array+).
+        CollectionSymbolizer = Data.define(:coercion) do
+          def call(val) = coercion.call(val).dup.map! { |item| item.is_a?(Hash) ? item.deep_symbolize_keys : item }
+        end
+
+        InstanceCheck = Data.define(:type) do
+          def call(value) = value.is_a?(type)
+        end
+
+        EnumerableCheck = Data.define(:type) do
+          def call(value) = value.is_a?(Enumerable) && value.all? { |val| matches?(type.first, val) }
+
+          private
+
+          def matches?(type, value)
+            return value.all? { |val| matches?(type.first, val) } if type.is_a?(Enumerable) && value.is_a?(Enumerable)
+
+            !type.is_a?(Enumerable) && value.is_a?(type)
+          end
+        end
+        private_constant :TYPE_CHECK_METHODS, :COLLECTION_TYPES, :HashSymbolizer, :CollectionSymbolizer, :InstanceCheck, :EnumerableCheck
+
+        # A new coercer for the given type specification
+        # and coercion method.
+        #
+        # @param type [Class,#coerced?,#parsed?,#call?]
+        #   specifier for the target type. See class docs.
+        # @param method [#parse,#call]
+        #   optional coercion method. See class docs.
+        def initialize(type, method = nil)
+          @method = build_coercion_method(type, method)
+          @type_check = infer_type_check(type)
+        end
+
+        # Coerces the given value.
+        #
+        # @param val [Object] value to be coerced
+        # @return [Object] the coerced result
+        def call(val)
+          coerced_val = @method.call(val)
+
+          return coerced_val if coerced_val.is_a?(InvalidValue)
+          return InvalidValue.new unless coerced?(coerced_val)
+
+          coerced_val
+        end
+
+        def coerced?(val)
+          val.nil? || @type_check.call(val)
+        end
+
+        private
+
+        def build_coercion_method(type, method)
+          coercion_method = infer_coercion_method(type, method)
+          return HashSymbolizer.new(coercion_method) if type == Hash
+          return CollectionSymbolizer.new(coercion_method) if COLLECTION_TYPES.include?(type)
+
+          coercion_method
+        end
+
+        def infer_coercion_method(type, method)
+          return type.method(:parse) unless method
+          return method unless method.respond_to?(:parse)
+
+          method.method(:parse)
+        end
+
+        def infer_type_check(type)
+          method_name = TYPE_CHECK_METHODS.detect { |m| type.respond_to?(m) }
+          return type.method(method_name) if method_name
+          return type if type.respond_to?(:call)
+          return EnumerableCheck.new(type) if type.is_a?(Enumerable)
+
+          InstanceCheck.new(type)
+        end
+      end
+    end
+  end
+end

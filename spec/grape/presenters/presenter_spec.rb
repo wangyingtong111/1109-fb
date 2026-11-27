@@ -1,0 +1,67 @@
+# frozen_string_literal: true
+
+describe Grape::Presenters::Presenter do
+  subject { dummy_class.new }
+
+  let(:dummy_class) do
+    Class.new do
+      include Grape::DSL::InsideRoute
+
+      attr_reader :env, :request, :new_settings
+
+      def initialize
+        @env = {}
+        @header = {}
+        @new_settings = { namespace_inheritable: {}, namespace_stackable: {} }
+      end
+    end
+  end
+
+  describe 'represent' do
+    let(:object_mock) do
+      Object.new
+    end
+
+    it 'represent object' do
+      expect(described_class.represent(object_mock)).to eq object_mock
+    end
+  end
+
+  describe 'present' do
+    let(:hash_mock) do
+      { key: :value }
+    end
+
+    describe 'instance' do
+      before do
+        subject.present hash_mock, with: described_class
+      end
+
+      it 'presents dummy hash' do
+        expect(subject.body).to eq hash_mock
+      end
+    end
+
+    describe 'multiple presenter' do
+      let(:first_hash_mock) do
+        { key1: :value1 }
+      end
+
+      let(:second_hash_mock) do
+        { key2: :value2 }
+      end
+
+      describe 'instance' do
+        before do
+          subject.present first_hash_mock, with: described_class
+          subject.present second_hash_mock, with: described_class
+        end
+
+        it 'presents both dummy presenter' do
+          expect(subject.body[:key1]).to eq first_hash_mock[:key1]
+          expect(subject.body[:key2]).to eq second_hash_mock[:key2]
+        end
+      end
+    end
+  end
+end

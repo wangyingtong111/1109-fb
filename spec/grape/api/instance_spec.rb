@@ -1,0 +1,145 @@
+# frozen_string_literal: true
+
+require 'shared/versioning_examples'
+
+describe Grape::API::Instance do
+  subject(:an_instance) do
+    Class.new(Grape::API::Instance) do
+      namespace :some_namespace do
+        get 'some_endpoint' do
+          'success'
+        end
+      end
+    end
+  end
+
+  let(:root_api) do
+    to_mount = an_instance
+    Class.new(Grape::API) do
+      mount to_mount
+    end
+  end
+
+  def app
+    root_api
+  end
+
+  context 'when an instance is mounted on the root' do
+    it 'can call the instance endpoint' do
+      get '/some_namespace/some_endpoint'
+      expect(last_response.body).to eq 'success'
+    end
+  end
+
+  describe '.to_s' do
+    it 'falls back to the class name when there is no base' do
+      expect(described_class.to_s).to eq('Grape::API::Instance')
+    end
+
+    it 'delegates to the base API once mounted' do
+      stub_const('SomeAPI', Class.new(Grape::API))
+      expect(SomeAPI.base_instance.to_s).to eq('SomeAPI')
+    end
+  end
+
+  context 'when an instance is the root' do
+    let(:root_api) do
+      to_mount = an_instance
+      Class.new(Grape::API::Instance) do
+        mount to_mount
+      end
+    end
+
+    it 'can call the instance endpoint' do
+      get '/some_namespace/some_endpoint'
+      expect(last_response.body).to eq 'success'
+    end
+  end
+
+  context 'with multiple moutes' do
+    let(:first) do
+      Class.new(Grape::API::Instance) do
+        namespace(:some_namespace) do
+          route :any, '*path' do
+            error!('Not found! (1)', 404)
+          end
+        end
+      end
+    end
+    let(:second) do
+      Class.new(Grape::API::Instance) do
+        namespace(:another_namespace) do
+          route :any, '*path' do
+            error!('Not found! (2)', 404)
+          end
+        end
+      end
+    end
+    let(:root_api) do
+      first_instance = first
+      second_instance = second
+      Class.new(Grape::API) do
+        mount first_instance
+        mount first_instance
+        mount second_instance
+      end
+    end
+
+    it 'does not raise a FrozenError on first instance' do
+      expect { patch '/some_namespace/anything' }.not_to \
+        raise_error
+    end
+
+    it 'responds the correct body at the first instance' do
+      patch '/some_namespace/anything'
+      expect(last_response.body).to eq 'Not found! (1)'
+    end
+
+    it 'does not raise a FrozenError on second instance' do
+      expect { get '/another_namespace/other' }.not_to \
+        raise_error
+    end
+
+    it 'responds the correct body at the second instance' do
+      get '/another_namespace/foobar'
+      expect(last_response.body).to eq 'Not found! (2)'
+    end
+  end
+
+  describe '.cascade?' do
+    subject(:an_instance) do
+      Class.new(Grape::API::Instance) do
+        cascade true
+      end
+    end
+
+    it 'returns the configured cascade setting' do
+      expect(an_instance.compile!.cascade?).to be(true)
+    end
+  end
+
+  describe '#call' do
+    context 'when cascade is false' do
+      let(:rack_headers) { { 'content-type' => 'text/plain', 'x-cascade' => 'pass' } }
+      let(:root_api) do
+        headers = rack_headers
+        Class.new(Grape::API::Instance) do
+          cascade false
+          mount ->(_env) { [200, headers, ['from rack']] } => '/rack'
+        end
+      end
+
+      it 'strips X-Cascade from the response' do
+        get '/rack'
+        expect(last_response.headers).not_to have_key('x-cascade')
+      end
+
+      # The mounted app owns the Hash it returned and is free to hand back one
+      # it shares, so removing X-Cascade has to happen on a copy.
+      it 'does not write into the headers the mounted app returned' do
+        get '/rack'
+        expect(rack_headers).to eq('content-type' => 'text/plain', 'x-cascade' => 'pass')
+      end
+    end
+  end
+end

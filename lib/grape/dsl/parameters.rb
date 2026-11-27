@@ -1,0 +1,253 @@
+# frozen_string_literal: true
+
+module Grape
+  module DSL
+    # Defines DSL methods, meant to be applied to a ParamsScope, which define
+    # and describe the parameters accepted by an endpoint, or all endpoints
+    # within a namespace.
+    module Parameters
+      # Set the builder used to build the request.params.
+      #
+      # @param build_with [Symbol] +:hash_with_indifferent_access+ (default,
+      #   see +Grape.config.param_builder+), +:hash+ or +:hashie_mash+
+      #
+      # @example
+      #
+      #     class API < Grape::API
+      #       desc "Get collection"
+      #       params do
+      #         build_with :hashie_mash
+      #         requires :user_id, type: Integer
+      #       end
+      #       get do
+      #         params['user_id']
+      #       end
+      #     end
+      def build_with(build_with)
+        @api.inheritable_setting.build_params_with = build_with
+      end
+
+      # Include reusable params rules among current.
+      # You can define reusable params with helpers method.
+      #
+      # @example
+      #
+      #     class API < Grape::API
+      #       helpers do
+      #         params :pagination do
+      #           optional :page, type: Integer
+      #           optional :per_page, type: Integer
+      #         end
+      #       end
+      #
+      #       desc "Get collection"
+      #       params do
+      #         use :pagination
+      #       end
+      #       get do
+      #         Collection.page(params[:page]).per(params[:per_page])
+      #       end
+      #     end
+      def use(*names, **options)
+        return redispatch_legacy_options(:use, names, options) if legacy_options?(names)
+
+        named_params = @api.inheritable_setting.named_params || {}
+        names.each do |name|
+          params_block = named_params[name]
+          # An API's params are evaluated before it is mounted, and the scope
+          # it is mounted in may define the name (see Grape::API.mount_instance).
+          # The endpoint raises if it is still missing when it compiles.
+          unless params_block
+            @api.inheritable_setting.route_setting(:unresolved_named_param, name)
+            next
+          end
+
+          if options.empty?
+            instance_exec(options, &params_block)
+          else
+            instance_exec(**options, &params_block)
+          end
+        end
+      end
+      alias use_scope use
+      alias includes use
+
+      # @!method requires(*attrs, using: nil, except: nil, as: nil, **opts, &block)
+      #   Require one or more parameters for the current endpoint.
+      #
+      #   @param attrs list of parameters names, or, if :using is
+      #     passed as an option, which keys to include (:all or :none) from
+      #     the :using hash. Passing the options as a trailing positional Hash
+      #     is deprecated; pass them as keyword arguments instead.
+      #   @option attrs :type [Class] the type to coerce this parameter to before
+      #     passing it to the endpoint. See {Grape::Validations::Types} for a list of
+      #     types that are supported automatically. Custom classes may be used
+      #     where they define a class-level `::parse` method, or in conjunction
+      #     with the `:coerce_with` parameter. `JSON` may be supplied to denote
+      #     `JSON`-formatted objects or arrays of objects. `Array[JSON]` accepts
+      #     the same values as `JSON` but will wrap single objects in an `Array`.
+      #   @option attrs :types [Array<Class>] may be supplied in place of +:type+
+      #     to declare an attribute that has multiple allowed types. See
+      #     {Validations::Types::MultipleTypeCoercer} for more details on coercion
+      #     and validation rules for variant-type parameters.
+      #   @option attrs :desc [String] description to document this parameter
+      #   @option attrs :default [Object] default value, if parameter is optional
+      #   @option attrs :values [Array] permissible values for this field. If any
+      #     other value is given, it will be handled as a validation error
+      #   @option attrs :using [Hash[Symbol => Hash]] a hash defining keys and
+      #     options, like that returned by {Grape::Entity#documentation}. The value
+      #     of each key is an options hash accepting the same parameters
+      #   @option attrs :except [Array[Symbol]] a list of keys to exclude from
+      #     the :using Hash. The meaning of this depends on if :all or :none was
+      #     passed; :all + :except will make the :except fields optional, whereas
+      #     :none + :except will make the :except fields required
+      #   @option attrs :coerce_with [#parse, #call] method to be used when coercing
+      #     the parameter to the type named by `attrs[:type]`. Any class or object
+      #     that defines `::parse` or `::call` may be used.
+      #
+      #   @example
+      #
+      #       params do
+      #         # Basic usage: require a parameter of a certain type
+      #         requires :user_id, type: Integer
+      #
+      #         # Without a type, the value is not coerced
+      #         requires :foo
+      #
+      #         # Multiple params can be specified at once if they share
+      #         # the same options.
+      #         requires :x, :y, :z, type: Date
+      #
+      #         # Nested parameters can be handled as hashes. You must
+      #         # pass in a block, within which you can use any of the
+      #         # parameters DSL methods.
+      #         requires :user, type: Hash do
+      #           requires :name, type: String
+      #         end
+      #       end
+      #
+      # @!method optional(*attrs, using: nil, except: nil, as: nil, **opts, &block)
+      #   Allow, but don't require, one or more parameters for the current
+      #     endpoint.
+      #   @param (see Grape::DSL::Parameters#requires)
+      #   @option (see Grape::DSL::Parameters#requires)
+      { requires: true, optional: false }.each do |method_name, required|
+        define_method(method_name) do |*attrs, using: nil, except: nil, as: nil, **opts, &block|
+          return redispatch_legacy_options(method_name, attrs, { using:, except:, as: }.compact.merge(opts), &block) if legacy_options?(attrs)
+
+          declare(param_names(attrs), opts, required:, using:, except:, as:, &block)
+        end
+      end
+
+      # Define common settings for one or more parameters
+      # @param (see #requires)
+      # @option (see #requires)
+      def with(**opts, &)
+        new_group_scope(with_group_options(opts), &)
+      end
+
+      %i[mutually_exclusive exactly_one_of at_least_one_of all_or_none_of].each do |validator|
+        define_method validator do |*attrs, message: nil|
+          validates(param_names(attrs), { validator => { value: true, message: } })
+        end
+      end
+
+      # Define a block of validations which should be applied if and only if
+      # the given parameter is present. The parameters are not nested.
+      # @param attrs [Array<Symbol, Hash>] the parameters which, if present (or
+      #   passing the Proc they map to), trigger the validations
+      # @raise Grape::Exceptions::UnknownParameter if one has not been
+      #   defined in this scope yet
+      # @yield a parameter definition DSL
+      def given(*attrs, &)
+        dependent_on = param_names(attrs)
+        dependent_on.each do |attr|
+          proxy_attr = first_hash_key_or_param(attr)
+          raise Grape::Exceptions::UnknownParameter.new(proxy_attr) unless declared_param?(proxy_attr)
+        end
+        new_lateral_scope(dependent_on:, &)
+      end
+
+      # Test for whether a certain parameter has been defined in this params
+      # block yet.
+      # @return [Boolean] whether the parameter has been defined
+      def declared_param?(param)
+        # Elements of @declared_params of lateral scope are pushed in @parent. So check them in @parent.
+        return @parent.declared_param?(param) if lateral?
+
+        name = param_name(param)
+        # A nested scope is recorded as an Attr keyed by { element => children }.
+        @declared_params.flatten.any? do |declared_param_attr|
+          first_hash_key_or_param(declared_param_attr.key) == name
+        end
+      end
+
+      alias group requires
+
+      private
+
+      # +requires+ and +optional+ differ only in whether what they declare is
+      # required, so the declaration itself lives here.
+      #
+      # The two +using:+ helpers stay separate. They are not one computation
+      # with a flag flipped: +requires+ treats +except+ as "these go in the
+      # other bucket", while +optional+ has no other bucket — +:all+ ignores
+      # +except+ and +:none+ uses it to drop fields entirely.
+      def declare(attrs, opts, required:, using:, except:, as:, &block)
+        merged_opts = with_group_options(opts)
+        declared_as = as || merged_opts[:as]
+
+        if using
+          return require_required_and_optional_fields(attrs.first, using:, except:) if required
+
+          return require_optional_fields(attrs.first, using:, except:)
+        end
+
+        # A block declares the keys of one param. Without a name its params
+        # landed one level up; with several, only the first got them.
+        raise ArgumentError, "a params block needs exactly one parameter name, got `#{attrs.size}`" if block && attrs.size != 1
+
+        validates(attrs, merged_opts, required:)
+        return push_declared_params(attrs, as: declared_as) unless block
+
+        new_scope(attrs.first, type: merged_opts[:type], as: declared_as, optional: !required, &block)
+      end
+
+      # +opts+ over the options of the +with+ blocks enclosing the declaration.
+      def with_group_options(opts)
+        @group&.deep_merge(opts) || opts
+      end
+
+      # A trailing positional options Hash (deprecated): since Ruby 3 keyword
+      # separation it lands in the splat and would be read as a parameter name.
+      def legacy_options?(args)
+        args.size > 1 && args.last.is_a?(Hash)
+      end
+
+      # Re-invokes +method_name+ with the trailing Hash splatted as keyword
+      # arguments, so Ruby routes its keys to the same place they would have
+      # reached had the caller omitted the braces.
+      def redispatch_legacy_options(method_name, args, opts, &)
+        Grape.deprecator.warn("Passing a positional options Hash to `#{method_name}` is deprecated. Pass keyword arguments instead.")
+        __send__(method_name, *args[0..-2], **args.last.merge(opts), &)
+      end
+
+      def first_hash_key_or_param(parameter)
+        parameter.is_a?(Hash) ? parameter.keys.first : parameter
+      end
+
+      # Every params builder finds a param by a Symbol, and +build_with :hash+
+      # only by a Symbol: a name declared as a String found nothing there. So
+      # a String name becomes a Symbol. Anything else is left as it is: a name
+      # read from +configuration+ is nil until the API is mounted with one. A
+      # +given+ may map a name to a Proc.
+      def param_names(attrs)
+        attrs.map { |attr| attr.is_a?(Hash) ? attr.transform_keys { |key| param_name(key) } : param_name(attr) }
+      end
+
+      def param_name(name)
+        name.is_a?(String) ? name.to_sym : name
+      end
+    end
+  end
+end
