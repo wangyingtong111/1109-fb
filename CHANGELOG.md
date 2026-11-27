@@ -1,5 +1,14 @@
 # Audited ChangeLog
 
+### Unreleased
+
+- Add `audit_browser` for paginated, point-in-time browsing of one record's
+  audits. Pages use compound `(created_at, version)` cursors so audits sharing a
+  timestamp are neither skipped nor repeated, the visible range is fixed when the
+  browser opens, and each row restores from that record's audits only.
+  `revision_at` also accepts an optional version to cut inside a shared
+  timestamp; the time-only reading is unchanged.
+
 ### 5.8.0 (2024-11-08)
 - Allow calling audited multiple times - @mohammednasser-32
   [734](https://github.com/collectiveidea/audited/pull/734)  

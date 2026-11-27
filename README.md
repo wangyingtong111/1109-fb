@@ -113,6 +113,65 @@ user.revision(1)
 user.revision_at(Date.parse("2016-01-01"))
 ```
 
+### Browsing the audit log
+
+A time is not a unique key: several audits of one record can share the same
+`created_at`. Paging on `created_at` alone therefore skips the tied rows, and
+restoring a row by time jumps to the last audit at that instant. `audit_browser`
+pages and restores by a compound `(created_at, version)` cursor instead.
+
+The range is fixed when the browser is opened, so audits appended while a user
+is paging (including ones written with the same timestamp) do not shift the
+pages already shown. Opening a new browser does show them.
+
+```ruby
+browser = user.audit_browser(per_page: 1) # snapshot == current history
+page = browser.page
+
+page.each do |row|
+  row.version      # audit version
+  row.created_at   # timestamp shared with its neighbours
+  row.revision     # the record right after this audit
+end
+
+page = page.next_page          # forward cursor
+page = page.previous_page      # backward cursor
+```
+
+Rows are scoped to the browsed record, so a cursor that happens to match
+another object's version never surfaces that object's attributes.
+
+Cursors are plain values and can be stored and handed back to a new browser.
+Doing so keeps the original range:
+
+```ruby
+cursor = browser.page.rows.first.cursor
+cursor.to_h # => {created_at: "...", version: 2, through: {...}}
+
+resumed = user.audit_browser(per_page: 10)
+resumed.page(cursor: cursor) # still bounded by the session that produced it
+```
+
+To restore a single row without paging, pass an audit, a cursor, a version or a
+time to `revision_for`:
+
+```ruby
+user.revision_for(2)                   # exactly version 2 of this record
+user.revision_for(audit)               # row for a given audit
+user.revision_for(cursor)              # row for a stored cursor
+user.revision_for(2, snapshot: cursor) # nil when 2 is outside the snapshot
+```
+
+The classic readers keep their behaviour. `revision_at` with only a time still
+applies every audit at or before that instant, i.e. it returns the last audit at
+a shared timestamp. It accepts an optional version to cut inside a shared
+timestamp:
+
+```ruby
+user.revision_at(time)             # last audit at or before time
+user.revision_at(time, version: 2) # exactly version 2, still bounded by time
+```
+
 ### Specifying columns
 
 By default, a new audit is created for any attribute changes. You can, however, limit the columns to be considered.

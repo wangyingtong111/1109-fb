@@ -65,6 +65,32 @@ module Audited
     scope :from_version, ->(version) { where("version >= ?", version) }
     scope :to_version, ->(version) { where("version <= ?", version) }
     scope :auditable_finder, ->(auditable_id, auditable_type) { where(auditable_id: auditable_id, auditable_type: auditable_type) }
+
+    # Stable order for browsing: timestamps may be shared by several audits, so
+    # the version disambiguates them.
+    scope :chronological, -> { reorder(created_at: :asc, version: :asc) }
+    scope :reverse_chronological, -> { reorder(created_at: :desc, version: :desc) }
+
+    # Audits that existed at a fixed range boundary: written by +date_or_time+
+    # and not newer than +version+. The version cap also keeps a backdated audit
+    # logged after the boundary out of the range, which tuple ordering alone
+    # would let through.
+    scope :through_snapshot, ->(date_or_time, version) {
+      where("created_at <= :time AND version <= :version", time: date_or_time, version: version)
+    }
+
+    # Audits strictly after the compound position (created_at, version).
+    scope :after_position, ->(date_or_time, version) {
+      where("created_at > :time OR (created_at = :time AND version > :version)",
+        time: date_or_time, version: version)
+    }
+
+    # Audits strictly before the compound position (created_at, version).
+    scope :before_position, ->(date_or_time, version) {
+      where("created_at < :time OR (created_at = :time AND version < :version)",
+        time: date_or_time, version: version)
+    }
+
     # Return all audits older than the current one.
     def ancestors
       self.class.ascending.auditable_finder(auditable_id, auditable_type).to_version(version)
@@ -73,11 +99,27 @@ module Audited
     # Return an instance of what the object looked like at this revision. If
     # the object has been destroyed, this will be a new record.
     def revision
-      clazz = auditable_type.constantize
-      (clazz.find_by_id(auditable_id) || clazz.new).tap do |m|
-        self.class.assign_revision_attributes(m, self.class.reconstruct_attributes(ancestors).merge(audit_version: version))
-      end
+      revision_from(ancestors)
     end
+
+    # Return an instance of what the object looked like right after this audit,
+    # reconstructed from the audits in +scope+ that are at or before this
+    # audit's position. The scope is expected to be bound to this audit's
+    # auditable record (a snapshot relation does that), which keeps another
+    # object's audits out of the result.
+    def revision_within(scope)
+      relation = scope.auditable_finder(auditable_id, auditable_type)
+        .through_snapshot(created_at, version)
+        .chronological
+      revision_from(relation)
+    end
+
+    # Position of this audit inside its record's history. Because
+    # +created_at+ is not unique, the version is part of the boundary.
+    def to_cursor
+      Audited::AuditCursor.new(created_at, version)
+    end
+    alias_method :audit_cursor, :to_cursor
 
     # Returns a hash of the changed attributes with the new values
     def new_attributes
@@ -173,6 +215,16 @@ module Audited
     end
 
     private
+
+    def revision_from(relation)
+      clazz = auditable_type.constantize
+      (clazz.find_by_id(auditable_id) || clazz.new).tap do |m|
+        self.class.assign_revision_attributes(
+          m,
+          self.class.reconstruct_attributes(relation).merge(audit_version: version)
+        )
+      end
+    end
 
     def set_version_number
       if action == "create"

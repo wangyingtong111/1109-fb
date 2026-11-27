@@ -51,6 +51,8 @@ require "audited/auditor"
 
 ActiveSupport.on_load :active_record do
   require "audited/audit"
+  require "audited/audit_cursor"
+  require "audited/audit_browser"
   include Audited::Auditor
 end
 

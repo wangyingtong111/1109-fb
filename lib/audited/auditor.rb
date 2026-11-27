@@ -181,10 +181,62 @@ module Audited
       end
 
       # Find the oldest revision recorded prior to the date/time provided.
-      def revision_at(date_or_time)
-        audits = self.audits.up_until(date_or_time)
+      #
+      # With only a time this keeps its original behaviour: all audits at or
+      # before that instant are applied, so a group of audits sharing the same
+      # +created_at+ resolves to the last one.
+      #
+      # Passing a version (positionally or as +version:+ / +at_version:+) cuts
+      # inside that group and returns the record as it looked right after the
+      # given version, which is what the audit browser needs when a timestamp is
+      # not unique. Only this record's audits are considered, so a version can
+      # never reach another object's history.
+      #
+      #   user.revision_at(time)                # last audit at or before time
+      #   user.revision_at(time, version: 2)    # exactly version 2 within time
+      def revision_at(date_or_time, version = nil, at_version: nil, through_version: nil, **options)
+        ceiling = version || at_version || through_version || options[:version] || options[:at_version]
+
+        audits = if ceiling.nil?
+          self.audits.up_until(date_or_time)
+        else
+          self.audits.through_snapshot(date_or_time, Integer(ceiling))
+        end
+
         revision_with Audited.audit_class.reconstruct_attributes(audits) unless audits.empty?
       end
+
+      # Open a paginated, point-in-time browser over this record's audits.
+      #
+      # The browser fixes its range to the record's current position when it is
+      # created, pages with (created_at, version) cursors so audits sharing a
+      # timestamp are neither skipped nor repeated, and restores each row from
+      # this record's audits only. +revision+ and +revision_at+ keep their
+      # existing behaviour.
+      #
+      #   browser = user.audit_browser(per_page: 1)
+      #   page = browser.page
+      #   page.rows.first.revision
+      #   page.next_page
+      #
+      def audit_browser(per_page: Audited::AuditBrowser::DEFAULT_PER_PAGE, limit: nil, snapshot: nil, through: nil)
+        Audited::AuditBrowser.new(self, per_page: per_page, limit: limit, snapshot: snapshot, through: through)
+      end
+      alias_method :audits_browser, :audit_browser
+      alias_method :browse_audits, :audit_browser
+      alias_method :audit_history, :audit_browser
+
+      # The record as it looked right after the given audit of this record.
+      #
+      # Accepts an audit, a cursor, a version, or a time. Audits belonging to
+      # another record (or outside the optional +snapshot+) return +nil+, so a
+      # version number can never cross over to a different object.
+      def revision_for(position, snapshot: nil)
+        browser = audit_browser(snapshot: snapshot)
+        browser.revision_at(position)
+      end
+      alias_method :audit_revision, :revision_for
+      alias_method :revision_at_cursor, :revision_for
 
       # List of attributes that are audited.
       def audited_attributes

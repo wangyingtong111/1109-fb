@@ -916,6 +916,33 @@ describe Audited::Auditor do
     it "should be nil if given a time before audits" do
       expect(user.revision_at(1.week.ago)).to be_nil
     end
+
+    context "when several audits share created_at" do
+      let(:instant) { Time.utc(2020, 1, 1, 12, 0, 0) }
+
+      before do
+        user.update! name: "B"
+        user.update! name: "C"
+        user.audits.update_all(created_at: instant)
+      end
+
+      it "keeps the time-only reading as the last audit at that instant" do
+        expect(user.revision_at(instant).name).to eq("C")
+      end
+
+      it "can cut inside the shared timestamp by version" do
+        expect(user.revision_at(instant, version: 2).name).to eq("B")
+        expect(user.revision_at(instant, 2).name).to eq("B")
+      end
+
+      it "still resolves a later time together with a version" do
+        expect(user.revision_at(instant + 1.hour, version: 2).name).to eq("B")
+      end
+
+      it "is nil before the timestamp even when a version is given" do
+        expect(user.revision_at(instant - 1, version: 2)).to be_nil
+      end
+    end
   end
 
   describe "own_and_associated_audits" do
