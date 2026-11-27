@@ -415,14 +415,46 @@ describe IceCube::Schedule do
     expect(schedule.occurring_at?(Time.local(2010, 5, 6, 10, 59, 59))).to be_truthy
   end
 
-  it "should be able to explicity remove a certain minute from a duration" do
+  it "should match exception times against occurrence start times, not queried times" do
     start_time = Time.local 2010, 5, 6, 10, 0, 0
     schedule = IceCube::Schedule.new(start_time, duration: 3600)
     schedule.add_recurrence_rule IceCube::Rule.daily
+    # The exception falls inside the occurrence's duration but is not its
+    # start time, so the occurrence still occupies that moment
     schedule.add_exception_time Time.local(2010, 5, 6, 10, 21, 30)
     expect(schedule.occurring_at?(Time.local(2010, 5, 6, 10, 21, 29))).to be_truthy
-    expect(schedule.occurring_at?(Time.local(2010, 5, 6, 10, 21, 30))).to be_falsey
+    expect(schedule.occurring_at?(Time.local(2010, 5, 6, 10, 21, 30))).to be_truthy
     expect(schedule.occurring_at?(Time.local(2010, 5, 6, 10, 21, 31))).to be_truthy
+    # An exception on the start time removes the whole occurrence
+    schedule.add_exception_time start_time
+    expect(schedule.occurring_at?(Time.local(2010, 5, 6, 10, 21, 30))).to be_falsey
+    expect(schedule.occurs_at?(start_time)).to be_falsey
+  end
+
+  it "should keep an overlapping longer occurrence when a shorter one starting during it is excepted" do
+    start_time = Time.local 2010, 5, 6, 9, 0, 0
+    ten_oclock = Time.local 2010, 5, 6, 10, 0, 0
+    schedule = IceCube::Schedule.new(start_time, duration: 2 * IceCube::ONE_HOUR)
+    schedule.add_recurrence_rule IceCube::Rule.hourly
+    # Cancel only the instance starting at 10:00; the 9:00 instance runs to 11:00
+    schedule.add_exception_time ten_oclock
+    expect(schedule.occurrences(Time.local(2010, 5, 6, 10, 30, 0)).map(&:start_time)).to eq([start_time])
+    expect(schedule.occurring_at?(ten_oclock)).to be_truthy
+    expect(schedule.occurring_at?(Time.local(2010, 5, 6, 10, 30, 0))).to be_truthy
+    expect(schedule.occurs_at?(ten_oclock)).to be_falsey
+  end
+
+  it "should honor exception rules by occurrence start time for overlapping durations" do
+    start_time = Time.local 2010, 5, 6, 9, 0, 0
+    ten_oclock = Time.local 2010, 5, 6, 10, 0, 0
+    schedule = IceCube::Schedule.new(start_time, duration: 2 * IceCube::ONE_HOUR)
+    schedule.add_recurrence_rule IceCube::Rule.hourly
+    # Exception rule matches only occurrences starting at hour 10, not the 9:00 one
+    schedule.add_exception_rule IceCube::Rule.hourly.hour_of_day(10)
+    expect(schedule.occurring_at?(start_time)).to be_truthy
+    expect(schedule.occurring_at?(ten_oclock)).to be_truthy
+    expect(schedule.occurring_at?(Time.local(2010, 5, 6, 10, 30, 0))).to be_truthy
+    expect(schedule.occurs_at?(ten_oclock)).to be_falsey
   end
 
   it "should be able to specify an end time for the schedule" do

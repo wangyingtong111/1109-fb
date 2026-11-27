@@ -248,11 +248,18 @@ module IceCube
       occurs_between?(begin_time, closing_time)
     end
 
-    # Determine if the schedule is occurring at a given time
+    # Determine if the schedule is occurring at a given time.
+    #
+    # Exception times and exception rules only remove an occurrence when it
+    # actually starts at the excluded time; matching is done against each
+    # occurrence's start time inside #next_time. They must not cancel a
+    # different, longer occurrence whose duration merely overlaps the
+    # excluded time, so the queried time is never tested for exceptions
+    # directly. The occurrence-start filtering performed by the enumeration
+    # is sufficient for both single exception times and exception rules.
     def occurring_at?(time)
       time = TimeUtil.match_zone(time, start_time) or raise ArgumentError, "Time required, got #{time.inspect}"
       if duration > 0
-        return false if exception_time?(time)
         occurs_between?(time - duration + 1, time)
       else
         occurs_at?(time)
