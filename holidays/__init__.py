@@ -14,6 +14,7 @@
 
 from holidays.constants import *
 from holidays.holiday_base import *
+from holidays.reception import *
 from holidays.registry import EntityLoader
 from holidays.utils import *
 
