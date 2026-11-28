@@ -53,9 +53,19 @@ module Grape
         # with a default in it, and the Hash scopes under it. A scope like
         # that depends on no other param, so the iterator and its dependency
         # check have nothing to add.
+        #
+        # A param is missing when its key is not in the params, not when its
+        # value reads +nil+ -- the distinction PresenceValidator, CoerceValidator
+        # and ExceptValuesValidator already draw. A client that sends an explicit
+        # null -- <tt>note: null</tt> in a JSON body, +note+ in a query string --
+        # is clearing the field, and a default keyed on +nil+ put back the very
+        # text it meant to remove. So the default fills only a key the request
+        # left out, and the null goes on to the rest of the declaration's
+        # validations like any other value: +allow_blank: false+ refuses it,
+        # +values:+ judges it, and +declared+ reports it as the null it is.
         def apply_defaults(params)
           @attrs.each do |attr_name|
-            params[attr_name] = @default_call.call(params) if params[attr_name].nil?
+            params[attr_name] = @default_call.call(params) unless params.key?(attr_name)
           end
         end
       end

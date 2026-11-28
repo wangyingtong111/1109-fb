@@ -194,6 +194,17 @@ describe Grape::Endpoint do
         expect(body['nested']['nested_two']).to be_a(Hash)
       end
 
+      it 'keeps an explicit null in place of the empty value the type stands for' do
+        get '/declared?first=present&empty_arr&empty_hash&empty_typed_arr&empty_set'
+        expect(last_response).to be_successful
+
+        body = JSON.parse(last_response.body)
+        expect(body['empty_arr']).to be_nil
+        expect(body['empty_typed_arr']).to be_nil
+        expect(body['empty_hash']).to be_nil
+        expect(body['empty_set']).to be_nil
+      end
+
       it 'sets objects with type=Set to be a set' do
         get '/declared?first=present'
         expect(last_response).to be_successful

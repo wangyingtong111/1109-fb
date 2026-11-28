@@ -999,7 +999,7 @@ curl -X POST -H "Content-Type: application/json" localhost:9292/users/signup -d 
 }
 ````
 
-Note that an attribute with a `nil` value is not considered *missing* and will also be returned when `include_missing` is set to `false`:
+Note that an attribute with a `nil` value is not considered *missing* and will also be returned when `include_missing` is set to `false`. A `nil` sent for a param declared as an `Array`, `Hash` or `Set` stays `nil` too: the empty value those types stand for fills a param the request left out, not one the client cleared with `null`.
 
 **Request**
 
@@ -1182,6 +1182,18 @@ end
 ```
 
 Default values are eagerly evaluated. Above `:non_random_number` will evaluate to the same number for each call to the endpoint of this `params` block. To have the default evaluate lazily with each request use a lambda, like `:random_number` above.
+
+A default applies to a parameter the request did not send. A parameter the request sent as `null` is not missing: the client is clearing the field, so the value stays `null` and the default is left alone. This is what lets an endpoint tell "leave it as it was" apart from "clear it":
+
+```ruby
+params do
+  optional :note, type: String, default: 'review'
+end
+```
+
+Above, a request that leaves `note` out gets `'review'`, while one that sends `note: null` gets `nil`. The `null` then goes through the rest of the declaration's validations like any other value, so `allow_blank: false` refuses it and `values:` judges it; `declared(params)` reports it as `null` rather than as the empty value its type would stand for.
+
+Inside a `Hash` or `Array` param, this applies once the request sends that param at all: a scope the request left out is not checked, so its params' defaults are not filled either.
 
 Note that default values will be passed through to any validation options specified.
 The following example raises `Grape::Exceptions::IncompatibleOptionValues` when the API is defined, since the default is not one of the allowed values.

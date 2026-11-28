@@ -41,19 +41,34 @@ module Grape
         next if @evaluate_given && !declared_param.scope.attr_meets_dependency?(passed_params)
 
         name = declared_param.name
-        next unless @include_missing || passed_params.key?(name)
+        sent = passed_params.key?(name)
+        next unless @include_missing || sent
 
-        memo[@stringify ? declared_param.string_key : declared_param.key] = declared_value(passed_params[name], declared_param, passed_params)
+        memo[@stringify ? declared_param.string_key : declared_param.key] = declared_value(passed_params[name], declared_param, passed_params, sent)
       end
     end
 
-    # What a declared param is filed as: its value, or the empty value its
-    # type has when that is nil, a fresh one every time since the caller may
-    # fill it.
-    def declared_value(passed_param, declared_param, passed_params)
-      children = declared_param.children
-      return declared_children(passed_param || passed_params.class.new, declared_param, children) if children
+    # What a declared param is filed as.
+    #
+    # A param the request left out stands for the empty value its type has --
+    # a fresh one every time, since the caller may fill it -- or for what its
+    # declared children compile to when the type has none. A param the
+    # request sent stands for what it sent, an explicit +nil+ included: null
+    # is how a client clears a field, so it stays null rather than being
+    # filed as an empty Array, Hash or Set and read back as a param that was
+    # never sent.
+    def declared_value(passed_param, declared_param, passed_params, sent)
+      return if sent && passed_param.nil?
 
+      children = declared_param.children
+      return declared_leaf(passed_param, declared_param) unless children
+
+      declared_children(passed_param || passed_params.class.new, declared_param, children)
+    end
+
+    # A leaf param's value, or the empty value its type stands for when the
+    # request left it out and it has one.
+    def declared_leaf(passed_param, declared_param)
       passed_param || declared_param.empty_value&.dup || passed_param
     end
 

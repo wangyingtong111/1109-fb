@@ -146,10 +146,149 @@ describe Grape::Validations::Validators::DefaultValidator do
       end
     end
 
-    it 'defaults a null, keeps a false and hands a proc the params of its own scope' do
-      post '/defaults', { type: nil, kept: false, nested: { name: 'n' } }.to_json, 'CONTENT_TYPE' => 'application/json'
+    it 'fills in a default the body left out and hands a proc the params of its own scope' do
+      post '/defaults', { kept: false, nested: { name: 'n' } }.to_json, 'CONTENT_TYPE' => 'application/json'
       expect(last_response.status).to eq(201)
       expect(JSON.parse(last_response.body)).to eq('type' => 'default-type', 'kept' => false, 'nested' => { 'name' => 'n', 'label' => 'n-label' })
+    end
+
+    it 'keeps a null the body sent, as the client clearing the field meant it' do
+      post '/defaults', { type: nil, kept: false, nested: { name: 'n' } }.to_json, 'CONTENT_TYPE' => 'application/json'
+      expect(last_response.status).to eq(201)
+      expect(JSON.parse(last_response.body)).to eq('type' => nil, 'kept' => false, 'nested' => { 'name' => 'n', 'label' => 'n-label' })
+    end
+  end
+
+  describe 'a default on the field a handoff note carries' do
+    let(:app) do
+      Class.new(Grape::API) do
+        format :json
+
+        params do
+          optional :note, type: String, default: 'review'
+        end
+        post '/notes' do
+          { note: params[:note], declared: declared(params, include_missing: false) }
+        end
+      end
+    end
+
+    it 'fills an empty handoff with the declared text' do
+      post '/notes', {}.to_json, 'CONTENT_TYPE' => 'application/json'
+      expect(last_response.status).to eq(201)
+      expect(JSON.parse(last_response.body)).to eq('note' => 'review', 'declared' => { 'note' => 'review' })
+    end
+
+    it 'keeps a note cleared with null, in params and in declared alike' do
+      post '/notes', { note: nil }.to_json, 'CONTENT_TYPE' => 'application/json'
+      expect(last_response.status).to eq(201)
+      expect(JSON.parse(last_response.body)).to eq('note' => nil, 'declared' => { 'note' => nil })
+    end
+
+    it 'keeps a note the client wrote' do
+      post '/notes', { note: 'handed over as is' }.to_json, 'CONTENT_TYPE' => 'application/json'
+      expect(last_response.status).to eq(201)
+      expect(JSON.parse(last_response.body)).to eq('note' => 'handed over as is', 'declared' => { 'note' => 'handed over as is' })
+    end
+  end
+
+  describe 'a default answered once per request' do
+    let(:calls) { [] }
+
+    let(:app) do
+      counted = calls
+      generator = lambda do
+        counted << :called
+        'generated'
+      end
+
+      Class.new(Grape::API) do
+        format :json
+
+        params do
+          optional :note, default: generator
+        end
+        post '/notes' do
+          { note: params[:note] }
+        end
+      end
+    end
+
+    it 'runs the default only for a param the request left out' do
+      post '/notes', {}.to_json, 'CONTENT_TYPE' => 'application/json'
+      expect(JSON.parse(last_response.body)).to eq('note' => 'generated')
+      post '/notes', { note: nil }.to_json, 'CONTENT_TYPE' => 'application/json'
+      expect(JSON.parse(last_response.body)).to eq('note' => nil)
+      post '/notes', { note: 'mine' }.to_json, 'CONTENT_TYPE' => 'application/json'
+      expect(JSON.parse(last_response.body)).to eq('note' => 'mine')
+
+      expect(calls.size).to eq(1)
+    end
+  end
+
+  describe 'a default inside a scope that repeats' do
+    let(:app) do
+      Class.new(Grape::API) do
+        format :json
+
+        params do
+          optional :lines, type: Array do
+            optional :note, type: String, default: 'review'
+          end
+        end
+        post('/lines') { declared(params, include_missing: false) }
+
+        params do
+          optional :filter, type: Hash do
+            optional :other
+            optional :note, type: String, default: 'review'
+          end
+        end
+        post('/filter') { declared(params, include_missing: false) }
+      end
+    end
+
+    it 'decides each element of the Array on its own' do
+      post '/lines', { lines: [{}, { note: nil }, { note: 'own' }] }.to_json, 'CONTENT_TYPE' => 'application/json'
+      expect(last_response.status).to eq(201)
+      expect(JSON.parse(last_response.body)).to eq('lines' => [{ 'note' => 'review' }, { 'note' => nil }, { 'note' => 'own' }])
+    end
+
+    # An empty Hash scope is not validated at all (see PR #3112), so the
+    # request has to send something else under it for its defaults to apply.
+    it 'decides each key of a Hash on its own' do
+      post '/filter', { filter: { other: 'o' } }.to_json, 'CONTENT_TYPE' => 'application/json'
+      expect(JSON.parse(last_response.body)).to eq('filter' => { 'other' => 'o', 'note' => 'review' })
+
+      post '/filter', { filter: { other: 'o', note: nil } }.to_json, 'CONTENT_TYPE' => 'application/json'
+      expect(JSON.parse(last_response.body)).to eq('filter' => { 'other' => 'o', 'note' => nil })
+    end
+  end
+
+  describe 'a null where the declaration refuses blank' do
+    let(:app) do
+      Class.new(Grape::API) do
+        format :json
+
+        params do
+          optional :note, type: String, default: 'review', allow_blank: false
+        end
+        post '/notes' do
+          { note: params[:note] }
+        end
+      end
+    end
+
+    it 'still fills the field when it was left out' do
+      post '/notes', {}.to_json, 'CONTENT_TYPE' => 'application/json'
+      expect(last_response.status).to eq(201)
+      expect(JSON.parse(last_response.body)).to eq('note' => 'review')
+    end
+
+    it 'refuses the null the client sent, rather than hiding it behind the default' do
+      post '/notes', { note: nil }.to_json, 'CONTENT_TYPE' => 'application/json'
+      expect(last_response.status).to eq(400)
+      expect(JSON.parse(last_response.body)).to eq('error' => 'note is empty')
     end
   end
 
@@ -409,7 +548,7 @@ describe Grape::Validations::Validators::DefaultValidator do
     end
   end
 
-  context 'optional with nil as value' do
+  context 'optional with a default value' do
     subject do
       Class.new(Grape::API) do
         default_format :json
@@ -441,7 +580,7 @@ describe Grape::Validations::Validators::DefaultValidator do
         [TrueClass, true],
         [FalseClass, false]
       ].each do |type, default|
-        it 'respects the default value' do
+        it 'respects the default value for a param that was left out' do
           subject.params do
             optional :param, type:, default:
           end
@@ -449,7 +588,7 @@ describe Grape::Validations::Validators::DefaultValidator do
             params[:param]
           end
 
-          get '/default_value', param: nil
+          get '/default_value'
           expect(last_response.status).to eq(200)
           expect(last_response.body).to eq(default.to_json)
         end
@@ -466,7 +605,7 @@ describe Grape::Validations::Validators::DefaultValidator do
         [Set, []],
         [Set, [1]]
       ].each do |type, default|
-        it 'respects the default value' do
+        it 'respects the default value for a param that was left out' do
           subject.params do
             optional :param, type:, default:
           end
@@ -474,7 +613,7 @@ describe Grape::Validations::Validators::DefaultValidator do
             params[:param]
           end
 
-          get '/default_value', param: nil
+          get '/default_value'
           expect(last_response.status).to eq(200)
           expect(last_response.body).to eq(default.to_json)
         end
@@ -492,7 +631,7 @@ describe Grape::Validations::Validators::DefaultValidator do
         [Rack::Multipart::UploadedFile, ''],
         [Rack::Multipart::UploadedFile, { test: 'non-empty-string' }.to_json]
       ].each do |type, default|
-        it 'respects the default value' do
+        it 'respects the default value for a param that was left out' do
           subject.params do
             optional :param, type:, default:
           end
@@ -500,7 +639,7 @@ describe Grape::Validations::Validators::DefaultValidator do
             params[:param]
           end
 
-          get '/default_value', param: nil
+          get '/default_value'
           expect(last_response.status).to eq(200)
           expect(last_response.body).to eq(default.to_json)
         end
@@ -514,7 +653,7 @@ describe Grape::Validations::Validators::DefaultValidator do
         [[Integer, String, Array[Integer, String]], [0, '', [0, '']]],
         [[Integer, String, Array[Integer, String]], [42, 'non-empty-string', [42, 'non-empty-string']]]
       ].each do |type, default|
-        it 'respects the default value' do
+        it 'respects the default value for a param that was left out' do
           subject.params do
             optional :param, type:, default:
           end
@@ -522,7 +661,7 @@ describe Grape::Validations::Validators::DefaultValidator do
             params[:param]
           end
 
-          get '/default_value', param: nil
+          get '/default_value'
           expect(last_response.status).to eq(200)
           expect(last_response.body).to eq(default.to_json)
         end

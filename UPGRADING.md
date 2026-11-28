@@ -3,6 +3,27 @@ Upgrading Grape
 
 ### Upgrading to >= 4.2.0
 
+#### A default fills a param the request left out, not one it sent as `null`
+
+A `default` now applies only to a param the request did not send ([#3116](https://github.com/ruby-grape/grape/pull/3116)). A param sent as `null` is no longer replaced by the default: the client meant to clear it, and the null goes through the rest of the declaration's validations like any other value. `declared(params)` reports it as `null` too, rather than as the empty Array, Hash or Set its type would stand for.
+
+```ruby
+params do
+  optional :note, type: String, default: 'review'
+end
+```
+
+```
+# Before: both bodies answered {"note":"review"}
+POST ''      '{}'
+POST ''      '{"note":null}'
+# After
+POST ''      '{}'             # => {"note":"review"}
+POST ''      '{"note":null}' # => {"note":null}
+```
+
+An API could rely on either half of this: a default standing in for a null it wanted filled, or a cleared `Array` or `Hash` param coming back as `[]` or `{}` from `declared`. Both now say what the request said. To keep a null reading as the declared default, give the param a `default` that is built from a value the request does send, or fill it in the endpoint; to refuse one, declare `allow_blank: false`, which now refuses the null the client sent instead of being masked by the default. A Hash or Array param the request left out is unaffected: it still stands for the empty value its type declares, its children still listed.
+
 #### Upload tempfiles are deleted once the response is closed
 
 Grape now closes and deletes the tempfiles of a multipart upload once the response is closed, or once an exception escapes the API ([#3086](https://github.com/ruby-grape/grape/pull/3086)). It used to leave them until garbage collection or the process exited, unless the API ran inside an application that already did this, such as Rails with its `Rack::TempfileReaper`.
