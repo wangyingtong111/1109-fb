@@ -72,6 +72,29 @@ module I18n
         end
       end
 
+      # New translations may carry a new pluralization lambda. The cached rule
+      # for the locale is dropped *before* the new data is written so that an
+      # update can never serve fresh words together with a stale rule: while
+      # the update is in flight (and if it fails) lookups fall back to the
+      # rule still stored with the previous, complete package. It is dropped
+      # again *after* the write because a reader racing the update may have
+      # re-cached the previous rule at the midpoint; clearing it then makes the
+      # next lookup resolve the freshly installed rule. An optional block is
+      # called at the midpoint, which allows callers (and tests) to coordinate
+      # an online update.
+      def store_translations(locale, data, options = EMPTY_HASH)
+        pluralizers.delete(locale)
+        yield if block_given?
+        result = super
+        pluralizers.delete(locale)
+        result
+      end
+
+      def reload!
+        pluralizers.clear
+        super
+      end
+
       protected
 
       def pluralizers
@@ -79,10 +102,31 @@ module I18n
       end
 
       def pluralizer(locale)
-        pluralizers[locale] ||= I18n.t(:'i18n.plural.rule', :locale => locale, :resolve => false)
+        # Look the rule up on this backend instead of through the global
+        # +I18n+ object so independent backends never share each other's
+        # rules for the same locale. A previously cached rule is kept when no
+        # rule can be resolved (e.g. while an update is in progress or after a
+        # failed install), which also guarantees a plain text-only update can't
+        # wipe out an already installed rule.
+        unless pluralizers.key?(locale)
+          rule = lookup_pluralization_rule(locale)
+          pluralizers[locale] = rule if rule.respond_to?(:call)
+        end
+        pluralizers[locale]
       end
 
       private
+
+      # Resolves the pluralization rule stored under +i18n.plural.rule+ on
+      # this very backend, returning +nil+ when the rule is missing. Any
+      # +MissingTranslation+ thrown by backends that signal misses via
+      # +throw(:exception)+ is treated the same as a missing rule.
+      def lookup_pluralization_rule(locale)
+        rule = catch(:exception) do
+          translate(locale, :'i18n.plural.rule', resolve: false)
+        end
+        rule unless rule.is_a?(MissingTranslation)
+      end
 
       # Normalizes categories of 0.0 and 1.0
       # and returns the symbolic version
