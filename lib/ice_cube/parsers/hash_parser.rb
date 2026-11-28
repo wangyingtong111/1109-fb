@@ -14,6 +14,7 @@ module IceCube
       apply_rrules schedule, data
       apply_exrules schedule, data
       apply_rtimes schedule, data
+      apply_duration_overrides schedule, data
       apply_extimes schedule, data
       yield schedule if block_given?
       schedule
@@ -78,6 +79,14 @@ module IceCube
       return unless data[:extimes]
       data[:extimes].each do |t|
         schedule.add_exception_time TimeUtil.deserialize_time(t)
+      end
+    end
+
+    def apply_duration_overrides(schedule, data)
+      return unless data[:duration_overrides]
+      data[:duration_overrides].each do |entry|
+        entry = IceCube::FlexibleHash.new(entry)
+        schedule.override_duration TimeUtil.deserialize_time(entry[:time]), entry[:duration]
       end
     end
 

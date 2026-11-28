@@ -106,6 +106,17 @@ schedule.add_recurrence_rule IceCube::Rule.daily
 schedule.occurring_at?(start + 3599) # true
 schedule.occurring_at?(start + 3600) # false
 
+# or override the duration of a single occurrence, leaving the
+# recurrence rules and the default duration untouched
+schedule = IceCube::Schedule.new(now, duration: 1800)
+schedule.add_recurrence_rule IceCube::Rule.weekly.day(:monday, :tuesday)
+schedule.override_duration(tuesday_at_9, 2 * 3600)
+schedule.occurring_at?(tuesday_at_9 + 5400) # true
+schedule.duration_override(tuesday_at_9)    # 7200
+schedule.remove_duration_override(tuesday_at_9)
+# cancelling an occurrence also invalidates its duration override
+schedule.add_exception_time(tuesday_at_9)
+
 # take control and use iteration
 schedule = IceCube::Schedule.new
 schedule.add_recurrence_rule IceCube::Rule.daily.until(Date.today + 30)

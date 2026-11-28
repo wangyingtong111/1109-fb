@@ -20,6 +20,7 @@ module IceCube
       @all_recurrence_rules = []
       @all_exception_rules = []
       @exception_index = {}
+      @duration_overrides = {}
       yield self if block_given?
     end
 
@@ -43,6 +44,38 @@ module IceCube
       @end_time = start_time + seconds
     end
 
+    # Override the duration of the single occurrence starting at a given
+    # time, without touching the recurrence rules or the default duration.
+    def override_duration(time, duration)
+      time = TimeUtil.match_zone(time, start_time) or
+        raise ArgumentError, "Time required, got #{time.inspect}"
+      @duration_overrides[time] = duration
+      time
+    end
+
+    # Remove the duration override for the occurrence at a given time
+    def remove_duration_override(time)
+      time = TimeUtil.match_zone(time, start_time)
+      @duration_overrides.delete(time) ? time : nil
+    end
+
+    # The duration override for the occurrence at a given time, if any
+    def duration_override(time)
+      time = TimeUtil.match_zone(time, start_time)
+      @duration_overrides[time]
+    end
+
+    # All of the single-occurrence duration overrides
+    def duration_overrides
+      @duration_overrides.dup
+    end
+
+    # The effective duration of the occurrence at a given time: its
+    # override if present, otherwise the schedule's default duration
+    def duration_for(time)
+      duration_override(time) || duration
+    end
+
     # Add a recurrence time to the schedule
     def add_recurrence_time(time)
       return if time.nil?
@@ -59,6 +92,7 @@ module IceCube
       return if time.nil?
       rule = SingleOccurrenceRule.new(time)
       add_exception_rule rule
+      remove_duration_override(time)
       time
     end
     alias_method :extime, :add_exception_time
@@ -251,9 +285,9 @@ module IceCube
     # Determine if the schedule is occurring at a given time
     def occurring_at?(time)
       time = TimeUtil.match_zone(time, start_time) or raise ArgumentError, "Time required, got #{time.inspect}"
-      if duration > 0
+      if duration > 0 || !@duration_overrides.empty?
         return false if exception_time?(time)
-        occurs_between?(time - duration + 1, time)
+        occurs_between?(time, time, spans: true) || (duration == 0 && occurs_at?(time))
       else
         occurs_at?(time)
       end
@@ -376,6 +410,11 @@ module IceCube
       data[:extimes] = exception_times.map do |et|
         TimeUtil.serialize_time(et)
       end
+      unless @duration_overrides.empty?
+        data[:duration_overrides] = @duration_overrides.map do |time, duration|
+          {time: TimeUtil.serialize_time(time), duration: duration}
+        end
+      end
       data
     end
     alias_method :to_h, :to_hash
@@ -398,7 +437,8 @@ module IceCube
       [
         TimeUtil.hash(start_time), duration,
         *@all_recurrence_rules.map(&:hash).sort!,
-        *@all_exception_rules.map(&:hash).sort!
+        *@all_exception_rules.map(&:hash).sort!,
+        @duration_overrides.map { |t, d| [TimeUtil.hash(t), d] }.sort.hash
       ].hash
     end
 
@@ -433,11 +473,11 @@ module IceCube
       closing_time = TimeUtil.match_zone(closing_time, start_time)
       opening_time += TimeUtil.subsec(start_time) - TimeUtil.subsec(opening_time)
       opening_time = start_time if opening_time < start_time
-      spans = options[:spans] == true && duration != 0
+      spans = options[:spans] == true && max_duration != 0
       Enumerator.new do |yielder|
         reset
         t1 = full_required? ? start_time : opening_time
-        t1 -= duration if spans
+        t1 -= max_duration if spans
         t1 = start_time if t1 < start_time
         loop do
           break unless (t0 = next_time(t1, closing_time))
@@ -470,7 +510,7 @@ module IceCube
           rule.increment_uses if candidate == min_time && rule.respond_to?(:increment_uses)
         end
         next (time = min_time + 1) if exception_time?(min_time)
-        break Occurrence.new(min_time, min_time + duration)
+        break Occurrence.new(min_time, min_time + duration_for(min_time))
       end
     end
 
@@ -479,6 +519,12 @@ module IceCube
     def full_required?
       @all_recurrence_rules.any?(&:full_required?) ||
         @all_exception_rules.any?(&:full_required?)
+    end
+
+    # The longest duration any single occurrence may span, taking
+    # per-occurrence overrides into account alongside the default duration
+    def max_duration
+      @duration_overrides.values.inject(duration) { |max, d| (d > max) ? d : max }
     end
 
     # Return a boolean indicating whether or not a specific time
