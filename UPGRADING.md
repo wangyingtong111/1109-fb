@@ -3,6 +3,12 @@ Upgrading Grape
 
 ### Upgrading to >= 4.2.0
 
+#### An `Accept` tie now follows the API's content-type order
+
+When an `Accept` header gives two content types the same quality, including the quality 1.0 an omitted `q` implies (RFC 9110 §12.5.1), Grape now answers with the one the API declared first rather than the one the header listed last ([#3103](https://github.com/ruby-grape/grape/pull/3103)). The declaration order was already the preference for the `*/*` every browser sends, so an API that declares `content_type :json` before `content_type :txt` now answers `application/json` to both `Accept: application/json, text/plain` and `Accept: text/plain, application/json`. A quality the client does set still wins, and a format named in the URL or with `?format=` is unchanged.
+
+A quality of zero is now a refusal rather than a low preference: a wildcard such as `*/*` no longer brings back a type the client sent with `q=0`. When every declared type is refused, the request falls through to the default format as it did for a header naming no supported type.
+
 #### Upload tempfiles are deleted once the response is closed
 
 Grape now closes and deletes the tempfiles of a multipart upload once the response is closed, or once an exception escapes the API ([#3086](https://github.com/ruby-grape/grape/pull/3086)). It used to leave them until garbage collection or the process exited, unless the API ran inside an application that already did this, such as Rails with its `Rack::TempfileReaper`.

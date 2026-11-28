@@ -94,9 +94,12 @@ module Grape
 
         # The available types are registered in lower case and Rack matches them
         # literally, so the header has to be down-cased to be compared against
-        # them at all.
+        # them at all. A blank header asks for the first type the API declared;
+        # ties otherwise follow its declaration order (see AcceptNegotiation).
         def best_quality_media_type(header, available_media_types)
-          header.blank? ? available_media_types.first : Rack::Utils.best_q_match(header.downcase, available_media_types)
+          return available_media_types.first if header.blank?
+
+          Grape::Util::AcceptNegotiation.best_media_type(header.downcase, available_media_types)
         end
       end
 

@@ -138,8 +138,8 @@ RSpec.describe Grape::Util::MediaType do
       let(:type) { 'text' }
       let(:subtype) { 'html' }
 
-      it 'calls Rack::Utils.best_q_match' do
-        allow(Rack::Utils).to receive(:best_q_match).and_call_original
+      it 'negotiates through Grape::Util::AcceptNegotiation' do
+        allow(Grape::Util::AcceptNegotiation).to receive(:best_media_type).and_call_original
         expect(media_type).to eq(described_class.new(type:, subtype:))
       end
     end

@@ -3812,6 +3812,53 @@ describe Grape::API do
     end
   end
 
+  describe 'a route that serves a report as JSON and text' do
+    # The declaration order is the route's business preference: JSON first.
+    let(:app) do
+      Class.new(described_class) do
+        content_type :json, 'application/json'
+        content_type :txt, 'text/plain'
+        get('/report') { { total: 42 } }
+      end
+    end
+
+    it 'encodes the body as JSON and labels it so when the client accepts both alike' do
+      %w[application/json,text/plain text/plain,application/json].each do |accept|
+        get '/report', {}, 'HTTP_ACCEPT' => accept
+        expect(last_response).to be_successful
+        expect(last_response.content_type).to eq('application/json')
+        expect(JSON.parse(last_response.body)).to eq('total' => 42)
+      end
+    end
+
+    it 'still answers text when the client refuses JSON with a quality of zero' do
+      get '/report', {}, 'HTTP_ACCEPT' => 'application/json;q=0,text/plain'
+      expect(last_response).to be_successful
+      expect(last_response.content_type).to eq('text/plain')
+      expect(last_response.body).to eq({ total: 42 }.to_s)
+    end
+
+    it 'does not bring refused JSON back through a wildcard' do
+      get '/report', {}, 'HTTP_ACCEPT' => 'application/json;q=0,*/*'
+      expect(last_response.content_type).to eq('text/plain')
+    end
+
+    it 'honors a quality the client did set over the business preference' do
+      get '/report', {}, 'HTTP_ACCEPT' => 'application/json;q=0.5,text/plain;q=0.9'
+      expect(last_response.content_type).to eq('text/plain')
+    end
+
+    it 'keeps the contract of a call that names the format in the URL' do
+      get '/report.txt'
+      expect(last_response.content_type).to eq('text/plain')
+      expect(last_response.body).to eq({ total: 42 }.to_s)
+
+      get '/report.json'
+      expect(last_response.content_type).to eq('application/json')
+      expect(JSON.parse(last_response.body)).to eq('total' => 42)
+    end
+  end
+
   describe '.formatter' do
     context 'multiple formatters' do
       before do

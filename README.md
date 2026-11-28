@@ -3407,6 +3407,8 @@ Serialization takes place automatically. For example, you do not have to call `t
 * Use the default format, if specified by the `default_format` option.
 * Default to `:txt`.
 
+When the `Accept` header gives two content types the same quality — including the quality 1.0 an omitted `q` implies — the one declared first with `content_type` wins, so the declaration order expresses the route's business preference. A quality the client does set still takes precedence, and a quality of zero is a refusal: a wildcard such as `*/*` does not bring a refused type back.
+
 For example, consider the following API.
 
 ```ruby

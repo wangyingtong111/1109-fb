@@ -24,10 +24,13 @@ module Grape
       # ones are spelled in lower case and Rack matches them literally, so an
       # `Accept: TEXT/PLAIN` found nothing and fell through to the default
       # format — the client quietly got something other than what it asked for.
+      # Ties follow the API's declaration order rather than the header's, and a
+      # quality of zero is a refusal a wildcard cannot undo (see
+      # Grape::Util::AcceptNegotiation).
       def self.format_for_accept(accept_header, mime_types)
         return if accept_header.blank? || accept_header == ALL_MEDIA_TYPES
 
-        media_type = Rack::Utils.best_q_match(accept_header.downcase, mime_types.keys)
+        media_type = Grape::Util::AcceptNegotiation.best_media_type(accept_header.downcase, mime_types.keys)
         mime_types[media_type] if media_type
       end
 
@@ -46,7 +49,7 @@ module Grape
       # client that names the format it wants sends one of those media types as
       # it is registered (+application/json+), and most others send +*/*+,
       # nothing or one of COMMON_ACCEPT_HEADERS, so those answers are worked
-      # out once instead of re-running Rack's q-value match on every request.
+      # out once instead of re-running the quality match on every request.
       # Any other header misses and is negotiated as before; a request never
       # adds a key, so a client cannot grow a table.
       #

@@ -221,10 +221,13 @@ describe Grape::Middleware::Formatter do
       expect(format_negotiated(Rack::PATH_INFO => '/info', 'HTTP_ACCEPT' => 'application/json; q=1.0,application/xml; q=0.3')).to eq(:json)
     end
 
-    it 'handles quality rankings mixed with nothing' do
+    # An omitted quality is 1.0 (RFC 9110 §12.5.1), so both types tie and the
+    # API's declaration order -- its business preference -- decides, not the
+    # order the client happened to list them in.
+    it 'breaks an equal-quality tie by declaration order rather than header order' do
       expect(format_negotiated(Rack::PATH_INFO => '/info', 'HTTP_ACCEPT' => 'application/json,application/xml; q=1.0')).to eq(:xml)
 
-      expect(format_negotiated(Rack::PATH_INFO => '/info', 'HTTP_ACCEPT' => 'application/xml; q=1.0,application/json')).to eq(:json)
+      expect(format_negotiated(Rack::PATH_INFO => '/info', 'HTTP_ACCEPT' => 'application/xml; q=1.0,application/json')).to eq(:xml)
     end
 
     it 'handles quality rankings that have a default 1.0 value' do
@@ -239,6 +242,17 @@ describe Grape::Middleware::Formatter do
     it 'ensures that a quality of 0 is less preferred than any other content type' do
       expect(format_negotiated(Rack::PATH_INFO => '/info', 'HTTP_ACCEPT' => 'application/json;q=0.0,application/xml')).to eq(:xml)
       expect(format_negotiated(Rack::PATH_INFO => '/info', 'HTTP_ACCEPT' => 'application/xml,application/json;q=0.0')).to eq(:xml)
+    end
+
+    # A quality of zero is a refusal (RFC 9110 §12.5.2), not a low preference:
+    # a wildcard that names nothing in its own right cannot bring the type back.
+    it 'does not revive a refused type through a wildcard' do
+      expect(format_negotiated(Rack::PATH_INFO => '/info', 'HTTP_ACCEPT' => 'application/json;q=0.0,*/*')).to eq(:xml)
+      expect(format_negotiated(Rack::PATH_INFO => '/info', 'HTTP_ACCEPT' => 'application/json;q=0.0,application/*')).to eq(:xml)
+    end
+
+    it 'answers nothing when every available type is refused' do
+      expect(format_negotiated(Rack::PATH_INFO => '/info', 'HTTP_ACCEPT' => 'application/json;q=0.0,application/xml;q=0.0,text/plain;q=0.0,application/octet-stream;q=0.0')).to eq(:txt)
     end
 
     context 'with custom vendored content types' do
@@ -277,9 +291,9 @@ describe Grape::Middleware::Formatter do
           expect(format_negotiated(Rack::PATH_INFO => '/info', 'HTTP_ACCEPT' => accept)).to eq(negotiated)
         end
 
-        it 'does not match it against the media types again' do
+        it 'does not negotiate the header again' do
           subject
-          expect(Rack::Utils).not_to receive(:best_q_match)
+          expect(Grape::Util::AcceptNegotiation).not_to receive(:best_media_type)
 
           format_negotiated(Rack::PATH_INFO => '/info', 'HTTP_ACCEPT' => accept)
         end

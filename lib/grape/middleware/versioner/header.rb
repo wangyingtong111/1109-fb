@@ -32,7 +32,7 @@ module Grape
         # middleware is built. Most requests send one of a handful of headers --
         # a declared media type spelled as declared (+application/vnd.acme-v1+json+)
         # or one of COMMON_ACCEPT_HEADERS -- so their answers are worked out
-        # once instead of re-running Rack's q-value match and a parse on every
+        # once instead of re-running the quality match and a parse on every
         # request. Any other header (a q-value list, another casing) is not a
         # key and takes the full path, so a client cannot grow a table.
         #
