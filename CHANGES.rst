@@ -1,3 +1,11 @@
+Unreleased
+----------
+
+* Added the ``relation_group`` filter argument. Filters sharing a group name
+  are combined into a single ``filter()`` call, so their conditions are
+  matched against the same related object instead of spanning a multi-valued
+  relationship. Grouped queries apply ``distinct()`` to avoid duplicate rows.
+
 Version 26.2 (2026-10-03)
 -------------------------
 

@@ -112,6 +112,41 @@ span relationships. Defaults to ``False``.
 A boolean that specifies whether the Filter should use ``filter`` or ``exclude``
 on the queryset. Defaults to ``False``.
 
+``relation_group``
+~~~~~~~~~~~~~~~~~~
+
+An optional name grouping several filters together so that their conditions
+are matched against the *same* related object. By default, each filter is
+applied as a separate ``filter()`` call, so conditions on a multi-valued
+relationship may be satisfied by *different* related objects (this mirrors
+Django's `spanning multi-valued relationships
+<https://docs.djangoproject.com/en/stable/topics/db/queries/#spanning-multi-valued-relationships>`_
+behavior). Filters that share a ``relation_group`` are instead combined into
+a single ``filter()`` call.
+
+For example, to find cases that have a material that is *both* a scan *and*
+confirmed::
+
+    class CaseFilter(FilterSet):
+        category = ChoiceFilter(
+            field_name='materials__category',
+            choices=Material.CATEGORY_CHOICES,
+            relation_group='materials',
+        )
+        confirmed = BooleanFilter(
+            field_name='materials__confirmed',
+            relation_group='materials',
+        )
+
+Filters without a ``relation_group`` (such as a plain case number filter)
+are applied independently, as usual. Since grouping targets multi-valued
+relationships, ``distinct()`` is always applied to the grouped conditions so
+that repeated joins do not produce duplicate rows.
+
+Grouped filters do not support the ``method`` argument or ``exclude=True``;
+combining them with ``relation_group`` raises a ``ValueError``. Defaults to
+``None``.
+
 ``required``
 ~~~~~~~~~~~~
 

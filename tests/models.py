@@ -210,3 +210,28 @@ class SpacewalkRecord(models.Model):
 
     astronaut = models.CharField(max_length=100)
     duration = models.DurationField()
+
+
+class LegalCase(models.Model):
+    case_number = models.CharField(max_length=20)
+
+    def __str__(self):
+        return self.case_number
+
+
+class CaseMaterial(models.Model):
+    SCAN = "scan"
+    PHOTO = "photo"
+    CATEGORY_CHOICES = (
+        (SCAN, "Scan"),
+        (PHOTO, "Photo"),
+    )
+
+    case = models.ForeignKey(
+        LegalCase, related_name="materials", on_delete=models.CASCADE
+    )
+    category = models.CharField(max_length=10, choices=CATEGORY_CHOICES)
+    confirmed = models.BooleanField(default=False)
+
+    def __str__(self):
+        return "%s of %s" % (self.category, self.case)

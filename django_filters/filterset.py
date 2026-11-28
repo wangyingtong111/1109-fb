@@ -229,8 +229,15 @@ class BaseFilterSet:
         This method should be overridden if additional filtering needs to be
         applied to the queryset before it is cached.
         """
+        relation_groups = OrderedDict()
         for name, value in self.form.cleaned_data.items():
-            queryset = self.filters[name].filter(queryset, value)
+            filter_ = self.filters[name]
+            if filter_.relation_group is not None:
+                relation_groups.setdefault(filter_.relation_group, []).append(
+                    (filter_, value)
+                )
+                continue
+            queryset = filter_.filter(queryset, value)
             assert isinstance(
                 queryset, models.QuerySet
             ), "Expected '%s.%s' to return a QuerySet, but got a %s instead." % (
@@ -238,7 +245,29 @@ class BaseFilterSet:
                 name,
                 type(queryset).__name__,
             )
+        for group, members in relation_groups.items():
+            queryset = self.filter_relation_group(queryset, group, members)
         return queryset
+
+    def filter_relation_group(self, queryset, group, members):
+        """
+        Apply a set of filters sharing the same `relation_group` as a single
+        `filter()` call, so that their conditions are matched against the
+        same related object instead of spanning the relationship.
+
+        `members` is a list of `(filter, value)` pairs. Since grouping is
+        intended for multi-valued relationships, `distinct()` is always
+        applied to avoid duplicate rows from the repeated joins.
+        """
+        condition = None
+        for filter_, value in members:
+            q = filter_.get_group_condition(value)
+            if q is None:
+                continue
+            condition = q if condition is None else condition & q
+        if condition is None:
+            return queryset
+        return queryset.filter(condition).distinct()
 
     @property
     def qs(self):

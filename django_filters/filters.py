@@ -85,16 +85,30 @@ class Filter:
         method=None,
         distinct=False,
         exclude=False,
+        relation_group=None,
         **kwargs
     ):
         if lookup_expr is None:
             lookup_expr = settings.DEFAULT_LOOKUP_EXPR
+        if relation_group is not None and method is not None:
+            raise ValueError(
+                "Filters using a 'relation_group' do not support the "
+                "'method' argument, as their conditions are combined "
+                "into a single filter() call."
+            )
+        if relation_group is not None and exclude:
+            raise ValueError(
+                "Filters using a 'relation_group' do not support "
+                "'exclude=True', as their conditions are combined "
+                "into a single filter() call."
+            )
         self.field_name = field_name
         self.lookup_expr = lookup_expr
         self.label = label
         self.method = method
         self.distinct = distinct
         self.exclude = exclude
+        self.relation_group = relation_group
 
         self.extra = kwargs
         self.extra.setdefault("required", False)
@@ -167,6 +181,18 @@ class Filter:
         qs = self.get_method(qs)(**{lookup: value})
         return qs
 
+    def get_group_condition(self, value):
+        """
+        Return a ``Q`` object for this filter's condition, or ``None`` if the
+        value should be skipped. Used to combine filters that share a
+        ``relation_group`` into a single ``filter()`` call, so that their
+        conditions are matched against the same related object.
+        """
+        if value in EMPTY_VALUES:
+            return None
+        lookup = "%s__%s" % (self.field_name, self.lookup_expr)
+        return Q(**{lookup: value})
+
 
 class CharFilter(Filter):
     field_class = forms.CharField
@@ -191,6 +217,15 @@ class ChoiceFilter(Filter):
             **{"%s__%s" % (self.field_name, self.lookup_expr): None}
         )
         return qs.distinct() if self.distinct else qs
+
+    def get_group_condition(self, value):
+        # Within a relation group the null choice is treated as "Any" and
+        # the condition is skipped: combining a null lookup with the other
+        # conditions of the group in a single filter() call would require
+        # the same related object to be both null and non-null.
+        if value == self.null_value:
+            return None
+        return super().get_group_condition(value)
 
 
 class TypedChoiceFilter(Filter):
