@@ -64,6 +64,7 @@ module IceCube
     autoload :MinuteOfHour, "ice_cube/validations/minute_of_hour"
     autoload :SecondOfMinute, "ice_cube/validations/second_of_minute"
     autoload :DayOfMonth, "ice_cube/validations/day_of_month"
+    autoload :MonthEndClamp, "ice_cube/validations/month_end_clamp"
     autoload :DayOfWeek, "ice_cube/validations/day_of_week"
     autoload :Day, "ice_cube/validations/day"
     autoload :DayOfYear, "ice_cube/validations/day_of_year"

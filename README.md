@@ -214,6 +214,29 @@ schedule.add_recurrence_rule IceCube::Rule.monthly(2).day_of_month(15)
 Monthly rules will skip months that are too short for the specified day of
 month (e.g. no occurrences in February for `day_of_month(31)`).
 
+#### Clamping to the end of the month
+
+For schedules that must still run in short months, enable
+`clamp_to_month_end`. A day that does not exist in a month is then rolled
+back to the last day of that month instead of being skipped. This is useful
+for month-end schedules such as a stock count booked for the 31st.
+
+```ruby
+# the 31st, or the last day of the month when there is no 31st
+schedule.add_recurrence_rule(
+  IceCube::Rule.monthly.day_of_month(31).clamp_to_month_end
+)
+# Starting Jan 31st in a leap year this yields Jan 31st, Feb 29th, Mar 31st...
+# In a non-leap year February yields the 28th.
+```
+
+The setting defaults to off, so without it the rule keeps skipping missing
+dates as before. Turn it back off with `clamp_to_month_end(false)`. When
+several rules in the same schedule land on one clamped day, that day is still
+emitted only once. The setting is preserved through `to_hash`/`from_hash` and
+YAML serialization (it has no iCalendar equivalent, so it is omitted from
+`to_ical`).
+
 ### Monthly (by day of Nth week)
 
 ```ruby

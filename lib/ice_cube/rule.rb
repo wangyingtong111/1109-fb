@@ -82,6 +82,12 @@ module IceCube
         rule.until(TimeUtil.deserialize_time(hash[:until])) if hash[:until]
         rule.count(hash[:count]) if hash[:count]
 
+        # Month-end clamping must be enabled before day_of_month validations
+        # are rebuilt so they inherit the setting during deserialization.
+        if hash[:validations]&.key?(:month_end_clamp)
+          rule.clamp_to_month_end(true) if rule.respond_to?(:clamp_to_month_end)
+        end
+
         hash[:validations]&.each do |name, args|
           apply_validation(rule, name, args)
         end
@@ -97,6 +103,10 @@ module IceCube
         unless ValidatedRule::VALIDATION_ORDER.include?(name)
           raise ArgumentError, "Invalid rule validation type: #{name}"
         end
+
+        # The month-end clamp marker is applied explicitly before the other
+        # validations so day_of_month can inherit the setting.
+        return if name == :month_end_clamp
 
         args.is_a?(Array) ? rule.send(name, *args) : rule.send(name, args)
       end

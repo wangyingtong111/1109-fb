@@ -52,6 +52,7 @@ en:
       other: Every %{count} years
     'on': on the %{sentence}
     in: 'in %{target}'
+    clamp_to_month_end: 'clamping to the last day of the month when the day does not exist'
     integer:
       negative: '%{ordinal} to last'
       literal_ordinals:

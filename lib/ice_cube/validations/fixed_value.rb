@@ -51,7 +51,9 @@ module IceCube
     # Negative day values (from month end) also include all months.
     #
     # Positive day values are taken literally so months with fewer days will
-    # be skipped.
+    # be skipped, unless the owning rule clamps to the month end (e.g. an
+    # explicit day 31 in February rolls back to the 28th/29th instead of
+    # dropping the whole month).
     #
     def validate_day_lock(time, start_time)
       days_in_month = TimeUtil.days_in_month(time)
@@ -63,21 +65,51 @@ module IceCube
       elsif value && value > 0
         start = value
         month_overflow = 0
+        if clamp_to_month_end? && start > days_in_month
+          # Roll the requested day back to the last day that exists in this
+          # month instead of skipping the month entirely.
+          start = days_in_month
+        end
       else
         start = TimeUtil.day_of_month(start_time.day, date)
         month_overflow = 0
       end
 
       sleeps = start - date.day
+      return sleeps if sleeps >= 0
+
+      # The target day already passed this month. With month-end clamping the
+      # next month may itself be a short month, so jump straight to its clamped
+      # day rather than adding a whole (calendar) month, which would overshoot.
+      return days_until_clamped_day(date, value) if clamp_to_month_end? && value && value > 0
 
       if value && value > 0
-        until_next_month = days_in_month + sleeps
+        days_in_month + sleeps
       else
         until_next_month = (start < 28) ? days_in_month : TimeUtil.days_to_next_month(date)
-        until_next_month += sleeps - month_overflow
+        until_next_month + sleeps - month_overflow
       end
+    end
 
-      (sleeps >= 0) ? sleeps : until_next_month
+    # Whether an explicit positive day should roll back to the last available
+    # day of a shorter month. Overridden by validations belonging to a rule
+    # with month-end clamping enabled; off by default to preserve the literal
+    # "skip missing dates" behavior.
+    #
+    def clamp_to_month_end?
+      false
+    end
+
+    # Number of days from +date+ (which is past this month's clamped target)
+    # to the clamped occurrence in the following month.
+    #
+    def days_until_clamped_day(date, value)
+      next_month = date >> 1
+      next_target = Date.new(
+        next_month.year, next_month.month,
+        [value, TimeUtil.days_in_month(next_month)].min
+      )
+      (next_target - date).to_i
     end
 
     def starting_unit(start_time)

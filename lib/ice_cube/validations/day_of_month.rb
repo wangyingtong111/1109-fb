@@ -6,7 +6,9 @@ module IceCube
           raise ArgumentError, "expecting Integer value for day, got #{day.inspect}"
         end
         verify_alignment(day, :day, :day_of_month) { |error| raise error }
-        validations_for(:day_of_month) << Validation.new(day)
+        validation = Validation.new(day)
+        validation.clamp_to_month_end = clamp_to_month_end? if respond_to?(:clamp_to_month_end?)
+        validations_for(:day_of_month) << validation
       end
       clobber_base_validations(:day, :wday)
       self
@@ -14,10 +16,16 @@ module IceCube
 
     class Validation < Validations::FixedValue
       attr_reader :day
+      attr_accessor :clamp_to_month_end
       alias_method :value, :day
 
       def initialize(day)
         @day = day
+        @clamp_to_month_end = false
+      end
+
+      def clamp_to_month_end?
+        @clamp_to_month_end == true
       end
 
       def key
