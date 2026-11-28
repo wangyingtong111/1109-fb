@@ -6,7 +6,8 @@ from django.db import models
 from django.db.transaction import get_connection
 from django.utils import timezone
 import reversion
-from test_app.models import TestModel, TestModelRelated, TestModelThrough, TestModelParent, TestMeta
+from reversion.models import Revision, Version
+from test_app.models import TestModel, TestModelRelated, TestModelThrough, TestModelParent, TestMeta, TestModelInline
 from test_app.tests.base import TestBase, TestBaseTransaction, TestModelMixin, UserMixin
 
 
@@ -223,6 +224,79 @@ class CreateRevisionIgnoreDuplicatesTest(TestBase):
         with reversion.create_revision():
             obj.save()
         self.assertSingleRevision((obj,))
+
+    def testCreateRevisionIgnoreDuplicatesFollowRevertedDraft(self):
+        # A followed object picked up implicitly with a draft value, then
+        # explicitly saved back to its last stored value, must not leave a
+        # stale draft version behind. Other genuinely changed objects in the
+        # same revision are still versioned.
+        reversion.register(TestModel, follow=("testmodelinline_set",), ignore_duplicates=True)
+        reversion.register(TestModelInline, ignore_duplicates=True)
+        with reversion.create_revision():
+            obj = TestModel.objects.create(name="v1")
+            inline_unchanged = TestModelInline.objects.create(test_model=obj, inline_name="v1")
+            inline_changed = TestModelInline.objects.create(test_model=obj, inline_name="v1")
+        with reversion.create_revision():
+            obj.name = "v2"
+            inline_unchanged.inline_name = "v2"
+            inline_changed.inline_name = "v2"
+            # Saving the parent follows its inlines, snapshotting the draft values.
+            obj.save()
+            # The first inline is explicitly reverted to its last stored value.
+            inline_unchanged.inline_name = "v1"
+            inline_unchanged.save()
+            # The second inline really changes and is saved explicitly.
+            inline_changed.save()
+        # The revision only contains the parent and the genuinely changed inline.
+        revision = Revision.objects.order_by("-pk").first()
+        self.assertEqual(revision.version_set.count(), 2)
+        self.assertTrue(
+            Version.objects.get_for_object(obj).filter(revision=revision).exists()
+        )
+        self.assertFalse(
+            Version.objects.get_for_object(inline_unchanged).filter(revision=revision).exists()
+        )
+        self.assertTrue(
+            Version.objects.get_for_object(inline_changed).filter(revision=revision).exists()
+        )
+        # The reverted inline keeps only its original version.
+        self.assertEqual(Version.objects.get_for_object(inline_unchanged).count(), 1)
+
+    def testCreateRevisionIgnoreDuplicatesFollowRevertedDraftSharedChild(self):
+        # The same followed object is reachable from two parents (a shared
+        # child). Reverting its draft must only drop its own stale snapshot;
+        # snapshots actually required by the revision are left untouched.
+        reversion.register(TestModel, follow=("testmodelinline_set",), ignore_duplicates=True)
+        reversion.register(TestModelInline, ignore_duplicates=True)
+        with reversion.create_revision():
+            obj_one = TestModel.objects.create(name="v1")
+            obj_two = TestModel.objects.create(name="v1")
+            shared_inline = TestModelInline.objects.create(test_model=obj_one, inline_name="v1")
+            changed_inline = TestModelInline.objects.create(test_model=obj_two, inline_name="v1")
+        with reversion.create_revision():
+            obj_one.name = "v2"
+            obj_two.name = "v2"
+            shared_inline.inline_name = "v2"
+            changed_inline.inline_name = "v2"
+            # Both parents follow their inlines, snapshotting the draft values.
+            obj_one.save()
+            obj_two.save()
+            # The shared child is explicitly reverted to its last stored value.
+            shared_inline.test_model = obj_one
+            shared_inline.inline_name = "v1"
+            shared_inline.save()
+            changed_inline.save()
+        revision = Revision.objects.order_by("-pk").first()
+        # Both parents and the genuinely changed inline are versioned; the
+        # reverted shared child is not.
+        self.assertEqual(revision.version_set.count(), 3)
+        self.assertFalse(
+            Version.objects.get_for_object(shared_inline).filter(revision=revision).exists()
+        )
+        self.assertTrue(
+            Version.objects.get_for_object(changed_inline).filter(revision=revision).exists()
+        )
+        self.assertEqual(Version.objects.get_for_object(shared_inline).count(), 1)
 
 
 class CreateRevisionInheritanceTest(TestModelMixin, TestBase):

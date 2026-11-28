@@ -196,6 +196,14 @@ def _add_to_revision(obj, using, model_db, explicit):
             obj.__class__, object_id, model_db=model_db
         ).first()
         if previous_version and previous_version._local_field_dict == version._local_field_dict:
+            # An explicit save that matches the last stored version produces no
+            # new version. Drop any draft snapshot collected earlier in this
+            # revision (e.g. picked up implicitly by a followed parent), so the
+            # stale intermediate state is not saved when the revision commits.
+            if version_key in versions:
+                db_versions = _copy_db_versions(db_versions)
+                del db_versions[using][version_key]
+                _update_frame(db_versions=db_versions)
             return
     # Store the version.
     db_versions = _copy_db_versions(db_versions)
