@@ -205,6 +205,26 @@ user.destroy
 user.audits.count # => 2
 ```
 
+### Undoing changes
+
+An audit can be undone with `undo`. Undoing an `update` audit is conflict-aware: only attributes whose current value still matches the value set by that audit are reverted. Attributes that were changed again by later edits are kept as-is and reported as conflicts, and the audit written by the undo only records the attributes that were actually reverted.
+
+```ruby
+ticket = Ticket.create!(title: "A", status: "open")
+ticket.update!(title: "B", status: "done")
+audit = ticket.audits.last
+ticket.update!(title: "C") # a later edit touches title
+
+result = audit.undo
+ticket.reload.title  # => "C" (later edit preserved)
+ticket.reload.status # => "open" (reverted)
+result.conflict?     # => true
+result.conflicts     # => {"title" => {expected: "B", current: "C"}}
+result.applied       # => {"status" => 0}
+```
+
+Undoing a `create` audit destroys the record; undoing a `destroy` audit recreates it.
+
 ### Current User Tracking
 
 If you're using Audited in a Rails application, all audited changes made within a request will automatically be attributed to the current user. By default, Audited uses the `current_user` method in your controller.

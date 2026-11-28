@@ -94,6 +94,13 @@ module Audited
     end
 
     # Allows user to undo changes
+    #
+    # For "update" audits this performs a conflict-aware partial revert: only
+    # attributes whose current value still matches the value set by this audit
+    # are changed back. Attributes that were modified again by later edits are
+    # left untouched and reported as conflicts on the returned UndoResult, so
+    # the new audit written by the undo only records the parts that were
+    # actually reverted.
     def undo
       case action
       when "create"
@@ -103,8 +110,8 @@ module Audited
         # creates a new record with the destroyed record attributes
         auditable_type.constantize.create!(audited_changes)
       when "update"
-        # changes back attributes
-        auditable.update!(audited_changes.transform_values(&:first))
+        # changes back attributes that have not been touched since
+        undo_update
       else
         raise StandardError, "invalid action given #{action}"
       end
@@ -173,6 +180,46 @@ module Audited
     end
 
     private
+
+    # Reverts only the attributes whose current value still matches the value
+    # this audit set. Attributes changed by later edits are kept as-is and
+    # reported as conflicts.
+    def undo_update
+      record = auditable
+      applied = {}
+      conflicts = {}
+
+      (audited_changes || {}).each do |attr, (old_value, new_value)|
+        if record && undoable_attribute?(record, attr, new_value)
+          applied[attr] = old_value
+        else
+          conflicts[attr] = {
+            expected: new_value,
+            current: record ? current_attribute_value(record, attr) : nil
+          }
+        end
+      end
+
+      record.update!(applied) if record && applied.any?
+
+      UndoResult.new(action: action, record: record, applied: applied, conflicts: conflicts)
+    end
+
+    # An attribute can be safely reverted when the record's current value is
+    # still the value this audit changed it to.
+    def undoable_attribute?(record, attr, expected_value)
+      return false unless record.has_attribute?(attr)
+
+      record[attr] == record.class.type_for_attribute(attr).cast(expected_value)
+    rescue ActiveModel::MissingAttributeError
+      false
+    end
+
+    def current_attribute_value(record, attr)
+      record[attr] if record.has_attribute?(attr)
+    rescue ActiveModel::MissingAttributeError
+      nil
+    end
 
     def set_version_number
       if action == "create"

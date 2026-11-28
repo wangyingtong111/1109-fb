@@ -81,9 +81,57 @@ describe Audited::Audit do
 
     it "undos changes" do
       user.update_attribute(:name, "Joe")
-      user.audits.last.undo
+      result = user.audits.last.undo
       user.reload
       expect(user.name).to eq("John")
+      expect(result.conflict?).to eq(false)
+      expect(result.applied).to eq("name" => "John")
+    end
+
+    it "partially undos changes, keeping later edits and reporting conflicts" do
+      user.update!(name: "Joe", status: "reliable")
+      audit = user.audits.last
+      user.update!(name: "Joseph")
+
+      result = audit.undo
+      user.reload
+
+      # the conflicting attribute keeps its later value
+      expect(user.name).to eq("Joseph")
+      # the untouched attribute is reverted
+      expect(user.status).to eq("active")
+
+      expect(result.conflict?).to eq(true)
+      expect(result.conflicts.keys).to eq(["name"])
+      expect(result.conflicts["name"][:expected]).to eq("Joe")
+      expect(result.conflicts["name"][:current]).to eq("Joseph")
+      expect(result.applied).to eq("status" => 0)
+    end
+
+    it "only audits the attributes that were actually reverted" do
+      user.update!(name: "Joe", status: "reliable")
+      audit = user.audits.last
+      user.update!(name: "Joseph")
+
+      expect { audit.undo }.to change { user.audits.count }.by(1)
+
+      undo_audit = user.audits.reorder(version: :asc).last
+      expect(undo_audit.action).to eq("update")
+      expect(undo_audit.audited_changes.keys).to eq(["status"])
+      expect(undo_audit.audited_changes["status"]).to eq([1, 0])
+    end
+
+    it "does not save or write an audit when every attribute conflicts" do
+      user.update!(name: "Joe")
+      audit = user.audits.last
+      user.update!(name: "Joseph")
+
+      result = nil
+      expect { result = audit.undo }.not_to change { user.audits.count }
+
+      expect(user.reload.name).to eq("Joseph")
+      expect(result.applied?).to eq(false)
+      expect(result.conflicts.keys).to eq(["name"])
     end
 
     it "undos destroy" do

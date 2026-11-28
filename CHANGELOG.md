@@ -1,5 +1,12 @@
 # Audited ChangeLog
 
+### Unreleased
+
+- `Audit#undo` on update audits now performs a conflict-aware partial revert:
+  attributes changed again by later edits are preserved and reported as
+  conflicts on the returned `Audited::UndoResult`, and only the actually
+  reverted attributes are written to the audit trail.
+
 ### 5.8.0 (2024-11-08)
 - Allow calling audited multiple times - @mohammednasser-32
   [734](https://github.com/collectiveidea/audited/pull/734)  
