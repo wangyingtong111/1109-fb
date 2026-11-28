@@ -1,3 +1,14 @@
+Unreleased
+----------
+
+* ``LookupChoiceFilter`` gains a ``value_less_lookups`` argument for declaring
+  lookups that don't take a value from the user, such as ``isnull``. Selecting
+  such a lookup while leaving the value input empty now forms a real condition
+  using the declared implied value instead of being ignored. Selecting an
+  ordinary lookup without a value now raises an "Enter a value." validation
+  error, while a genuine ``0`` value continues to be applied as a real
+  condition.
+
 Version 26.2 (2026-10-03)
 -------------------------
 

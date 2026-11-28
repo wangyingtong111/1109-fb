@@ -1481,6 +1481,70 @@ class LookupChoiceFilterTests(TestCase):
         qs.filter.assert_called_once_with(somefield__some_lookup_expr="value")
         self.assertNotEqual(qs, result)
 
+    def test_normalize_value_less_lookups_none(self):
+        self.assertEqual(LookupChoiceFilter.normalize_value_less_lookups(None), {})
+
+    def test_normalize_value_less_lookups_iterable(self):
+        self.assertEqual(
+            LookupChoiceFilter.normalize_value_less_lookups(["isnull"]),
+            {"isnull": False},
+        )
+
+    def test_normalize_value_less_lookups_mapping(self):
+        self.assertEqual(
+            LookupChoiceFilter.normalize_value_less_lookups({"isnull": True}),
+            {"isnull": True},
+        )
+
+    def test_value_less_lookups_passed_to_field(self):
+        f = LookupChoiceFilter(
+            field_name="date",
+            field_class=forms.DateField,
+            lookup_choices=["exact", "isnull"],
+            value_less_lookups={"isnull": False},
+        )
+        self.assertEqual(f.field.value_less_lookups, {"isnull": False})
+
+    def test_filtering_value_less_lookup(self):
+        # A value-less lookup still forms a real condition, with its implied
+        # value rather than a user-supplied one.
+        qs = mock.Mock(spec=["filter"])
+        qs.filter.return_value = qs
+        f = LookupChoiceFilter(
+            field_name="date",
+            lookup_choices=["isnull"],
+            value_less_lookups={"isnull": False},
+        )
+        result = f.filter(qs, Lookup(False, "isnull"))
+        qs.filter.assert_called_once_with(date__isnull=False)
+        self.assertEqual(result, qs)
+
+    def test_filtering_value_less_lookup_none_value(self):
+        # A ``Lookup`` carrying ``None`` (rather than the implied value) still
+        # forms a condition instead of being treated as an empty no-op.
+        qs = mock.Mock(spec=["filter"])
+        qs.filter.return_value = qs
+        f = LookupChoiceFilter(
+            field_name="date",
+            lookup_choices=["isnull"],
+            value_less_lookups={"isnull": False},
+        )
+        result = f.filter(qs, Lookup(None, "isnull"))
+        qs.filter.assert_called_once_with(date__isnull=None)
+        self.assertEqual(result, qs)
+
+    def test_filtering_zero_value(self):
+        # Zero is a genuine value and produces a real condition.
+        qs = mock.Mock(spec=["filter"])
+        f = LookupChoiceFilter(
+            field_name="amount",
+            field_class=forms.DecimalField,
+            lookup_choices=["exact"],
+        )
+        result = f.filter(qs, Lookup(0, "exact"))
+        qs.filter.assert_called_once_with(amount__exact=0)
+        self.assertNotEqual(qs, result)
+
 
 class CSVFilterTests(TestCase):
     def setUp(self):

@@ -1,5 +1,5 @@
 from collections import OrderedDict
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from datetime import timedelta
 from itertools import chain
 
@@ -627,15 +627,20 @@ class LookupChoiceFilter(Filter):
     * ``field_class`` is an optional argument that allows you to set the inner
       form field class used to validate the value. Default: ``forms.CharField``
 
+    * ``value_less_lookups`` is an optional argument that declares the lookup
+      expressions which don't take a value from the user. When such a lookup is
+      selected, leaving the value input empty is valid and the lookup is applied
+      using the declared value instead. Accepts an iterable of lookup expressions
+      (defaulting the implied value to ``False``) or a mapping of lookup
+      expression to the value it implies. This is useful for lookups such as
+      ``isnull``, where the absence of a value still forms a real condition.
+
     ex::
 
-        price = django_filters.LookupChoiceFilter(
-            field_class=forms.DecimalField,
-            lookup_choices=[
-                ('exact', 'Equals'),
-                ('gt', 'Greater than'),
-                ('lt', 'Less than'),
-            ]
+        date = django_filters.LookupChoiceFilter(
+            field_class=forms.DateField,
+            lookup_choices=["exact", "isnull"],
+            value_less_lookups={"isnull": False},
         )
 
     """
@@ -644,15 +649,45 @@ class LookupChoiceFilter(Filter):
     outer_class = LookupChoiceField
 
     def __init__(
-        self, field_name=None, lookup_choices=None, field_class=None, **kwargs
+        self,
+        field_name=None,
+        lookup_choices=None,
+        field_class=None,
+        value_less_lookups=None,
+        **kwargs
     ):
         self.empty_label = kwargs.pop("empty_label", settings.EMPTY_CHOICE_LABEL)
 
         super(LookupChoiceFilter, self).__init__(field_name=field_name, **kwargs)
 
         self.lookup_choices = lookup_choices
+        self.value_less_lookups = self.normalize_value_less_lookups(value_less_lookups)
         if field_class is not None:
             self.field_class = field_class
+
+    @staticmethod
+    def normalize_value_less_lookups(value_less_lookups):
+        """
+        Normalize the value-less lookup declarations into a mapping of
+        ``{lookup expression: implied value}``.
+
+        An iterable of lookup expressions is normalized with ``False`` as the
+        implied value. A mapping is passed through unchanged.
+
+        ex::
+
+            >>> LookupChoiceFilter.normalize_value_less_lookups(["isnull"])
+            {'isnull': False}
+
+            >>> LookupChoiceFilter.normalize_value_less_lookups({"isnull": True})
+            {'isnull': True}
+
+        """
+        if not value_less_lookups:
+            return {}
+        if isinstance(value_less_lookups, Mapping):
+            return dict(value_less_lookups)
+        return {lookup_expr: False for lookup_expr in value_less_lookups}
 
     @classmethod
     def normalize_lookup(cls, lookup):
@@ -699,6 +734,7 @@ class LookupChoiceFilter(Filter):
             self._field = self.outer_class(
                 inner_field,
                 lookups,
+                value_less_lookups=self.value_less_lookups,
                 label=self.label,
                 empty_label=self.empty_label,
                 required=self.extra["required"],
@@ -711,6 +747,14 @@ class LookupChoiceFilter(Filter):
             return super().filter(qs, None)
 
         self.lookup_expr = lookup.lookup_expr
+        # A value-less lookup (e.g. ``isnull``) carries ``None`` as its value,
+        # which the base implementation would otherwise treat as a no-op. Build
+        # the condition directly so the implied lookup is still applied.
+        if lookup.value is None:
+            if self.distinct:
+                qs = qs.distinct()
+            condition = "%s__%s" % (self.field_name, self.lookup_expr)
+            return self.get_method(qs)(**{condition: None})
         return super().filter(qs, lookup.value)
 
 

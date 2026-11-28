@@ -87,10 +87,18 @@ class TimeRangeField(RangeField):
 
 class Lookup(namedtuple("Lookup", ("value", "lookup_expr"))):
     def __new__(cls, value, lookup_expr):
-        if value in EMPTY_VALUES or lookup_expr in EMPTY_VALUES:
+        # ``value`` is allowed to be ``None`` for value-less lookups (e.g.
+        # ``isnull``), which don't take a value from the user. Other empty
+        # values remain invalid, and the lookup expression must always be set.
+        if value in EMPTY_VALUES and value is not None:
             raise ValueError(
-                "Empty values ([], (), {}, '', None) are not "
-                "valid Lookup arguments. Return None instead."
+                "Empty values ([], (), {}, '') are not valid Lookup "
+                "arguments. Return None instead."
+            )
+        if lookup_expr in EMPTY_VALUES:
+            raise ValueError(
+                "An empty lookup expression is not a valid Lookup argument. "
+                "Return None instead."
             )
 
         return super().__new__(cls, value, lookup_expr)
@@ -99,10 +107,16 @@ class Lookup(namedtuple("Lookup", ("value", "lookup_expr"))):
 class LookupChoiceField(forms.MultiValueField):
     default_error_messages = {
         "lookup_required": _("Select a lookup."),
+        "value_required": _("Enter a value."),
     }
 
-    def __init__(self, field, lookup_choices, *args, **kwargs):
+    def __init__(
+        self, field, lookup_choices, value_less_lookups=None, *args, **kwargs
+    ):
         empty_label = kwargs.pop("empty_label", settings.EMPTY_CHOICE_LABEL)
+        # Mapping of lookup expressions that don't take a value to the value
+        # that should be used instead (e.g. {"isnull": False}).
+        self.value_less_lookups = value_less_lookups or {}
         fields = (field, ChoiceField(choices=lookup_choices, empty_label=empty_label))
         widget = LookupChoiceWidget(widgets=[f.widget for f in fields])
         kwargs["widget"] = widget
@@ -112,13 +126,23 @@ class LookupChoiceField(forms.MultiValueField):
     def compress(self, data_list):
         if len(data_list) == 2:
             value, lookup_expr = data_list
-            if value not in EMPTY_VALUES:
-                if lookup_expr not in EMPTY_VALUES:
+            if lookup_expr not in EMPTY_VALUES:
+                if value not in EMPTY_VALUES:
                     return Lookup(value=value, lookup_expr=lookup_expr)
-                else:
-                    raise forms.ValidationError(
-                        self.error_messages["lookup_required"], code="lookup_required"
+                # A value-less lookup (e.g. ``isnull``) doesn't require the
+                # user to enter a value -- fall back to its declared value.
+                if lookup_expr in self.value_less_lookups:
+                    return Lookup(
+                        value=self.value_less_lookups[lookup_expr],
+                        lookup_expr=lookup_expr,
                     )
+                raise forms.ValidationError(
+                    self.error_messages["value_required"], code="value_required"
+                )
+            if value not in EMPTY_VALUES:
+                raise forms.ValidationError(
+                    self.error_messages["lookup_required"], code="lookup_required"
+                )
         return None
 
 

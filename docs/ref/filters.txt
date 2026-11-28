@@ -665,6 +665,16 @@ A combined filter that allows users to select the lookup expression from a dropd
 * ``field_class`` is an optional argument that allows you to set the inner
   form field class used to validate the value. Default: ``forms.CharField``
 
+* ``value_less_lookups`` is an optional argument that declares the lookup
+  expressions which don't take a value from the user. When one of these
+  lookups is selected, leaving the value input empty is still valid and the
+  condition is applied using the declared value instead. It accepts either an
+  iterable of lookup expressions (each implied value defaults to ``False``) or
+  a mapping of lookup expression to the value it implies. This is useful for
+  lookups such as ``isnull``, where the absence of a value still forms a real
+  condition. For any other lookup, selecting the lookup without entering a
+  value raises a "Enter a value." validation error.
+
 ex::
 
     price = django_filters.LookupChoiceFilter(
@@ -675,6 +685,21 @@ ex::
             ('lt', 'Less than'),
         ]
     )
+
+A value-less lookup, such as an "is null / has a date" choice, is declared
+like this::
+
+    date = django_filters.LookupChoiceFilter(
+        field_class=forms.DateField,
+        lookup_choices=['exact', 'isnull'],
+        value_less_lookups={'isnull': False},
+    )
+
+With ``date_lookup=isnull`` and no date entered, the filter applies
+``date__isnull=False`` (i.e. rows that *have* a date). An ordinary lookup such
+as ``exact`` still requires a value -- note that ``0`` is a genuine value, so
+``amount_lookup=exact`` with ``amount=0`` applies ``amount__exact=0``, while
+selecting ``exact`` without a value is reported as an input error.
 
 .. _base-in-filter:
 .. class:: BaseInFilter

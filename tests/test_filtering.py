@@ -1,5 +1,6 @@
 import contextlib
 import datetime
+import decimal
 import unittest
 from operator import attrgetter
 from unittest import mock
@@ -31,6 +32,7 @@ from django_filters.filters import (
     TimeRangeFilter,
     TypedMultipleChoiceFilter,
 )
+from django_filters.fields import Lookup
 from django_filters.filterset import FilterSet
 from django_filters.widgets import QueryArrayWidget
 
@@ -1745,14 +1747,11 @@ class LookupChoiceFilterTests(TestCase):
         self.assertQuerySetEqual(f.qs, ["Ender's Game"], lambda o: o.title)
         f = F({"price": "15", "price_lookup": "lt"})
         self.assertQuerySetEqual(f.qs, ["Ender's Game"], lambda o: o.title)
+        # Selecting a lookup without entering a value is an input error: the
+        # value is required for ordinary lookups.
         f = F({"price": "", "price_lookup": "lt"})
-        self.assertTrue(f.is_valid())
-        self.assertQuerySetEqual(
-            f.qs,
-            ["Ender's Game", "Rainbow Six", "Snowcrash"],
-            lambda o: o.title,
-            ordered=False,
-        )
+        self.assertFalse(f.is_valid())
+        self.assertEqual(f.errors, {"price": ["Enter a value."]})
         f = F({"price": "15"})
         self.assertFalse(f.is_valid())
         self.assertQuerySetEqual(
@@ -1761,6 +1760,47 @@ class LookupChoiceFilterTests(TestCase):
             lambda o: o.title,
             ordered=False,
         )
+
+    def test_zero_value_is_a_real_condition(self):
+        Book.objects.create(title="Free Book", price="0.0", average_rating=0.0)
+        # Zero is a genuine value: both inputs form a real condition rather
+        # than being treated as an empty (no-op) value.
+        f = self.BookFilter({"price": "0", "price_lookup": "lt"})
+        self.assertTrue(f.is_valid())
+        self.assertEqual(
+            f.form.cleaned_data["price"],
+            Lookup(value=decimal.Decimal("0"), lookup_expr="lt"),
+        )
+        self.assertIn('"tests_book"."price" < 0', str(f.qs.query))
+        # No book has a negative price, hence the condition matches nothing
+        # (proving the condition was actually applied).
+        self.assertQuerySetEqual(f.qs, [], lambda o: o.title)
+
+    def test_value_less_lookup_forms_condition_without_value(self):
+        class CommentFilter(FilterSet):
+            date = LookupChoiceFilter(
+                field_name="date",
+                field_class=forms.DateField,
+                lookup_choices=["exact", "isnull"],
+                value_less_lookups={"isnull": False},
+            )
+
+            class Meta:
+                model = Comment
+                fields = ["date"]
+
+        # isnull selected, date left blank -> still a real condition.
+        f = CommentFilter({"date_lookup": "isnull"})
+        self.assertTrue(f.is_valid())
+        self.assertEqual(
+            f.form.cleaned_data["date"], Lookup(value=False, lookup_expr="isnull")
+        )
+        self.assertIn('"tests_comment"."date" IS NOT NULL', str(f.qs.query))
+
+        # An ordinary lookup still requires a value.
+        f = CommentFilter({"date_lookup": "exact"})
+        self.assertFalse(f.is_valid())
+        self.assertEqual(f.errors, {"date": ["Enter a value."]})
 
     def test_inner_field_class_validation(self):
         f = self.BookFilter({"price": "asdf", "price_lookup": "lt"})

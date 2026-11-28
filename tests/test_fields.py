@@ -41,9 +41,16 @@ class LookupTests(TestCase):
         with self.assertRaisesMessage(ValueError, ""):
             Lookup("", "exact")
 
+    def test_none_value_allowed_for_value_less_lookup(self):
+        # ``None`` is a valid value for value-less lookups such as ``isnull``.
+        self.assertEqual(Lookup(None, "isnull"), (None, "isnull"))
+
     def test_empty_lookup_expr(self):
         with self.assertRaisesMessage(ValueError, ""):
             Lookup("Value", "")
+
+        with self.assertRaisesMessage(ValueError, ""):
+            Lookup(None, "")
 
 
 class RangeFieldTests(TestCase):
@@ -146,6 +153,41 @@ class LookupChoiceFieldTests(TestCase):
 
         with self.assertRaisesMessage(forms.ValidationError, "Select a lookup."):
             f.clean(["12.34", ""])
+
+    def test_clean_zero_value(self):
+        # A zero is a real value and must not be treated as empty.
+        inner = forms.DecimalField()
+        f = LookupChoiceField(inner, [("exact", "exact")], required=False)
+        self.assertEqual(f.clean(["0", "exact"]), Lookup(to_d(0), "exact"))
+
+    def test_clean_missing_value_raises_value_required(self):
+        inner = forms.DecimalField()
+        f = LookupChoiceField(inner, [("exact", "exact")], required=False)
+        with self.assertRaisesMessage(forms.ValidationError, "Enter a value."):
+            f.clean(["", "exact"])
+
+    def test_clean_value_less_lookup_without_value(self):
+        # A declared value-less lookup forms a real condition using its
+        # implied value, even though no value was entered.
+        inner = forms.DateField()
+        f = LookupChoiceField(
+            inner,
+            [("exact", "exact"), ("isnull", "isnull")],
+            value_less_lookups={"isnull": False},
+            required=False,
+        )
+        self.assertEqual(f.clean(["", "isnull"]), Lookup(False, "isnull"))
+
+    def test_clean_value_less_lookup_explicit_value_wins(self):
+        inner = forms.DateField()
+        f = LookupChoiceField(
+            inner,
+            [("exact", "exact"), ("isnull", "isnull")],
+            value_less_lookups={"isnull": False},
+            required=False,
+        )
+        value = f.clean(["2020-01-01", "isnull"])
+        self.assertEqual(value, Lookup(dt.date(2020, 1, 1), "isnull"))
 
     def test_render_used_html5(self):
         inner = forms.DecimalField()
