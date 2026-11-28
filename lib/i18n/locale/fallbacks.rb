@@ -54,6 +54,9 @@ module I18n
 
       def defaults=(defaults)
         @defaults = defaults.flat_map { |default| compute(default, false) }
+        # Defaults are appended to every fallback chain, so any chain that was
+        # computed before the defaults changed is stale now.
+        clear
       end
       attr_reader :defaults
 
@@ -67,13 +70,16 @@ module I18n
       def map(*args, &block)
         if args.count == 1 && !block_given?
           mappings = args.first
+          changed = []
           mappings.each do |from, to|
             from, to = from.to_sym, Array(to)
             to.each do |_to|
               @map[from] ||= []
+              changed << from unless @map[from].include?(_to.to_sym)
               @map[from] << _to.to_sym
             end
           end
+          invalidate(changed)
         else
           @map.map(*args, &block)
         end
@@ -88,6 +94,18 @@ module I18n
       end
 
       protected
+
+      # Drops only the cached chains that can be affected by a change to the
+      # given mappings. A chain is affected when it passes through one of the
+      # changed locales itself, e.g. mapping :fr affects both the :fr and
+      # :"fr-CA" chains. Chains of unrelated locales stay cached and reusable.
+      def invalidate(locales)
+        locales = locales.uniq
+        each_key do |cached_locale|
+          chain = self[cached_locale]
+          delete(cached_locale) if locales.any? { |locale| chain.include?(locale) }
+        end
+      end
 
       def compute(tags, include_defaults = true, exclude = [])
         result = []

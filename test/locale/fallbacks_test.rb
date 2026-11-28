@@ -160,6 +160,61 @@ class I18nFallbacksComputationTest < I18n::TestCase
   end
 end
 
+class I18nFallbacksCachingTest < I18n::TestCase
+  def setup
+    super
+    @fallbacks = Fallbacks.new(:'en-US')
+  end
+
+  test "a chain computed before a new mapping is added is recomputed afterwards" do
+    assert_equal [:"fr-CA", :fr, :"en-US", :en], @fallbacks[:"fr-CA"]
+    @fallbacks.map(:fr => :it)
+    assert_equal [:"fr-CA", :fr, :it, :"en-US", :en], @fallbacks[:"fr-CA"]
+    assert_equal [:fr, :it, :"en-US", :en], @fallbacks[:fr]
+  end
+
+  test "a child locale chain is invalidated when a parent locale gets a mapping" do
+    assert_equal [:"fr-CA", :fr, :"en-US", :en], @fallbacks[:"fr-CA"]
+    @fallbacks.map(:fr => :it)
+    assert_includes @fallbacks[:"fr-CA"], :it
+  end
+
+  test "chains of locales not affected by a new mapping keep being reused" do
+    spanish = @fallbacks[:es]
+    german = @fallbacks[:de]
+
+    @fallbacks.map(:fr => :it)
+
+    assert_same spanish, @fallbacks[:es]
+    assert_same german, @fallbacks[:de]
+    assert_equal [:es, :"en-US", :en], @fallbacks[:es]
+    assert_equal [:de, :"en-US", :en], @fallbacks[:de]
+  end
+
+  test "re-adding an existing mapping does not invalidate cached chains" do
+    @fallbacks.map(:fr => :it)
+    french = @fallbacks[:fr]
+
+    @fallbacks.map(:fr => :it)
+
+    assert_same french, @fallbacks[:fr]
+  end
+
+  test "mappings that build a cycle stay deduplicated with a stable order" do
+    @fallbacks.map(:no => :nb, :nb => :no)
+    assert_equal [:no, :nb, :"en-US", :en], @fallbacks[:no]
+    assert_equal [:nb, :no, :"en-US", :en], @fallbacks[:nb]
+  end
+
+  test "changing the defaults invalidates previously computed chains" do
+    assert_equal [:es, :"en-US", :en], @fallbacks[:es]
+
+    @fallbacks.defaults = [:"de-DE"]
+
+    assert_equal [:es, :"de-DE", :de], @fallbacks[:es]
+  end
+end
+
 class I18nFallbacksHashCompatibilityTest < I18n::TestCase
   def setup
     super
