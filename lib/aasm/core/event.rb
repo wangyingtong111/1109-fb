@@ -51,6 +51,21 @@ module AASM::Core
       _fire(obj, options, to_state, *args) # false indicates this is not a test (fire!)
     end
 
+    # Fire the event on the strength of a transition that was already selected
+    # during a preflight pass. The guards are not re-evaluated, which keeps
+    # preflight and commit on exactly one decision and avoids guards with side
+    # effects running twice.
+    def fire_with_preflight(obj, transition, *args)
+      clear_failed_callbacks
+      return nil if transition.nil?
+      return nil unless transition.from == obj.aasm(state_machine.name).current_state || transition.from.nil?
+
+      result = Array(transition.to).first
+      Array(transition.to).each { |to| @valid_transitions[obj.object_id][to] = transition }
+      transition.execute(obj, *args)
+      result
+    end
+
     def transitions_from_state?(state)
       transitions_from_state(state).any?
     end
@@ -77,10 +92,30 @@ module AASM::Core
       invoke_callbacks(@options[callback_name], record, args)
     end
 
-    def fire_transition_callbacks(obj, *args)
+    # The transition that was selected for +obj+ during the last fire.
+    def valid_transition_for(obj)
       from_state = obj.aasm(state_machine.name).current_state
-      transition = @valid_transitions[obj.object_id][from_state]
+      @valid_transitions[obj.object_id][from_state]
+    end
+
+    def fire_transition_callbacks(obj, *args)
+      transition = valid_transition_for(obj)
       transition.invoke_success_callbacks(obj, *args) if transition
+      @valid_transitions.delete(obj.object_id)
+    end
+
+    # Invoque the success callbacks of an explicitly remembered transition.
+    # Linked operations use this when the per-event notifications are
+    # postponed until every part has committed, so later parts cannot hide the
+    # transition of an earlier one.
+    def fire_remembered_transition_callbacks(obj, transition, *args)
+      @valid_transitions.delete(obj.object_id)
+      transition.invoke_success_callbacks(obj, *args) if transition
+    end
+
+    # Forget the transition selected for +obj+. Used by linked operations when
+    # a part is rolled back, so no stale transition is left behind.
+    def clear_valid_transitions(obj)
       @valid_transitions.delete(obj.object_id)
     end
 

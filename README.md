@@ -16,6 +16,7 @@
   - [Transitions](#transitions)
   - [Multiple state machines per class](#multiple-state-machines-per-class)
     - [Handling naming conflicts between multiple state machines](#handling-naming-conflicts-between-multiple-state-machines)
+    - [Linked operations](#linked-operations)
     - [Binding event](#binding-event)
   - [Auto-generated Status Constants](#auto-generated-status-constants)
   - [Extending AASM](#extending-aasm)
@@ -591,6 +592,149 @@ So, for example, to use inspection on a class level, you have to use
 ```ruby
 SimpleMultipleExample.aasm(:move).states.map(&:name)
 # => [:standing, :walking, :running]
+```
+
+### Linked operations
+
+Sometimes one business action has to move several state machines of the same
+object together. Firing the events one after the other is not the same thing:
+if the second event refuses, the first one has already committed and the object
+is left half-processed.
+
+`aasm_linked_event` declares an operation that fires several events as one
+unit. Every part's guard is evaluated **before** anything is committed
+(preflight); only when all parts are permitted are the transitions committed,
+inside one outer transaction when the persistence layer supports transactions.
+
+```ruby
+class Application
+  include AASM
+
+  aasm(:docs, namespace: true) do
+    state :collecting, initial: true
+    state :archived
+
+    event :finish do
+      transitions from: :collecting, to: :archived, guard: :materials_valid?
+    end
+  end
+
+  aasm(:pub, namespace: true) do
+    state :queued, initial: true
+    state :published
+
+    event :finish do
+      transitions from: :queued, to: :published, guard: :delivery_date?
+    end
+  end
+
+  aasm_linked_event :confirm do
+    part :docs, :finish
+    part :pub, :finish, reason: 'delivery date is empty'
+    success :application_confirmed
+  end
+end
+
+application = Application.new
+application.delivery_date = nil
+result = application.confirm!
+result.success?                    # => false
+result.reason                      # => "pub.finish: delivery date is empty"
+application.aasm(:docs).current_state  # => :collecting (unchanged)
+application.aasm(:pub).current_state   # => :queued     (unchanged)
+
+application.delivery_date = '2026-12-01'
+result = application.confirm!
+result.success?                    # => true
+result.states                      # => { docs: :archived, pub: :published }
+application.aasm(:docs).current_state  # => :archived
+application.aasm(:pub).current_state   # => :published
+```
+
+Declaring an operation generates three methods:
+
+* `confirm` fires the operation without persistence and returns the result.
+* `confirm!` fires the operation with persistence and returns the result.
+* `may_confirm?` runs the preflight only and returns `true` when every part is
+permitted.
+
+Every part may declare a `reason:`. Strings are used verbatim, symbols are
+called as methods on the instance and procs are `instance_exec`ed, so the
+rejection can carry the business cause (here: the missing delivery date). When
+no reason is declared AASM falls back to the failed guard callbacks, so the
+result always says *why* a part refused.
+
+```ruby
+aasm_linked_event :confirm do
+  part :docs, :finish, reason: :missing_materials_reason
+  part :pub,  :finish, reason: ->(record) { record.delivery_date_error }
+  part on: :review, event: :finish, args: [R7]   # keyword spelling / explicit args
+end
+```
+
+The result is an `AASM::Core::LinkedResult`:
+
+```ruby
+result.success?            # every part committed
+result.rejected?           # at least one part refused
+result.reason              # first rejection as "part: reason"
+result.reasons             # every rejection as "part: reason"
+result.states              # { docs: :archived, pub: :published } - committed parts
+result[:docs]              # the per-part decision
+result[:docs].permitted?   # guard allowed it during the preflight
+result[:docs].committed?   # it actually committed
+result[:pub].rejected?     # it refused
+result[:pub].reason        # "delivery date is empty"
+result[:pub].failures      # [:delivery_date?]
+result.to_h                # everything above, as plain data
+```
+
+A part that commits but a later part aborts the operation is rolled back with
+it and reported as `rolled_back?`, so `result.states` only ever holds one
+consistent snapshot.
+
+Callbacks can be declared on the operation itself (`before`, `success`,
+`failure`, `error`, `after`, `always`). They receive the result as their first
+argument. (`always` is the `ensure` callback; it is spelled differently because
+`ensure` is a Ruby keyword.) The per-event success callbacks (`:success` on the
+event) are postponed until every part has committed, so they can see the whole
+operation through `aasm_linked_result(:confirm)`:
+
+```ruby
+aasm_linked_event :confirm do
+  part :docs, :finish
+  part :pub, :finish, reason: 'delivery date is empty'
+  success :application_confirmed        # => def application_confirmed(result)
+  failure :application_refused          # => def application_refused(result)
+  always  ->(result) { Rails.logger.info(result.to_h) }
+end
+
+class Application
+  def pub_finished(*)
+    # fired only after both parts committed
+    aasm_linked_result(:confirm).states   # => { docs: :archived, pub: :published }
+  end
+end
+```
+
+Firing is also available without generated methods, which is handy when the
+name is not known statically:
+
+```ruby
+application.aasm_linked_fire(:confirm)
+application.aasm_linked_fire(:confirm, persist: true)
+application.aasm_linked_fire(:confirm, args: ['R7'])
+application.aasm_linked_fired?(:confirm)     # last firing succeeded?
+application.aasm_linked_result(:confirm)     # last result
+```
+
+The old single events keep working exactly as before, including their own
+guards, callbacks and persistence:
+
+```ruby
+application.finish_docs                      # only the docs state machine
+application.aasm(:docs).current_state        # => :archived
+application.aasm(:pub).current_state         # => :queued
 ```
 
 ### Binding event

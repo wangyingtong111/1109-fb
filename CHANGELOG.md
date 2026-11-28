@@ -1,6 +1,7 @@
 # CHANGELOG
 
 ## unreleased
+* Add declarable linked operations (`aasm_linked_event`) that preflight and commit several events across state machines as one unit, report the rejecting part and its reason, and keep single-event behaviour unchanged
 * typo fixes, thanks @kumar-mithlesh [#870](https://github.com/aasm/aasm/pull/870)
 
 ## 6.0.0 (5 July 2026)

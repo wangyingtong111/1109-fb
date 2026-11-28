@@ -19,4 +19,12 @@ module AASM
   class UndefinedState < RuntimeError; end
   class UndefinedEvent < UndefinedState; end
   class NoDirectAssignmentError < RuntimeError; end
+
+  # Raised when an instance is asked to perform a linked operation that has not
+  # been declared on its class.
+  class UnknownLinkedOperation < RuntimeError; end
+
+  # Internal signal used to abort the commit phase of a linked operation so
+  # that any surrounding transaction can roll back the parts that already ran.
+  class LinkedRollback < RuntimeError; end
 end

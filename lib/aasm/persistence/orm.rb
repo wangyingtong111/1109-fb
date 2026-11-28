@@ -77,6 +77,20 @@ module AASM
         raise("Define #aasm_transaction the AASM Persistence class.")
       end
 
+      # Run several state changes as one atomic unit.
+      #
+      # Used by linked operations so that a rejection detected while
+      # committing part N also undoes part 1..N-1. Adapters that support
+      # transactions override this; the default just yields so that plain
+      # objects (and adapters without transactions) keep working.
+      def aasm_atomic(requires_new = false, requires_lock = false, &block)
+        if aasm_supports_transactions?
+          aasm_transaction(requires_new, requires_lock, &block)
+        else
+          yield
+        end
+      end
+
       def aasm_supports_transactions?
         true
       end
