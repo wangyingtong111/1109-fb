@@ -134,6 +134,36 @@ class I18nBackendChainTest < I18n::TestCase
     assert_equal expected, I18n.backend.send(:translations)
   end
 
+  test "replace applies to the first backend of the chain" do
+    @first.store_translations(:en, { :notice => { :ready => 'Ready', :old => 'Old' } })
+    @second.store_translations(:en, { :notice => { :old => 'Lower old' }, :billing => { :total => 'Total' } })
+
+    I18n.backend.store_translations(:en, { :notice => { :ready => 'Ready!' } }, :replace => :notice)
+
+    assert_equal({ :ready => 'Ready!' }, @first.send(:translations)[:en][:notice])
+    assert_equal false, @first.exists?(:en, :'notice.old')
+  end
+
+  test "a replaced key of the first backend can still be read from a lower backend" do
+    @first.store_translations(:en, { :notice => { :ready => 'Ready', :old => 'Old' } })
+    @second.store_translations(:en, { :notice => { :old => 'Lower old' }, :billing => { :total => 'Total' } })
+
+    I18n.backend.store_translations(:en, { :notice => { :ready => 'Ready!' } }, :replace => :notice)
+
+    assert_equal 'Ready!', I18n.t(:'notice.ready')
+    assert_equal 'Lower old', I18n.t(:'notice.old')
+    assert_equal 'Total', I18n.t(:'billing.total')
+  end
+
+  test "replacing a namespace of the first backend does not remove lower namespaces from namespace lookups" do
+    @first.store_translations(:en, { :notice => { :ready => 'Ready', :old => 'Old' } })
+    @second.store_translations(:en, { :notice => { :old => 'Lower old', :archived => 'Archived' } })
+
+    I18n.backend.store_translations(:en, { :notice => { :ready => 'Ready!' } }, :replace => :notice)
+
+    assert_equal({ :ready => 'Ready!', :old => 'Lower old', :archived => 'Archived' }, I18n.t(:notice))
+  end
+
   protected
 
     def backend(translations)

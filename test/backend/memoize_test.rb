@@ -51,6 +51,16 @@ class I18nBackendMemoizeTest < I18nBackendSimpleTest
     assert_equal 0, I18n.backend.spy_calls
   end
 
+  test "test_resets_memoizations_on_replace_translations" do
+    I18n.backend.store_translations(:en, :notice => { :ready => 'Ready', :old => 'Old' })
+    assert_equal 'Old', I18n.t(:'notice.old')
+
+    I18n.backend.store_translations(:en, { :notice => { :ready => 'Ready!' } }, :replace => :notice)
+
+    assert_equal false, I18n.exists?(:'notice.old')
+    assert_equal 'Ready!', I18n.t(:'notice.ready')
+  end
+
   module TestLookup
     def lookup(locale, key, scope = [], options = {})
       keys = I18n.normalize_keys(locale, key, scope, options[:separator])

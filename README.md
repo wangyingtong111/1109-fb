@@ -66,6 +66,37 @@ I18n.config.with(locale: :ja).set!
 `set!` stores a frozen config in the current execution context.
 This keeps inherited state safe and lets updates happen by replacing config objects.
 
+### Replacing a namespace instead of deep merging it
+
+`store_translations` deep merges by default, so keys that are no longer part of
+the submitted data stay around. That is a problem when a whole dictionary is
+re-uploaded and entries have been removed. Pass the `:replace` option to replace
+one or more namespaces as a whole:
+
+```ruby
+I18n.backend.store_translations(:en, {
+  notice: { ready: "Ready" }
+}, replace: :notice)
+```
+
+Keys of `notice` that are missing from the new data are removed from the current
+layer, so `I18n.t("notice.old")` no longer resolves there. Other namespaces of
+the same locale (`billing` in this example) are untouched, and with a
+`I18n::Backend::Chain` the removed key can still be read from a lower backend.
+`:replace` accepts a namespace (`:notice`, `'notice.old'` for a nested one), an
+array of namespaces, or `true` to replace every top level namespace contained in
+the data:
+
+```ruby
+I18n.backend.store_translations(:en, data, replace: [:notice, :billing])
+I18n.backend.store_translations(:en, data, replace: true)
+```
+
+Replacing is atomic: when storing raises the previously stored translations are
+left untouched, and concurrent lookups see either the previous or the new
+version of the namespace, never a partially applied one. Without the option the
+behavior is unchanged (a deep merge).
+
 ## Features
 
 * Translation and localization

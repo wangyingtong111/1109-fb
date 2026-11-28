@@ -185,6 +185,85 @@ class I18nBackendSimpleTest < I18n::TestCase
     assert_equal Hash[:foo, {'bar' => 'barfr', 'baz' => 'bazfr'}], translations[:fr]
   end
 
+  # storing translations with an explicit namespace replacement
+
+  test "simple store_translations: replace drops keys missing from the new namespace" do
+    store_translations :en, :notice => { :ready => 'Ready', :old => 'Old', :draft => 'Draft' }
+    store_translations :en, { :notice => { :ready => 'Ready!' } }, :replace => :notice
+
+    assert_equal Hash[:ready => 'Ready!'], I18n.t(:notice)
+    assert_equal false, I18n.exists?(:'notice.old')
+    assert_equal false, I18n.exists?(:'notice.draft')
+    assert_equal 'Ready!', I18n.t(:'notice.ready')
+  end
+
+  test "simple store_translations: replace keeps other namespaces of the same locale" do
+    store_translations :en, :notice => { :ready => 'Ready', :old => 'Old' }, :billing => { :invoice => 'Invoice' }
+    store_translations :en, { :notice => { :ready => 'Ready!' } }, :replace => :notice
+
+    assert_equal Hash[:invoice => 'Invoice'], I18n.t(:billing)
+    assert_equal 'Invoice', I18n.t(:'billing.invoice')
+  end
+
+  test "simple store_translations: replace accepts a nested namespace" do
+    store_translations :en, :dashboard => { :notice => { :flash => 'Flash', :old => 'Old' }, :other => 'Other' }
+    store_translations :en, { :dashboard => { :notice => { :flash => 'Flash!' } } }, :replace => :'dashboard.notice'
+
+    assert_equal Hash[:flash => 'Flash!'], I18n.t(:'dashboard.notice')
+    assert_equal false, I18n.exists?(:'dashboard.notice.old')
+    assert_equal 'Other', I18n.t(:'dashboard.other')
+  end
+
+  test "simple store_translations: replace accepts several namespaces" do
+    store_translations :en, :notice => { :old => 'Old' }, :billing => { :old => 'Old' }, :other => { :keep => 'Keep' }
+    store_translations :en, { :notice => { :ready => 'Ready' }, :billing => { :invoice => 'Invoice' } }, :replace => [:notice, :billing]
+
+    assert_equal Hash[:ready => 'Ready'], I18n.t(:notice)
+    assert_equal Hash[:invoice => 'Invoice'], I18n.t(:billing)
+    assert_equal Hash[:keep => 'Keep'], I18n.t(:other)
+  end
+
+  test "simple store_translations: replace true replaces every namespace given in the data" do
+    store_translations :en, :notice => { :old => 'Old' }, :other => { :keep => 'Keep', :gone => 'Gone' }
+    store_translations :en, { :other => { :keep => 'Keep!' } }, :replace => true
+
+    assert_equal Hash[:keep => 'Keep!'], I18n.t(:other)
+    assert_equal Hash[:old => 'Old'], I18n.t(:notice)
+  end
+
+  test "simple store_translations: replace removes a namespace missing from the data" do
+    store_translations :en, :notice => { :ready => 'Ready' }, :billing => { :invoice => 'Invoice' }
+    store_translations :en, { :billing => { :invoice => 'Invoice!' } }, :replace => :notice
+
+    assert_nil I18n.t(:notice, :default => nil)
+    assert_equal 'Invoice!', I18n.t(:'billing.invoice')
+  end
+
+  test "simple store_translations: without the replace option the stored data is still deep merged" do
+    store_translations :en, :notice => { :ready => 'Ready', :old => 'Old' }
+    store_translations :en, :notice => { :ready => 'Ready!' }
+
+    assert_equal Hash[:ready => 'Ready!', :old => 'Old'], I18n.t(:notice)
+  end
+
+  test "simple store_translations: a failing replace import keeps the previous dictionary" do
+    store_translations :en, :notice => { :ready => 'Ready', :old => 'Old' }
+
+    assert_raises(I18n::InvalidLocaleData) do
+      store_translations :en, 'not a hash', :replace => :notice
+    end
+
+    assert_equal Hash[:ready => 'Ready', :old => 'Old'], I18n.t(:notice)
+  end
+
+  test "simple store_translations: replace does not mutate the given data hash" do
+    data = { :notice => { :ready => 'Ready' } }
+    store_translations :en, { :notice => { :old => 'Old' } }
+    store_translations :en, data, :replace => :notice
+
+    assert_equal Hash[:notice => { :ready => 'Ready' }], data
+  end
+
   # reloading translations
 
   test "simple reload_translations: unloads translations" do

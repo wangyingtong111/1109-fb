@@ -21,6 +21,17 @@ module I18n
 
       # This method receives a locale, a data hash and options for storing translations.
       # Should be implemented
+      #
+      # Backends that keep the stored translations around (such as
+      # I18n::Backend::Simple) accept a :replace option to replace one or more
+      # namespaces as a whole instead of deep merging them, so that keys which
+      # are no longer part of the submitted data are removed from the current
+      # layer:
+      #
+      #   store_translations(:en, { :notice => { :ready => 'Ready' } }, :replace => :notice)
+      #
+      # Namespaces not mentioned by the option keep being deep merged, and the
+      # behavior without the option is unchanged.
       def store_translations(locale, data, options = EMPTY_HASH)
         raise NotImplementedError
       end
